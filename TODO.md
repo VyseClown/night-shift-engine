@@ -12,3 +12,4 @@ spec.
 - [x] feature: Toggle todo done state offline (`specs/toggle-todo.md`)
 - [x] feature: Greeting helper demo (`specs/greeting-demo.md`)
 - [x] feature: Visual Validation panel (`specs/visual-validation.md`)
+- [x] feature: In-viewer spec editor (`specs/spec-editor.md`)

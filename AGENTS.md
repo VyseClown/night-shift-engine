@@ -103,6 +103,12 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project PATH --spec specs/
 
 - **`NIGHT_SHIFT_ACCEPT_COSTS=YES`** is just a safety gate so live model calls
   are never made by accident. It is not a billing switch.
+- **Candidate validation deps.** The isolated validation worktree symlinks the
+  project's ignored dependency dirs so tests run without reinstalling. The default
+  covers both the rn layout (`node_modules`, `ios/Pods`) and the web layout where
+  deps live in sub-packages (`server/node_modules`, `web/node_modules`), so the
+  viewer works out of the box. For a non-standard layout, set
+  `NIGHT_SHIFT_DEPENDENCY_LINKS="<space-separated rel paths>"`.
 - **Subscription vs API key.** If the `claude` CLI is logged in with a Claude
   Pro/Max account (no `ANTHROPIC_API_KEY` set), runs consume your plan's **usage
   limits**, not extra dollars. If an API key is set, calls are **billed

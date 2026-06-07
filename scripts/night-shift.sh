@@ -31,7 +31,12 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # Ignored, dependency directories the isolated validation worktree needs but git
 # does not track. They are symlinked from the project so RN tooling works without
 # reinstalling or triggering npx downloads. Override with NIGHT_SHIFT_DEPENDENCY_LINKS.
-DEPENDENCY_LINKS="${NIGHT_SHIFT_DEPENDENCY_LINKS:-node_modules ios/Pods}"
+# Defaults cover both the rn layout (root node_modules + CocoaPods) and the web
+# layout where node_modules live in sub-packages (e.g. the viewer's server/ and
+# web/). link_worktree_dependencies skips any entry that does not exist, so listing
+# all of them is safe — each project only links what it actually has. Override with
+# NIGHT_SHIFT_DEPENDENCY_LINKS for a non-standard layout.
+DEPENDENCY_LINKS="${NIGHT_SHIFT_DEPENDENCY_LINKS:-node_modules ios/Pods server/node_modules web/node_modules}"
 
 usage() {
   cat <<'EOF'
@@ -372,6 +377,9 @@ run_dry_fixtures() {
   fixture_assert "missing tool detection (exit 127)" fixture_missing_tools "$root"
   fixture_assert "finding stall counter accumulates and resets" fixture_finding_stall "$root"
   fixture_assert "validation worktree gets linked dependencies" fixture_worktree_dependencies "$root"
+  fixture_assert "validation worktree links nested (web-layout) dependencies" fixture_worktree_dependencies_nested "$root"
+  fixture_assert "tmp base is canonical (worktree path matches cleanup prefix)" fixture_tmp_base_canonical "$root"
+  fixture_assert "review fields are read only from the ## Review section" fixture_review_fields_scoped "$root"
   fixture_assert "spec validation accepts slash fields" fixture_spec_validation "$root"
   fixture_assert "web spec validates without native permission lines" fixture_spec_validation_web "$root"
   fixture_assert "review profile resolves to floor + scoped personas" fixture_review_profile "$root"
@@ -524,6 +532,54 @@ fixture_worktree_dependencies() {
   link_worktree_dependencies "$worktree"
   PROJECT="$saved_project"; DEPENDENCY_LINKS="$saved_links"
   [ -L "$worktree/node_modules" ] && [ -f "$worktree/node_modules/marker.txt" ]
+}
+
+fixture_worktree_dependencies_nested() {
+  # A nested dependency dir (web layout, e.g. server/node_modules) is linked into
+  # the worktree — the parent dir is created first. Proves the expanded default
+  # works for the viewer without a manual NIGHT_SHIFT_DEPENDENCY_LINKS override.
+  local root="$1" repo="$root/ndeprepo" worktree="$root/ndepwt" saved_project saved_links
+  mkdir -p "$repo/server/node_modules"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email fixture@example.invalid
+  git -C "$repo" config user.name Fixture
+  printf 'committed\n' >"$repo/tracked.txt"
+  printf 'dep\n' >"$repo/server/node_modules/marker.txt"
+  git -C "$repo" add tracked.txt
+  git -C "$repo" commit -qm fixture
+  git -C "$repo" worktree add --detach "$worktree" HEAD >/dev/null 2>&1
+  saved_project="$PROJECT"; saved_links="$DEPENDENCY_LINKS"
+  PROJECT="$repo"; DEPENDENCY_LINKS="node_modules server/node_modules web/node_modules"
+  link_worktree_dependencies "$worktree"
+  PROJECT="$saved_project"; DEPENDENCY_LINKS="$saved_links"
+  [ -L "$worktree/server/node_modules" ] && [ -f "$worktree/server/node_modules/marker.txt" ]
+}
+
+fixture_tmp_base_canonical() {
+  local base p1 p2
+  base="$(tmp_base)"
+  case "$base" in */) return 1 ;; esac        # no trailing slash
+  [ -d "$base" ] || return 1                  # resolves to a real dir
+  # The cleanup prefix and a stored worktree path derive from the same base, so a
+  # stored path always matches the prefix check (the /var vs /private/var bug).
+  p1="$base/night-shift-RUN-"
+  p2="$base/night-shift-RUN-abc123"
+  case "$p2" in "$p1"*) return 0 ;; *) return 1 ;; esac
+}
+
+fixture_review_fields_scoped() {
+  local root="$1" spec="$root/scoped.md" active
+  # A "- Personas:" line OUTSIDE the ## Review section (here under Related) must
+  # NOT be read as the explicit-personas field. Without scoping it would be parsed
+  # as an off-track explicit override and abort resolution; with scoping the spec
+  # resolves to its plain full rn profile.
+  fixture_write_min_spec "$spec" '## Related
+- Personas: Web Architect'
+  active="$(resolve_active_personas "$spec")" || return 1
+  [ "$(printf '%s' "$active" | tr '|' '\n' | grep -c .)" -eq 6 ] || return 1
+  printf '%s' "$active" | grep -q "Web Architect" && return 1
+  printf '%s' "$active" | grep -q "Mobile UX Designer" || return 1
+  return 0
 }
 
 fixture_spec_validation() {
@@ -699,8 +755,6 @@ fixture_write_min_spec() {
 - Project path: `~/work/app`
 - Base branch: `main`
 - Feature branch: `feat/x`
-## Review
-- Review Profile: full
 ## Permissions
 - New dependencies permitted: no - none
 - Native `ios/` changes permitted: no - js only
@@ -719,7 +773,13 @@ fixture_write_min_spec() {
   1. `npm test`
 - Final validation commands:
   1. `npm test`
+## Review
+- Review Profile: full
 SPEC
+  # `## Review` is intentionally last so an appended extra (a field line like
+  # `- Optional reviewers:` / `- Personas:` / `- Track:`) lands INSIDE the Review
+  # section, where spec_field_scope reads it. An appended `## …` contract heading
+  # ends the Review section and is found by the whole-file section scan.
   [ -z "$extra" ] || printf '%s\n' "$extra" >>"$spec"
 }
 
@@ -1209,6 +1269,15 @@ canonical_file() {
   printf '%s/%s\n' "$(cd "$dir" && pwd -P)" "$base"
 }
 
+# Canonical temp base directory. On macOS $TMPDIR is /var/folders/.../T/ (a
+# symlink with a trailing slash), but `git worktree list` reports the resolved
+# /private/var/... form, so a stored path built from raw $TMPDIR never
+# string-matches git's. Resolve it once (pwd -P strips the symlink, trailing and
+# double slashes) so stored worktree paths and the cleanup prefix match git.
+tmp_base() {
+  (cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P) || printf '%s' "${TMPDIR:-/tmp}"
+}
+
 validate_spec() {
   local file="$1" missing="" field value persona active track reason
   track="$(spec_track "$file")"
@@ -1629,7 +1698,7 @@ cleanup_validation_worktree() {
   [ -n "${STATE:-}" ] && [ -f "$STATE" ] || return 0
   path="$(jq -r '.validation_worktree // empty' "$STATE")"
   [ -n "$path" ] || return 0
-  expected_prefix="${TMPDIR:-/tmp}/night-shift-$RUN_ID-"
+  expected_prefix="$(tmp_base)/night-shift-$RUN_ID-"
   case "$path" in "$expected_prefix"*) ;; *) return 1 ;; esac
   if git -C "$PROJECT" worktree list --porcelain | grep -Fqx "worktree $path"; then
     git -C "$PROJECT" worktree remove --force "$path" >/dev/null || return 1
@@ -1764,7 +1833,7 @@ EOF
   previous="$(jq -r '.candidate // empty' "$STATE")"
   [ "$candidate" != "$previous" ] ||
     block_run "CREATE_CANDIDATE did not produce a new candidate commit"
-  validation_worktree="${TMPDIR:-/tmp}/night-shift-$RUN_ID-$candidate"
+  validation_worktree="$(tmp_base)/night-shift-$RUN_ID-$candidate"
   [ ! -e "$validation_worktree" ] ||
     block_run "candidate validation worktree already exists: $validation_worktree"
   git -C "$PROJECT" worktree add --detach "$validation_worktree" "$candidate" >/dev/null ||

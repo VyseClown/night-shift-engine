@@ -81,12 +81,31 @@ profile_personas() {
   esac
 }
 
+# The text the review fields (Track, Review Profile, Optional reviewers, Personas)
+# are read from. When the spec has a `## Review` heading, only that section (up to
+# the next `## ` heading) is used, so a prose line elsewhere (e.g. a "- Personas:"
+# reference under Related) is never mis-read as a field. A spec with no `## Review`
+# heading falls back to the whole file (backward compatible for terse/legacy
+# specs). The section-presence checks for optional contract headings still scan
+# the whole file separately.
+spec_field_scope() {
+  if grep -Eq '^## Review([[:space:]]|$)' "$1"; then
+    awk '
+      /^## Review([ \t]|$)/ { inrev=1; next }
+      /^## / { inrev=0 }
+      inrev { print }
+    ' "$1"
+  else
+    cat "$1"
+  fi
+}
+
 # Extracts the `- Track: <value>` field from a spec, normalized to a lowercase,
 # whitespace-free token. Falls back to DEFAULT_TRACK when the field is absent so
 # pre-existing specs (which never declared a track) keep resolving to rn.
 spec_track() {
   local t
-  t="$(sed -nE 's/^- Track: ?(.*)/\1/p' "$1" | head -n 1 |
+  t="$(spec_field_scope "$1" | sed -nE 's/^- Track: ?(.*)/\1/p' | head -n 1 |
     tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   [ -n "$t" ] || t="$DEFAULT_TRACK"
   printf '%s' "$t"
@@ -95,7 +114,7 @@ spec_track() {
 # Extracts the `- Review Profile: <value>` field from a spec, normalized to a
 # lowercase, whitespace-free token. Empty when the field is absent.
 spec_review_profile() {
-  sed -nE 's/^- Review Profile: ?(.*)/\1/p' "$1" | head -n 1 |
+  spec_field_scope "$1" | sed -nE 's/^- Review Profile: ?(.*)/\1/p' | head -n 1 |
     tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
 }
 
@@ -120,7 +139,7 @@ optional_contract_heading() {
 # no output, so a spec that does not opt in adds nothing to the active set.
 spec_optional_personas() {
   local file="$1" raw entry match opt heading old_ifs sec_ifs
-  raw="$(sed -nE 's/^- Optional reviewers: ?(.*)/\1/p' "$file" | head -n 1)"
+  raw="$(spec_field_scope "$1" | sed -nE 's/^- Optional reviewers: ?(.*)/\1/p' | head -n 1)"
   old_ifs="$IFS"; IFS=',|'
   for entry in $raw; do
     IFS="$old_ifs"
@@ -161,7 +180,7 @@ spec_explicit_personas() {
   local file="$1" track universe raw entry match cand old_ifs inner_ifs
   track="$(spec_track "$file")"
   universe="$(persona_set "$track" 2>/dev/null)|$PERSONAS_OPTIONAL"
-  raw="$(sed -nE 's/^- Personas: ?(.*)/\1/p' "$file" | head -n 1)"
+  raw="$(spec_field_scope "$1" | sed -nE 's/^- Personas: ?(.*)/\1/p' | head -n 1)"
   old_ifs="$IFS"; IFS=',|'
   for entry in $raw; do
     IFS="$old_ifs"
