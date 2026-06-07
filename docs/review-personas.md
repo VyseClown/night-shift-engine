@@ -288,15 +288,30 @@ section (`## API Contract`) is present.*
 
 Pixel-level design validation is intentionally out of scope for this phase. The
 Design Fidelity Reviewer performs static (text/traceability) checks only and
-defers pixel validation when no screenshots exist. The next phase would add the
-pieces that require a running simulator (full Xcode / Android SDK), which this
-environment lacks:
+defers pixel validation when no screenshots exist.
 
-- screenshot capture from a running simulator/emulator,
-- a pixel-diff / `visual-diff` comparison tool with a tolerance contract,
-- a `visual-diff` evidence schema (vendored like the other schemas), and
-- observer visual packets so the independent observer can confirm visual
-  evidence.
+**Contract scaffold (in place).** The engine half is now scaffolded in
+`scripts/lib/visual-capture.sh` and exercised by the fixture suite:
 
-Until that environment exists, treat Design Fidelity as a static design-contract
-conformance reviewer.
+- the `visual-diff` evidence schema is vendored (`schemas/visual-diff.json`,
+  byte-identical to the viewer's copy) and enforced by `json_schema_basic
+  visual-diff`, including pass-consistency (`pass == diff_pct <= tolerance`);
+- the **deterministic** pipeline is real: `visual_capture_screens` parses the
+  Design Contract's `- Frames:` × `- Required states:` into the screens to cover,
+  `visual_capture_tolerance` reads `- Tolerance:` (default 0.10), and
+  `visual_assemble_screen` builds a conforming per-screen report with a *derived*
+  pass; `run_visual_capture` assembles `visual-diff-*.json` into the run's
+  `validated/` dir, which the viewer already renders.
+
+**Still required (needs a real machine).** Two clearly-marked stubs
+(`__visual_capture_screenshot`, `__visual_pixel_diff`) are the only
+simulator/tool-dependent steps; a real deployment sets `NIGHT_SHIFT_VISUAL_CAPTURE=1`
+and provides a simulator (`xcrun`/`adb`) and an image-diff tool, then implements
+those two functions. Also still open: observer visual packets so the independent
+observer can confirm visual evidence.
+
+`run_visual_capture` is **inert by default** — a no-op SKIP unless capture is
+enabled *and* the tooling is present — so it never affects a normal run, and is
+not yet wired into the live state machine (the integration point is documented in
+the file header). Until the capture/diff steps are implemented, treat Design
+Fidelity as a static design-contract conformance reviewer.

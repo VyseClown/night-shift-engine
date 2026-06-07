@@ -28,6 +28,12 @@ RATE_LIMIT_MAX_WAIT_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_MAX_WAIT_SECONDS:-21600}"
 NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # shellcheck source=scripts/lib/personas.sh
 . "$NIGHT_SHIFT_LIB/personas.sh"
+# Design-fidelity visual capture (Phase 2). A contract scaffold: inert by default
+# (no-op SKIP without a simulator + image-diff tool); see the file header for the
+# integration point. Sourced so its functions and the visual-diff schema check
+# are available to the run and the fixtures.
+# shellcheck source=scripts/lib/visual-capture.sh
+. "$NIGHT_SHIFT_LIB/visual-capture.sh"
 # Ignored, dependency directories the isolated validation worktree needs but git
 # does not track. They are symlinked from the project so RN tooling works without
 # reinstalling or triggering npx downloads. Override with NIGHT_SHIFT_DEPENDENCY_LINKS.
@@ -151,6 +157,28 @@ json_schema_basic() {
           (.failing_output | type == "string" and length > 0) and
           (.passing_exit_status == 0) and
           (.passing_output | type == "string" and length > 0))
+      ' "$file" >/dev/null 2>&1
+      ;;
+    visual-diff)
+      # Design-fidelity report the engine's visual-capture scaffold emits and the
+      # viewer renders. Mirrors schemas/visual-diff.json (kept byte-identical to
+      # the viewer's vendored copy), including pass-consistency: pass is true iff
+      # diff_pct <= tolerance.
+      jq -e '
+        type == "object" and
+        ((keys | sort) == ["screens","task"]) and
+        (.task | type == "string" and length > 0) and
+        (.screens | type == "array" and length > 0 and all(.[];
+          ((keys | sort) == ["diff_image","diff_pct","pass","reference","screen","screenshot","state","tolerance"]) and
+          (.screen | type == "string" and length > 0) and
+          (.state | type == "string" and length > 0) and
+          (.reference | type == "string" and length > 0) and
+          (.screenshot | type == "string" and length > 0) and
+          (.diff_pct | type == "number" and . >= 0) and
+          (.tolerance | type == "number" and . >= 0) and
+          (.pass | type == "boolean") and
+          (.diff_image == null or (.diff_image | type == "string" and length > 0)) and
+          (.pass == (.diff_pct <= .tolerance))))
       ' "$file" >/dev/null 2>&1
       ;;
     *) return 1 ;;
@@ -380,6 +408,10 @@ run_dry_fixtures() {
   fixture_assert "validation worktree links nested (web-layout) dependencies" fixture_worktree_dependencies_nested "$root"
   fixture_assert "tmp base is canonical (worktree path matches cleanup prefix)" fixture_tmp_base_canonical "$root"
   fixture_assert "review fields are read only from the ## Review section" fixture_review_fields_scoped "$root"
+  fixture_assert "visual-diff schema enforces shape + pass-consistency" fixture_visual_diff_schema "$root"
+  fixture_assert "visual capture parses Design Contract frames x states" fixture_visual_capture_screens "$root"
+  fixture_assert "visual screen assembly derives pass and null diff_image" fixture_visual_assemble_screen "$root"
+  fixture_assert "visual capture is an inert no-op without tooling" fixture_visual_capture_skips "$root"
   fixture_assert "spec validation accepts slash fields" fixture_spec_validation "$root"
   fixture_assert "web spec validates without native permission lines" fixture_spec_validation_web "$root"
   fixture_assert "review profile resolves to floor + scoped personas" fixture_review_profile "$root"
@@ -579,6 +611,56 @@ fixture_review_fields_scoped() {
   [ "$(printf '%s' "$active" | tr '|' '\n' | grep -c .)" -eq 6 ] || return 1
   printf '%s' "$active" | grep -q "Web Architect" && return 1
   printf '%s' "$active" | grep -q "Mobile UX Designer" || return 1
+  return 0
+}
+
+fixture_visual_diff_schema() {
+  local root="$1" good="$root/vd-good.json" bad="$root/vd-bad.json" badkey="$root/vd-key.json"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"diff_image":null}]}' >"$good"
+  json_schema_basic visual-diff "$good" || return 1
+  # pass=true but diff_pct > tolerance → inconsistent → rejected.
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"diff_image":null}]}' >"$bad"
+  json_schema_basic visual-diff "$bad" && return 1
+  # missing a per-screen key → rejected.
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true}]}' >"$badkey"
+  json_schema_basic visual-diff "$badkey" && return 1
+  return 0
+}
+
+fixture_visual_capture_screens() {
+  local root="$1" spec="$root/dc.md" out
+  printf '%s\n' '## Design Contract' '- Frames: Home, Settings' '- Required states: default, empty' '## Edge Cases' >"$spec"
+  out="$(visual_capture_screens "$spec")"
+  [ "$(printf '%s\n' "$out" | grep -c .)" -eq 4 ] || return 1
+  printf '%s\n' "$out" | grep -qx 'Home|default' || return 1
+  printf '%s\n' "$out" | grep -qx 'Settings|empty' || return 1
+  # No Design Contract → no screens.
+  printf 'no contract\n' >"$spec"
+  [ -z "$(visual_capture_screens "$spec")" ] || return 1
+  return 0
+}
+
+fixture_visual_assemble_screen() {
+  local root="$1" obj
+  # Within tolerance → pass derived true; diff_image preserved.
+  obj="$(visual_assemble_screen Home default design/h.png shots/h.png 0.05 0.1 diffs/h.png)"
+  printf '%s' "$obj" | jq -e '.pass == true and .diff_image == "diffs/h.png"' >/dev/null || return 1
+  # Over tolerance → pass derived false; empty diff_image → null.
+  obj="$(visual_assemble_screen Home empty r s 0.4 0.1 "")"
+  printf '%s' "$obj" | jq -e '.pass == false and .diff_image == null' >/dev/null || return 1
+  # The assembled object is a valid screen inside a report.
+  printf '{"task":"t","screens":[%s]}\n' "$obj" >"$root/asm.json"
+  json_schema_basic visual-diff "$root/asm.json" || return 1
+  return 0
+}
+
+fixture_visual_capture_skips() {
+  local root="$1" out="$root/capout"
+  mkdir -p "$out"
+  # Inert by default: unavailable → no-op, returns 0, writes no report, never blocks.
+  visual_capture_available && return 1
+  run_visual_capture "$root/spec.md" abc123 "$out" >/dev/null 2>&1 || return 1
+  [ -z "$(find "$out" -name 'visual-diff-*.json' 2>/dev/null)" ] || return 1
   return 0
 }
 

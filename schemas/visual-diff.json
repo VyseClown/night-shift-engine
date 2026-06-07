@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/night-shift/visual-diff.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "screens"],
+  "properties": {
+    "task": { "type": "string", "minLength": 1 },
+    "screens": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "screen",
+          "state",
+          "reference",
+          "screenshot",
+          "diff_pct",
+          "tolerance",
+          "pass",
+          "diff_image"
+        ],
+        "properties": {
+          "screen": { "type": "string", "minLength": 1 },
+          "state": { "type": "string", "minLength": 1 },
+          "reference": { "type": "string", "minLength": 1 },
+          "screenshot": { "type": "string", "minLength": 1 },
+          "diff_pct": { "type": "number", "minimum": 0 },
+          "tolerance": { "type": "number", "minimum": 0 },
+          "pass": { "type": "boolean" },
+          "diff_image": { "type": ["string", "null"], "minLength": 1 }
+        }
+      }
+    }
+  }
+}
