@@ -1,0 +1,20 @@
+# Night-shift ENGINE repo (rooted at ~/work). Tracks the orchestrator and its
+# contracts/docs/specs; the sibling app projects are their own repos and are
+# excluded here.
+
+# Run state (per-project, regenerated each run).
+.night-shift/
+
+# Independent project repos that live alongside the engine (each has its own git).
+/rn-sandbox/
+/web-app/
+/night-shift-viewer/
+/nightshift-demo/
+
+# Local tooling / machine config — never publish.
+.claude/
+.DS_Store
+*.log
+
+# Node (in case any helper ever adds deps at the root).
+node_modules/

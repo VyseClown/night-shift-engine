@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/night-shift/observer-review.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "observer",
+    "primary",
+    "task",
+    "candidate_commit",
+    "status",
+    "findings",
+    "documentation_changes"
+  ],
+  "properties": {
+    "observer": { "const": "claude" },
+    "primary": { "const": "claude" },
+    "task": { "type": "string", "minLength": 1 },
+    "candidate_commit": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
+    "status": { "enum": ["APPROVE", "BLOCK"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "evidence", "required_change"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^OBS-[0-9]{3,}$" },
+          "evidence": { "type": "string", "minLength": 1 },
+          "required_change": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "documentation_changes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "APPROVE" } } },
+      "then": { "properties": { "findings": { "maxItems": 0 } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "BLOCK" } } },
+      "then": { "properties": { "findings": { "minItems": 1 } } }
+    }
+  ]
+}

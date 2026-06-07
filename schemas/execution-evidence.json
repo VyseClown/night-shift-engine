@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/night-shift/execution-evidence.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "baseline", "test_first", "final_validation"],
+  "properties": {
+    "task": { "type": "string", "minLength": 1 },
+    "baseline": { "$ref": "#/$defs/commands" },
+    "test_first": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "failing_exit_status", "failing_output", "passing_exit_status", "passing_output"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "failing_exit_status": { "type": "integer", "minimum": 1 },
+        "failing_output": { "type": "string", "minLength": 1 },
+        "passing_exit_status": { "const": 0 },
+        "passing_output": { "type": "string", "minLength": 1 }
+      }
+    },
+    "final_validation": { "$ref": "#/$defs/commands" }
+  },
+  "$defs": {
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_status", "output"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "exit_status": { "type": "integer", "minimum": 0 },
+          "output": { "type": "string" }
+        }
+      }
+    }
+  }
+}

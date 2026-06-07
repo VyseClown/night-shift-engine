@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/night-shift/persona-review.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "persona",
+    "stage",
+    "commit",
+    "status",
+    "findings",
+    "documentation_changes"
+  ],
+  "properties": {
+    "persona": {
+      "$comment": "Union of the rn-track and web-track persona sets plus the cross-track optional personas; must stay in sync with the inline $PERSONAS union in scripts/night-shift.sh. This enum only bounds the universe of valid persona names — per-track/profile correctness is enforced separately by resolve_active_personas + the exact active-set gate in run_personas.",
+      "enum": [
+        "Mobile UX Designer",
+        "React Native Architect",
+        "Mobile Domain Expert",
+        "Web UX & Accessibility Designer",
+        "Web Architect",
+        "Backend & Data Expert",
+        "TypeScript & Code Quality Expert",
+        "Performance Expert",
+        "Human Advocate",
+        "Product Reviewer",
+        "Design Fidelity Reviewer",
+        "Security Reviewer",
+        "API Contract Reviewer"
+      ]
+    },
+    "stage": { "enum": ["plan", "implementation"] },
+    "commit": { "type": ["string", "null"], "minLength": 1 },
+    "status": { "enum": ["APPROVE", "BLOCK"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "evidence", "required_change"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Z][A-Z0-9_-]*-[0-9]{3,}$" },
+          "evidence": { "type": "string", "minLength": 1 },
+          "required_change": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "documentation_changes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "APPROVE" } } },
+      "then": { "properties": { "findings": { "maxItems": 0 } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "BLOCK" } } },
+      "then": { "properties": { "findings": { "minItems": 1 } } }
+    }
+  ]
+}

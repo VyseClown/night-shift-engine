@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/night-shift/next-action.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action", "task", "stage", "artifacts", "reason"],
+  "properties": {
+    "action": {
+      "enum": [
+        "RUN_PERSONAS",
+        "CREATE_CANDIDATE",
+        "REQUEST_OBSERVER",
+        "NEXT_TASK",
+        "BLOCKED",
+        "COMPLETE"
+      ]
+    },
+    "task": { "type": "string", "minLength": 1 },
+    "stage": { "type": "string", "minLength": 1 },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+      },
+      "uniqueItems": true
+    },
+    "reason": { "type": "string", "minLength": 1 }
+  }
+}
