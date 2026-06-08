@@ -16,3 +16,4 @@ spec.
 - [ ] feature: Sum helper demo (`specs/sum-demo.md`)
 - [x] feature: Web app logic audit (`specs/web-audit.md`)
 - [x] bug: Web app P1 correctness fixes (`specs/web-p1-fixes.md`)
+- [ ] feature: Web app call-site resilience (HUMAN-001 follow-up) (`specs/web-resilience.md`)
