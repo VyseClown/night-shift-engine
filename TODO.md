@@ -13,3 +13,6 @@ spec.
 - [x] feature: Greeting helper demo (`specs/greeting-demo.md`)
 - [x] feature: Visual Validation panel (`specs/visual-validation.md`)
 - [x] feature: In-viewer spec editor (`specs/spec-editor.md`)
+- [ ] feature: Sum helper demo (`specs/sum-demo.md`)
+- [x] feature: Web app logic audit (`specs/web-audit.md`)
+- [ ] bug: Web app P1 correctness fixes (`specs/web-p1-fixes.md`)

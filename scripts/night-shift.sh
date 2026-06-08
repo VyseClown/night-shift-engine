@@ -388,6 +388,7 @@ run_dry_fixtures() {
   fixture_reject "test-first evidence requires an observed failure" json_schema_basic execution-evidence "$bad"
 
   fixture_assert "bug-first task ordering" fixture_task_order "$root"
+  fixture_assert "unchecked queue lists bugs-first, excludes checked" fixture_unchecked_queue_order "$root"
   fixture_assert "stage limit boundary" fixture_limits
   fixture_assert "review retry preserves successful results" fixture_partial_retry "$root"
   fixture_assert "in-place persona artifact copy is a no-op (no BSD cp failure)" fixture_persona_inplace_copy "$root"
@@ -449,6 +450,23 @@ fixture_task_order() {
 - [ ] bug: First bug (`specs/bug.md`)
 EOF
   [ "$(select_task_from_todo "$root/TODO.md")" = "specs/bug.md" ]
+}
+
+fixture_unchecked_queue_order() {
+  local root="$1" out
+  cat >"$root/TODO.md" <<'EOF'
+- [x] feature: Done (`specs/done.md`)
+- [ ] feature: Later feature (`specs/feature.md`)
+- [ ] bug: First bug (`specs/bug.md`)
+EOF
+  # All unchecked specs, bugs before features, checked entries excluded. This is
+  # what start_next_task walks to find the next spec for THIS run's project.
+  out="$(list_unchecked_specs "$root/TODO.md")"
+  [ "$(printf '%s\n' "$out" | grep -c .)" -eq 2 ] || return 1
+  [ "$(printf '%s\n' "$out" | head -n 1)" = "specs/bug.md" ] || return 1
+  [ "$(printf '%s\n' "$out" | tail -n 1)" = "specs/feature.md" ] || return 1
+  printf '%s' "$out" | grep -q "specs/done.md" && return 1
+  return 0
 }
 
 fixture_limits() {
@@ -1178,6 +1196,16 @@ select_task_from_todo() {
   fi
   [ -n "$result" ] || return 1
   printf '%s\n' "$result"
+}
+
+# All unchecked TODO specs in selection order — bugs first, then features — one
+# per line. start_next_task walks these and picks the first one for THIS run's
+# project, so a queued spec for another project is skipped (not a block).
+list_unchecked_specs() {
+  local todo="$1"
+  [ -f "$todo" ] || return 0
+  sed -nE 's/^- \[ \] bug:.*\(`([^`]+)`\).*/\1/p' "$todo"
+  sed -nE 's/^- \[ \] feature:.*\(`([^`]+)`\).*/\1/p' "$todo"
 }
 
 limit_exceeded() {
@@ -2197,18 +2225,24 @@ complete_run() {
 }
 
 start_next_task() {
-  local next_spec epoch
-  next_spec="$(select_task_from_todo "$WORKSPACE_ROOT/TODO.md")" || {
-    complete_run
-    return
-  }
-  case "$next_spec" in /*) ;; *) next_spec="$WORKSPACE_ROOT/$next_spec" ;; esac
-  next_spec="$(canonical_file "$next_spec")" || block_run "next TODO spec does not exist"
-  [ "$next_spec" != "$SPEC" ] ||
-    block_run "NEXT_TASK requires the completed TODO entry to be checked off"
+  local next_spec="" epoch cand canon
+  # Walk the unchecked queue and pick the first spec that belongs to THIS run's
+  # project. Specs for other projects are skipped (a run is pinned to one
+  # --project and cannot switch). If none remain for this project, the run is
+  # done — complete and archive rather than block on someone else's spec.
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    case "$cand" in /*) canon="$cand" ;; *) canon="$WORKSPACE_ROOT/$cand" ;; esac
+    canon="$(canonical_file "$canon")" || continue
+    validate_spec_project "$canon" || continue
+    [ "$canon" != "$SPEC" ] ||
+      block_run "NEXT_TASK requires the completed TODO entry to be checked off"
+    next_spec="$canon"; break
+  done <<EOF
+$(list_unchecked_specs "$WORKSPACE_ROOT/TODO.md")
+EOF
+  [ -n "$next_spec" ] || { complete_run; return; }
   validate_spec "$next_spec" || block_run "next TODO spec is incomplete"
-  validate_spec_project "$next_spec" ||
-    block_run "next TODO spec routes to a different or invalid project"
   SPEC="$next_spec"
   BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
   BASE_BRANCH="$(git -C "$PROJECT" branch --show-current)"

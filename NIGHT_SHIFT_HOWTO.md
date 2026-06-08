@@ -98,6 +98,16 @@ Add one line pointing at the spec. Bugs are selected before features:
      --project ~/work/web-app --spec specs/my-feature.md
    ```
    Omit `--spec` to let it pull the next `TODO.md` entry.
+5. **Or launch from the viewer** (a UI over the same script — no terminal):
+   ```sh
+   cd ~/work/night-shift-viewer/server && NSV_ALLOW_EDIT=1 NSV_ALLOW_LAUNCH=1 NSV_ALLOW_REAL=1 npm run dev:real
+   cd ~/work/night-shift-viewer/web && npm run dev      # second terminal
+   ```
+   Open http://127.0.0.1:5173 → **Specs** tab to read/edit specs, **Launch** tab →
+   *Real run* → pick the project + spec → watch it stream. The project must be on
+   the spec's feature branch and gitignore `.night-shift/` first (the script
+   refuses otherwise). The viewer scans `rn-sandbox`, `web-app`,
+   `nightshift-demo` only.
 
 > `NIGHT_SHIFT_ACCEPT_COSTS=YES` is a safety gate so live model calls aren't made
 > by accident — not a billing switch. On a Claude Pro/Max login it consumes plan
