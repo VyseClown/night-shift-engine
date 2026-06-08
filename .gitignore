@@ -1,9 +1,16 @@
 # Night-shift ENGINE repo (rooted at ~/work). Tracks the orchestrator and its
-# contracts/docs/specs; the sibling app projects are their own repos and are
+# contracts/docs; the sibling app projects are their own repos and are
 # excluded here.
 
 # Run state (per-project, regenerated each run).
 .night-shift/
+
+# Feature specs stay LOCAL ONLY — they carry per-project/product detail and must
+# not be published with the engine. The generic templates are kept tracked so the
+# engine stays self-contained scaffolding.
+/specs/*
+!/specs/_template.md
+!/specs/_template-web.md
 
 # Independent project repos that live alongside the engine (each has its own git).
 /rn-sandbox/
