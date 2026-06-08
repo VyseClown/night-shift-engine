@@ -15,4 +15,4 @@ spec.
 - [x] feature: In-viewer spec editor (`specs/spec-editor.md`)
 - [ ] feature: Sum helper demo (`specs/sum-demo.md`)
 - [x] feature: Web app logic audit (`specs/web-audit.md`)
-- [ ] bug: Web app P1 correctness fixes (`specs/web-p1-fixes.md`)
+- [x] bug: Web app P1 correctness fixes (`specs/web-p1-fixes.md`)
