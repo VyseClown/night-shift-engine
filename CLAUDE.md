@@ -42,7 +42,10 @@ engine/workflow git here at the root.
   paid runs, `NSV_ALLOW_EDIT` = spec editor. The viewer scans `rn-sandbox`,
   `web-app`, `nightshift-demo` only.
 - A target project must gitignore `.night-shift/` and be on the spec's feature
-  branch before a run. `NEXT_TASK` only continues to same-project TODO specs.
+  branch before a run. `NEXT_TASK` only continues to same-project TODO specs,
+  and only on runs started *without* `--spec` (the engine picks the task from
+  TODO). An explicit `--spec` run is a single task: on `NEXT_TASK` it completes
+  and exits 0 so an external wrapper can own cross-spec sequencing/branching.
 
 > **Note:** the night-shift workflow is two-track. A spec declares `- Track: rn`
 > or `- Track: web` (default `rn`), which selects the review persona set

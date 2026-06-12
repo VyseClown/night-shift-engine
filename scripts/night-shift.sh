@@ -7,6 +7,7 @@ SCHEMA_DIR="$WORKSPACE_ROOT/schemas"
 PRIMARY=""
 PROJECT=""
 SPEC=""
+EXPLICIT_SPEC=0
 FIXTURE_TEST=0
 DRY_RUN=0
 FULL_PERSONA_LIVE_TEST=0
@@ -70,7 +71,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --primary) [ "$#" -ge 2 ] || die "--primary requires a value"; PRIMARY="$2"; shift 2 ;;
     --project) [ "$#" -ge 2 ] || die "--project requires a value"; PROJECT="$2"; shift 2 ;;
-    --spec) [ "$#" -ge 2 ] || die "--spec requires a value"; SPEC="$2"; shift 2 ;;
+    --spec) [ "$#" -ge 2 ] || die "--spec requires a value"; SPEC="$2"; EXPLICIT_SPEC=1; shift 2 ;;
     --fixture-test) FIXTURE_TEST=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --full-persona-live-test) FULL_PERSONA_LIVE_TEST=1; shift ;;
@@ -1492,7 +1493,7 @@ extract_validation_commands() {
 run_test_command() {
   local phase="$1" command="$2" target="$3" run_dir="${4:-$PROJECT}" output rc=0
   output="$RUN_ROOT/raw/test-first-$phase.log"
-  (cd "$run_dir" && bash -lc "$command") >"$output" 2>&1 || rc=$?
+  (cd "$run_dir" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
   jq -n --arg command "$command" --argjson exit_status "$rc" \
     --arg output "$(tail -c 20000 "$output")" \
     '{command:$command,exit_status:$exit_status,output:$output}' >"$target"
@@ -1506,7 +1507,10 @@ run_validation_commands() {
     [ -n "$command" ] || continue
     output="$RUN_ROOT/raw/validation-$kind-$(printf '%s' "$command" | cksum | awk '{print $1}').log"
     rc=0
-    (cd "$run_dir" && bash -lc "$command") >"$output" 2>&1 || rc=$?
+    # Redirect stdin from /dev/null: a command that reads stdin (e.g.
+    # `docker compose exec`) would otherwise drain this while-read loop's heredoc
+    # and silently skip the remaining commands.
+    (cd "$run_dir" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
     [ "$first" -eq 1 ] || printf ',\n' >>"$tmp"
     jq -n --arg command "$command" --argjson exit_status "$rc" \
       --arg output "$(tail -c 20000 "$output")" \
@@ -2291,7 +2295,16 @@ handle_signal() {
     NEXT_TASK)
       [ "$(jq -r '.stage' "$STATE")" = "completion" ] ||
         block_run "NEXT_TASK requires observer approval"
-      start_next_task
+      # An explicit `--spec` run is a single task — the caller (e.g. a wrapper that
+      # owns cross-spec sequencing + per-spec branch routing) advances to the next
+      # spec itself. Treat NEXT_TASK as COMPLETE so the run exits 0 cleanly instead
+      # of trying to chain to another TODO entry whose branch isn't checked out.
+      if [ "${EXPLICIT_SPEC:-0}" = "1" ]; then
+        log "explicit --spec run: task complete; not chaining to the next TODO entry"
+        complete_run
+      else
+        start_next_task
+      fi
       ;;
     BLOCKED) block_run "primary reported: $(jq -r '.reason' "$signal")" ;;
     COMPLETE)
