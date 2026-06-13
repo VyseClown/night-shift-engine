@@ -439,6 +439,7 @@ run_dry_fixtures() {
   fixture_assert "persona gate enforces the active profile set" fixture_profile_gate "$root"
   fixture_assert "re-review rounds require only pending blockers" fixture_review_round_subset "$root"
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
+  fixture_assert "persona collection skips non-persona artifacts" fixture_persona_collect "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
@@ -901,6 +902,28 @@ fixture_cost_ledger() {
     "$ledger" >/dev/null || return 1
   # The raw files themselves are still compacted away.
   [ ! -d "$dir/raw" ] || return 1
+  return 0
+}
+
+fixture_persona_collect() {
+  local root="$1" result_dir signal
+  local PROJECT="$root/collect"
+  result_dir="$PROJECT/.night-shift/out"
+  signal="$PROJECT/signal.json"
+  mkdir -p "$PROJECT" "$result_dir"
+  printf '{"persona":"Web Architect","stage":"plan","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/a.json"
+  printf '{"persona":"Human Advocate","stage":"plan","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/b.json"
+  # A non-persona deliverable the primary also lists (the review bundle).
+  printf '# review bundle\nnot persona-review json\n' >"$PROJECT/bundle.md"
+  printf '{"artifacts":["bundle.md","a.json","b.json"]}\n' >"$signal"
+  collect_persona_results "$signal" "$result_dir" || return 1
+  # Exactly the two persona files were collected; the bundle was skipped.
+  [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || return 1
+  [ -f "$result_dir/a.json" ] && [ -f "$result_dir/b.json" ] || return 1
+  [ ! -f "$result_dir/bundle.md" ] || return 1
+  # An unsafe/absolute path anywhere in the list is still fatal (traversal guard).
+  printf '{"artifacts":["/etc/hosts","a.json"]}\n' >"$signal"
+  collect_persona_results "$signal" "$result_dir" && return 1
   return 0
 }
 
@@ -1900,9 +1923,10 @@ $SPEC. "artifacts" lists only project-relative files (no absolute paths, no
   repo themselves. Write exactly $persona_count result files, one per listed
   persona, each validating against $SCHEMA_DIR/persona-review.json, with the
   persona's exact name and "stage" set to "plan" during plan_review or
-  "implementation" during implementation_review. List all of those file paths in
-  artifacts. Do not run personas outside the listed set. Every finding is a
-  blocker; APPROVE carries no findings.
+  "implementation" during implementation_review. In "artifacts" list ONLY those
+  persona result files — do NOT list the review bundle or the plan doc (they are
+  written to disk but are not persona results). Do not run personas outside the
+  listed set. Every finding is a blocker; APPROVE carries no findings.
 - CREATE_CANDIDATE: create ONE local commit on the feature branch containing
   only files this run changed (never baseline dirty paths). Then write an
   execution-evidence file validating against $SCHEMA_DIR/execution-evidence.json
@@ -2083,6 +2107,31 @@ extract_claude_structured() {
   return 1
 }
 
+# Copies the persona-review artifacts listed in a RUN_PERSONAS signal into the
+# round result dir. Each artifact is resolved for safety first (an unsafe or
+# missing path is fatal — path-traversal guard). Artifacts that do not validate as
+# persona-review records are SKIPPED, not fatal: the primary also lists non-persona
+# deliverables it produced (the review bundle, the plan doc), and the exact-set +
+# count + stage gate in run_personas is the real enforcement. Mirrors how
+# verify_candidate picks the execution-evidence file out of a mixed artifact list.
+# Returns non-zero only on an unsafe/missing path or a copy failure.
+collect_persona_results() {
+  local signal="$1" result_dir="$2" artifact out dst
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
+    out="$(resolve_artifact "$artifact")" || return 1
+    # Skip (don't fail on) artifacts that aren't persona-review records — the
+    # review bundle and plan doc are listed alongside the real results.
+    json_schema_basic persona-review "$out" || continue
+    dst="$result_dir/$(basename "$out")"
+    # The primary may have written the artifact directly into $result_dir; in that
+    # case the copy is a no-op (and BSD cp would fail with "are identical").
+    [ "$out" -ef "$dst" ] || cp "$out" "$dst" || return 1
+  done <<EOF
+$(jq -r '.artifacts[]' "$signal")
+EOF
+}
+
 run_personas() {
   local signal="$1" review_stage persona_stage result_dir out artifact
   review_stage="$(jq -r '.stage' "$STATE")"
@@ -2096,15 +2145,10 @@ run_personas() {
   state_set '.review_round += 1'
 
   # Claude primary runs the active personas as native sub-agents and lists their
-  # result files as artifacts. Each must validate against persona-review.json.
-  jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
-    out="$(resolve_artifact "$artifact")" || exit 20
-    json_schema_basic persona-review "$out" || exit 21
-    dst="$result_dir/$(basename "$out")"
-    # The primary may have written the artifact directly into $result_dir; in that
-    # case the copy is a no-op (and BSD cp would fail with "are identical").
-    [ "$out" -ef "$dst" ] || cp "$out" "$dst" || exit 22
-  done || block_run "persona result artifacts are missing, unsafe, or malformed"
+  # result files as artifacts. Collect the persona-review files into the round dir;
+  # the exact-set/count gate below does the real enforcement.
+  collect_persona_results "$signal" "$result_dir" ||
+    block_run "persona result artifacts are missing, unsafe, or malformed"
 
   local full_set expected_set expected_count pending pending_stage
   full_set="$(resolve_active_personas "$SPEC")" ||
