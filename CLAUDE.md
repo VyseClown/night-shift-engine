@@ -5,6 +5,8 @@ and follow `AGENT_LOOP.md`.
 
 The startup-selected model remains the primary for the entire run. Do not switch
 roles with reviewers or the observer, and do not use implicit session selectors.
+(Persona review sub-agents are the one deliberate exception: they default to the
+cheaper `sonnet` via `NIGHT_SHIFT_PERSONA_MODEL`; set it to `inherit` to opt out.)
 
 ## Workspace Map
 
@@ -46,6 +48,11 @@ engine/workflow git here at the root.
   and only on runs started *without* `--spec` (the engine picks the task from
   TODO). An explicit `--spec` run is a single task: on `NEXT_TASK` it completes
   and exits 0 so an external wrapper can own cross-spec sequencing/branching.
+- **Cost knobs:** the primary runs as **stage-scoped sessions** by default
+  (`NIGHT_SHIFT_SESSION_SCOPE=stage`) — a fresh Claude session per stage scope
+  (plan → implement → observe) handing off through files, which avoids replaying
+  one ever-growing session every turn; set `=run` for the legacy single pinned
+  session. Persona sub-agents default to `sonnet` (`NIGHT_SHIFT_PERSONA_MODEL`).
 
 > **Note:** the night-shift workflow is two-track. A spec declares `- Track: rn`
 > or `- Track: web` (default `rn`), which selects the review persona set

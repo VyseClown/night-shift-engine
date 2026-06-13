@@ -127,7 +127,7 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project PATH --spec specs/
   mid-run.
 - **Limit behavior is safe.** If Claude returns a structured session-limit 429,
   the wrapper waits until the reported reset time plus a safety buffer, pauses
-  its elapsed-time budgets, and resumes the same explicit primary session.
+  its elapsed-time budgets, and resumes the same explicit stage session.
   Other API failures still stop via `block_run`. Nothing is pushed or merged.
 
 ---
@@ -181,9 +181,15 @@ differs by track: for `rn` it is React Native Architect, TypeScript & Code
 Quality Expert, and Human Advocate; for `web` it is Web Architect, TypeScript &
 Code Quality Expert, and Human Advocate. `full` runs all six in the track. Each
 active persona owns its corresponding documentation assessment. Every finding is
-a blocker; progress requires an approval from each active persona. A fresh,
-independent Claude observer session then reviews the candidate commit in every
-profile. Only validated structured review artifacts count.
+a blocker; progress requires an approval from each active persona. Approvals do
+not expire: a re-review round re-runs only the personas with open findings (each
+verifies its own findings are resolved) while earlier approvals carry forward.
+Personas review from a single primary-prepared bundle (spec + plan + diff + test
+output) rather than each exploring the repo, and launch on a cheaper reviewer
+model by default (`NIGHT_SHIFT_PERSONA_MODEL`, default `sonnet`; the primary
+session's model never changes). A fresh, independent Claude observer session
+then reviews the candidate commit in every profile. Only validated structured
+review artifacts count.
 
 **Optional reviewers** (cross-track, off by default): Product Reviewer, Design
 Fidelity Reviewer, Security Reviewer, API Contract Reviewer. A spec opts in via an

@@ -81,8 +81,17 @@
 
 1. Run the implementation personas active in the spec's review profile using
    `schemas/persona-review.json`. Every finding is a blocker, and progress
-   requires one `APPROVE` from each active persona.
-2. Resolve findings in the fixed primary session, rerun tests, and review again.
+   requires one `APPROVE` from each active persona. Personas judge from a
+   primary-prepared review bundle (spec + plan + diff + test output) and launch
+   on the cheaper reviewer model (`NIGHT_SHIFT_PERSONA_MODEL`, default `sonnet`).
+2. Resolve findings in the current stage session, rerun tests, and review again.
+   Re-review rounds re-run ONLY the personas with open findings — each verifies
+   its own findings are resolved; approvals already earned carry forward. A stage
+   scope boundary (plan → implement → observe, and observer-BLOCK → implement)
+   starts a fresh session that picks up state from disk — the plan at
+   `.night-shift/control/plan.md`, persona findings, evidence, and the working
+   tree — instead of replaying one ever-growing session
+   (`NIGHT_SHIFT_SESSION_SCOPE=run` restores the legacy single session).
 3. A finding round changes materially only with relevant behavior, a test for
    the disputed behavior, or new executable/documented evidence. Three
    unchanged rounds for one finding ID block the task.
@@ -144,7 +153,7 @@ Stop immediately and report if:
 - A native file needs to change but the spec does not mention native changes
 - You have been iterating on the same fix for more than 3 attempts without progress
 - The spec contradicts the existing codebase in a way that requires an architectural decision
-- An explicit primary session ID is missing, changes, or cannot resume
+- An explicit primary session ID is missing, changes, or cannot resume (within a stage)
 - A stage reaches 12 primary turns or 60 minutes
 - A task reaches 36 primary turns or three hours
 - A reviewer remains missing or malformed after one retry

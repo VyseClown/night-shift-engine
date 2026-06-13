@@ -20,6 +20,22 @@ RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
 # few hours; a wait longer than this almost certainly means the reset time was
 # misparsed, so we block for manual resume instead of sleeping for ~a day.
 RATE_LIMIT_MAX_WAIT_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_MAX_WAIT_SECONDS:-21600}"
+# Model for the persona review sub-agents. Personas verify mostly binary
+# conditions against a primary-prepared bundle, which a cheaper reviewer model
+# handles well (the fresh cheap observer already proves the pattern); the
+# primary session's own model is never changed. Set to "inherit" to launch
+# personas on the primary's model.
+PERSONA_MODEL="${NIGHT_SHIFT_PERSONA_MODEL:-sonnet}"
+# Primary session scope. A single pinned session for the whole run replays its
+# entire (ever-growing) history on every turn — cache reads/writes scale ~quad-
+# ratically with turn count, and the 5-minute cache TTL expires across slow gaps
+# (validation suites, persona fan-outs), re-writing the full prefix at 1.25x
+# instead of reading it at 0.1x. "stage" starts a fresh session at each stage
+# scope boundary (plan -> implement -> observe -> complete, plus task boundaries
+# and observer-BLOCK -> implement) and hands off through files on disk, the same
+# fresh-and-cheap pattern the observer already uses. Set to "run" for the legacy
+# single pinned session.
+SESSION_SCOPE="${NIGHT_SHIFT_SESSION_SCOPE:-stage}"
 # Persona/profile resolution — the persona/track constants (PERSONAS_RN,
 # PERSONAS_WEB, PERSONAS_OPTIONAL, PERSONAS, the floors, DEFAULT_TRACK) and the
 # pure functions that map a spec to its active review set — live in
@@ -52,11 +68,13 @@ Usage:
   scripts/night-shift.sh --fixture-test --dry-run
   scripts/night-shift.sh --fixture-test [--full-persona-live-test]
 
-Claude runs the entire flow: the pinned primary session implements, the spec's
-review personas (selected by its Track + Review Profile) review, and a fresh
-independent Claude session observes each candidate. Runs use explicit session
-IDs, local candidate commits, per-profile persona approvals, and observer
-approval. Live fixture tests make paid Claude calls;
+Claude runs the entire flow: stage-scoped primary sessions implement (a fresh
+session per stage scope — plan, implement, observe — handing off through files
+on disk to keep cost down; set NIGHT_SHIFT_SESSION_SCOPE=run for one pinned
+session), the spec's review personas (selected by its Track + Review Profile)
+review, and a fresh independent Claude session observes each candidate. Runs use
+explicit session IDs, local candidate commits, per-profile persona approvals, and
+observer approval. Live fixture tests make paid Claude calls;
 full six-persona live coverage requires --full-persona-live-test and
 NIGHT_SHIFT_ACCEPT_COSTS=YES. (--primary is accepted only as claude.)
 EOF
@@ -419,6 +437,11 @@ run_dry_fixtures() {
   fixture_assert "review profile resolves to floor + scoped personas" fixture_review_profile "$root"
   fixture_assert "web track resolves to web personas + floor" fixture_review_profile_web "$root"
   fixture_assert "persona gate enforces the active profile set" fixture_profile_gate "$root"
+  fixture_assert "re-review rounds require only pending blockers" fixture_review_round_subset "$root"
+  fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
+  fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
+  fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
+  fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -842,6 +865,98 @@ fixture_profile_gate() {
     >"$dir/extra.json"
   jq -s -e --arg personas "$set" \
     '($personas|split("|")|sort) as $e | (map(.persona)|sort)==$e' "$dir"/*.json >/dev/null && return 1
+  return 0
+}
+
+fixture_review_round_subset() {
+  local full="A|B|C" out
+  # First round (no pending blockers): the full active set is required.
+  out="$(review_round_set "$full" "" "" plan)"; [ "$out" = "$full" ] || return 1
+  # Re-review round in the same stage: only the recorded blockers re-run.
+  out="$(review_round_set "$full" "B|C" plan plan)"; [ "$out" = "B|C" ] || return 1
+  # Blockers recorded for a different stage never leak into a new stage's
+  # first round (plan blockers must not shrink the implementation round).
+  out="$(review_round_set "$full" "B|C" plan implementation)"; [ "$out" = "$full" ] || return 1
+  # A non-review stage (empty name) never matches a pending set.
+  out="$(review_round_set "$full" "B|C" plan "")"; [ "$out" = "$full" ] || return 1
+  return 0
+}
+
+fixture_cost_ledger() {
+  local root="$1" dir="$root/cost-ledger" ledger
+  mkdir -p "$dir/raw"
+  printf '{"session_id":"s","total_cost_usd":1.25,"num_turns":4,"usage":{"output_tokens":10}}\n' \
+    >"$dir/raw/primary-1.json"
+  # Observer raw is a JSONL stream; lines without total_cost_usd are skipped.
+  printf '{"type":"noise"}\n{"total_cost_usd":0.5,"usage":{"output_tokens":2}}\n' \
+    >"$dir/raw/observer-abc.jsonl"
+  # A non-JSON raw file (e.g. a rate-limit retry's partial output) is tolerated.
+  printf 'not json' >"$dir/raw/primary-2.json"
+  printf '{}\n' >"$dir/state.json"
+  compact_success "$dir" testrun
+  ledger="$dir/archive/testrun/costs.jsonl"
+  [ -f "$ledger" ] || return 1
+  [ "$(grep -c . "$ledger")" -eq 3 ] || return 1
+  jq -se '[.[] | select(.source == "TOTAL")][0] | .total_cost_usd == 1.75 and .records == 2' \
+    "$ledger" >/dev/null || return 1
+  # The raw files themselves are still compacted away.
+  [ ! -d "$dir/raw" ] || return 1
+  return 0
+}
+
+fixture_session_scope() {
+  # Same-scope transitions keep the session (boundary returns non-zero).
+  session_boundary planning plan_review stage && return 1
+  session_boundary implementation implementation_review stage && return 1
+  session_boundary implementation_review implementation_ready stage && return 1
+  # Cross-scope transitions clear the session (boundary returns zero).
+  session_boundary plan_review implementation stage || return 1
+  session_boundary implementation_ready observer_review stage || return 1
+  session_boundary observer_review implementation stage || return 1
+  session_boundary observer_review completion stage || return 1
+  # Legacy "run" mode never clears, even across scopes.
+  session_boundary plan_review implementation run && return 1
+  # An unknown stage is its own scope, so entering/leaving it clears.
+  session_boundary planning some_new_stage stage || return 1
+  return 0
+}
+
+fixture_stage_session_reset() {
+  local root="$1" dir="$root/session-reset"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" RUN_ROOT="$dir" SESSION_SCOPE=stage
+  # Cross-scope (plan_review -> implementation) nulls the pinned session.
+  printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"session_id":"sess-1"}\n' >"$STATE"
+  set_stage implementation >/dev/null 2>&1
+  [ "$(jq -r '.session_id' "$STATE")" = "null" ] || return 1
+  # Same-scope (implementation -> implementation_review) keeps the session.
+  printf '{"stage":"implementation","stage_turns":1,"stage_counters":{},"session_id":"sess-2"}\n' >"$STATE"
+  set_stage implementation_review >/dev/null 2>&1
+  [ "$(jq -r '.session_id' "$STATE")" = "sess-2" ] || return 1
+  # Legacy "run" mode keeps the session across a scope change.
+  SESSION_SCOPE=run
+  printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"session_id":"sess-3"}\n' >"$STATE"
+  set_stage implementation >/dev/null 2>&1
+  [ "$(jq -r '.session_id' "$STATE")" = "sess-3" ] || return 1
+  return 0
+}
+
+fixture_handoff_prompt() {
+  local root="$1" dir="$root/handoff" prompt
+  prompt="$dir/prompt.txt"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef
+  fixture_write_min_spec "$SPEC"
+  # Fresh stage session mid-run (no session_id, prior turns) gets the handoff note.
+  printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
+  primary_prompt "$prompt"
+  grep -q "FRESH stage session" "$prompt" || return 1
+  grep -q ".night-shift/control/plan.md" "$prompt" || return 1
+  # First turn of the run (no prior turns) gets no handoff note.
+  printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
+  primary_prompt "$prompt"
+  grep -q "FRESH stage session" "$prompt" && return 1
   return 0
 }
 
@@ -1269,12 +1384,28 @@ bump_finding_history() {
 }
 
 compact_success() {
-  local run_dir="$1" run_id="$2" archive
+  local run_dir="$1" run_id="$2" archive ledger f
   archive="$run_dir/archive/$run_id"
   mkdir -p "$archive"
   [ -f "$run_dir/state.json" ] && cp "$run_dir/state.json" "$archive/state.json"
   [ -d "$run_dir/validated" ] && cp -R "$run_dir/validated" "$archive/validated"
   [ -f "$run_dir/summary.json" ] && cp "$run_dir/summary.json" "$archive/summary.json"
+  # Preserve per-turn cost telemetry before the raw files are deleted: the raw
+  # primary/observer JSON is the only record of total_cost_usd and token usage,
+  # and persona/session cost cannot be tuned without it. Non-JSON raw files
+  # (e.g. a rate-limit retry's partial output) are skipped, not fatal.
+  ledger="$archive/costs.jsonl"
+  for f in "$run_dir"/raw/primary-*.json "$run_dir"/raw/observer-*.jsonl; do
+    [ -f "$f" ] || continue
+    jq -c --arg source "$(basename "$f")" \
+      'select(type == "object" and has("total_cost_usd")) |
+       {source: $source, total_cost_usd, num_turns: (.num_turns // null), usage: (.usage // null)}' \
+      "$f" >>"$ledger" 2>/dev/null || true
+  done
+  if [ -s "$ledger" ]; then
+    jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd) | add), records: length}' \
+      "$ledger" >>"$ledger" 2>/dev/null || true
+  fi
   for entry in "$run_dir"/* "$run_dir"/.[!.]* "$run_dir"/..?*; do
     [ -e "$entry" ] || continue
     [ "$entry" = "$run_dir/archive" ] || rm -rf "$entry"
@@ -1646,14 +1777,95 @@ archive_old_signal() {
   fi
 }
 
+# Pure: which personas must produce results for the next review round. On the
+# first round of a stage (no pending blockers, or blockers recorded for a
+# different stage) it is the full active set; after a BLOCK round only the
+# blockers re-run. Approvals already earned do not expire — each open finding
+# is verified resolved by the persona that raised it, so re-running approvers
+# is pure waste.
+review_round_set() {
+  local full="$1" pending="$2" pending_stage="$3" stage="$4"
+  if [ -n "$pending" ] && [ -n "$pending_stage" ] && [ "$pending_stage" = "$stage" ]; then
+    printf '%s' "$pending"
+  else
+    printf '%s' "$full"
+  fi
+}
+
+# Pure: the session scope a stage belongs to. Stages within one scope share a
+# primary session; crossing scopes starts a fresh one. An unrecognized stage maps
+# to itself, so any new stage is its own scope (a safe default that errs toward a
+# reset rather than silently extending a session).
+stage_session_scope() {
+  case "$1" in
+    planning|plan_review) printf 'plan' ;;
+    implementation|implementation_review|implementation_ready) printf 'implement' ;;
+    observer_review) printf 'observe' ;;
+    completion) printf 'complete' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Pure: exit 0 if moving OLD_STAGE -> NEW_STAGE must clear the pinned session.
+# In "run" mode the session is never cleared (legacy single pinned session). In
+# "stage" mode the session is cleared whenever the stage scope changes.
+session_boundary() {
+  local old_stage="$1" new_stage="$2" mode="$3"
+  [ "$mode" = "stage" ] || return 1
+  [ "$(stage_session_scope "$old_stage")" != "$(stage_session_scope "$new_stage")" ]
+}
+
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
+  local review_stage_name pending pending_stage review_set model_line reround_note
+  local session primary_turns handoff_note spec_base
   stage="$(jq -r '.stage' "$STATE")"
   turns="$(jq -r '.stage_turns' "$STATE")"
   remaining=$((MAX_STAGE_TURNS - turns))
   active="$(resolve_active_personas "$SPEC")" || block_run "cannot resolve review profile for $SPEC"
-  persona_list="$(printf '%s' "$active" | tr '|' '\n' | sed 's/^/  - /')"
-  persona_count="$(printf '%s' "$active" | tr '|' '\n' | grep -c .)"
+  case "$stage" in
+    planning|plan_review) review_stage_name="plan" ;;
+    implementation|implementation_review) review_stage_name="implementation" ;;
+    *) review_stage_name="" ;;
+  esac
+  pending="$(jq -r '.pending_personas // empty' "$STATE")"
+  pending_stage="$(jq -r '.pending_stage // empty' "$STATE")"
+  review_set="$(review_round_set "$active" "$pending" "$pending_stage" "$review_stage_name")"
+  persona_list="$(printf '%s' "$review_set" | tr '|' '\n' | sed 's/^/  - /')"
+  persona_count="$(printf '%s' "$review_set" | tr '|' '\n' | grep -c .)"
+  model_line=""
+  [ "$PERSONA_MODEL" = "inherit" ] || model_line=" launched with model \"$PERSONA_MODEL\","
+  reround_note=""
+  if [ "$review_set" != "$active" ]; then
+    reround_note="
+Re-review round: the personas listed above are the only ones with open findings
+from the previous round. Re-run ONLY them — each verifies its own findings are
+resolved. Approvals from the other active personas carry forward; do not re-run
+approved personas."
+  fi
+  # A fresh stage session (empty session after at least one prior turn) carries no
+  # in-memory context. Point it at the files that hold the run state so it picks up
+  # where the previous stage left off instead of re-planning or redoing resolved
+  # work. The persona round dirs use the same layout run_observer reads.
+  session="$(jq -r '.session_id // empty' "$STATE")"
+  primary_turns="$(jq -r '.primary_turns' "$STATE")"
+  spec_base="$(basename "$SPEC" .md)"
+  handoff_note=""
+  if [ -z "$session" ] && [ "$primary_turns" -gt 0 ]; then
+    handoff_note="
+This is a FRESH stage session — you have no memory of earlier stages. All prior
+context lives ONLY in files; trust them over any assumption, and do NOT re-plan
+approved work or redo findings already resolved. Read what you need:
+  - the spec ($SPEC) — the requirements;
+  - the approved plan at .night-shift/control/plan.md — your own plan from the
+    planning stage;
+  - the latest persona reviews under
+    .night-shift/validated/personas/$spec_base/<stage>/round-N/ (highest N);
+  - the latest observer verdict at .night-shift/validated/observer-*.json, if any;
+  - the in-progress implementation IS the working tree — diff it against the base
+    commit $BASE_COMMIT to see exactly what has been done so far.
+"
+  fi
   cat >"$prompt" <<EOF
 You are the fixed $PRIMARY primary for night-shift run $RUN_ID.
 Project: $PROJECT
@@ -1662,25 +1874,34 @@ Current stage: $stage
 Base commit: $BASE_COMMIT
 
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
-the task in this same session. Preserve baseline dirty work. You own planning,
-implementation, reviewer coordination, finding resolution, validation,
-candidate commits, documentation, and task completion.
+the task in this session from the state on disk. Preserve baseline dirty work.
+You own planning, implementation, reviewer coordination, finding resolution,
+validation, candidate commits, documentation, and task completion.
 
-The active review personas for this run (review profile selects them — $persona_count total) are:
+Maintain the authoritative plan at .night-shift/control/plan.md: write it during
+planning (acceptance criteria, approach, file-level steps) and keep it current as
+work proceeds. It is the handoff record across stage sessions and the "current
+plan" section of the RUN_PERSONAS review bundle.
+$handoff_note
+The review personas to run on the next RUN_PERSONAS action ($persona_count required results) are:
 $persona_list
-
+$reround_note
 Before ending this turn, write a fresh JSON signal to:
   .night-shift/control/next-action.json
 It must validate against $SCHEMA_DIR/next-action.json. "task" must equal
 $SPEC. "artifacts" lists only project-relative files (no absolute paths, no
 "..") the wrapper must consume for the chosen action:
 
-- RUN_PERSONAS: run each active persona listed above as a separate sub-agent,
-  each scoped to its own domain. Write exactly $persona_count result files, one
-  per active persona, each validating against $SCHEMA_DIR/persona-review.json,
-  with the persona's exact name and "stage" set to "plan" during plan_review or
+- RUN_PERSONAS: first assemble ONE review bundle at
+  .night-shift/control/review-bundle.md containing the spec, the current plan,
+  the full diff against the base commit, and the latest test output. Then run
+  each persona listed above as a separate sub-agent,${model_line} each scoped to
+  its own domain and judging from the bundle — personas must not re-explore the
+  repo themselves. Write exactly $persona_count result files, one per listed
+  persona, each validating against $SCHEMA_DIR/persona-review.json, with the
+  persona's exact name and "stage" set to "plan" during plan_review or
   "implementation" during implementation_review. List all of those file paths in
-  artifacts. Do not run personas outside the active set. Every finding is a
+  artifacts. Do not run personas outside the listed set. Every finding is a
   blocker; APPROVE carries no findings.
 - CREATE_CANDIDATE: create ONE local commit on the feature branch containing
   only files this run changed (never baseline dirty paths). Then write an
@@ -1781,14 +2002,22 @@ set_stage() {
   # are re-entered on review blocks, and a long run/resume gap would otherwise
   # restore an ancient start and trip the elapsed limit immediately). Turn counts
   # still accumulate per stage via stage_counters.
-  state_set '
+  local old_stage session_clear=''
+  old_stage="$(jq -r '.stage' "$STATE")"
+  # Crossing a session-scope boundary clears the pinned session so the next
+  # primary turn starts fresh and hands off through files (see SESSION_SCOPE).
+  if session_boundary "$old_stage" "$1" "$SESSION_SCOPE"; then
+    session_clear=' | .session_id=null'
+    log "stage $old_stage → $1: starting a fresh stage session"
+  fi
+  state_set "
     .stage_counters[.stage]=.stage_turns |
-    .stage=$stage |
-    .stage_turns=(.stage_counters[$stage] // 0) |
-    .stage_started_at=$epoch |
-    .stage_started[$stage]=$epoch |
-    .updated_at=$now
-  ' \
+    .stage=\$stage |
+    .stage_turns=(.stage_counters[\$stage] // 0) |
+    .stage_started_at=\$epoch |
+    .stage_started[\$stage]=\$epoch |
+    .updated_at=\$now${session_clear}
+  " \
     --arg stage "$1" --argjson epoch "$(now_epoch)" --arg now "$(now_iso)"
 }
 
@@ -1877,9 +2106,15 @@ run_personas() {
     [ "$out" -ef "$dst" ] || cp "$out" "$dst" || exit 22
   done || block_run "persona result artifacts are missing, unsafe, or malformed"
 
-  local expected_set expected_count
-  expected_set="$(resolve_active_personas "$SPEC")" ||
+  local full_set expected_set expected_count pending pending_stage
+  full_set="$(resolve_active_personas "$SPEC")" ||
     block_run "cannot resolve the active persona set for $SPEC"
+  # Re-review rounds only require results from the personas that blocked the
+  # previous round (recorded in state as pending); earlier approvals carry
+  # forward. The first round of each stage always requires the full active set.
+  pending="$(jq -r '.pending_personas // empty' "$STATE")"
+  pending_stage="$(jq -r '.pending_stage // empty' "$STATE")"
+  expected_set="$(review_round_set "$full_set" "$pending" "$pending_stage" "$persona_stage")"
   expected_count="$(printf '%s' "$expected_set" | tr '|' '\n' | grep -c .)"
   [ "$(find "$result_dir" -type f -name '*.json' | wc -l | tr -d ' ')" -eq "$expected_count" ] ||
     block_run "persona gate requires exactly $expected_count validated results for this spec's active personas"
@@ -1892,13 +2127,26 @@ run_personas() {
   if find "$result_dir" -type f -name '*.json' -exec jq -e '.status == "APPROVE"' {} \; |
     grep -q false; then
     local blocked
-    blocked="$(find "$result_dir" -type f -name '*.json' -exec jq -r 'select(.status=="BLOCK").persona' {} \; | paste -sd ', ' -)"
-    log "personas ($persona_stage): BLOCK by $blocked — primary must resolve"
+    blocked="$(find "$result_dir" -type f -name '*.json' -exec jq -r 'select(.status=="BLOCK").persona' {} \; | paste -sd '|' -)"
+    log "personas ($persona_stage): BLOCK by $(printf '%s' "$blocked" | sed 's/|/, /g') — primary must resolve"
+    # Only the blockers re-run next round; the personas that approved this
+    # round (or an earlier one) keep their approval.
+    state_set '.pending_personas=$p | .pending_stage=$s' \
+      --arg p "$blocked" --arg s "$persona_stage"
     detect_stalled_personas "$result_dir" "$persona_stage"
     set_stage "$([ "$persona_stage" = plan ] && printf planning || printf implementation)"
   else
-    log "personas ($persona_stage): $expected_count/$expected_count APPROVE"
+    if [ "$expected_set" = "$full_set" ]; then
+      log "personas ($persona_stage): $expected_count/$expected_count APPROVE"
+    else
+      log "personas ($persona_stage): $expected_count/$expected_count re-reviewed blockers APPROVE (earlier approvals carried)"
+    fi
+    state_set 'del(.pending_personas, .pending_stage)'
     if [ "$persona_stage" = plan ]; then
+      # The plan doc is the cross-session handoff record; the implementation stage
+      # may run in a fresh session that has nothing but the files on disk.
+      [ -s "$RUN_ROOT/control/plan.md" ] ||
+        block_run "plan approved but .night-shift/control/plan.md is missing or empty"
       state_set '.plan_approved=true'
       set_stage implementation
     else
@@ -2255,6 +2503,7 @@ EOF
   epoch="$(now_epoch)"
   state_set '
     .task=$task | .stage="planning" | .stage_turns=0 | .task_turns=0 |
+    .session_id=null |
     .stage_started_at=$epoch | .task_started_at=$epoch |
     .base_commit=$base | .base_branch=$branch | .review_round=0 |
     .baseline_status=$baseline_status | .finding_ids=[] | .candidate_commits=[] |

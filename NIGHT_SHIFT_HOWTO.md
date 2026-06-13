@@ -114,7 +114,14 @@ Add one line pointing at the spec. Bugs are selected before features:
 > usage; with `ANTHROPIC_API_KEY` set it bills per token. See `AGENTS.md`
 > ("Running the night shift") for cost details.
 
-### Night shift — autonomous (wrapper + a pinned Claude session)
+### Night shift — autonomous (wrapper + stage-scoped Claude sessions)
+
+> Each stage scope (plan → implement → observe) runs in a fresh Claude session
+> that hands off through files on disk — the plan at `.night-shift/control/plan.md`,
+> persona findings, candidate evidence, and the working tree — rather than one
+> pinned session replaying its whole history every turn. Set
+> `NIGHT_SHIFT_SESSION_SCOPE=run` for the legacy single pinned session.
+
 
 1. Validate spec → resolve **Track + Review Profile** → active persona set.
 2. Baseline validation; run the first-failing test (must fail).
