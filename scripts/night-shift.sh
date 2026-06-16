@@ -470,6 +470,7 @@ run_dry_fixtures() {
   fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
+  fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -913,18 +914,27 @@ fixture_review_round_subset() {
 fixture_cost_ledger() {
   local root="$1" dir="$root/cost-ledger" ledger
   mkdir -p "$dir/raw"
+  local RUN_ROOT="$dir"
+  # Each turn records its cost at the source the moment it finishes, so a costly
+  # turn (notably the opus observer) is never lost to a transient raw file
+  # disappearing before archive.
   printf '{"session_id":"s","total_cost_usd":1.25,"num_turns":4,"usage":{"output_tokens":10}}\n' \
     >"$dir/raw/primary-1.json"
-  # Observer raw is a JSONL stream; lines without total_cost_usd are skipped.
-  printf '{"type":"noise"}\n{"total_cost_usd":0.5,"usage":{"output_tokens":2}}\n' \
+  record_cost "$dir/raw/primary-1.json" "primary-1.json"
+  printf '{"total_cost_usd":0.5,"num_turns":2,"usage":{"output_tokens":2}}\n' \
     >"$dir/raw/observer-abc.jsonl"
-  # A non-JSON raw file (e.g. a rate-limit retry's partial output) is tolerated.
+  record_cost "$dir/raw/observer-abc.jsonl" "observer-abc.jsonl"
+  # A non-JSON raw (e.g. a rate-limit retry's partial output) contributes nothing.
   printf 'not json' >"$dir/raw/primary-2.json"
+  record_cost "$dir/raw/primary-2.json" "primary-2.json"
   printf '{}\n' >"$dir/state.json"
   compact_success "$dir" testrun
   ledger="$dir/archive/testrun/costs.jsonl"
   [ -f "$ledger" ] || return 1
   [ "$(grep -c . "$ledger")" -eq 3 ] || return 1
+  # The observer turn's cost is captured — the gap this guards against.
+  jq -se 'any(.[]; .source == "observer-abc.jsonl" and .total_cost_usd == 0.5)' \
+    "$ledger" >/dev/null || return 1
   jq -se '[.[] | select(.source == "TOTAL")][0] | .total_cost_usd == 1.75 and .records == 2' \
     "$ledger" >/dev/null || return 1
   # The raw files themselves are still compacted away.
@@ -991,6 +1001,26 @@ fixture_stage_session_reset() {
   return 0
 }
 
+fixture_expected_action() {
+  # The per-stage expected action must match the wrapper's transition table, so a
+  # cold/cheaper primary cannot skip ahead to an out-of-stage signal.
+  [ "$(expected_action planning)" = "RUN_PERSONAS" ] || return 1
+  [ "$(expected_action plan_review)" = "RUN_PERSONAS" ] || return 1
+  [ "$(expected_action implementation)" = "RUN_PERSONAS" ] || return 1
+  [ "$(expected_action implementation_review)" = "RUN_PERSONAS" ] || return 1
+  [ "$(expected_action implementation_ready)" = "CREATE_CANDIDATE" ] || return 1
+  [ "$(expected_action observer_review)" = "REQUEST_OBSERVER" ] || return 1
+  [ "$(expected_action completion)" = "NEXT_TASK or COMPLETE" ] || return 1
+  # Each single-action stage's expected action is actually permitted by the gate
+  # (the regression that blocked the slack-status run: REQUEST_OBSERVER from
+  # implementation is NOT allowed, RUN_PERSONAS is).
+  transition_allowed implementation "$(expected_action implementation)" || return 1
+  transition_allowed implementation REQUEST_OBSERVER && return 1
+  transition_allowed implementation_ready "$(expected_action implementation_ready)" || return 1
+  transition_allowed observer_review "$(expected_action observer_review)" || return 1
+  return 0
+}
+
 fixture_model_flag() {
   # "inherit" and empty produce no flag; a real model name produces "--model NAME"
   # (unquoted-string form so it word-splits into argv under bash 3.2 + set -u).
@@ -1031,6 +1061,10 @@ fixture_handoff_prompt() {
   primary_prompt "$prompt"
   grep -q "FRESH stage session" "$prompt" || return 1
   grep -q ".night-shift/control/plan.md" "$prompt" || return 1
+  # The implementation-stage prompt must pin RUN_PERSONAS as the only valid signal
+  # so the primary cannot skip ahead to REQUEST_OBSERVER (the slack-status block).
+  grep -q "Stage gate" "$prompt" || return 1
+  grep -q "only valid signal from this stage is: RUN_PERSONAS" "$prompt" || return 1
   # First turn of the run (no prior turns) gets no handoff note.
   printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
   primary_prompt "$prompt"
@@ -1461,25 +1495,33 @@ bump_finding_history() {
   jq -r '[to_entries[].value.count] | max // 0' "$history"
 }
 
+# Append a finished turn's cost to the run's incremental ledger. The raw claude
+# JSON is the only source of total_cost_usd/usage, so record it the instant the
+# turn completes rather than re-reading raw files at archive time — a costly turn
+# (notably the opus observer) is then never lost to a raw file that has since been
+# rewritten, retried, or cleaned. A raw without total_cost_usd (rate-limit partial,
+# non-JSON) contributes nothing and is not fatal.
+record_cost() {
+  local raw="$1" source="$2"
+  [ -f "$raw" ] || return 0
+  jq -c --arg source "$source" \
+    'select(type == "object" and has("total_cost_usd")) |
+     {source: $source, total_cost_usd, num_turns: (.num_turns // null), usage: (.usage // null)}' \
+    "$raw" >>"$RUN_ROOT/cost-ledger.jsonl" 2>/dev/null || true
+}
+
 compact_success() {
-  local run_dir="$1" run_id="$2" archive ledger f
+  local run_dir="$1" run_id="$2" archive ledger
   archive="$run_dir/archive/$run_id"
   mkdir -p "$archive"
   [ -f "$run_dir/state.json" ] && cp "$run_dir/state.json" "$archive/state.json"
   [ -d "$run_dir/validated" ] && cp -R "$run_dir/validated" "$archive/validated"
   [ -f "$run_dir/summary.json" ] && cp "$run_dir/summary.json" "$archive/summary.json"
-  # Preserve per-turn cost telemetry before the raw files are deleted: the raw
-  # primary/observer JSON is the only record of total_cost_usd and token usage,
-  # and persona/session cost cannot be tuned without it. Non-JSON raw files
-  # (e.g. a rate-limit retry's partial output) are skipped, not fatal.
+  # Preserve per-turn cost telemetry built incrementally by record_cost (every
+  # primary turn + the observer). It is independent of the raw files, so it
+  # survives even when a raw is gone by archive time; copy it and add a TOTAL row.
   ledger="$archive/costs.jsonl"
-  for f in "$run_dir"/raw/primary-*.json "$run_dir"/raw/observer-*.jsonl; do
-    [ -f "$f" ] || continue
-    jq -c --arg source "$(basename "$f")" \
-      'select(type == "object" and has("total_cost_usd")) |
-       {source: $source, total_cost_usd, num_turns: (.num_turns // null), usage: (.usage // null)}' \
-      "$f" >>"$ledger" 2>/dev/null || true
-  done
+  [ -f "$run_dir/cost-ledger.jsonl" ] && cp "$run_dir/cost-ledger.jsonl" "$ledger"
   if [ -s "$ledger" ]; then
     jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd) | add), records: length}' \
       "$ledger" >>"$ledger" 2>/dev/null || true
@@ -1922,8 +1964,9 @@ stage_model() {
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set model_line reround_note
-  local session primary_turns handoff_note spec_base
+  local session primary_turns handoff_note spec_base expected
   stage="$(jq -r '.stage' "$STATE")"
+  expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
   remaining=$((MAX_STAGE_TURNS - turns))
   active="$(resolve_active_personas "$SPEC")" || block_run "cannot resolve review profile for $SPEC"
@@ -1990,6 +2033,15 @@ $handoff_note
 The review personas to run on the next RUN_PERSONAS action ($persona_count required results) are:
 $persona_list
 $reround_note
+Stage gate — you are at stage "$stage". The wrapper advances stages ONE step at a
+time, so the only valid signal from this stage is: $expected (or BLOCKED if you
+truly cannot proceed). Do NOT skip ahead to a later action. In the implementation
+stage this means: implement the code, run the implementation personas, then emit
+RUN_PERSONAS — the wrapper moves you to the candidate (CREATE_CANDIDATE) and the
+independent observer (REQUEST_OBSERVER) on later turns. Do not create the
+candidate commit or request the observer yourself from an earlier stage; any
+out-of-stage signal is rejected and wastes a turn.
+
 Before ending this turn, write a fresh JSON signal to:
   .night-shift/control/next-action.json
 It must validate against $SCHEMA_DIR/next-action.json. "task" must equal
@@ -2082,6 +2134,7 @@ invoke_primary() {
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
     .updated_at=$now
   ' --arg session "$emitted" --arg now "$(now_iso)"
+  record_cost "$raw" "$(basename "$raw")"
   enforce_elapsed_limits
 }
 
@@ -2137,6 +2190,21 @@ transition_allowed() {
   case "$1:$2" in
     planning:RUN_PERSONAS|plan_review:RUN_PERSONAS|implementation:RUN_PERSONAS|implementation_review:RUN_PERSONAS|implementation_ready:CREATE_CANDIDATE|observer_review:REQUEST_OBSERVER|completion:NEXT_TASK|completion:COMPLETE|*:BLOCKED) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+# Pure: the single forward action a stage may emit (BLOCKED is always also valid).
+# Mirrors transition_allowed so the prompt can tell the primary exactly which
+# signal to write — the wrapper advances stages one step at a time, so a primary
+# that skips ahead (e.g. REQUEST_OBSERVER straight from implementation) is blocked.
+# Keep in sync with transition_allowed above.
+expected_action() {
+  case "$1" in
+    planning|plan_review|implementation|implementation_review) printf 'RUN_PERSONAS' ;;
+    implementation_ready) printf 'CREATE_CANDIDATE' ;;
+    observer_review) printf 'REQUEST_OBSERVER' ;;
+    completion) printf 'NEXT_TASK or COMPLETE' ;;
+    *) printf 'BLOCKED' ;;
   esac
 }
 
@@ -2474,6 +2542,7 @@ run_observer() {
   raw="$RUN_ROOT/raw/observer-$candidate.jsonl"
   validated_observer_retry "$context" "$candidate" "$out" "$raw" ||
     block_run "observer output remained invalid after one retry"
+  record_cost "$raw" "$(basename "$raw")"
   append_observer_review "$out"
   record_findings "$(dirname "$out")"
   if [ "$(jq -r '.status' "$out")" = "APPROVE" ]; then
