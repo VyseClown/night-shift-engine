@@ -464,6 +464,7 @@ run_dry_fixtures() {
   fixture_assert "persona gate enforces the active profile set" fixture_profile_gate "$root"
   fixture_assert "re-review rounds require only pending blockers" fixture_review_round_subset "$root"
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
+  fixture_assert "observer cost is recorded from the retry's .attempt raw" fixture_observer_cost_capture "$root"
   fixture_assert "persona collection skips non-persona artifacts" fixture_persona_collect "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
@@ -1018,6 +1019,32 @@ fixture_expected_action() {
   transition_allowed implementation REQUEST_OBSERVER && return 1
   transition_allowed implementation_ready "$(expected_action implementation_ready)" || return 1
   transition_allowed observer_review "$(expected_action observer_review)" || return 1
+  return 0
+}
+
+fixture_observer_cost_capture() {
+  # The observer raw is written to "$raw.$attempt" by validated_observer_retry, so
+  # the cost must be recorded from THAT path (the original glob/`$raw` both missed
+  # it). Drive the real retry wrapper with stubs — no paid call — and assert the
+  # observer's cost lands in the incremental ledger.
+  local root="$1" dir="$root/obs-cost"
+  mkdir -p "$dir/raw"
+  (
+    RUN_ROOT="$dir"; OBSERVER=claude; PRIMARY=claude; SPEC="/x/spec.md"
+    enforce_limits() { :; }
+    enforce_elapsed_limits() { :; }
+    normalize_observer_output() { :; }
+    invoke_observer_once() {
+      # Mimic the real call: cost-bearing raw to the .attempt path ($4), valid
+      # verdict to $out ($3). candidate_commit must match the schema's hex pattern.
+      printf '{"total_cost_usd":2.5,"num_turns":3,"usage":{"output_tokens":5}}\n' >"$4"
+      printf '{"observer":"claude","primary":"claude","task":"/x/spec.md","candidate_commit":"a7a950b","status":"APPROVE","findings":[],"documentation_changes":[]}\n' >"$3"
+    }
+    validated_observer_retry "ctx" "a7a950b" "$dir/out.json" "$dir/raw/observer-abc.jsonl" || exit 1
+    [ -f "$dir/cost-ledger.jsonl" ] || exit 1
+    jq -se 'any(.[]; .source == "observer-abc.jsonl" and .total_cost_usd == 2.5)' \
+      "$dir/cost-ledger.jsonl" >/dev/null || exit 1
+  ) || return 1
   return 0
 }
 
@@ -2542,7 +2569,6 @@ run_observer() {
   raw="$RUN_ROOT/raw/observer-$candidate.jsonl"
   validated_observer_retry "$context" "$candidate" "$out" "$raw" ||
     block_run "observer output remained invalid after one retry"
-  record_cost "$raw" "$(basename "$raw")"
   append_observer_review "$out"
   record_findings "$(dirname "$out")"
   if [ "$(jq -r '.status' "$out")" = "APPROVE" ]; then
@@ -2616,6 +2642,9 @@ validated_observer_retry() {
       { [ "$(jq -r '.task' "$out")" = "$SPEC" ] ||
         [ "$(basename "$(jq -r '.task' "$out")")" = "$(basename "$SPEC")" ]; } &&
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
+      # Record from the actual raw this attempt wrote ("$raw.$attempt"); the bare
+      # "$raw" never exists, which is why the observer cost was silently missing.
+      record_cost "$raw.$attempt" "$(basename "$raw")"
       return 0
     fi
     attempt=$((attempt + 1))
