@@ -17,6 +17,7 @@
 /web-app/
 /night-shift-viewer/
 /nightshift-demo/
+/slack-status/
 
 # Local tooling / machine config — never publish.
 .claude/
@@ -25,3 +26,4 @@
 
 # Node (in case any helper ever adds deps at the root).
 node_modules/
+agui-jsonrender-rn/
