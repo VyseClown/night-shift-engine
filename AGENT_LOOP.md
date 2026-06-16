@@ -97,7 +97,9 @@
    unchanged rounds for one finding ID block the task.
 4. Create a local candidate commit containing only run-owned changes.
 5. Send the candidate/base hashes, spec, persona summary, validation evidence,
-   relevant tests, and documentation to a fresh, independent Claude observer session.
+   relevant tests, and documentation to a fresh, independent Claude observer
+   session (on `NIGHT_SHIFT_OBSERVER_MODEL`, default `opus` — the strong final
+   gate; a BLOCK returns the task to a fresh implement session).
 6. Validate observer output against `schemas/observer-review.json` and append
    it to `NIGHT_SHIFT_REVIEW.md`. Resolve every finding before another task.
 

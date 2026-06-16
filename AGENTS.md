@@ -187,9 +187,18 @@ verifies its own findings are resolved) while earlier approvals carry forward.
 Personas review from a single primary-prepared bundle (spec + plan + diff + test
 output) rather than each exploring the repo, and launch on a cheaper reviewer
 model by default (`NIGHT_SHIFT_PERSONA_MODEL`, default `sonnet`; the primary
-session's model never changes). A fresh, independent Claude observer session
-then reviews the candidate commit in every profile. Only validated structured
-review artifacts count.
+session's model is tiered by role, see below). A fresh, independent Claude
+observer session then reviews the candidate commit in every profile, on
+`NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) — the strong final gate regardless
+of what the primary ran; an observer BLOCK returns the task to a fresh implement
+session to fix the findings. Only validated structured review artifacts count.
+
+The primary itself is tiered: it **plans** on `NIGHT_SHIFT_PLAN_MODEL` (default
+`opus`, the high-leverage step) and does the implement grind, observe-request, and
+completion on the cheaper `NIGHT_SHIFT_IMPLEMENT_MODEL` (default `sonnet`). The
+model changes only at stage-scope boundaries (which already start a fresh
+session), so it is constant within a scope and resumes never re-pass it. Set any
+model knob to `inherit` to use the CLI's startup model.
 
 **Optional reviewers** (cross-track, off by default): Product Reviewer, Design
 Fidelity Reviewer, Security Reviewer, API Contract Reviewer. A spec opts in via an
@@ -209,7 +218,9 @@ and an off-track name is rejected) — the finest control over token burn. See
 - Do not add `// TODO` comments — if something is unfinished, stop and report it.
 - Do not skip tests for new logic. Every exported function gets a test.
 - Do not assume a library is available — check `package.json` first.
-- Do not switch the primary model during a night-shift run.
+- Do not manually switch models or roles mid-run. (The engine itself tiers models
+  by role at stage-scope boundaries — plan/implement/observer — by design; that is
+  not a manual switch.)
 - Do not use implicit session selectors such as `--continue` or `--last`.
 - Do not push, merge, force-push, clean, reset, or perform destructive Git
   operations during an autonomous run.

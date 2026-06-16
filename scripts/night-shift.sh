@@ -36,6 +36,26 @@ PERSONA_MODEL="${NIGHT_SHIFT_PERSONA_MODEL:-sonnet}"
 # fresh-and-cheap pattern the observer already uses. Set to "run" for the legacy
 # single pinned session.
 SESSION_SCOPE="${NIGHT_SHIFT_SESSION_SCOPE:-stage}"
+# Per-role model tiering. Concentrate the strongest model on the two low-token,
+# high-judgment steps and use a cheaper model for the expensive middle:
+#   - PLAN_MODEL: planning is few turns but the highest-leverage step (a bad plan
+#     poisons the whole implement loop), so it defaults to opus.
+#   - IMPLEMENT_MODEL: the test-first implement grind is where most tokens live
+#     and the most constrained step (plan fixed, failing tests written), so it
+#     defaults to the cheaper sonnet. The observe-request and completion turns
+#     run here too (they are not judgment).
+#   - OBSERVER_MODEL: the independent final gate runs once on fresh context (~cheap
+#     to upgrade) and is the last line of defense before a human sees the work, so
+#     it defaults to opus regardless of what the primary ran. On an observer BLOCK
+#     the task returns to a fresh IMPLEMENT_MODEL session to fix the findings.
+# These switch model only at stage-scope boundaries, which already start a fresh
+# session, so the model is constant within a scope (resumes pass the same flag).
+# Set any to "inherit" to use the CLI's startup model instead (e.g. a Claude Pro
+# plan without Opus access). Only opt out of OBSERVER_MODEL if you must — it is
+# the strong backstop that makes a cheaper primary safe.
+PLAN_MODEL="${NIGHT_SHIFT_PLAN_MODEL:-opus}"
+IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
+OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # Persona/profile resolution — the persona/track constants (PERSONAS_RN,
 # PERSONAS_WEB, PERSONAS_OPTIONAL, PERSONAS, the floors, DEFAULT_TRACK) and the
 # pure functions that map a spec to its active review set — live in
@@ -72,7 +92,12 @@ Claude runs the entire flow: stage-scoped primary sessions implement (a fresh
 session per stage scope — plan, implement, observe — handing off through files
 on disk to keep cost down; set NIGHT_SHIFT_SESSION_SCOPE=run for one pinned
 session), the spec's review personas (selected by its Track + Review Profile)
-review, and a fresh independent Claude session observes each candidate. Runs use
+review, and a fresh independent Claude session observes each candidate. Models are
+tiered by role: plan on NIGHT_SHIFT_PLAN_MODEL (default opus), implement/observe-
+request/completion on NIGHT_SHIFT_IMPLEMENT_MODEL (default sonnet), personas on
+NIGHT_SHIFT_PERSONA_MODEL (default sonnet), and the observer on
+NIGHT_SHIFT_OBSERVER_MODEL (default opus); any "inherit" uses the startup model.
+Runs use
 explicit session IDs, local candidate commits, per-profile persona approvals, and
 observer approval. Live fixture tests make paid Claude calls;
 full six-persona live coverage requires --full-persona-live-test and
@@ -443,6 +468,8 @@ run_dry_fixtures() {
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
+  fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
+  fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -961,6 +988,34 @@ fixture_stage_session_reset() {
   printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"session_id":"sess-3"}\n' >"$STATE"
   set_stage implementation >/dev/null 2>&1
   [ "$(jq -r '.session_id' "$STATE")" = "sess-3" ] || return 1
+  return 0
+}
+
+fixture_model_flag() {
+  # "inherit" and empty produce no flag; a real model name produces "--model NAME"
+  # (unquoted-string form so it word-splits into argv under bash 3.2 + set -u).
+  [ -z "$(model_flag inherit)" ] || return 1
+  [ -z "$(model_flag '')" ] || return 1
+  [ "$(model_flag opus)" = "--model opus" ] || return 1
+  [ "$(model_flag sonnet)" = "--model sonnet" ] || return 1
+  return 0
+}
+
+fixture_stage_model() {
+  # The primary plans on PLAN_MODEL and does all post-plan work (implement, the
+  # observe-request turn, completion) on the cheaper IMPLEMENT_MODEL; the strong
+  # judgment in the observe scope is the separate independent observer.
+  local PLAN_MODEL=opus IMPLEMENT_MODEL=sonnet
+  [ "$(stage_model plan)" = "opus" ] || return 1
+  [ "$(stage_model implement)" = "sonnet" ] || return 1
+  [ "$(stage_model observe)" = "sonnet" ] || return 1
+  [ "$(stage_model complete)" = "sonnet" ] || return 1
+  # An unrecognized scope falls back to inherit (no forced model).
+  [ "$(stage_model bogus)" = "inherit" ] || return 1
+  # inherit values flow straight through (no model pinned).
+  PLAN_MODEL=inherit IMPLEMENT_MODEL=inherit
+  [ "$(stage_model plan)" = "inherit" ] || return 1
+  [ "$(stage_model implement)" = "inherit" ] || return 1
   return 0
 }
 
@@ -1838,6 +1893,32 @@ session_boundary() {
   [ "$(stage_session_scope "$old_stage")" != "$(stage_session_scope "$new_stage")" ]
 }
 
+# Pure: print the "--model NAME" CLI argument for a model, or nothing for
+# "inherit"/empty (use the CLI's startup model). Printed unquoted at the call
+# site so it word-splits into argv — safe under bash 3.2 + set -u, where an empty
+# array expansion would trip "unbound variable" (model names never contain spaces).
+model_flag() {
+  case "$1" in
+    inherit|"") ;;
+    *) printf -- '--model %s' "$1" ;;
+  esac
+}
+
+# Pure: the model the primary should run on in a given session scope. Planning is
+# low-token, high-leverage judgment (a bad plan poisons the whole implement loop),
+# so it gets PLAN_MODEL; everything after the plan — the implement grind, the
+# observe-request turn, and completion — is constrained execution on the cheaper
+# IMPLEMENT_MODEL. The strong independent judgment in the observe scope is the
+# separate observer (OBSERVER_MODEL), not this primary turn. Unknown scope ->
+# "inherit" (force no model; safe default).
+stage_model() {
+  case "$1" in
+    plan) printf '%s' "$PLAN_MODEL" ;;
+    implement|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
+    *) printf 'inherit' ;;
+  esac
+}
+
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set model_line reround_note
@@ -1953,11 +2034,18 @@ EOF
 invoke_primary() {
   local prompt="$RUN_ROOT/prompts/primary-$(jq -r '.primary_turns + 1' "$STATE").txt"
   local raw="$RUN_ROOT/raw/primary-$(jq -r '.primary_turns + 1' "$STATE").json"
-  local session emitted rc
+  local session emitted rc model
   enforce_limits
   archive_old_signal
   primary_prompt "$prompt"
   session="$(jq -r '.session_id // empty' "$STATE")"
+  # Model for this stage's scope, pinned only on a FRESH start. A session is born
+  # inside one scope and the model is constant within a scope (a scope boundary
+  # already nulls .session_id and starts a fresh session), so a --resume — whether
+  # a turn-to-turn continue, a rate-limit retry, or recovery of a blocked run —
+  # already carries its creation model and must NOT re-pass --model. This keeps
+  # resume robust regardless of whether the CLI accepts --model alongside --resume.
+  model="$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
   while :; do
     rc=0
@@ -1966,7 +2054,7 @@ invoke_primary() {
     # feature branch and the wrapper forbids push/merge/destructive Git ops and
     # excludes pre-existing dirt from candidate commits.
     if [ -z "$session" ]; then
-      (cd "$PROJECT" && claude -p --permission-mode bypassPermissions \
+      (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
         --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
     else
       (cd "$PROJECT" && claude -p --resume "$session" --permission-mode bypassPermissions \
@@ -2355,7 +2443,7 @@ invoke_observer_once() {
   # and hangs, producing nothing. Instead the prompt asks the observer to end its
   # reply with a fenced ```json verdict block, which extract_claude_structured
   # pulls out; json_schema_basic then enforces the strict contract.
-  (cd "$neutral" && claude -p --output-format json \
+  (cd "$neutral" && claude -p $(model_flag "$OBSERVER_MODEL") --output-format json \
     "$(observer_prompt "$context" "$candidate")") >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }

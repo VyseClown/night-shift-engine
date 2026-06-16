@@ -3,10 +3,19 @@
 Read and follow `AGENTS.md` first. For autonomous or overnight work, also read
 and follow `AGENT_LOOP.md`.
 
-The startup-selected model remains the primary for the entire run. Do not switch
-roles with reviewers or the observer, and do not use implicit session selectors.
-(Persona review sub-agents are the one deliberate exception: they default to the
-cheaper `sonnet` via `NIGHT_SHIFT_PERSONA_MODEL`; set it to `inherit` to opt out.)
+Do not switch roles with reviewers or the observer, and do not use implicit
+session selectors. The engine deliberately tiers models by role to spend the
+strongest model only where judgment matters: the primary **plans** on
+`NIGHT_SHIFT_PLAN_MODEL` (default `opus`) and does all post-plan work — implement,
+observe-request, completion — on the cheaper `NIGHT_SHIFT_IMPLEMENT_MODEL`
+(default `sonnet`); persona review sub-agents default to `sonnet`
+(`NIGHT_SHIFT_PERSONA_MODEL`); and the independent final observer runs on
+`NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) as the strong backstop that makes a
+cheaper primary safe (an observer BLOCK returns the task to a fresh implement
+session). The model switches only at stage-scope boundaries, which already start
+a fresh session, so it is constant within a scope and resumes never re-pass it.
+Set any knob to `inherit` to use the CLI's startup model (e.g. a Pro plan without
+Opus access).
 
 ## Workspace Map
 
@@ -53,6 +62,10 @@ engine/workflow git here at the root.
   (plan → implement → observe) handing off through files, which avoids replaying
   one ever-growing session every turn; set `=run` for the legacy single pinned
   session. Persona sub-agents default to `sonnet` (`NIGHT_SHIFT_PERSONA_MODEL`).
+  Per-role model tiering: `NIGHT_SHIFT_PLAN_MODEL` (default `opus`) for planning,
+  `NIGHT_SHIFT_IMPLEMENT_MODEL` (default `sonnet`) for the implement grind, and
+  `NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) for the independent final gate —
+  any set to `inherit` to fall back to the CLI's startup model.
 
 > **Note:** the night-shift workflow is two-track. A spec declares `- Track: rn`
 > or `- Track: web` (default `rn`), which selects the review persona set
