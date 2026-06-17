@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  # ── Job A: Shell lint ───────────────────────────────────────────────────────
+  lint:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-latest typically ships shellcheck and jq already; the || true
+      # prevents a failure if apt tries to "reinstall" an already-present package
+      # at an incompatible version — just let whatever is present be used.
+      - name: Ensure shellcheck and jq are available
+        run: |
+          command -v shellcheck || sudo apt-get update && sudo apt-get install -y shellcheck
+          command -v jq         || sudo apt-get install -y jq
+
+      # Run at --severity=error to catch real bugs (undefined vars, bad
+      # redirects, command-injection risks, etc.) while ignoring style nits.
+      # This keeps CI green on a large script without drowning the signal in
+      # noise. Tighten to --severity=warning or drop the flag altogether once
+      # the existing style warnings have been cleaned up.
+      - name: Shellcheck (error-level only)
+        run: shellcheck --severity=error scripts/night-shift.sh scripts/lib/*.sh
+
+  # ── Job B: Deterministic fixture suite ─────────────────────────────────────
+  fixtures:
+    name: Fixture tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure jq is available
+        run: command -v jq || { sudo apt-get update && sudo apt-get install -y jq; }
+
+      # --dry-run keeps this 100% offline — no paid API calls are made.
+      # NIGHT_SHIFT_ACCEPT_COSTS=YES is required to pass the cost-acceptance
+      # guard inside the script; it does NOT trigger real spending when
+      # combined with --dry-run.
+      - name: Run fixture suite
+        run: NIGHT_SHIFT_ACCEPT_COSTS=YES bash scripts/night-shift.sh --fixture-test --dry-run
