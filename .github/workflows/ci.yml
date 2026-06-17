@@ -19,7 +19,7 @@ jobs:
       # at an incompatible version — just let whatever is present be used.
       - name: Ensure shellcheck and jq are available
         run: |
-          command -v shellcheck || sudo apt-get update && sudo apt-get install -y shellcheck
+          command -v shellcheck || { sudo apt-get update && sudo apt-get install -y shellcheck; }
           command -v jq         || sudo apt-get install -y jq
 
       # Run at --severity=error to catch real bugs (undefined vars, bad

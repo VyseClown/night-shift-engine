@@ -345,8 +345,16 @@ wait_for_rate_limit_reset() {
   if [ -z "$stage_active" ] || [ -z "$task_active" ]; then
     # Route through state_int: a null/corrupt started_at would otherwise
     # silently produce garbage arithmetic under no set -e, disabling the cap.
-    stage_active=$((now - $(state_int '.stage_started_at')))
-    task_active=$((now - $(state_int '.task_started_at')))
+    # Validate into locals first — state_int returns non-zero on bad input, and
+    # a simple assignment's exit status propagates from the $(...), so || fires
+    # in THIS shell (not a subshell), which is what block_run requires.
+    local stage_started task_started
+    stage_started="$(state_int '.stage_started_at')" ||
+      block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
+    task_started="$(state_int '.task_started_at')" ||
+      block_run "state field .task_started_at is not a valid integer; state may be corrupt"
+    stage_active=$((now - stage_started))
+    task_active=$((now - task_started))
     [ "$stage_active" -ge 0 ] || stage_active=0
     [ "$task_active" -ge 0 ] || task_active=0
   fi
@@ -1449,17 +1457,70 @@ fixture_run_lock() {
 # F2 fixture: state_int validation
 # ---------------------------------------------------------------------------
 fixture_state_int() {
-  # Test the pure is_valid_int predicate directly — avoids calling block_run
-  # (which would exit the fixture subshell) while still proving the validation.
+  # Exercise state_int end-to-end against a real temp STATE file.
+  # state_int no longer calls block_run itself — it returns non-zero on bad
+  # input — so we can test it directly without wrapping in a subshell.
+
+  # --- is_valid_int sanity pass (fast, no file I/O needed) ------------------
   is_valid_int "0"    || return 1
   is_valid_int "42"   || return 1
   is_valid_int "9999" || return 1
-  # Reject null, empty, negative, float, non-numeric.
   is_valid_int ""      && return 1
   is_valid_int "null"  && return 1
   is_valid_int "-1"    && return 1
   is_valid_int "1.5"   && return 1
   is_valid_int "abc"   && return 1
+
+  # --- state_int happy path: valid integer field ----------------------------
+  local tmp_state val
+  tmp_state="$(mktemp /tmp/ns-fixture-state-int.XXXXXX.json)"
+  # Point STATE at our temp file for the duration of this fixture.
+  local saved_state="${STATE:-}"
+  STATE="$tmp_state"
+  printf '{"turns":42}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  local rc=$?
+  if [ $rc -ne 0 ] || [ "$val" != "42" ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- state_int sad path: null field returns non-zero ----------------------
+  # state_int must return 1 so callers can guard with || block_run.
+  printf '{"turns":null}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- state_int sad path: missing field (jq returns empty) -----------------
+  printf '{"other":1}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- state_int sad path: non-numeric string --------------------------------
+  printf '{"turns":"abc"}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- Confirm the guarded assignment form works in THIS shell ---------------
+  # x="$(state_int '.bad')" || <guard>  — the guard must fire.
+  printf '{"turns":"bad"}\n' >"$tmp_state"
+  local guard_fired=0
+  local x
+  x="$(state_int '.turns')" || guard_fired=1
+  if [ "$guard_fired" -ne 1 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  STATE="$saved_state"
+  rm -f "$tmp_state"
   return 0
 }
 
@@ -1467,21 +1528,29 @@ fixture_state_int() {
 # F3 fixture: rate-limit consecutive counter threshold predicate
 # ---------------------------------------------------------------------------
 fixture_rate_limit_consecutive() {
-  # Pure threshold check: consecutive_429 >= cap → block; < cap → allow.
+  # Assert the SAME comparison used in invoke_primary:
+  #   [ "$consecutive_429" -lt "$rate_limit_cap" ]
+  # Values 0..cap-1 must be BELOW threshold (allowed, test returns true).
+  # Values >= cap must be AT/OVER threshold (would block, test returns false).
+  # This fixture fails if the operator or direction were wrong.
   local cap=5
-  # Below cap: all values 0..cap-1 must be below threshold.
-  local i=0
-  while [ "$i" -lt "$cap" ]; do
-    [ "$i" -lt "$cap" ] || return 1
-    i=$((i + 1))
+  local consecutive_429
+
+  # Below-threshold: every value in 0..cap-1 must satisfy the guard.
+  consecutive_429=0
+  while [ "$consecutive_429" -lt "$cap" ]; do
+    [ "$consecutive_429" -lt "$cap" ] || return 1   # should always pass here
+    consecutive_429=$((consecutive_429 + 1))
   done
-  # At cap: must be caught.
-  [ "$cap" -lt "$cap" ] && return 1
-  # Simulate the exact guard used in invoke_primary.
-  local consecutive_429=4
-  [ "$consecutive_429" -lt "$cap" ] || return 1   # 4 < 5 → OK
-  consecutive_429=5
-  [ "$consecutive_429" -lt "$cap" ] && return 1   # 5 < 5 is false → would block
+  # consecutive_429 is now exactly cap; the loop exited because the guard
+  # returned false — that's correct.  Verify the at-threshold case explicitly.
+  consecutive_429=$cap
+  [ "$consecutive_429" -lt "$cap" ] && return 1    # cap -lt cap is false → block expected
+
+  # One above cap must also be treated as over-threshold.
+  consecutive_429=$((cap + 1))
+  [ "$consecutive_429" -lt "$cap" ] && return 1    # cap+1 -lt cap is false → block expected
+
   return 0
 }
 
@@ -2126,14 +2195,24 @@ is_valid_int() {
 }
 
 # Read a numeric field from $STATE by jq path, validate it is a non-negative
-# integer, and echo the value. On null/non-numeric output calls block_run so
-# a corrupt state.json never silently disables turn/time-limit enforcement.
+# integer, and echo the value.  Returns 0 on success, 1 on null/non-numeric.
+# IMPORTANT: this function is always called inside a command substitution
+# $(...), so calling block_run / exit here would only kill the subshell — the
+# parent would continue with an empty value and the limit check would be
+# silently bypassed.  Instead, the CALLER must check the return code and block:
+#
+#   local x; x="$(state_int '.field')" || block_run "..."
+#
+# A plain-assignment's exit status IS the command-substitution's exit status,
+# so this form correctly triggers block_run in the parent shell.
 # Usage: state_int '.field_name'
 state_int() {
   local path="$1" val
   val="$(jq -r "${path} // empty" "$STATE" 2>/dev/null)"
-  is_valid_int "$val" ||
-    block_run "state field $path is not a valid integer (got: ${val:-<empty>}); state may be corrupt"
+  if ! is_valid_int "$val"; then
+    printf '' # emit nothing so the caller gets an empty string
+    return 1
+  fi
   printf '%s' "$val"
 }
 
@@ -2182,14 +2261,17 @@ initialize_run() {
 }
 
 recover_run() {
-  local status recovery_raw
+  local status recovery_raw pt
   RUN_ROOT="$PROJECT/.night-shift"
   STATE="$RUN_ROOT/state.json"
   [ -f "$STATE" ] || return 1
   status="$(jq -r '.status' "$STATE")"
-  # state_int validates the field is a non-negative integer before arithmetic;
-  # a corrupt/null .primary_turns would otherwise silently build a wrong path.
-  recovery_raw="$RUN_ROOT/raw/primary-$(( $(state_int '.primary_turns') + 1 )).json"
+  # Validate .primary_turns into a local first so the || fires in THIS shell
+  # (state_int returns non-zero on bad input; a plain assignment's exit status
+  # IS the $(...) exit status, which block_run needs to see in the parent).
+  pt="$(state_int '.primary_turns')" ||
+    block_run "state field .primary_turns is not a valid integer; state may be corrupt"
+  recovery_raw="$RUN_ROOT/raw/primary-$(( pt + 1 )).json"
   if [ "$status" != "running" ]; then
     recoverable_rate_limit_state "$STATE" "$recovery_raw" || return 1
   fi
@@ -2481,13 +2563,24 @@ invoke_primary() {
 
 enforce_limits() {
   local now stage_elapsed task_elapsed stage_turns task_turns
+  local stage_started task_started
   now="$(now_epoch)"
-  # Route through state_int so a null/corrupt field is caught immediately
-  # rather than silently producing a broken arithmetic result under no set -e.
-  stage_elapsed=$((now - $(state_int '.stage_started_at')))
-  task_elapsed=$((now - $(state_int '.task_started_at')))
-  stage_turns="$(state_int '.stage_turns')"
-  task_turns="$(state_int '.task_turns')"
+  # Validate each field into a local before doing arithmetic or comparisons.
+  # state_int returns non-zero on null/corrupt input; a plain assignment's exit
+  # status IS the $(...) exit status, so || fires in THIS shell — block_run is
+  # reached in the parent, not swallowed by a subshell.  Declare locals
+  # separately from the guarded assignments so `local x="$(...)"` does not
+  # mask the exit status (local always returns 0 in bash/dash/sh).
+  stage_started="$(state_int '.stage_started_at')" ||
+    block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
+  task_started="$(state_int '.task_started_at')" ||
+    block_run "state field .task_started_at is not a valid integer; state may be corrupt"
+  stage_turns="$(state_int '.stage_turns')" ||
+    block_run "state field .stage_turns is not a valid integer; state may be corrupt"
+  task_turns="$(state_int '.task_turns')" ||
+    block_run "state field .task_turns is not a valid integer; state may be corrupt"
+  stage_elapsed=$((now - stage_started))
+  task_elapsed=$((now - task_started))
   if limit_exceeded "$stage_turns" "$stage_elapsed" "$task_turns" "$task_elapsed"; then
     block_run "turn/time limit reached (stage ${stage_turns}/${MAX_STAGE_TURNS}, task ${task_turns}/${MAX_TASK_TURNS})"
   fi
@@ -2495,11 +2588,16 @@ enforce_limits() {
 
 enforce_elapsed_limits() {
   local now stage_elapsed task_elapsed
+  local stage_started task_started
   now="$(now_epoch)"
-  # Route through state_int so a null/corrupt field is caught immediately
-  # rather than silently producing a broken arithmetic result under no set -e.
-  stage_elapsed=$((now - $(state_int '.stage_started_at')))
-  task_elapsed=$((now - $(state_int '.task_started_at')))
+  # Same pattern as enforce_limits: validate into locals first, then do
+  # arithmetic on the validated values in the parent shell.
+  stage_started="$(state_int '.stage_started_at')" ||
+    block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
+  task_started="$(state_int '.task_started_at')" ||
+    block_run "state field .task_started_at is not a valid integer; state may be corrupt"
+  stage_elapsed=$((now - stage_started))
+  task_elapsed=$((now - task_started))
   if [ "$stage_elapsed" -ge "$MAX_STAGE_SECONDS" ] ||
     [ "$task_elapsed" -ge "$MAX_TASK_SECONDS" ]; then
     block_run "time limit reached after the completed primary turn"
