@@ -483,6 +483,7 @@ run_dry_fixtures() {
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
+  fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -1118,6 +1119,20 @@ fixture_expected_action() {
   transition_allowed implementation_ready "$(expected_action implementation_ready)" || return 1
   transition_allowed observer_review "$(expected_action observer_review)" || return 1
   return 0
+}
+
+fixture_visual_stage_machine() {
+  # visual_review is its own scope, runs on the implement-tier model, and accepts
+  # exactly RUN_VISUAL (plus BLOCKED). It sits between candidate and observer.
+  [ "$(stage_session_scope visual_review)" = "visual" ] || return 1
+  [ "$(stage_model visual)" = "$IMPLEMENT_MODEL" ] || return 1
+  [ "$(expected_action visual_review)" = "RUN_VISUAL" ] || return 1
+  transition_allowed visual_review RUN_VISUAL || return 1
+  transition_allowed visual_review BLOCKED || return 1
+  # Skipping ahead from visual_review to the observer is NOT allowed.
+  ! transition_allowed visual_review REQUEST_OBSERVER || return 1
+  # implementation_ready may still only CREATE_CANDIDATE.
+  transition_allowed implementation_ready CREATE_CANDIDATE || return 1
 }
 
 fixture_observer_cost_capture() {
@@ -2328,6 +2343,7 @@ stage_session_scope() {
   case "$1" in
     planning|plan_review) printf 'plan' ;;
     implementation|implementation_review|implementation_ready) printf 'implement' ;;
+    visual_review) printf 'visual' ;;
     observer_review) printf 'observe' ;;
     completion) printf 'complete' ;;
     *) printf '%s' "$1" ;;
@@ -2364,7 +2380,7 @@ model_flag() {
 stage_model() {
   case "$1" in
     plan) printf '%s' "$PLAN_MODEL" ;;
-    implement|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
+    implement|visual|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
     *) printf 'inherit' ;;
   esac
 }
@@ -2631,7 +2647,7 @@ set_stage() {
 
 transition_allowed() {
   case "$1:$2" in
-    planning:RUN_PERSONAS|plan_review:RUN_PERSONAS|implementation:RUN_PERSONAS|implementation_review:RUN_PERSONAS|implementation_ready:CREATE_CANDIDATE|observer_review:REQUEST_OBSERVER|completion:NEXT_TASK|completion:COMPLETE|*:BLOCKED) return 0 ;;
+    planning:RUN_PERSONAS|plan_review:RUN_PERSONAS|implementation:RUN_PERSONAS|implementation_review:RUN_PERSONAS|implementation_ready:CREATE_CANDIDATE|visual_review:RUN_VISUAL|observer_review:REQUEST_OBSERVER|completion:NEXT_TASK|completion:COMPLETE|*:BLOCKED) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2645,6 +2661,7 @@ expected_action() {
   case "$1" in
     planning|plan_review|implementation|implementation_review) printf 'RUN_PERSONAS' ;;
     implementation_ready) printf 'CREATE_CANDIDATE' ;;
+    visual_review) printf 'RUN_VISUAL' ;;
     observer_review) printf 'REQUEST_OBSERVER' ;;
     completion) printf 'NEXT_TASK or COMPLETE' ;;
     *) printf 'BLOCKED' ;;
