@@ -13,24 +13,36 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "screen",
-          "state",
-          "reference",
-          "screenshot",
-          "diff_pct",
-          "tolerance",
-          "pass",
-          "diff_image"
+          "screen", "state", "device", "reference", "screenshot",
+          "diff_pct", "tolerance", "pass", "analysis", "attempts", "diff_image"
         ],
         "properties": {
           "screen": { "type": "string", "minLength": 1 },
           "state": { "type": "string", "minLength": 1 },
+          "device": { "type": "string", "minLength": 1 },
           "reference": { "type": "string", "minLength": 1 },
           "screenshot": { "type": "string", "minLength": 1 },
           "diff_pct": { "type": "number", "minimum": 0 },
           "tolerance": { "type": "number", "minimum": 0 },
           "pass": { "type": "boolean" },
-          "diff_image": { "type": ["string", "null"], "minLength": 1 }
+          "analysis": { "type": "string" },
+          "diff_image": { "type": ["string", "null"], "minLength": 1 },
+          "attempts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["attempt", "diff_pct", "pass", "analysis", "screenshot", "diff_image"],
+              "properties": {
+                "attempt": { "type": "integer", "minimum": 1 },
+                "diff_pct": { "type": "number", "minimum": 0 },
+                "pass": { "type": "boolean" },
+                "analysis": { "type": "string" },
+                "screenshot": { "type": "string", "minLength": 1 },
+                "diff_image": { "type": ["string", "null"], "minLength": 1 }
+              }
+            }
+          }
         }
       }
     }
