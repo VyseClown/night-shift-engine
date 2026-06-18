@@ -63,11 +63,15 @@ project directories below are independent repos, git-ignored here.
 
 ## Before You Write Any Code
 
-1. **Find the spec.** A selected spec is the implementation contract. It must
-   contain repository path, base and feature branches, a review profile,
-   validation commands, dependency/native permissions, documentation references,
-   persona documentation ownership, and a test plan. Missing fields block the
-   task.
+1. **Find the spec.** A selected spec is the implementation contract.
+   `validate_spec` mechanically enforces: repository path, base branch, feature
+   branch (all non-placeholder); a valid Review Profile for the declared track;
+   dependency/native permissions with `yes/no - <details>`; a documentation
+   owner line for each active persona; and all three Test Plan fields (first
+   failing test, baseline commands, final commands). Missing or placeholder
+   values block the task. Prose sections — Summary, User Story, Acceptance
+   Criteria — are not checked by the validator; they are evaluated by the review
+   personas and the observer during the run.
 2. **Route to the repository.** The workspace root is not assumed to be a Git
    repository. Resolve the spec's project path and run all Git and validation
    commands there.
@@ -105,6 +109,14 @@ Launch unattended from a terminal (not a Claude session):
 NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --fixture-test            # one-time pre-flight
 NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project PATH --spec specs/<name>.md
 ```
+
+> **Trust boundary — specs are executable.** The night-shift primary runs with
+> `--permission-mode bypassPermissions` (all tool use auto-approved, unattended).
+> The spec's `Baseline validation commands`, `Final validation commands`, and
+> `First failing test or executable check` are executed verbatim via `bash -lc`
+> inside the project and the validation worktree. A spec is therefore effectively
+> executable code. Only run specs you authored or have fully reviewed; treat the
+> spec file as a trust boundary the same way you would a shell script.
 
 - **`NIGHT_SHIFT_ACCEPT_COSTS=YES`** is just a safety gate so live model calls
   are never made by accident. It is not a billing switch.

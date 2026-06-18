@@ -34,14 +34,15 @@ cp specs/_template-web.md specs/my-feature.md   # web example
 A spec is only valid once these are filled. The wrapper's `validate_spec`
 enforces them — an **incomplete spec blocks the run** instead of guessing:
 
-| Section | What it pins | Drives… |
+| Section | What `validate_spec` mechanically enforces | Drives… |
 |---|---|---|
-| **Repository** | project path, base branch, feature branch | routing + branch safety |
-| **Review** | `Track:` + `Review Profile:` | which persona set/floor reviews |
-| **Permissions** | deps / migration (native ios/android only for `rn`) | what the agent may touch |
-| **Documentation** | an owner line per active persona | review ownership |
-| **Acceptance Criteria** | binary pass/fail items | the definition of "done" |
-| **Test Plan** | **first failing test**, **baseline** cmds, **final** cmds | the run/implement/validate loop |
+| **Repository** | project path, base branch, feature branch — all must be non-placeholder values | routing + branch safety |
+| **Review** | valid `Track:` + valid `Review Profile:` for that track | which persona set/floor reviews |
+| **Permissions** | `New dependencies permitted: yes/no - <details>`; `ios/`+`android/` lines on the `rn` track | what the agent may touch |
+| **Documentation** | an owner line for each persona active in the chosen profile | review ownership |
+| **Test Plan** | `First failing test or executable check:`, `Baseline validation commands`, `Final validation commands` — all present and non-placeholder | the run/implement/validate loop |
+
+`validate_spec` checks **structural completeness only** — it does not read or evaluate the prose in **Summary**, **User Story**, or **Acceptance Criteria**. Those sections are evaluated by the review personas and the observer during the run.
 
 ### The Test Plan is the engine
 

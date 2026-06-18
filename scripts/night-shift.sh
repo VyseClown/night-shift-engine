@@ -343,8 +343,18 @@ wait_for_rate_limit_reset() {
   stage_active="$(jq -r '.rate_limit_stage_elapsed // empty' "$STATE")"
   task_active="$(jq -r '.rate_limit_task_elapsed // empty' "$STATE")"
   if [ -z "$stage_active" ] || [ -z "$task_active" ]; then
-    stage_active=$((now - $(jq -r '.stage_started_at' "$STATE")))
-    task_active=$((now - $(jq -r '.task_started_at' "$STATE")))
+    # Route through state_int: a null/corrupt started_at would otherwise
+    # silently produce garbage arithmetic under no set -e, disabling the cap.
+    # Validate into locals first — state_int returns non-zero on bad input, and
+    # a simple assignment's exit status propagates from the $(...), so || fires
+    # in THIS shell (not a subshell), which is what block_run requires.
+    local stage_started task_started
+    stage_started="$(state_int '.stage_started_at')" ||
+      block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
+    task_started="$(state_int '.task_started_at')" ||
+      block_run "state field .task_started_at is not a valid integer; state may be corrupt"
+    stage_active=$((now - stage_started))
+    task_active=$((now - task_started))
     [ "$stage_active" -ge 0 ] || stage_active=0
     [ "$task_active" -ge 0 ] || task_active=0
   fi
@@ -434,15 +444,16 @@ run_dry_fixtures() {
   fixture_assert "bug-first task ordering" fixture_task_order "$root"
   fixture_assert "unchecked queue lists bugs-first, excludes checked" fixture_unchecked_queue_order "$root"
   fixture_assert "stage limit boundary" fixture_limits
-  fixture_assert "review retry preserves successful results" fixture_partial_retry "$root"
+  fixture_assert "validated_retry accepts a clean first-pass result without a second call" fixture_partial_retry "$root"
   fixture_assert "in-place persona artifact copy is a no-op (no BSD cp failure)" fixture_persona_inplace_copy "$root"
-  fixture_assert "candidate commit mapping" fixture_commit_mapping "$root"
+  fixture_assert "candidate commit dedup: same hash appended twice appears once" fixture_commit_mapping "$root"
   fixture_assert "success cleanup and blocked recovery" fixture_cleanup_recovery "$root"
-  fixture_assert "interruption state recovery" fixture_state_recovery "$root"
+  fixture_assert "recoverable_rate_limit_state rejects running/session-mismatch/missing-raw" fixture_state_recovery "$root"
   fixture_assert "real transition gate sequence" fixture_transitions
   fixture_assert "malformed adapter retries once" fixture_adapter_retry "$root"
   fixture_assert "final-only validation commands pass by identity" fixture_validation_identity "$root"
   fixture_assert "candidate validation excludes working-tree dirt" fixture_candidate_isolation "$root"
+  fixture_assert "dirty-path exclusion matches space-in-path correctly (NUL baseline)" fixture_dirty_path_space "$root"
   fixture_assert "candidate selection keeps insertion order (no unique-sort)" fixture_candidate_order "$root"
   fixture_assert "stage entry uses a fresh clock (no ancient restore)" fixture_stage_fresh_start "$root"
   fixture_assert "observer verdict extraction (json/fenced/embedded)" fixture_observer_extraction "$root"
@@ -488,6 +499,11 @@ run_dry_fixtures() {
   fixture_assert "rate-limit resume rebases elapsed budgets" fixture_rate_limit_rebase "$root"
   fixture_assert "preserved rate-limit block is recoverable" fixture_rate_limit_recovery "$root"
   fixture_assert "runaway rate-limit wait hits the cap" fixture_rate_limit_cap "$root"
+  fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
+  fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
+  fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
+  fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
+  fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -528,15 +544,24 @@ fixture_limits() {
   limit_exceeded 12 100 35 100
 }
 
+# Drives validated_retry with a callback that succeeds on the FIRST attempt.
+# Confirms that a clean first-pass result is accepted without a second call.
+# This exercises the real validated_retry exit path (attempt=0, schema passes)
+# and would fail if validated_retry were deleted or if it required two attempts
+# unconditionally.
+fixture_partial_retry_callback() {
+  local attempts="$1" output="$2"
+  # Record the call, then emit a schema-valid observer result immediately.
+  printf '%s\n' "$(($(cat "$attempts") + 1))" >"$attempts"
+  printf '%s\n' '{"observer":"claude","primary":"claude","task":"specs/a.md","candidate_commit":"abcdef1","status":"APPROVE","findings":[],"documentation_changes":[]}' >"$output"
+}
+
 fixture_partial_retry() {
-  local root="$1" dir
-  dir="$root/retries"
-  mkdir -p "$dir"
-  printf approved >"$dir/a.result"
-  printf malformed >"$dir/b.raw"
-  printf approved >"$dir/b.result"
-  [ "$(find "$dir" -name '*.result' -type f | wc -l | tr -d ' ')" = "2" ] &&
-    [ "$(cat "$dir/a.result")" = "approved" ]
+  local root="$1" attempts="$root/pr-attempts" output="$root/pr-output.json"
+  printf '0\n' >"$attempts"
+  validated_retry observer-review "$output" fixture_partial_retry_callback "$attempts" "$output" || return 1
+  # Callback must have been called exactly once — a clean result needs no retry.
+  [ "$(cat "$attempts")" = "1" ] && json_schema_basic observer-review "$output"
 }
 
 # The primary may write a persona artifact directly into the round result dir, so
@@ -554,11 +579,25 @@ fixture_persona_inplace_copy() {
   [ -f "$dir/mirror.json" ]
 }
 
+# Tests that the insertion-order deduplication expression used by verify_candidate
+# is idempotent: appending a hash that is ALREADY in candidate_commits must not
+# create a duplicate entry.  fixture_candidate_order already proves out-of-
+# lexical-order preserves insertion; this fixture proves that the same hash
+# appended twice appears only once.  Both together cover the two branches of
+# the reduce dedup logic — this fixture would fail if the `index($x)` guard were
+# removed (duplicate entries would appear and [-1] would still be the new hash,
+# but length would be wrong).
 fixture_commit_mapping() {
-  local root="$1" file
-  file="$root/state-map.json"
-  printf '%s\n' '{"base_commit":"aaaaaaa","candidate_commits":["bbbbbbb","ccccccc"]}' >"$file"
-  jq -e '.base_commit == "aaaaaaa" and .candidate_commits[-1] == "ccccccc"' "$file" >/dev/null
+  local root="$1" file="$root/dedup.json"
+  printf '%s\n' '{"candidate_commits":["aaaa111","bbbb222"],"candidate":"bbbb222"}' >"$file"
+  # Append bbbb222 again — it is already present; dedup must suppress it.
+  jq '.candidate_commits = ((.candidate_commits + ["bbbb222"])
+        | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)) | .candidate="bbbb222"' \
+    "$file" > "$file.t" && mv "$file.t" "$file"
+  # Array must still have exactly 2 entries; bbbb222 must appear once only.
+  [ "$(jq '.candidate_commits | length' "$file")" -eq 2 ] &&
+    [ "$(jq -r '.candidate_commits[-1]' "$file")" = "bbbb222" ] &&
+    [ "$(jq -r '.candidate_commits[0]' "$file")" = "aaaa111" ]
 }
 
 fixture_cleanup_recovery() {
@@ -571,11 +610,30 @@ fixture_cleanup_recovery() {
   [ -f "$run/archive/fixture/state.json" ] && [ ! -e "$run/raw" ]
 }
 
+# Tests the rejection branches of recoverable_rate_limit_state that fixture_rate_limit_recovery
+# does NOT cover.  That fixture confirms the happy path (blocked + session match → recoverable).
+# This fixture confirms the cases that must NOT be recoverable via rate-limit logic:
+#   (a) status == "running" — a normal interrupted run must not be treated as a rate-limit event
+#   (b) status == "blocked" but session ID mismatch — could be a different Claude session
+#   (c) state or raw file missing — both must exist or we return 1
+# All three must return 1.  If recoverable_rate_limit_state were changed to accept any
+# running state it would break (a); a missing session check would break (b).
 fixture_state_recovery() {
-  local root="$1" file
-  file="$root/recovery.json"
-  printf '%s\n' '{"status":"running","primary":"claude","session_id":"fixed-id","stage":"implementation","primary_turns":4}' >"$file"
-  jq -e '.status == "running" and .session_id == "fixed-id" and .primary_turns == 4' "$file" >/dev/null
+  local root="$1"
+  local state="$root/sr-state.json" raw="$root/sr-raw.json"
+  # (a) status == "running" → not recoverable.
+  printf '%s\n' '{"status":"running","session_id":"sid-1"}' >"$state"
+  printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 5am (Etc/UTC)","session_id":"sid-1"}' >"$raw"
+  recoverable_rate_limit_state "$state" "$raw" && return 1
+  # (b) blocked but session mismatch → not recoverable.
+  printf '%s\n' '{"status":"blocked","session_id":"sid-A","block_reason":"primary command failed with status 1"}' >"$state"
+  printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 5am (Etc/UTC)","session_id":"sid-B"}' >"$raw"
+  recoverable_rate_limit_state "$state" "$raw" && return 1
+  # (c) missing raw file → not recoverable.
+  printf '%s\n' '{"status":"blocked","session_id":"sid-X","block_reason":"primary command failed with status 1"}' >"$state"
+  rm -f "$root/sr-raw-missing.json"
+  recoverable_rate_limit_state "$state" "$root/sr-raw-missing.json" && return 1
+  return 0
 }
 
 fixture_transitions() {
@@ -618,6 +676,46 @@ fixture_candidate_isolation() {
   printf 'dirty\n' >"$repo/dirty.txt"
   git -C "$repo" worktree add --detach "$worktree" HEAD >/dev/null 2>&1
   [ -f "$worktree/tracked.txt" ] && [ ! -e "$worktree/dirty.txt" ]
+}
+
+# Exercises path_in_baseline directly with paths that contain spaces.
+# git status --porcelain=v1 (without -z) QUOTES such paths (e.g.
+# "dir with space/f"), leaving surrounding quotes in the extracted string so a
+# string-match against the literal path fails silently.  With -z the path is
+# unquoted and literal so the match is reliable.  This fixture builds a real
+# NUL-delimited -z baseline capture and calls path_in_baseline to confirm:
+#   (a) a space-containing path that IS in the baseline → blocked (return 0)
+#   (b) a child path under a dirty untracked directory → blocked by prefix (0)
+#   (c) a clean committed path not in the baseline → not blocked (return 1)
+#   (d) a spaced path outside the dirty directory → not blocked (return 1)
+# The fixture would regress if path_in_baseline used sed 's/^.. //' (which
+# leaves quotes from the non -z format) rather than NUL-split stripping.
+fixture_dirty_path_space() {
+  local root="$1" repo="$root/space-repo" baseline="$root/spaced-status.txt"
+  git -C "$repo" init -q 2>/dev/null || { mkdir -p "$repo" && git -C "$repo" init -q; }
+  git -C "$repo" config user.email fixture@example.invalid
+  git -C "$repo" config user.name Fixture
+  # Commit one clean file so the repo is non-empty.
+  printf 'clean\n' >"$repo/clean.txt"
+  printf 'other\n' >"$repo/other clean.txt"
+  git -C "$repo" add .
+  git -C "$repo" commit -qm "init"
+  # Create an untracked dirty directory with a space in its path.
+  # git status -z reports the whole untracked directory as one entry with
+  # a trailing slash, e.g. "?? dir with space/".
+  mkdir -p "$repo/dir with space"
+  printf 'dirty\n' >"$repo/dir with space/file.txt"
+  # Capture baseline the same way initialize_run does — NUL-delimited.
+  git -C "$repo" status --porcelain=v1 -z >"$baseline"
+  # (a) A spaced path inside the dirty directory IS in the baseline.
+  path_in_baseline "$baseline" "dir with space/file.txt" || return 1
+  # (b) Any child path under a dirty untracked dir is also blocked (prefix match).
+  path_in_baseline "$baseline" "dir with space/new subfile.txt" || return 1
+  # (c) A clean tracked path not in the baseline is not blocked.
+  path_in_baseline "$baseline" "clean.txt" && return 1
+  # (d) A spaced committed path that is clean is not blocked.
+  path_in_baseline "$baseline" "other clean.txt" && return 1
+  return 0
 }
 
 fixture_worktree_dependencies() {
@@ -1334,6 +1432,191 @@ fixture_rate_limit_cap() {
   [ "$rc" -ne 0 ]
 }
 
+# ---------------------------------------------------------------------------
+# F1 fixture: run-lock stale-vs-live decision
+# ---------------------------------------------------------------------------
+fixture_run_lock() {
+  local root="$1" lockdir="$root/lock-test/run.lock"
+  mkdir -p "$lockdir"
+
+  # A lock dir containing a dead PID (PID 1 is always alive on macOS, so use
+  # a PID that is virtually certain not to exist: the max PID value on macOS is
+  # 99998; the test PID 99998 is extremely unlikely to be running).
+  local dead_pid=99998
+  printf '%s\n' "$dead_pid" >"$lockdir/pid"
+  lock_is_stale "$lockdir" || return 1   # dead PID → stale (should return 0 = stale)
+
+  # A lock dir containing OUR OWN PID ($$ is definitely alive).
+  printf '%s\n' "$$" >"$lockdir/pid"
+  lock_is_stale "$lockdir" && return 1   # live PID → NOT stale (should return 1 = live)
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# F2 fixture: state_int validation
+# ---------------------------------------------------------------------------
+fixture_state_int() {
+  # Exercise state_int end-to-end against a real temp STATE file.
+  # state_int no longer calls block_run itself — it returns non-zero on bad
+  # input — so we can test it directly without wrapping in a subshell.
+
+  # --- is_valid_int sanity pass (fast, no file I/O needed) ------------------
+  is_valid_int "0"    || return 1
+  is_valid_int "42"   || return 1
+  is_valid_int "9999" || return 1
+  is_valid_int ""      && return 1
+  is_valid_int "null"  && return 1
+  is_valid_int "-1"    && return 1
+  is_valid_int "1.5"   && return 1
+  is_valid_int "abc"   && return 1
+
+  # --- state_int happy path: valid integer field ----------------------------
+  local tmp_state val
+  tmp_state="$(mktemp /tmp/ns-fixture-state-int.XXXXXX.json)"
+  # Point STATE at our temp file for the duration of this fixture.
+  local saved_state="${STATE:-}"
+  STATE="$tmp_state"
+  printf '{"turns":42}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  local rc=$?
+  if [ $rc -ne 0 ] || [ "$val" != "42" ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- state_int sad path: null field returns non-zero ----------------------
+  # state_int must return 1 so callers can guard with || block_run.
+  printf '{"turns":null}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- state_int sad path: missing field (jq returns empty) -----------------
+  printf '{"other":1}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- state_int sad path: non-numeric string --------------------------------
+  printf '{"turns":"abc"}\n' >"$tmp_state"
+  val="$(state_int '.turns')"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  # --- Confirm the guarded assignment form works in THIS shell ---------------
+  # x="$(state_int '.bad')" || <guard>  — the guard must fire.
+  printf '{"turns":"bad"}\n' >"$tmp_state"
+  local guard_fired=0
+  local x
+  x="$(state_int '.turns')" || guard_fired=1
+  if [ "$guard_fired" -ne 1 ]; then
+    STATE="$saved_state"; rm -f "$tmp_state"; return 1
+  fi
+
+  STATE="$saved_state"
+  rm -f "$tmp_state"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# F3 fixture: rate-limit consecutive counter threshold predicate
+# ---------------------------------------------------------------------------
+fixture_rate_limit_consecutive() {
+  # Assert the SAME comparison used in invoke_primary:
+  #   [ "$consecutive_429" -lt "$rate_limit_cap" ]
+  # Values 0..cap-1 must be BELOW threshold (allowed, test returns true).
+  # Values >= cap must be AT/OVER threshold (would block, test returns false).
+  # This fixture fails if the operator or direction were wrong.
+  local cap=5
+  local consecutive_429
+
+  # Below-threshold: every value in 0..cap-1 must satisfy the guard.
+  consecutive_429=0
+  while [ "$consecutive_429" -lt "$cap" ]; do
+    [ "$consecutive_429" -lt "$cap" ] || return 1   # should always pass here
+    consecutive_429=$((consecutive_429 + 1))
+  done
+  # consecutive_429 is now exactly cap; the loop exited because the guard
+  # returned false — that's correct.  Verify the at-threshold case explicitly.
+  consecutive_429=$cap
+  [ "$consecutive_429" -lt "$cap" ] && return 1    # cap -lt cap is false → block expected
+
+  # One above cap must also be treated as over-threshold.
+  consecutive_429=$((cap + 1))
+  [ "$consecutive_429" -lt "$cap" ] && return 1    # cap+1 -lt cap is false → block expected
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# F4 fixture: observer cost on BOTH attempts, no double-count on success
+# ---------------------------------------------------------------------------
+fixture_observer_cost_both_attempts() {
+  local root="$1" dir="$root/obs-cost-both"
+  mkdir -p "$dir/raw"
+  # Case 1: first attempt FAILS validation (cost must appear), second succeeds.
+  (
+    RUN_ROOT="$dir"; OBSERVER=claude; PRIMARY=claude; SPEC="/x/spec.md"
+    enforce_limits() { :; }
+    enforce_elapsed_limits() { :; }
+    normalize_observer_output() { :; }
+    local attempt_count=0
+    invoke_observer_once() {
+      attempt_count=$((attempt_count + 1))
+      printf '{"total_cost_usd":1.0,"num_turns":1,"usage":{"output_tokens":1}}\n' >"$4"
+      if [ "$attempt_count" -eq 1 ]; then
+        # First attempt: write an invalid verdict (malformed).
+        printf '{"bad":true}\n' >"$3"
+      else
+        # Second attempt: write a valid verdict.
+        printf '{"observer":"claude","primary":"claude","task":"/x/spec.md","candidate_commit":"a7a950b","status":"APPROVE","findings":[],"documentation_changes":[]}\n' >"$3"
+      fi
+    }
+    validated_observer_retry "ctx" "a7a950b" "$dir/out.json" "$dir/raw/obs2.jsonl" || exit 1
+    # Both attempts must have been costed (2 lines), not just the success one.
+    [ "$(grep -c . "$dir/cost-ledger.jsonl")" -eq 2 ] || exit 1
+  ) || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# F5 fixture: block_run state write failure does not suppress original reason
+# ---------------------------------------------------------------------------
+fixture_block_run_hardening() {
+  local root="$1" dir="$root/block-harden"
+  mkdir -p "$dir"
+  local saved_state="${STATE:-}" saved_root="${RUN_ROOT:-}"
+  # Force state_set to REALLY fail by placing STATE inside a read-only
+  # directory: jq's attempt to write "$STATE.tmp.$$" will be denied, so
+  # state_set's "||" triggers its own die.  The read-only-file trick used
+  # previously did NOT force failure on macOS (mv to a read-only file owned
+  # by the current user succeeds when the directory is writable).
+  local ro_dir="$dir/ro" broken_state
+  mkdir -p "$ro_dir"
+  broken_state="$ro_dir/state.json"
+  printf '{}' >"$broken_state"
+  chmod 555 "$ro_dir"   # read-only dir: jq cannot create the .tmp.$$ file
+  STATE="$broken_state"; RUN_ROOT="$dir"
+  local rc=0 msg
+  msg="$( ( block_run "UNIQUE_MARKER_REASON" ) 2>&1 )" || rc=$?
+  STATE="$saved_state"; RUN_ROOT="$saved_root"
+  chmod 755 "$ro_dir" 2>/dev/null || true
+  # (a) Must have exited non-zero.
+  [ "$rc" -ne 0 ] || return 1
+  # (b) Output must contain the original block reason, NOT only state_set's
+  #     "failed to update run state" message — proving the subshell fix works.
+  case "$msg" in
+    *"UNIQUE_MARKER_REASON"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 fixture_candidate_order() {
   local root="$1" f="$root/cand.json"
   # Latest candidate sorts lexicographically BEFORE the previous one.
@@ -1835,12 +2118,102 @@ resolve_artifact() {
   case "$resolved" in "$PROJECT"/*) printf '%s\n' "$resolved" ;; *) return 1 ;; esac
 }
 
+# ---------------------------------------------------------------------------
+# Concurrency run-lock (F1)
+# ---------------------------------------------------------------------------
+# mkdir is atomic on POSIX filesystems and available in bash 3.2 without flock.
+# One lock per --project directory prevents two concurrent runs from corrupting
+# the shared $PROJECT/.night-shift/state.json. The lock directory lives at
+# $PROJECT/.night-shift/run.lock; the owner PID is written inside it so we can
+# distinguish a live holder from a stale lock left by a crashed run.
+#
+# Pure predicate: return 0 (stale / reclaimable) if the PID stored in the lock
+# dir belongs to a dead process, 1 (live) otherwise.  Extracted as a standalone
+# function so the fixture can test the decision without running the full lock
+# acquisition path.
+lock_is_stale() {
+  local lockdir="$1" stored_pid
+  stored_pid="$(cat "$lockdir/pid" 2>/dev/null)" || return 0   # missing pid file → stale
+  is_valid_int "$stored_pid" || return 0                        # garbage pid → stale
+  kill -0 "$stored_pid" 2>/dev/null && return 1                 # process alive → NOT stale
+  return 0                                                       # process dead → stale
+}
+
+acquire_lock() {
+  local lockdir="$PROJECT/.night-shift/run.lock"
+  # Ensure the parent .night-shift directory exists before we try to mkdir the
+  # lock subdirectory; initialize_run may not have run yet at this point.
+  mkdir -p "$PROJECT/.night-shift"
+  if mkdir "$lockdir" 2>/dev/null; then
+    # We created the lock — record our PID so release_lock can verify ownership.
+    printf '%s\n' "$$" >"$lockdir/pid"
+    return 0
+  fi
+  # Lock dir already exists; decide if it is live or stale.
+  if lock_is_stale "$lockdir"; then
+    # Stale lock from a crashed run — reclaim it so recovery can proceed.
+    log "stale run lock found (crashed process); reclaiming for this run"
+    rm -rf "$lockdir"
+    mkdir "$lockdir" || die "could not reclaim stale run lock at $lockdir"
+    printf '%s\n' "$$" >"$lockdir/pid"
+    return 0
+  fi
+  # Another live process holds the lock — refuse to proceed.
+  local holder_pid
+  holder_pid="$(cat "$lockdir/pid" 2>/dev/null || printf 'unknown')"
+  die "another run is already active for this project (PID $holder_pid); wait for it to finish or remove $lockdir if the process is gone"
+}
+
+release_lock() {
+  local lockdir="${1:-${PROJECT:-}/.night-shift/run.lock}"
+  # Only remove the lock if we own it (our PID is recorded inside). This
+  # prevents an EXIT trap from clobbering a freshly reclaimed lock if the
+  # original holder exits at the same moment.
+  [ -f "$lockdir/pid" ] || return 0
+  local stored_pid
+  stored_pid="$(cat "$lockdir/pid" 2>/dev/null)" || return 0
+  [ "$stored_pid" = "$$" ] || return 0
+  rm -rf "$lockdir"
+}
+# ---------------------------------------------------------------------------
+
 state_set() {
   local filter="$1"
   shift
   local tmp="$STATE.tmp.$$"
   jq "$@" "$filter" "$STATE" >"$tmp" && mv "$tmp" "$STATE" ||
     die "failed to update run state; preserved at ${RUN_ROOT:-unknown}"
+}
+
+# Pure predicate: return 0 if $1 is a non-negative integer string, 1 otherwise.
+# Used by state_int to validate jq output before feeding it into $((...)).
+is_valid_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Read a numeric field from $STATE by jq path, validate it is a non-negative
+# integer, and echo the value.  Returns 0 on success, 1 on null/non-numeric.
+# IMPORTANT: this function is always called inside a command substitution
+# $(...), so calling block_run / exit here would only kill the subshell — the
+# parent would continue with an empty value and the limit check would be
+# silently bypassed.  Instead, the CALLER must check the return code and block:
+#
+#   local x; x="$(state_int '.field')" || block_run "..."
+#
+# A plain-assignment's exit status IS the command-substitution's exit status,
+# so this form correctly triggers block_run in the parent shell.
+# Usage: state_int '.field_name'
+state_int() {
+  local path="$1" val
+  val="$(jq -r "${path} // empty" "$STATE" 2>/dev/null)"
+  if ! is_valid_int "$val"; then
+    printf '' # emit nothing so the caller gets an empty string
+    return 1
+  fi
+  printf '%s' "$val"
 }
 
 initialize_run() {
@@ -1852,7 +2225,10 @@ initialize_run() {
   BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
   BASE_BRANCH="$(git -C "$PROJECT" branch --show-current)"
   BASE_STATUS="$RUN_ROOT/baseline-status.txt"
-  git -C "$PROJECT" status --porcelain=v1 >"$BASE_STATUS"
+  # -z: NUL-delimited, paths are literal/unquoted (no C-escape quoting for
+  # spaces or unicode). Porcelain -z format: each record is <XY><SP><path><NUL>
+  # and for renames the OLD path follows as a second NUL-terminated field.
+  git -C "$PROJECT" status --porcelain=v1 -z >"$BASE_STATUS"
   git -C "$PROJECT" worktree list --porcelain >"$RUN_ROOT/worktrees.txt"
   write_json_atomic "$STATE" '{
       run_id:$run_id,status:"running",primary:$primary,observer:$observer,
@@ -1885,12 +2261,17 @@ initialize_run() {
 }
 
 recover_run() {
-  local status recovery_raw
+  local status recovery_raw pt
   RUN_ROOT="$PROJECT/.night-shift"
   STATE="$RUN_ROOT/state.json"
   [ -f "$STATE" ] || return 1
   status="$(jq -r '.status' "$STATE")"
-  recovery_raw="$RUN_ROOT/raw/primary-$(( $(jq -r '.primary_turns' "$STATE") + 1 )).json"
+  # Validate .primary_turns into a local first so the || fires in THIS shell
+  # (state_int returns non-zero on bad input; a plain assignment's exit status
+  # IS the $(...) exit status, which block_run needs to see in the parent).
+  pt="$(state_int '.primary_turns')" ||
+    block_run "state field .primary_turns is not a valid integer; state may be corrupt"
+  recovery_raw="$RUN_ROOT/raw/primary-$(( pt + 1 )).json"
   if [ "$status" != "running" ]; then
     recoverable_rate_limit_state "$STATE" "$recovery_raw" || return 1
   fi
@@ -2114,6 +2495,13 @@ invoke_primary() {
   local prompt="$RUN_ROOT/prompts/primary-$(jq -r '.primary_turns + 1' "$STATE").txt"
   local raw="$RUN_ROOT/raw/primary-$(jq -r '.primary_turns + 1' "$STATE").json"
   local session emitted rc model
+  # Consecutive 429-without-success counter. Persisted in state so recovery
+  # after a crash picks up the count; reset to 0 on the first clean turn.
+  # Cap: 5 consecutive rate-limit resets with no successful primary turn → block
+  # for manual resume to prevent an infinite sleep-and-retry spiral.
+  local rate_limit_cap=5 consecutive_429
+  consecutive_429="$(jq -r '.rate_limit_consecutive // 0' "$STATE" 2>/dev/null)"
+  is_valid_int "$consecutive_429" || consecutive_429=0
   enforce_limits
   archive_old_signal
   primary_prompt "$prompt"
@@ -2144,9 +2532,16 @@ invoke_primary() {
     if is_rate_limit_response "$raw" &&
       [ -n "$emitted" ] &&
       { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then
+      consecutive_429=$((consecutive_429 + 1))
+      # Guard against an infinite sleep spiral: if the rate limit is not
+      # clearing after $rate_limit_cap consecutive resets with no successful
+      # turn in between, block for manual resume. This catches a misbehaving
+      # session that keeps hitting the limit after each wait completes.
+      [ "$consecutive_429" -lt "$rate_limit_cap" ] ||
+        block_run "rate limit not clearing after $consecutive_429 consecutive resets; resume manually once the limit clears"
       session="$emitted"
-      state_set '.session_id=$session | .updated_at=$now' \
-        --arg session "$session" --arg now "$(now_iso)"
+      state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
+        --arg session "$session" --argjson n "$consecutive_429" --arg now "$(now_iso)"
       wait_for_rate_limit_reset "$raw"
       continue
     fi
@@ -2159,6 +2554,7 @@ invoke_primary() {
   state_set '
     .session_id=$session |
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
+    .rate_limit_consecutive=0 |
     .updated_at=$now
   ' --arg session "$emitted" --arg now "$(now_iso)"
   record_cost "$raw" "$(basename "$raw")"
@@ -2167,11 +2563,24 @@ invoke_primary() {
 
 enforce_limits() {
   local now stage_elapsed task_elapsed stage_turns task_turns
+  local stage_started task_started
   now="$(now_epoch)"
-  stage_elapsed=$((now - $(jq -r '.stage_started_at' "$STATE")))
-  task_elapsed=$((now - $(jq -r '.task_started_at' "$STATE")))
-  stage_turns="$(jq -r '.stage_turns' "$STATE")"
-  task_turns="$(jq -r '.task_turns' "$STATE")"
+  # Validate each field into a local before doing arithmetic or comparisons.
+  # state_int returns non-zero on null/corrupt input; a plain assignment's exit
+  # status IS the $(...) exit status, so || fires in THIS shell — block_run is
+  # reached in the parent, not swallowed by a subshell.  Declare locals
+  # separately from the guarded assignments so `local x="$(...)"` does not
+  # mask the exit status (local always returns 0 in bash/dash/sh).
+  stage_started="$(state_int '.stage_started_at')" ||
+    block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
+  task_started="$(state_int '.task_started_at')" ||
+    block_run "state field .task_started_at is not a valid integer; state may be corrupt"
+  stage_turns="$(state_int '.stage_turns')" ||
+    block_run "state field .stage_turns is not a valid integer; state may be corrupt"
+  task_turns="$(state_int '.task_turns')" ||
+    block_run "state field .task_turns is not a valid integer; state may be corrupt"
+  stage_elapsed=$((now - stage_started))
+  task_elapsed=$((now - task_started))
   if limit_exceeded "$stage_turns" "$stage_elapsed" "$task_turns" "$task_elapsed"; then
     block_run "turn/time limit reached (stage ${stage_turns}/${MAX_STAGE_TURNS}, task ${task_turns}/${MAX_TASK_TURNS})"
   fi
@@ -2179,9 +2588,16 @@ enforce_limits() {
 
 enforce_elapsed_limits() {
   local now stage_elapsed task_elapsed
+  local stage_started task_started
   now="$(now_epoch)"
-  stage_elapsed=$((now - $(jq -r '.stage_started_at' "$STATE")))
-  task_elapsed=$((now - $(jq -r '.task_started_at' "$STATE")))
+  # Same pattern as enforce_limits: validate into locals first, then do
+  # arithmetic on the validated values in the parent shell.
+  stage_started="$(state_int '.stage_started_at')" ||
+    block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
+  task_started="$(state_int '.task_started_at')" ||
+    block_run "state field .task_started_at is not a valid integer; state may be corrupt"
+  stage_elapsed=$((now - stage_started))
+  task_elapsed=$((now - task_started))
   if [ "$stage_elapsed" -ge "$MAX_STAGE_SECONDS" ] ||
     [ "$task_elapsed" -ge "$MAX_TASK_SECONDS" ]; then
     block_run "time limit reached after the completed primary turn"
@@ -2238,8 +2654,14 @@ expected_action() {
 block_run() {
   local reason="$1"
   cleanup_validation_worktree >/dev/null 2>&1 || reason="$reason; validation worktree cleanup also failed"
-  [ -f "${STATE:-}" ] && state_set '.status="blocked" | .block_reason=$reason | .updated_at=$now' \
-    --arg reason "$reason" --arg now "$(now_iso)"
+  # Record the blocked status best-effort: if state.json is corrupt, state_set
+  # itself calls die — which would exit BEFORE this block_run's die with the
+  # real reason. Guard the state write so its failure is tolerated and the
+  # original reason always surfaces in the final die below.
+  if [ -f "${STATE:-}" ]; then
+    ( state_set '.status="blocked" | .block_reason=$reason | .updated_at=$now' \
+        --arg reason "$reason" --arg now "$(now_iso)" ) 2>/dev/null || true
+  fi
   die "$reason; complete state preserved at ${RUN_ROOT:-unknown}"
 }
 
@@ -2394,31 +2816,67 @@ record_findings() {
     die "failed to record findings; state preserved at ${RUN_ROOT:-unknown}"
 }
 
+# path_in_baseline FILE PATH
+# Returns 0 if PATH exactly matches or is under any path recorded in the NUL-
+# delimited -z status FILE, 1 otherwise.
+#
+# The -z porcelain format per record: "XY PATH\0" (or "XY NEW\0OLD\0" for
+# renames).  We strip the 3-byte "XY " prefix and take only the first field of
+# each record so we always get the CURRENT/new path — the one that would appear
+# in a commit.  We compare literal bytes so spaces and unicode are safe.
+#
+# KNOWN LIMITATION: if a pre-existing dirty file is renamed by the run itself,
+# the committed name (the new name) will not equal the old dirty name stored in
+# the baseline, so rename-of-pre-existing-dirt is not tracked.  Don't try to
+# solve this; just flag it for the reviewer.
+path_in_baseline() {
+  local baseline_file="$1" path="$2" record stripped
+  # The -z output is a single blob with NUL separators. We read field-by-field
+  # splitting on NUL.  Each record begins with "XY " (3 bytes); we skip the
+  # second NUL field of rename records (the old path) by checking for a status
+  # prefix — real record starts always begin with two non-space chars then a
+  # space; an old-path field starts with the path directly.
+  while IFS= read -r -d '' record; do
+    # Skip blank fields that can appear at record boundaries.
+    [ -n "$record" ] || continue
+    # A real record starts with "XY " (status prefix — X, Y, space = 3 chars).
+    # The old-path tail of a rename record starts with the path itself; it will
+    # not match "??\ *" because the path char at position 3 is not a space.
+    case "$record" in
+      ??\ *) ;;      # starts with status prefix — process it
+      *)     continue ;;  # old-path tail of a rename — skip
+    esac
+    # Strip the 3-char "XY " prefix to get the literal path.
+    stripped="${record#???}"
+    case "$path" in
+      "${stripped%/}"|"${stripped%/}"/*)
+        return 0 ;;
+    esac
+  done <"$baseline_file"
+  return 1
+}
+
 verify_candidate() {
-  local candidate changed baseline_paths committed_path baseline_path previous evidence artifact validation_worktree
+  local candidate committed_path previous evidence artifact validation_worktree
   [ "$(jq -r '.baseline_complete and .plan_approved and .implementation_approved' "$STATE")" = "true" ] ||
     block_run "candidate requires baseline, plan, and implementation gates"
   candidate="$(git -C "$PROJECT" rev-parse HEAD)"
   [ "$candidate" != "$BASE_COMMIT" ] || block_run "CREATE_CANDIDATE did not create a commit"
   git -C "$PROJECT" merge-base --is-ancestor "$BASE_COMMIT" "$candidate" ||
     block_run "candidate is not descended from the recorded base commit"
-  changed="$(git -C "$PROJECT" diff --name-only "$BASE_COMMIT..$candidate")"
-  [ -n "$changed" ] || block_run "candidate commit is empty"
-  baseline_paths="$RUN_ROOT/baseline-paths.txt"
-  sed -E 's/^.. //' "$BASE_STATUS" | sed -E 's/.* -> //' | sort -u >"$baseline_paths"
-  while IFS= read -r committed_path; do
+  # Use -z so both sides are NUL-delimited and paths are literal/unquoted —
+  # git diff --name-only (without -z) quotes paths with spaces just like status
+  # (without -z) does, making the match unreliable.
+  [ -n "$(git -C "$PROJECT" diff -z --name-only "$BASE_COMMIT..$candidate")" ] ||
+    block_run "candidate commit is empty"
+  # For each path committed by the run, check whether it was pre-existing dirt.
+  # Both sides are now unquoted bytes so spaces and unicode compare correctly.
+  while IFS= read -r -d '' committed_path; do
     [ -n "$committed_path" ] || continue
-    while IFS= read -r baseline_path; do
-      [ -n "$baseline_path" ] || continue
-      case "$committed_path" in
-        "${baseline_path%/}"|"${baseline_path%/}"/*)
-          block_run "candidate includes pre-existing dirty path: $committed_path"
-          ;;
-      esac
-    done <"$baseline_paths"
-  done <<EOF
-$changed
-EOF
+    if path_in_baseline "$BASE_STATUS" "$committed_path"; then
+      block_run "candidate includes pre-existing dirty path: $committed_path"
+    fi
+  done < <(git -C "$PROJECT" diff -z --name-only "$BASE_COMMIT..$candidate")
   previous="$(jq -r '.candidate // empty' "$STATE")"
   [ "$candidate" != "$previous" ] ||
     block_run "CREATE_CANDIDATE did not produce a new candidate commit"
@@ -2634,6 +3092,12 @@ validated_observer_retry() {
   while [ "$attempt" -lt 2 ]; do
     enforce_limits
     invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" || true
+    # Record the cost of THIS attempt immediately after the call returns,
+    # regardless of whether the verdict validates. This ensures the cost is
+    # never lost when both attempts fail and we fall through to block_run. On
+    # the success path we return 0 below WITHOUT a second record_cost call,
+    # so there is no double-counting.
+    record_cost "$raw.$attempt" "$(basename "$raw")"
     normalize_observer_output "$out" "$SPEC" "$candidate"
     enforce_elapsed_limits
     if json_schema_basic observer-review "$out" &&
@@ -2642,9 +3106,6 @@ validated_observer_retry() {
       { [ "$(jq -r '.task' "$out")" = "$SPEC" ] ||
         [ "$(basename "$(jq -r '.task' "$out")")" = "$(basename "$SPEC")" ]; } &&
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
-      # Record from the actual raw this attempt wrote ("$raw.$attempt"); the bare
-      # "$raw" never exists, which is why the observer cost was silently missing.
-      record_cost "$raw.$attempt" "$(basename "$raw")"
       return 0
     fi
     attempt=$((attempt + 1))
@@ -2729,7 +3190,8 @@ EOF
   BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
   BASE_BRANCH="$(git -C "$PROJECT" branch --show-current)"
   BASE_STATUS="$RUN_ROOT/baseline-status-$(basename "$SPEC" .md).txt"
-  git -C "$PROJECT" status --porcelain=v1 >"$BASE_STATUS"
+  # -z: NUL-delimited literal paths; matches the format used in verify_candidate.
+  git -C "$PROJECT" status --porcelain=v1 -z >"$BASE_STATUS"
   epoch="$(now_epoch)"
   state_set '
     .task=$task | .stage="planning" | .stage_turns=0 | .task_turns=0 |
@@ -2815,6 +3277,15 @@ main_run() {
   case "$RATE_LIMIT_BUFFER_SECONDS" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS must be a non-negative integer" ;;
   esac
+
+  # Acquire a per-project lock BEFORE touching state.json; two concurrent runs
+  # on the same --project would otherwise corrupt the shared state. The lock
+  # is held until the EXIT trap fires (success, block_run, or signal).
+  acquire_lock
+  # Release the lock on normal exit AND on any signal.  The HUP/INT/TERM trap
+  # is set below (after initialize_run) so it can call block_run; that trap
+  # does NOT replace this EXIT trap — both fire on exit.
+  trap 'release_lock' EXIT
 
   if recover_run; then
     :

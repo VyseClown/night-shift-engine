@@ -32,9 +32,12 @@ and observer approval.
   Observer output is parsed from the result text (tolerating a code fence) and
   validated against the schema with one retry, instead of an unverified
   structured-output flag.
-- Observer is now context-isolated: launched from a neutral empty directory with
-  `--allowedTools ""`, so it reviews only the supplied evidence and cannot read
-  the repository (was: ran inside the project with full tool access).
+- Observer is now context-isolated: launched as a fresh independent session (no
+  `--resume`) from a neutral empty temporary directory in the default
+  (non-bypass) permission mode, so tool use is not auto-approved and the observer
+  cannot inspect the repository — it reviews only the supplied evidence passed in
+  the prompt (was: ran inside the project with full tool access). Note: `--allowedTools`
+  is not passed because it is variadic and would swallow the prompt argument.
 - Isolated validation worktree now symlinks ignored dependency dirs
   (`node_modules`, `ios/Pods`, override via `NIGHT_SHIFT_DEPENDENCY_LINKS`) from
   the project, so RN type-check/lint/test run without reinstalling or triggering
