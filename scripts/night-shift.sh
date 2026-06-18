@@ -56,6 +56,10 @@ SESSION_SCOPE="${NIGHT_SHIFT_SESSION_SCOPE:-stage}"
 PLAN_MODEL="${NIGHT_SHIFT_PLAN_MODEL:-opus}"
 IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
+# Design-fidelity visual capture. OFF by default: the visual_review stage is a
+# clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
+# the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
+VISUAL_CAPTURE="${NIGHT_SHIFT_VISUAL_CAPTURE:-0}"
 # Persona/profile resolution — the persona/track constants (PERSONAS_RN,
 # PERSONAS_WEB, PERSONAS_OPTIONAL, PERSONAS, the floors, DEFAULT_TRACK) and the
 # pure functions that map a spec to its active review set — live in
@@ -484,6 +488,7 @@ run_dry_fixtures() {
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
   fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
+  fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -1133,6 +1138,18 @@ fixture_visual_stage_machine() {
   ! transition_allowed visual_review REQUEST_OBSERVER || return 1
   # implementation_ready may still only CREATE_CANDIDATE.
   transition_allowed implementation_ready CREATE_CANDIDATE || return 1
+}
+
+fixture_visual_routing() {
+  local root="$1" spec_yes="$root/dc.md" spec_no="$root/plain.md"
+  printf '## Design Contract\n- Frames: Login\n- Required states: default\n' >"$spec_yes"
+  printf '# plain spec\nno contract here\n' >"$spec_no"
+  # Disabled globally -> never route to visual, regardless of contract.
+  ( NIGHT_SHIFT_VISUAL_CAPTURE=0; VISUAL_CAPTURE=0; ! visual_stage_enabled "$spec_yes" ) || return 1
+  # Enabled but no Design Contract -> skip.
+  ( VISUAL_CAPTURE=1; ! visual_stage_enabled "$spec_no" ) || return 1
+  # Enabled AND Design Contract present -> route to visual.
+  ( VISUAL_CAPTURE=1; visual_stage_enabled "$spec_yes" ) || return 1
 }
 
 fixture_observer_cost_capture() {
@@ -2961,7 +2978,11 @@ EOF
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
   log "candidate $candidate validated; handing to observer"
-  set_stage observer_review
+  if visual_stage_enabled "$SPEC"; then
+    set_stage visual_review
+  else
+    set_stage observer_review
+  fi
 }
 
 observer_prompt() {
@@ -3016,6 +3037,32 @@ invoke_observer_once() {
   (cd "$neutral" && claude -p $(model_flag "$OBSERVER_MODEL") --output-format json \
     "$(observer_prompt "$context" "$candidate")") >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
+}
+
+# Pure: should the visual_review stage do work for this spec? True iff capture is
+# globally enabled AND the spec declares a `## Design Contract`. Tooling presence
+# is checked later in the capture helper (which SKIPs cleanly if absent), so this
+# decision is deterministic and fixture-testable without a simulator.
+visual_stage_enabled() {
+  [ "$VISUAL_CAPTURE" = "1" ] || return 1
+  grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
+}
+
+# The visual_review stage handler. The primary (fresh 'visual' scope session) runs
+# the Figma-MCP -> capture -> diff -> repair loop using scripts/lib/visual-capture.sh
+# and writes a valid visual-diff-<spec>.json into validated/. This wrapper only
+# gates that a valid report exists, then advances to the observer (which reviews the
+# post-repair candidate + the report). Per-screen pass/fail is the observer's
+# concern, not the gate's -- a failing report still goes to the observer as evidence.
+run_visual() {
+  local report
+  report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
+  [ -s "$report" ] ||
+    block_run "RUN_VISUAL but $report is missing or empty"
+  jq -e '.task and (.screens | type=="array" and length>0)' "$report" >/dev/null 2>&1 ||
+    block_run "RUN_VISUAL but visual-diff report is malformed"
+  log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass); handing to observer"
+  set_stage observer_review
 }
 
 run_observer() {
@@ -3250,6 +3297,7 @@ handle_signal() {
     RUN_PERSONAS) run_personas "$signal" ;;
     CREATE_CANDIDATE) verify_candidate ;;
     REQUEST_OBSERVER) run_observer "$signal" ;;
+    RUN_VISUAL) run_visual ;;
     NEXT_TASK)
       [ "$(jq -r '.stage' "$STATE")" = "completion" ] ||
         block_run "NEXT_TASK requires observer approval"
