@@ -482,6 +482,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture parses Design Contract frames x states" fixture_visual_capture_screens "$root"
   fixture_assert "visual screen assembly derives pass and null diff_image" fixture_visual_assemble_screen "$root"
   fixture_assert "visual capture is an inert no-op without tooling" fixture_visual_capture_skips "$root"
+  fixture_assert "visual report assembled from per-screen jsonl is schema-valid" fixture_visual_assemble_report "$root"
   fixture_assert "spec validation accepts slash fields" fixture_spec_validation "$root"
   fixture_assert "web spec validates without native permission lines" fixture_spec_validation_web "$root"
   fixture_assert "review profile resolves to floor + scoped personas" fixture_review_profile "$root"
@@ -856,6 +857,15 @@ fixture_visual_capture_skips() {
   run_visual_capture "$root/spec.md" abc123 "$out" >/dev/null 2>&1 || return 1
   [ -z "$(find "$out" -name 'visual-diff-*.json' 2>/dev/null)" ] || return 1
   return 0
+}
+
+fixture_visual_assemble_report() {
+  local root="$1" jl="$root/screens.jsonl" rep="$root/rep.json"
+  visual_assemble_screen Login default iphone-15 design/r.png shots/s.png 0.02 0.10 diffs/d.png "ok" "[]" >"$jl"
+  visual_assemble_screen Login error iphone-15 design/r2.png shots/s2.png 0.40 0.10 "" "over tol" '[{"attempt":1,"diff_pct":0.40,"pass":false,"analysis":"x","screenshot":"a.png","diff_image":null}]' >>"$jl"
+  assemble_report "specs/foo.md" "$jl" >"$rep"
+  json_schema_basic visual-diff "$rep" || return 1
+  jq -e '.task=="specs/foo.md" and (.screens|length)==2' "$rep" >/dev/null || return 1
 }
 
 fixture_spec_validation() {

@@ -181,14 +181,23 @@ EOF
     '{task: $task, screens: $screens}' >"$out_dir/visual-diff-$(basename "$spec" .md).json"
 }
 
+# Combine per-screen JSON objects (one compact object per line in $2) into a full
+# visual-diff report for task $1. Prints the report JSON. Pure.
+assemble_report() {
+  local task="$1" screens_file="$2"
+  jq -s --arg task "$task" '{task: $task, screens: .}' "$screens_file"
+}
+
 # When executed directly (not sourced), expose capture/diff as subcommands for the
 # agent's repair loop. Sourcing (the orchestrator's use) skips this block.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   cmd="${1:-}"; shift || true
   case "$cmd" in
-    capture) __visual_capture_screenshot "$@"; exit $? ;;
-    diff)    __visual_pixel_diff "$@"; exit $? ;;
-    screens) visual_capture_screens "$@"; exit $? ;;
-    *) printf 'usage: visual-capture.sh {capture screen state device out|diff ref shot diffout|screens spec}\n' >&2; exit 64 ;;
+    capture)        __visual_capture_screenshot "$@"; exit $? ;;
+    diff)           __visual_pixel_diff "$@"; exit $? ;;
+    screens)        visual_capture_screens "$@"; exit $? ;;
+    assemble-screen) visual_assemble_screen "$@"; exit $? ;;
+    report)          assemble_report "$@"; exit $? ;;
+    *) printf 'usage: visual-capture.sh {capture screen state device out|diff ref shot diffout|screens spec|assemble-screen ...|report task screens.jsonl}\n' >&2; exit 64 ;;
   esac
 fi
