@@ -227,7 +227,14 @@ json_schema_basic() {
           (.tolerance | type == "number" and . >= 0) and
           (.pass | type == "boolean") and
           (.analysis | type == "string") and
-          (.attempts | type == "array") and
+          (.attempts | type == "array" and all(.[];
+            ((keys | sort) == ["analysis","attempt","diff_image","diff_pct","pass","screenshot"]) and
+            (.attempt | type == "number" and floor == . and . >= 1) and
+            (.diff_pct | type == "number" and . >= 0) and
+            (.pass | type == "boolean") and
+            (.analysis | type == "string") and
+            (.screenshot | type == "string" and length > 0) and
+            (.diff_image == null or (.diff_image | type == "string" and length > 0)))) and
           (.diff_image == null or (.diff_image | type == "string" and length > 0)) and
           (.pass == (.diff_pct <= .tolerance))))
       ' "$file" >/dev/null 2>&1
@@ -805,6 +812,12 @@ fixture_visual_diff_schema() {
   # missing a per-screen key → rejected.
   printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true,"analysis":"","attempts":[]}]}' >"$badkey"
   json_schema_basic visual-diff "$badkey" && return 1
+  # A non-empty attempts array with a malformed entry (non-integer attempt) is rejected.
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":"one","diff_pct":0.0,"pass":true,"analysis":"","screenshot":"a.png","diff_image":null}]}]}' >"$root/badattempt.json"
+  ! json_schema_basic visual-diff "$root/badattempt.json" || return 1
+  # A well-formed non-empty attempts array is still accepted.
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":1,"diff_pct":0.0,"pass":true,"analysis":"ok","screenshot":"a.png","diff_image":null}]}]}' >"$root/goodattempt.json"
+  json_schema_basic visual-diff "$root/goodattempt.json" || return 1
   return 0
 }
 
