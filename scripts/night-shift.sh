@@ -56,6 +56,12 @@ SESSION_SCOPE="${NIGHT_SHIFT_SESSION_SCOPE:-stage}"
 PLAN_MODEL="${NIGHT_SHIFT_PLAN_MODEL:-opus}"
 IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
+# Design-fidelity visual capture. OFF by default: the visual_review stage is a
+# clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
+# the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
+VISUAL_CAPTURE="${NIGHT_SHIFT_VISUAL_CAPTURE:-0}"
+# Max auto-repair attempts per screen in the visual_review loop (cost guard).
+VISUAL_MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}"
 # Persona/profile resolution — the persona/track constants (PERSONAS_RN,
 # PERSONAS_WEB, PERSONAS_OPTIONAL, PERSONAS, the floors, DEFAULT_TRACK) and the
 # pure functions that map a spec to its active review set — live in
@@ -135,7 +141,7 @@ json_schema_basic() {
       jq -e '
         type == "object" and
         ((keys | sort) == ["action","artifacts","reason","stage","task"]) and
-        (.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","NEXT_TASK","BLOCKED","COMPLETE")) and
+        (.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","RUN_VISUAL","NEXT_TASK","BLOCKED","COMPLETE")) and
         (.task | type == "string" and length > 0) and
         (.stage | type == "string" and length > 0) and
         (.reason | type == "string" and length > 0) and
@@ -213,14 +219,24 @@ json_schema_basic() {
         ((keys | sort) == ["screens","task"]) and
         (.task | type == "string" and length > 0) and
         (.screens | type == "array" and length > 0 and all(.[];
-          ((keys | sort) == ["diff_image","diff_pct","pass","reference","screen","screenshot","state","tolerance"]) and
+          ((keys | sort) == ["analysis","attempts","device","diff_image","diff_pct","pass","reference","screen","screenshot","state","tolerance"]) and
           (.screen | type == "string" and length > 0) and
           (.state | type == "string" and length > 0) and
+          (.device | type == "string" and length > 0) and
           (.reference | type == "string" and length > 0) and
           (.screenshot | type == "string" and length > 0) and
           (.diff_pct | type == "number" and . >= 0) and
           (.tolerance | type == "number" and . >= 0) and
           (.pass | type == "boolean") and
+          (.analysis | type == "string") and
+          (.attempts | type == "array" and all(.[];
+            ((keys | sort) == ["analysis","attempt","diff_image","diff_pct","pass","screenshot"]) and
+            (.attempt | type == "number" and floor == . and . >= 1) and
+            (.diff_pct | type == "number" and . >= 0) and
+            (.pass | type == "boolean") and
+            (.analysis | type == "string") and
+            (.screenshot | type == "string" and length > 0) and
+            (.diff_image == null or (.diff_image | type == "string" and length > 0)))) and
           (.diff_image == null or (.diff_image | type == "string" and length > 0)) and
           (.pass == (.diff_pct <= .tolerance))))
       ' "$file" >/dev/null 2>&1
@@ -468,6 +484,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture parses Design Contract frames x states" fixture_visual_capture_screens "$root"
   fixture_assert "visual screen assembly derives pass and null diff_image" fixture_visual_assemble_screen "$root"
   fixture_assert "visual capture is an inert no-op without tooling" fixture_visual_capture_skips "$root"
+  fixture_assert "visual report assembled from per-screen jsonl is schema-valid" fixture_visual_assemble_report "$root"
   fixture_assert "spec validation accepts slash fields" fixture_spec_validation "$root"
   fixture_assert "web spec validates without native permission lines" fixture_spec_validation_web "$root"
   fixture_assert "review profile resolves to floor + scoped personas" fixture_review_profile "$root"
@@ -480,9 +497,14 @@ run_dry_fixtures() {
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
+  fixture_assert "visual_review prompt carries the RUN_VISUAL procedure" fixture_visual_review_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
+  fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
+  fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
+  fixture_assert "visual capture grid includes device axis" fixture_visual_grid "$root"
+  fixture_assert "visual report assembles device/analysis/attempts" fixture_visual_assemble "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -504,6 +526,7 @@ run_dry_fixtures() {
   fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
+  fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -786,14 +809,20 @@ fixture_review_fields_scoped() {
 
 fixture_visual_diff_schema() {
   local root="$1" good="$root/vd-good.json" bad="$root/vd-bad.json" badkey="$root/vd-key.json"
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"diff_image":null}]}' >"$good"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$good"
   json_schema_basic visual-diff "$good" || return 1
   # pass=true but diff_pct > tolerance → inconsistent → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"diff_image":null}]}' >"$bad"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$bad"
   json_schema_basic visual-diff "$bad" && return 1
   # missing a per-screen key → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true}]}' >"$badkey"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true,"analysis":"","attempts":[]}]}' >"$badkey"
   json_schema_basic visual-diff "$badkey" && return 1
+  # A non-empty attempts array with a malformed entry (non-integer attempt) is rejected.
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":"one","diff_pct":0.0,"pass":true,"analysis":"","screenshot":"a.png","diff_image":null}]}]}' >"$root/badattempt.json"
+  ! json_schema_basic visual-diff "$root/badattempt.json" || return 1
+  # A well-formed non-empty attempts array is still accepted.
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":1,"diff_pct":0.0,"pass":true,"analysis":"ok","screenshot":"a.png","diff_image":null}]}]}' >"$root/goodattempt.json"
+  json_schema_basic visual-diff "$root/goodattempt.json" || return 1
   return 0
 }
 
@@ -802,8 +831,8 @@ fixture_visual_capture_screens() {
   printf '%s\n' '## Design Contract' '- Frames: Home, Settings' '- Required states: default, empty' '## Edge Cases' >"$spec"
   out="$(visual_capture_screens "$spec")"
   [ "$(printf '%s\n' "$out" | grep -c .)" -eq 4 ] || return 1
-  printf '%s\n' "$out" | grep -qx 'Home|default' || return 1
-  printf '%s\n' "$out" | grep -qx 'Settings|empty' || return 1
+  printf '%s\n' "$out" | grep -qx 'Home|default|iphone-15' || return 1
+  printf '%s\n' "$out" | grep -qx 'Settings|empty|iphone-15' || return 1
   # No Design Contract → no screens.
   printf 'no contract\n' >"$spec"
   [ -z "$(visual_capture_screens "$spec")" ] || return 1
@@ -813,10 +842,10 @@ fixture_visual_capture_screens() {
 fixture_visual_assemble_screen() {
   local root="$1" obj
   # Within tolerance → pass derived true; diff_image preserved.
-  obj="$(visual_assemble_screen Home default design/h.png shots/h.png 0.05 0.1 diffs/h.png)"
+  obj="$(visual_assemble_screen Home default iphone-15 design/h.png shots/h.png 0.05 0.1 diffs/h.png)"
   printf '%s' "$obj" | jq -e '.pass == true and .diff_image == "diffs/h.png"' >/dev/null || return 1
   # Over tolerance → pass derived false; empty diff_image → null.
-  obj="$(visual_assemble_screen Home empty r s 0.4 0.1 "")"
+  obj="$(visual_assemble_screen Home empty iphone-15 r s 0.4 0.1 "")"
   printf '%s' "$obj" | jq -e '.pass == false and .diff_image == null' >/dev/null || return 1
   # The assembled object is a valid screen inside a report.
   printf '{"task":"t","screens":[%s]}\n' "$obj" >"$root/asm.json"
@@ -832,6 +861,15 @@ fixture_visual_capture_skips() {
   run_visual_capture "$root/spec.md" abc123 "$out" >/dev/null 2>&1 || return 1
   [ -z "$(find "$out" -name 'visual-diff-*.json' 2>/dev/null)" ] || return 1
   return 0
+}
+
+fixture_visual_assemble_report() {
+  local root="$1" jl="$root/screens.jsonl" rep="$root/rep.json"
+  visual_assemble_screen Login default iphone-15 design/r.png shots/s.png 0.02 0.10 diffs/d.png "ok" "[]" >"$jl"
+  visual_assemble_screen Login error iphone-15 design/r2.png shots/s2.png 0.40 0.10 "" "over tol" '[{"attempt":1,"diff_pct":0.40,"pass":false,"analysis":"x","screenshot":"a.png","diff_image":null}]' >>"$jl"
+  assemble_report "specs/foo.md" "$jl" >"$rep"
+  json_schema_basic visual-diff "$rep" || return 1
+  jq -e '.task=="specs/foo.md" and (.screens|length)==2' "$rep" >/dev/null || return 1
 }
 
 fixture_spec_validation() {
@@ -1120,6 +1158,63 @@ fixture_expected_action() {
   return 0
 }
 
+fixture_visual_stage_machine() {
+  # visual_review is its own scope, runs on the implement-tier model, and accepts
+  # exactly RUN_VISUAL (plus BLOCKED). It sits between candidate and observer.
+  [ "$(stage_session_scope visual_review)" = "visual" ] || return 1
+  [ "$(stage_model visual)" = "$IMPLEMENT_MODEL" ] || return 1
+  [ "$(expected_action visual_review)" = "RUN_VISUAL" ] || return 1
+  transition_allowed visual_review RUN_VISUAL || return 1
+  transition_allowed visual_review BLOCKED || return 1
+  # Skipping ahead from visual_review to the observer is NOT allowed.
+  ! transition_allowed visual_review REQUEST_OBSERVER || return 1
+  # implementation_ready may still only CREATE_CANDIDATE.
+  transition_allowed implementation_ready CREATE_CANDIDATE || return 1
+}
+
+fixture_visual_routing() {
+  local root="$1" spec_yes="$root/dc.md" spec_no="$root/plain.md"
+  printf '## Design Contract\n- Frames: Login\n- Required states: default\n' >"$spec_yes"
+  printf '# plain spec\nno contract here\n' >"$spec_no"
+  # Disabled globally -> never route to visual, regardless of contract.
+  ( NIGHT_SHIFT_VISUAL_CAPTURE=0; VISUAL_CAPTURE=0; ! visual_stage_enabled "$spec_yes" ) || return 1
+  # Enabled but no Design Contract -> skip.
+  ( VISUAL_CAPTURE=1; ! visual_stage_enabled "$spec_no" ) || return 1
+  # Enabled AND Design Contract present -> route to visual.
+  ( VISUAL_CAPTURE=1; visual_stage_enabled "$spec_yes" ) || return 1
+}
+
+fixture_visual_grid() {
+  local root="$1" spec="$root/dc.md"
+  printf '## Design Contract\n- Frames: Login, Home\n- Required states: default, error\n- Devices: iphone-se, iphone-15\n' >"$spec"
+  local out; out="$(visual_capture_screens "$spec" | sort)"
+  # 2 frames x 2 states x 2 devices = 8 rows of screen|state|device
+  [ "$(printf '%s\n' "$out" | grep -c '|')" -eq 8 ] || return 1
+  printf '%s\n' "$out" | grep -q '^Login|error|iphone-15$' || return 1
+  printf '%s\n' "$out" | grep -q '^Home|default|iphone-se$' || return 1
+}
+
+fixture_visual_assemble() {
+  local obj
+  obj="$(visual_assemble_screen Login error iphone-15 design/r.png shot/s.png 0.04 0.10 diff/d.png \
+        "title 2px low; fixed" '[{"attempt":1,"diff_pct":0.31,"pass":false,"analysis":"low","screenshot":"a1.png","diff_image":"d1.png"}]')"
+  printf '%s' "$obj" | jq -e '.device=="iphone-15" and .analysis=="title 2px low; fixed" and .pass==true and (.attempts|length)==1 and .attempts[0].attempt==1' >/dev/null || return 1
+}
+
+fixture_visual_pick_udid() {
+  local js='{"devices":{"rt":[
+    {"name":"iPhone 17 Pro","udid":"AAA","state":"Booted","isAvailable":true},
+    {"name":"iPhone 15 Pro Max","udid":"BBB","state":"Shutdown","isAvailable":true},
+    {"name":"iPhone 15 Pro Max","udid":"CCC","state":"Booted","isAvailable":true}]}}'
+  # exact label + Booted wins
+  [ "$(printf '%s' "$js" | __visual_pick_udid iphone-15-pro-max)" = "CCC" ] || return 1
+  # exact label (non-booted) when that label has no booted device
+  local js2='{"devices":{"rt":[{"name":"iPhone 15 Pro Max","udid":"DDD","state":"Shutdown","isAvailable":true}]}}'
+  [ "$(printf '%s' "$js2" | __visual_pick_udid iphone-15-pro-max)" = "DDD" ] || return 1
+  # no label match -> first Booted
+  [ "$(printf '%s' "$js" | __visual_pick_udid no-such-device)" = "AAA" ] || return 1
+}
+
 fixture_observer_cost_capture() {
   # The observer raw is written to "$raw.$attempt" by validated_observer_retry, so
   # the cost must be recorded from THAT path (the original glob/`$raw` both missed
@@ -1179,7 +1274,7 @@ fixture_handoff_prompt() {
   prompt="$dir/prompt.txt"
   mkdir -p "$dir"
   local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
-  local PROJECT="$dir" BASE_COMMIT=deadbeef
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
   fixture_write_min_spec "$SPEC"
   # Fresh stage session mid-run (no session_id, prior turns) gets the handoff note.
   printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
@@ -1194,6 +1289,24 @@ fixture_handoff_prompt() {
   printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
   primary_prompt "$prompt"
   grep -q "FRESH stage session" "$prompt" && return 1
+  return 0
+}
+
+fixture_visual_review_prompt() {
+  local root="$1" dir="$root/vis-prompt" prompt
+  prompt="$dir/prompt.txt"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  fixture_write_min_spec "$SPEC"
+  printf '{"stage":"visual_review","stage_turns":0,"primary_turns":2,"session_id":null}\n' >"$STATE"
+  primary_prompt "$prompt"
+  grep -q "RUN_VISUAL: only from the visual_review stage" "$prompt" || return 1
+  grep -q "visual-capture.sh capture" "$prompt" || return 1
+  grep -q "visual-capture.sh diff" "$prompt" || return 1
+  grep -q "assemble-screen" "$prompt" || return 1
+  grep -q "visual-capture.sh report" "$prompt" || return 1
+  grep -q "Figma MCP" "$prompt" || return 1
   return 0
 }
 
@@ -2328,6 +2441,7 @@ stage_session_scope() {
   case "$1" in
     planning|plan_review) printf 'plan' ;;
     implementation|implementation_review|implementation_ready) printf 'implement' ;;
+    visual_review) printf 'visual' ;;
     observer_review) printf 'observe' ;;
     completion) printf 'complete' ;;
     *) printf '%s' "$1" ;;
@@ -2364,7 +2478,7 @@ model_flag() {
 stage_model() {
   case "$1" in
     plan) printf '%s' "$PLAN_MODEL" ;;
-    implement|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
+    implement|visual|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
     *) printf 'inherit' ;;
   esac
 }
@@ -2475,6 +2589,51 @@ $SPEC. "artifacts" lists only project-relative files (no absolute paths, no
   List that evidence file in artifacts.
 - REQUEST_OBSERVER: list the candidate evidence, relevant tests, and docs the
   fresh observer needs. The wrapper runs the observer; do not run it yourself.
+- RUN_VISUAL: only from the visual_review stage. Prove every screen in the spec's
+  ## Design Contract is pixel-perfect to its Figma reference, auto-repairing the RN
+  code until each is within tolerance, then emit the report. The app is already
+  running on a booted iOS simulator with the preview harness. Procedure:
+    1. Targets: bash $NIGHT_SHIFT_LIB/visual-capture.sh screens $SPEC
+       prints one "screen|state|device" line per target. The per-screen tolerance
+       is the Design Contract's "- Tolerance:" (default 0.10).
+    2. For each target, export its Figma reference frame as a PNG to the ABSOLUTE
+       path $RUN_ROOT/validated/design/<screen>-<state>-<device>.png using the
+       Figma MCP (match the frame to the screen/state and the device pixel size);
+       read its design tokens/measurements for diagnosis.
+    3. Capture the harness (ABSOLUTE output path):
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh capture <screen> <state> <device> \
+         $RUN_ROOT/validated/screenshots/<screen>-<state>-<device>.png
+    4. Diff (ABSOLUTE paths; prints diff_pct):
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh diff \
+         $RUN_ROOT/validated/design/<screen>-<state>-<device>.png \
+         $RUN_ROOT/validated/screenshots/<screen>-<state>-<device>.png \
+         $RUN_ROOT/validated/diffs/<screen>-<state>-<device>.png
+       If diff_pct <= tolerance the screen passes. Otherwise read the reference,
+       screenshot, diff image and Figma tokens, edit the RN screen to close the
+       gap, reload/rebuild the running app, and re-capture/re-diff. At most
+       $VISUAL_MAX_ATTEMPTS attempts per screen; record every attempt.
+    5. Build each screen object (paths here are RELATIVE to validated/, e.g.
+       design/<name>.png — NOT absolute):
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh assemble-screen <screen> <state> \
+         <device> design/<n>.png screenshots/<n>.png <diff_pct> <tolerance> \
+         diffs/<n>.png "<analysis>" '<attempts JSON array>' \
+         >> $RUN_ROOT/control/visual-screens.jsonl
+       <analysis> is your written diagnosis; the attempts array holds objects
+       {attempt,diff_pct,pass,analysis,screenshot,diff_image} (screenshot/diff_image
+       relative to validated/). A screen that never reaches tolerance is pass:false
+       with a final analysis explaining why — never fake a pass.
+    6. Assemble the report:
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh report $SPEC \
+         $RUN_ROOT/control/visual-screens.jsonl \
+         > $RUN_ROOT/validated/visual-diff-<NAME>.json
+       where <NAME> is $SPEC with its directory and .md suffix removed (e.g.
+       specs/login.md -> login).
+    7. If you edited RN code while repairing, re-run the spec's final validation
+       commands (they must stay green) and refresh the candidate commit so the
+       observer reviews the repaired code.
+  "artifacts" may be an empty array for RUN_VISUAL — the wrapper reads the report
+  from its canonical path. If capture/diff tooling is unavailable, do not fake
+  results: emit BLOCKED with the reason.
 - NEXT_TASK: only after observer APPROVE. First check off the completed entry in
   $WORKSPACE_ROOT/TODO.md, then signal NEXT_TASK.
 - COMPLETE: only after observer APPROVE with no remaining TODO entries.
@@ -2631,7 +2790,7 @@ set_stage() {
 
 transition_allowed() {
   case "$1:$2" in
-    planning:RUN_PERSONAS|plan_review:RUN_PERSONAS|implementation:RUN_PERSONAS|implementation_review:RUN_PERSONAS|implementation_ready:CREATE_CANDIDATE|observer_review:REQUEST_OBSERVER|completion:NEXT_TASK|completion:COMPLETE|*:BLOCKED) return 0 ;;
+    planning:RUN_PERSONAS|plan_review:RUN_PERSONAS|implementation:RUN_PERSONAS|implementation_review:RUN_PERSONAS|implementation_ready:CREATE_CANDIDATE|visual_review:RUN_VISUAL|observer_review:REQUEST_OBSERVER|completion:NEXT_TASK|completion:COMPLETE|*:BLOCKED) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2645,6 +2804,7 @@ expected_action() {
   case "$1" in
     planning|plan_review|implementation|implementation_review) printf 'RUN_PERSONAS' ;;
     implementation_ready) printf 'CREATE_CANDIDATE' ;;
+    visual_review) printf 'RUN_VISUAL' ;;
     observer_review) printf 'REQUEST_OBSERVER' ;;
     completion) printf 'NEXT_TASK or COMPLETE' ;;
     *) printf 'BLOCKED' ;;
@@ -2944,7 +3104,11 @@ EOF
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
   log "candidate $candidate validated; handing to observer"
-  set_stage observer_review
+  if visual_stage_enabled "$SPEC"; then
+    set_stage visual_review
+  else
+    set_stage observer_review
+  fi
 }
 
 observer_prompt() {
@@ -2999,6 +3163,32 @@ invoke_observer_once() {
   (cd "$neutral" && claude -p $(model_flag "$OBSERVER_MODEL") --output-format json \
     "$(observer_prompt "$context" "$candidate")") >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
+}
+
+# Pure: should the visual_review stage do work for this spec? True iff capture is
+# globally enabled AND the spec declares a `## Design Contract`. Tooling presence
+# is checked later in the capture helper (which SKIPs cleanly if absent), so this
+# decision is deterministic and fixture-testable without a simulator.
+visual_stage_enabled() {
+  [ "$VISUAL_CAPTURE" = "1" ] || return 1
+  grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
+}
+
+# The visual_review stage handler. The primary (fresh 'visual' scope session) runs
+# the Figma-MCP -> capture -> diff -> repair loop using scripts/lib/visual-capture.sh
+# and writes a valid visual-diff-<spec>.json into validated/. This wrapper only
+# gates that a valid report exists, then advances to the observer (which reviews the
+# post-repair candidate + the report). Per-screen pass/fail is the observer's
+# concern, not the gate's -- a failing report still goes to the observer as evidence.
+run_visual() {
+  local report
+  report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
+  [ -s "$report" ] ||
+    block_run "RUN_VISUAL but $report is missing or empty"
+  jq -e '.task and (.screens | type=="array" and length>0)' "$report" >/dev/null 2>&1 ||
+    block_run "RUN_VISUAL but visual-diff report is malformed"
+  log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass); handing to observer"
+  set_stage observer_review
 }
 
 run_observer() {
@@ -3233,6 +3423,7 @@ handle_signal() {
     RUN_PERSONAS) run_personas "$signal" ;;
     CREATE_CANDIDATE) verify_candidate ;;
     REQUEST_OBSERVER) run_observer "$signal" ;;
+    RUN_VISUAL) run_visual ;;
     NEXT_TASK)
       [ "$(jq -r '.stage' "$STATE")" = "completion" ] ||
         block_run "NEXT_TASK requires observer approval"

@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # shellcheck shell=bash
 # Design-fidelity visual capture — CONTRACT SCAFFOLD (Phase 2).
 #
@@ -33,12 +34,14 @@ visual_capture_available() {
   return 0
 }
 
-# Reads the spec's `## Design Contract` and prints one `screen|state` line per
-# (frame × required-state) pair — the screens a capture run must cover. Frames
-# come from `- Frames:` and states from `- Required states:` (comma-separated).
-# Pure/deterministic; prints nothing when the section or fields are absent.
+# Reads the spec's `## Design Contract` and prints one `screen|state|device` line
+# per (frame × required-state × device) triple — the screens a capture run must
+# cover. Frames come from `- Frames:`, states from `- Required states:`, and
+# devices from `- Devices:` (all comma-separated). Devices default to `iphone-15`
+# when absent. Pure/deterministic; prints nothing when the section or fields are
+# absent.
 visual_capture_screens() {
-  local file="$1" section frames states f s old_ifs
+  local file="$1" section frames states devices f s d old_ifs
   section="$(awk '
     /^## Design Contract([ \t]|$)/ { ind=1; next }
     /^## / { ind=0 }
@@ -47,20 +50,22 @@ visual_capture_screens() {
   # Capture the value, dropping any trailing `<!-- ... -->` guidance comment.
   frames="$(printf '%s\n' "$section" | sed -nE 's/^- Frames: ?(.*)/\1/p' | head -n 1 | sed -E 's/[[:space:]]*<!--.*$//')"
   states="$(printf '%s\n' "$section" | sed -nE 's/^- Required states: ?(.*)/\1/p' | head -n 1 | sed -E 's/[[:space:]]*<!--.*$//')"
+  devices="$(printf '%s\n' "$section" | sed -nE 's/^- Devices: ?(.*)/\1/p' | head -n 1 | sed -E 's/[[:space:]]*<!--.*$//')"
+  [ -n "$devices" ] || devices="iphone-15"
   [ -n "$frames" ] && [ -n "$states" ] || return 0
   old_ifs="$IFS"; IFS=','
   for f in $frames; do
     f="$(printf '%s' "$f" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     [ -n "$f" ] || continue
-    local inner="$IFS"; IFS=','
     for s in $states; do
-      IFS="$inner"
       s="$(printf '%s' "$s" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
       [ -n "$s" ] || continue
-      printf '%s|%s\n' "$f" "$s"
-      IFS=','
+      for d in $devices; do
+        d="$(printf '%s' "$d" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        [ -n "$d" ] || continue
+        printf '%s|%s|%s\n' "$f" "$s" "$d"
+      done
     done
-    IFS=','
   done
   IFS="$old_ifs"
 }
@@ -78,38 +83,120 @@ visual_capture_tolerance() {
   printf '%s' "$t"
 }
 
-# Assembles one conforming visual-diff screen object. pass is derived, never
-# trusted from input: pass == (diff_pct <= tolerance). Pure; emits one JSON
-# object. diff_image may be empty → null.
+# Pure: emit one screen object for the report. pass is derived, never trusted from
+# input: pass == (diff_pct <= tolerance). `attempts` is a JSON array string.
 visual_assemble_screen() {
-  local screen="$1" state="$2" reference="$3" screenshot="$4" \
-    diff_pct="$5" tolerance="$6" diff_image="$7"
-  jq -n \
-    --arg screen "$screen" --arg state "$state" \
+  local screen="$1" state="$2" device="$3" reference="$4" screenshot="$5" \
+    diff_pct="$6" tolerance="$7" diff_image="$8" analysis="${9:-}" attempts="${10:-[]}"
+  jq -nc \
+    --arg screen "$screen" --arg state "$state" --arg device "$device" \
     --arg reference "$reference" --arg screenshot "$screenshot" \
     --argjson diff_pct "$diff_pct" --argjson tolerance "$tolerance" \
-    --arg diff_image "$diff_image" '
+    --arg diff_image "$diff_image" --arg analysis "$analysis" \
+    --argjson attempts "$attempts" '
     {
-      screen: $screen, state: $state, reference: $reference,
+      screen: $screen, state: $state, device: $device, reference: $reference,
       screenshot: $screenshot, diff_pct: $diff_pct, tolerance: $tolerance,
-      pass: ($diff_pct <= $tolerance),
-      diff_image: (if $diff_image == "" then null else $diff_image end)
+      pass: ($diff_pct <= $tolerance), analysis: $analysis,
+      diff_image: (if $diff_image == "" then null else $diff_image end),
+      attempts: $attempts
     }'
 }
 
-# ── STUBS: the only simulator/tool-dependent steps. A real deployment replaces
-# these; both return non-zero here so run_visual_capture cleanly degrades. ──
+# ── Gated implementations: return 2 when tooling is absent so run_visual_capture
+# degrades cleanly (CI / fixtures are unaffected). ──
 
-# Would boot a simulator/emulator, navigate to <screen>/<state>, and write a PNG
-# to $3. Returns 2 = "not implemented in this environment".
-__visual_capture_screenshot() {
-  return 2  # requires xcrun simctl / adb screencap on a real machine
+# Pure: given simctl `list devices -j` JSON on stdin and a device label ($1),
+# print the chosen device UDID. Selection priority: exact label match that is
+# Booted, then any exact label match, then any Booted device, then any device.
+# Label = the simctl device name lowercased with spaces -> hyphens
+# (e.g. "iPhone 15 Pro Max" -> "iphone-15-pro-max"). Prints empty if none.
+__visual_pick_udid() {
+  jq -r --arg d "$1" '
+    [.devices[][]? | {name, udid, state, label: (.name | ascii_downcase | gsub(" "; "-"))}]
+    | ( (map(select(.label==$d and .state=="Booted")))
+        + (map(select(.label==$d)))
+        + (map(select(.state=="Booted")))
+        + . )
+    | .[0].udid // empty
+  '
 }
 
-# Would pixel-diff $1 (reference) vs $2 (screenshot), write a diff image to $3,
-# and print the difference percentage. Returns 2 = "not implemented".
+# Resolve a device label to a simulator UDID via simctl. Returns empty on failure.
+__visual_resolve_udid() {
+  local device="$1" js
+  js="$(xcrun simctl list devices available -j 2>/dev/null)" || return 1
+  printf '%s' "$js" | __visual_pick_udid "$device"
+}
+
+# Capture <screen> <state> <device> -> PNG at $4. Requires xcrun. Returns 2 when
+# unavailable so run_visual_capture degrades cleanly.
+__visual_capture_screenshot() {
+  local screen="$1" state="$2" device="$3" out="$4"
+  command -v xcrun >/dev/null 2>&1 || return 2
+  local udid; udid="$(__visual_resolve_udid "$device")"
+  [ -n "$udid" ] || return 2
+  xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
+  xcrun simctl status_bar "$udid" override \
+    --time "2026-06-18T09:41:00" --batteryState charged --batteryLevel 100 \
+    --cellularBars 4 --wifiBars 3 >/dev/null 2>&1 || true
+  mkdir -p "$(dirname "$out")"
+  # Drive the app into preview mode. Preferred: a prompt-free cold launch with a
+  # launch argument (NIGHT_SHIFT_PREVIEW_BUNDLE_ID set) the app reads into preview
+  # mode — deterministic, no custom-scheme "Open in app?" confirmation. Fallback:
+  # a custom-scheme deep link (may show that confirmation on newer iOS).
+  local bid="${NIGHT_SHIFT_PREVIEW_BUNDLE_ID:-}"
+  if [ -n "$bid" ]; then
+    # Cold-launch into preview mode: terminate any running instance, then launch
+    # with the preview arg (portable — avoids the --terminate-existing flag, which
+    # some simctl versions reject).
+    xcrun simctl terminate "$udid" "$bid" >/dev/null 2>&1 || true
+    xcrun simctl launch "$udid" "$bid" \
+      --nightshift-preview "${screen}:${state}" >/dev/null 2>&1 || return 2
+  else
+    xcrun simctl openurl "$udid" \
+      "${NIGHT_SHIFT_PREVIEW_SCHEME:-nightshift}://preview?screen=${screen}&state=${state}&device=${device}" >/dev/null 2>&1 || return 2
+  fi
+  # Let the app cold-start and the JS bundle render before capturing.
+  sleep "${NIGHT_SHIFT_VISUAL_SETTLE_SECONDS:-6}"
+  xcrun simctl io "$udid" screenshot "$out" >/dev/null 2>&1 || return 2
+  [ -s "$out" ]
+}
+
+# Diff <reference> <screenshot> <diff_out>; prints diff_pct (0-100). Requires
+# odiff. Returns 2 when unavailable.
 __visual_pixel_diff() {
-  return 2  # requires an image-diff tool (e.g. odiff / pixelmatch)
+  local reference="$1" screenshot="$2" diff_out="$3"
+  command -v "${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" >/dev/null 2>&1 || return 2
+  mkdir -p "$(dirname "$diff_out")"
+  # odiff requires identical dimensions. Resize a COPY of the reference to the
+  # screenshot's exact pixel size so the diff is always valid. The original
+  # reference file (referenced by the report) is left untouched. Falls back to the
+  # original reference if sips is unavailable or sizing fails.
+  local ref_use="$reference"
+  if command -v sips >/dev/null 2>&1; then
+    local dims w h
+    dims="$(sips -g pixelWidth -g pixelHeight "$screenshot" 2>/dev/null)"
+    w="$(printf '%s\n' "$dims" | awk '/pixelWidth/{print $2}')"
+    h="$(printf '%s\n' "$dims" | awk '/pixelHeight/{print $2}')"
+    if [ -n "$w" ] && [ -n "$h" ]; then
+      ref_use="$(dirname "$diff_out")/.ref-resized-$$.png"
+      cp "$reference" "$ref_use" 2>/dev/null && sips -z "$h" "$w" "$ref_use" >/dev/null 2>&1 || ref_use="$reference"
+    fi
+  fi
+  local outp pct
+  outp="$("${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" --parsable-stdout "$ref_use" "$screenshot" "$diff_out" 2>/dev/null)"
+  # Prefer an explicit percentage token (e.g. "5.60%") if the tool prints one;
+  # otherwise fall back to the first bare number. NOTE: the exact
+  # `--parsable-stdout` numeric format must be confirmed against the installed
+  # odiff during the Task 12 real-run smoke and this extraction adjusted if needed.
+  pct="$(printf '%s' "$outp" | grep -oE '[0-9]+(\.[0-9]+)?%' | head -n1 | tr -d '%')"
+  [ -n "$pct" ] || pct="$(printf '%s' "$outp" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
+  # Fail closed: an unparseable result must NOT silently become 0% (a false PASS).
+  # Returning non-zero makes run_visual_capture log + skip this screen instead.
+  [ -n "$pct" ] || return 2
+  printf '%s' "$pct"
 }
 
 # Orchestrator. No-op SKIP unless capture is available; otherwise drives the
@@ -122,16 +209,16 @@ run_visual_capture() {
     log "visual-capture: SKIP — no simulator/diff tooling or NIGHT_SHIFT_VISUAL_CAPTURE!=1; design fidelity stays static-only (the viewer renders reports if/when emitted)"
     return 0
   fi
-  local screens tol screen state ref shot diff_img pct objs="" line
+  local screens tol screen state device ref shot diff_img pct objs="" line
   screens="$(visual_capture_screens "$spec")"
   [ -n "$screens" ] || { log "visual-capture: no Design Contract frames/states; nothing to capture"; return 0; }
   tol="$(visual_capture_tolerance "$spec")"
-  while IFS='|' read -r screen state; do
+  while IFS='|' read -r screen state device; do
     [ -n "$screen" ] || continue
-    ref="design/${screen}-${state}.png"
-    shot="screenshots/${candidate}/${screen}-${state}.png"
-    diff_img="diffs/${candidate}/${screen}-${state}.png"
-    if ! __visual_capture_screenshot "$screen" "$state" "$out_dir/$shot"; then
+    ref="design/${screen}-${state}-${device}.png"
+    shot="screenshots/${candidate}/${screen}-${state}-${device}.png"
+    diff_img="diffs/${candidate}/${screen}-${state}-${device}.png"
+    if ! __visual_capture_screenshot "$screen" "$state" "$device" "$out_dir/$shot"; then
       log "visual-capture: capture step not implemented; skipping (scaffold only)"
       return 0
     fi
@@ -139,7 +226,7 @@ run_visual_capture() {
       log "visual-capture: diff step not implemented; skipping (scaffold only)"
       return 0
     }
-    objs="$objs$(visual_assemble_screen "$screen" "$state" "$ref" "$shot" "$pct" "$tol" "$diff_img"),"
+    objs="$objs$(visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$pct" "$tol" "$diff_img" "" "[]"),"
   done <<EOF
 $screens
 EOF
@@ -147,3 +234,24 @@ EOF
   jq -n --arg task "$spec" --argjson screens "[${objs%,}]" \
     '{task: $task, screens: $screens}' >"$out_dir/visual-diff-$(basename "$spec" .md).json"
 }
+
+# Combine per-screen JSON objects (one compact object per line in $2) into a full
+# visual-diff report for task $1. Prints the report JSON. Pure.
+assemble_report() {
+  local task="$1" screens_file="$2"
+  jq -s --arg task "$task" '{task: $task, screens: .}' "$screens_file"
+}
+
+# When executed directly (not sourced), expose capture/diff as subcommands for the
+# agent's repair loop. Sourcing (the orchestrator's use) skips this block.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  cmd="${1:-}"; shift || true
+  case "$cmd" in
+    capture)        __visual_capture_screenshot "$@"; exit $? ;;
+    diff)           __visual_pixel_diff "$@"; exit $? ;;
+    screens)        visual_capture_screens "$@"; exit $? ;;
+    assemble-screen) visual_assemble_screen "$@"; exit $? ;;
+    report)          assemble_report "$@"; exit $? ;;
+    *) printf 'usage: visual-capture.sh {capture screen state device out|diff ref shot diffout|screens spec|assemble-screen ...|report task screens.jsonl}\n' >&2; exit 64 ;;
+  esac
+fi
