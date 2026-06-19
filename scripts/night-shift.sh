@@ -497,6 +497,7 @@ run_dry_fixtures() {
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
+  fixture_assert "visual_review prompt carries the RUN_VISUAL procedure" fixture_visual_review_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
@@ -1258,7 +1259,7 @@ fixture_handoff_prompt() {
   prompt="$dir/prompt.txt"
   mkdir -p "$dir"
   local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
-  local PROJECT="$dir" BASE_COMMIT=deadbeef
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
   fixture_write_min_spec "$SPEC"
   # Fresh stage session mid-run (no session_id, prior turns) gets the handoff note.
   printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
@@ -1273,6 +1274,24 @@ fixture_handoff_prompt() {
   printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
   primary_prompt "$prompt"
   grep -q "FRESH stage session" "$prompt" && return 1
+  return 0
+}
+
+fixture_visual_review_prompt() {
+  local root="$1" dir="$root/vis-prompt" prompt
+  prompt="$dir/prompt.txt"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  fixture_write_min_spec "$SPEC"
+  printf '{"stage":"visual_review","stage_turns":0,"primary_turns":2,"session_id":null}\n' >"$STATE"
+  primary_prompt "$prompt"
+  grep -q "RUN_VISUAL: only from the visual_review stage" "$prompt" || return 1
+  grep -q "visual-capture.sh capture" "$prompt" || return 1
+  grep -q "visual-capture.sh diff" "$prompt" || return 1
+  grep -q "assemble-screen" "$prompt" || return 1
+  grep -q "visual-capture.sh report" "$prompt" || return 1
+  grep -q "Figma MCP" "$prompt" || return 1
   return 0
 }
 
@@ -2555,6 +2574,51 @@ $SPEC. "artifacts" lists only project-relative files (no absolute paths, no
   List that evidence file in artifacts.
 - REQUEST_OBSERVER: list the candidate evidence, relevant tests, and docs the
   fresh observer needs. The wrapper runs the observer; do not run it yourself.
+- RUN_VISUAL: only from the visual_review stage. Prove every screen in the spec's
+  ## Design Contract is pixel-perfect to its Figma reference, auto-repairing the RN
+  code until each is within tolerance, then emit the report. The app is already
+  running on a booted iOS simulator with the preview harness. Procedure:
+    1. Targets: bash $NIGHT_SHIFT_LIB/visual-capture.sh screens $SPEC
+       prints one "screen|state|device" line per target. The per-screen tolerance
+       is the Design Contract's "- Tolerance:" (default 0.10).
+    2. For each target, export its Figma reference frame as a PNG to the ABSOLUTE
+       path $RUN_ROOT/validated/design/<screen>-<state>-<device>.png using the
+       Figma MCP (match the frame to the screen/state and the device pixel size);
+       read its design tokens/measurements for diagnosis.
+    3. Capture the harness (ABSOLUTE output path):
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh capture <screen> <state> <device> \
+         $RUN_ROOT/validated/screenshots/<screen>-<state>-<device>.png
+    4. Diff (ABSOLUTE paths; prints diff_pct):
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh diff \
+         $RUN_ROOT/validated/design/<screen>-<state>-<device>.png \
+         $RUN_ROOT/validated/screenshots/<screen>-<state>-<device>.png \
+         $RUN_ROOT/validated/diffs/<screen>-<state>-<device>.png
+       If diff_pct <= tolerance the screen passes. Otherwise read the reference,
+       screenshot, diff image and Figma tokens, edit the RN screen to close the
+       gap, reload/rebuild the running app, and re-capture/re-diff. At most
+       $VISUAL_MAX_ATTEMPTS attempts per screen; record every attempt.
+    5. Build each screen object (paths here are RELATIVE to validated/, e.g.
+       design/<name>.png — NOT absolute):
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh assemble-screen <screen> <state> \
+         <device> design/<n>.png screenshots/<n>.png <diff_pct> <tolerance> \
+         diffs/<n>.png "<analysis>" '<attempts JSON array>' \
+         >> $RUN_ROOT/control/visual-screens.jsonl
+       <analysis> is your written diagnosis; the attempts array holds objects
+       {attempt,diff_pct,pass,analysis,screenshot,diff_image} (screenshot/diff_image
+       relative to validated/). A screen that never reaches tolerance is pass:false
+       with a final analysis explaining why — never fake a pass.
+    6. Assemble the report:
+       bash $NIGHT_SHIFT_LIB/visual-capture.sh report $SPEC \
+         $RUN_ROOT/control/visual-screens.jsonl \
+         > $RUN_ROOT/validated/visual-diff-<NAME>.json
+       where <NAME> is $SPEC with its directory and .md suffix removed (e.g.
+       specs/login.md -> login).
+    7. If you edited RN code while repairing, re-run the spec's final validation
+       commands (they must stay green) and refresh the candidate commit so the
+       observer reviews the repaired code.
+  "artifacts" may be an empty array for RUN_VISUAL — the wrapper reads the report
+  from its canonical path. If capture/diff tooling is unavailable, do not fake
+  results: emit BLOCKED with the reason.
 - NEXT_TASK: only after observer APPROVE. First check off the completed entry in
   $WORKSPACE_ROOT/TODO.md, then signal NEXT_TASK.
 - COMPLETE: only after observer APPROVE with no remaining TODO entries.
