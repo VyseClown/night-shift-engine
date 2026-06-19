@@ -141,9 +141,25 @@ __visual_capture_screenshot() {
   xcrun simctl status_bar "$udid" override \
     --time "2026-06-18T09:41:00" --batteryState charged --batteryLevel 100 \
     --cellularBars 4 --wifiBars 3 >/dev/null 2>&1 || true
-  xcrun simctl openurl "$udid" \
-    "${NIGHT_SHIFT_PREVIEW_SCHEME:-nightshift}://preview?screen=${screen}&state=${state}&device=${device}" >/dev/null 2>&1 || return 2
   mkdir -p "$(dirname "$out")"
+  # Drive the app into preview mode. Preferred: a prompt-free cold launch with a
+  # launch argument (NIGHT_SHIFT_PREVIEW_BUNDLE_ID set) the app reads into preview
+  # mode — deterministic, no custom-scheme "Open in app?" confirmation. Fallback:
+  # a custom-scheme deep link (may show that confirmation on newer iOS).
+  local bid="${NIGHT_SHIFT_PREVIEW_BUNDLE_ID:-}"
+  if [ -n "$bid" ]; then
+    # Cold-launch into preview mode: terminate any running instance, then launch
+    # with the preview arg (portable — avoids the --terminate-existing flag, which
+    # some simctl versions reject).
+    xcrun simctl terminate "$udid" "$bid" >/dev/null 2>&1 || true
+    xcrun simctl launch "$udid" "$bid" \
+      --nightshift-preview "${screen}:${state}" >/dev/null 2>&1 || return 2
+  else
+    xcrun simctl openurl "$udid" \
+      "${NIGHT_SHIFT_PREVIEW_SCHEME:-nightshift}://preview?screen=${screen}&state=${state}&device=${device}" >/dev/null 2>&1 || return 2
+  fi
+  # Let the app cold-start and the JS bundle render before capturing.
+  sleep "${NIGHT_SHIFT_VISUAL_SETTLE_SECONDS:-6}"
   xcrun simctl io "$udid" screenshot "$out" >/dev/null 2>&1 || return 2
   [ -s "$out" ]
 }
