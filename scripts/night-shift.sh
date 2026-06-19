@@ -526,6 +526,7 @@ run_dry_fixtures() {
   fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
+  fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1198,6 +1199,20 @@ fixture_visual_assemble() {
   obj="$(visual_assemble_screen Login error iphone-15 design/r.png shot/s.png 0.04 0.10 diff/d.png \
         "title 2px low; fixed" '[{"attempt":1,"diff_pct":0.31,"pass":false,"analysis":"low","screenshot":"a1.png","diff_image":"d1.png"}]')"
   printf '%s' "$obj" | jq -e '.device=="iphone-15" and .analysis=="title 2px low; fixed" and .pass==true and (.attempts|length)==1 and .attempts[0].attempt==1' >/dev/null || return 1
+}
+
+fixture_visual_pick_udid() {
+  local js='{"devices":{"rt":[
+    {"name":"iPhone 17 Pro","udid":"AAA","state":"Booted","isAvailable":true},
+    {"name":"iPhone 15 Pro Max","udid":"BBB","state":"Shutdown","isAvailable":true},
+    {"name":"iPhone 15 Pro Max","udid":"CCC","state":"Booted","isAvailable":true}]}}'
+  # exact label + Booted wins
+  [ "$(printf '%s' "$js" | __visual_pick_udid iphone-15-pro-max)" = "CCC" ] || return 1
+  # exact label (non-booted) when that label has no booted device
+  local js2='{"devices":{"rt":[{"name":"iPhone 15 Pro Max","udid":"DDD","state":"Shutdown","isAvailable":true}]}}'
+  [ "$(printf '%s' "$js2" | __visual_pick_udid iphone-15-pro-max)" = "DDD" ] || return 1
+  # no label match -> first Booted
+  [ "$(printf '%s' "$js" | __visual_pick_udid no-such-device)" = "AAA" ] || return 1
 }
 
 fixture_observer_cost_capture() {

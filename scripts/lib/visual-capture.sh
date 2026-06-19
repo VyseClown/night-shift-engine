@@ -106,12 +106,35 @@ visual_assemble_screen() {
 # ── Gated implementations: return 2 when tooling is absent so run_visual_capture
 # degrades cleanly (CI / fixtures are unaffected). ──
 
+# Pure: given simctl `list devices -j` JSON on stdin and a device label ($1),
+# print the chosen device UDID. Selection priority: exact label match that is
+# Booted, then any exact label match, then any Booted device, then any device.
+# Label = the simctl device name lowercased with spaces -> hyphens
+# (e.g. "iPhone 15 Pro Max" -> "iphone-15-pro-max"). Prints empty if none.
+__visual_pick_udid() {
+  jq -r --arg d "$1" '
+    [.devices[][]? | {name, udid, state, label: (.name | ascii_downcase | gsub(" "; "-"))}]
+    | ( (map(select(.label==$d and .state=="Booted")))
+        + (map(select(.label==$d)))
+        + (map(select(.state=="Booted")))
+        + . )
+    | .[0].udid // empty
+  '
+}
+
+# Resolve a device label to a simulator UDID via simctl. Returns empty on failure.
+__visual_resolve_udid() {
+  local device="$1" js
+  js="$(xcrun simctl list devices available -j 2>/dev/null)" || return 1
+  printf '%s' "$js" | __visual_pick_udid "$device"
+}
+
 # Capture <screen> <state> <device> -> PNG at $4. Requires xcrun. Returns 2 when
 # unavailable so run_visual_capture degrades cleanly.
 __visual_capture_screenshot() {
   local screen="$1" state="$2" device="$3" out="$4"
   command -v xcrun >/dev/null 2>&1 || return 2
-  local udid; udid="$(xcrun simctl list devices available | grep -oE '\(([0-9A-Fa-f-]{36})\)' | head -n1 | tr -d '()')"
+  local udid; udid="$(__visual_resolve_udid "$device")"
   [ -n "$udid" ] || return 2
   xcrun simctl boot "$udid" >/dev/null 2>&1 || true
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
@@ -131,8 +154,23 @@ __visual_pixel_diff() {
   local reference="$1" screenshot="$2" diff_out="$3"
   command -v "${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" >/dev/null 2>&1 || return 2
   mkdir -p "$(dirname "$diff_out")"
+  # odiff requires identical dimensions. Resize a COPY of the reference to the
+  # screenshot's exact pixel size so the diff is always valid. The original
+  # reference file (referenced by the report) is left untouched. Falls back to the
+  # original reference if sips is unavailable or sizing fails.
+  local ref_use="$reference"
+  if command -v sips >/dev/null 2>&1; then
+    local dims w h
+    dims="$(sips -g pixelWidth -g pixelHeight "$screenshot" 2>/dev/null)"
+    w="$(printf '%s\n' "$dims" | awk '/pixelWidth/{print $2}')"
+    h="$(printf '%s\n' "$dims" | awk '/pixelHeight/{print $2}')"
+    if [ -n "$w" ] && [ -n "$h" ]; then
+      ref_use="$(dirname "$diff_out")/.ref-resized-$$.png"
+      cp "$reference" "$ref_use" 2>/dev/null && sips -z "$h" "$w" "$ref_use" >/dev/null 2>&1 || ref_use="$reference"
+    fi
+  fi
   local outp pct
-  outp="$("${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" --parsable-stdout "$reference" "$screenshot" "$diff_out" 2>/dev/null)"
+  outp="$("${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" --parsable-stdout "$ref_use" "$screenshot" "$diff_out" 2>/dev/null)"
   # Prefer an explicit percentage token (e.g. "5.60%") if the tool prints one;
   # otherwise fall back to the first bare number. NOTE: the exact
   # `--parsable-stdout` numeric format must be confirmed against the installed
