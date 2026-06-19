@@ -217,14 +217,17 @@ json_schema_basic() {
         ((keys | sort) == ["screens","task"]) and
         (.task | type == "string" and length > 0) and
         (.screens | type == "array" and length > 0 and all(.[];
-          ((keys | sort) == ["diff_image","diff_pct","pass","reference","screen","screenshot","state","tolerance"]) and
+          ((keys | sort) == ["analysis","attempts","device","diff_image","diff_pct","pass","reference","screen","screenshot","state","tolerance"]) and
           (.screen | type == "string" and length > 0) and
           (.state | type == "string" and length > 0) and
+          (.device | type == "string" and length > 0) and
           (.reference | type == "string" and length > 0) and
           (.screenshot | type == "string" and length > 0) and
           (.diff_pct | type == "number" and . >= 0) and
           (.tolerance | type == "number" and . >= 0) and
           (.pass | type == "boolean") and
+          (.analysis | type == "string") and
+          (.attempts | type == "array") and
           (.diff_image == null or (.diff_image | type == "string" and length > 0)) and
           (.pass == (.diff_pct <= .tolerance))))
       ' "$file" >/dev/null 2>&1
@@ -490,6 +493,7 @@ run_dry_fixtures() {
   fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
   fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
   fixture_assert "visual capture grid includes device axis" fixture_visual_grid "$root"
+  fixture_assert "visual report assembles device/analysis/attempts" fixture_visual_assemble "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -793,13 +797,13 @@ fixture_review_fields_scoped() {
 
 fixture_visual_diff_schema() {
   local root="$1" good="$root/vd-good.json" bad="$root/vd-bad.json" badkey="$root/vd-key.json"
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"diff_image":null}]}' >"$good"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$good"
   json_schema_basic visual-diff "$good" || return 1
   # pass=true but diff_pct > tolerance → inconsistent → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"diff_image":null}]}' >"$bad"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$bad"
   json_schema_basic visual-diff "$bad" && return 1
   # missing a per-screen key → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true}]}' >"$badkey"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true,"analysis":"","attempts":[]}]}' >"$badkey"
   json_schema_basic visual-diff "$badkey" && return 1
   return 0
 }
@@ -820,10 +824,10 @@ fixture_visual_capture_screens() {
 fixture_visual_assemble_screen() {
   local root="$1" obj
   # Within tolerance → pass derived true; diff_image preserved.
-  obj="$(visual_assemble_screen Home default design/h.png shots/h.png 0.05 0.1 diffs/h.png)"
+  obj="$(visual_assemble_screen Home default iphone-15 design/h.png shots/h.png 0.05 0.1 diffs/h.png)"
   printf '%s' "$obj" | jq -e '.pass == true and .diff_image == "diffs/h.png"' >/dev/null || return 1
   # Over tolerance → pass derived false; empty diff_image → null.
-  obj="$(visual_assemble_screen Home empty r s 0.4 0.1 "")"
+  obj="$(visual_assemble_screen Home empty iphone-15 r s 0.4 0.1 "")"
   printf '%s' "$obj" | jq -e '.pass == false and .diff_image == null' >/dev/null || return 1
   # The assembled object is a valid screen inside a report.
   printf '{"task":"t","screens":[%s]}\n' "$obj" >"$root/asm.json"
@@ -1161,6 +1165,13 @@ fixture_visual_grid() {
   [ "$(printf '%s\n' "$out" | grep -c '|')" -eq 8 ] || return 1
   printf '%s\n' "$out" | grep -q '^Login|error|iphone-15$' || return 1
   printf '%s\n' "$out" | grep -q '^Home|default|iphone-se$' || return 1
+}
+
+fixture_visual_assemble() {
+  local obj
+  obj="$(visual_assemble_screen Login error iphone-15 design/r.png shot/s.png 0.04 0.10 diff/d.png \
+        "title 2px low; fixed" '[{"attempt":1,"diff_pct":0.31,"pass":false,"analysis":"low","screenshot":"a1.png","diff_image":"d1.png"}]')"
+  printf '%s' "$obj" | jq -e '.device=="iphone-15" and .analysis=="title 2px low; fixed" and .pass==true and (.attempts|length)==1 and .attempts[0].attempt==1' >/dev/null || return 1
 }
 
 fixture_observer_cost_capture() {

@@ -82,22 +82,23 @@ visual_capture_tolerance() {
   printf '%s' "$t"
 }
 
-# Assembles one conforming visual-diff screen object. pass is derived, never
-# trusted from input: pass == (diff_pct <= tolerance). Pure; emits one JSON
-# object. diff_image may be empty → null.
+# Pure: emit one screen object for the report. pass is derived, never trusted from
+# input: pass == (diff_pct <= tolerance). `attempts` is a JSON array string.
 visual_assemble_screen() {
-  local screen="$1" state="$2" reference="$3" screenshot="$4" \
-    diff_pct="$5" tolerance="$6" diff_image="$7"
-  jq -n \
-    --arg screen "$screen" --arg state "$state" \
+  local screen="$1" state="$2" device="$3" reference="$4" screenshot="$5" \
+    diff_pct="$6" tolerance="$7" diff_image="$8" analysis="${9:-}" attempts="${10:-[]}"
+  jq -nc \
+    --arg screen "$screen" --arg state "$state" --arg device "$device" \
     --arg reference "$reference" --arg screenshot "$screenshot" \
     --argjson diff_pct "$diff_pct" --argjson tolerance "$tolerance" \
-    --arg diff_image "$diff_image" '
+    --arg diff_image "$diff_image" --arg analysis "$analysis" \
+    --argjson attempts "$attempts" '
     {
-      screen: $screen, state: $state, reference: $reference,
+      screen: $screen, state: $state, device: $device, reference: $reference,
       screenshot: $screenshot, diff_pct: $diff_pct, tolerance: $tolerance,
-      pass: ($diff_pct <= $tolerance),
-      diff_image: (if $diff_image == "" then null else $diff_image end)
+      pass: ($diff_pct <= $tolerance), analysis: $analysis,
+      diff_image: (if $diff_image == "" then null else $diff_image end),
+      attempts: $attempts
     }'
 }
 
@@ -143,7 +144,7 @@ run_visual_capture() {
       log "visual-capture: diff step not implemented; skipping (scaffold only)"
       return 0
     }
-    objs="$objs$(visual_assemble_screen "$screen" "$state" "$ref" "$shot" "$pct" "$tol" "$diff_img"),"
+    objs="$objs$(visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$pct" "$tol" "$diff_img" "" "[]"),"
   done <<EOF
 $screens
 EOF
