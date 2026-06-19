@@ -66,6 +66,12 @@ engine/workflow git here at the root.
   `NIGHT_SHIFT_IMPLEMENT_MODEL` (default `sonnet`) for the implement grind, and
   `NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) for the independent final gate —
   any set to `inherit` to fall back to the CLI's startup model.
+- **Visual fidelity (opt-in):** set `NIGHT_SHIFT_VISUAL_CAPTURE=1` and give an rn
+  spec a `## Design Contract` to enable the `visual_review` stage (Figma-MCP
+  reference + iOS-simulator capture + `odiff` pixel-diff + agent auto-repair).
+  Requires `xcrun`, `odiff`, a Figma MCP server, and the app's preview harness;
+  absent any of these it cleanly SKIPs. The viewer renders the per-screen
+  reference/implementation/diff images, diff%, analysis, and attempt history.
 
 > **Note:** the night-shift workflow is two-track. A spec declares `- Track: rn`
 > or `- Track: web` (default `rn`), which selects the review persona set
