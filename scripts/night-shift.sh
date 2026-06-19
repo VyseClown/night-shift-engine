@@ -489,6 +489,7 @@ run_dry_fixtures() {
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
   fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
   fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
+  fixture_assert "visual capture grid includes device axis" fixture_visual_grid "$root"
   fixture_assert "optional reviewer field unions into active set" fixture_optional_persona_field "$root"
   fixture_assert "comma-separated optional reviewers all union in" fixture_optional_persona_multi "$root"
   fixture_assert "contract section auto-activates optional reviewer" fixture_optional_persona_section "$root"
@@ -808,8 +809,8 @@ fixture_visual_capture_screens() {
   printf '%s\n' '## Design Contract' '- Frames: Home, Settings' '- Required states: default, empty' '## Edge Cases' >"$spec"
   out="$(visual_capture_screens "$spec")"
   [ "$(printf '%s\n' "$out" | grep -c .)" -eq 4 ] || return 1
-  printf '%s\n' "$out" | grep -qx 'Home|default' || return 1
-  printf '%s\n' "$out" | grep -qx 'Settings|empty' || return 1
+  printf '%s\n' "$out" | grep -qx 'Home|default|iphone-15' || return 1
+  printf '%s\n' "$out" | grep -qx 'Settings|empty|iphone-15' || return 1
   # No Design Contract → no screens.
   printf 'no contract\n' >"$spec"
   [ -z "$(visual_capture_screens "$spec")" ] || return 1
@@ -1150,6 +1151,16 @@ fixture_visual_routing() {
   ( VISUAL_CAPTURE=1; ! visual_stage_enabled "$spec_no" ) || return 1
   # Enabled AND Design Contract present -> route to visual.
   ( VISUAL_CAPTURE=1; visual_stage_enabled "$spec_yes" ) || return 1
+}
+
+fixture_visual_grid() {
+  local root="$1" spec="$root/dc.md"
+  printf '## Design Contract\n- Frames: Login, Home\n- Required states: default, error\n- Devices: iphone-se, iphone-15\n' >"$spec"
+  local out; out="$(visual_capture_screens "$spec" | sort)"
+  # 2 frames x 2 states x 2 devices = 8 rows of screen|state|device
+  [ "$(printf '%s\n' "$out" | grep -c '|')" -eq 8 ] || return 1
+  printf '%s\n' "$out" | grep -q '^Login|error|iphone-15$' || return 1
+  printf '%s\n' "$out" | grep -q '^Home|default|iphone-se$' || return 1
 }
 
 fixture_observer_cost_capture() {

@@ -33,12 +33,14 @@ visual_capture_available() {
   return 0
 }
 
-# Reads the spec's `## Design Contract` and prints one `screen|state` line per
-# (frame × required-state) pair — the screens a capture run must cover. Frames
-# come from `- Frames:` and states from `- Required states:` (comma-separated).
-# Pure/deterministic; prints nothing when the section or fields are absent.
+# Reads the spec's `## Design Contract` and prints one `screen|state|device` line
+# per (frame × required-state × device) triple — the screens a capture run must
+# cover. Frames come from `- Frames:`, states from `- Required states:`, and
+# devices from `- Devices:` (all comma-separated). Devices default to `iphone-15`
+# when absent. Pure/deterministic; prints nothing when the section or fields are
+# absent.
 visual_capture_screens() {
-  local file="$1" section frames states f s old_ifs
+  local file="$1" section frames states devices f s d old_ifs
   section="$(awk '
     /^## Design Contract([ \t]|$)/ { ind=1; next }
     /^## / { ind=0 }
@@ -47,20 +49,22 @@ visual_capture_screens() {
   # Capture the value, dropping any trailing `<!-- ... -->` guidance comment.
   frames="$(printf '%s\n' "$section" | sed -nE 's/^- Frames: ?(.*)/\1/p' | head -n 1 | sed -E 's/[[:space:]]*<!--.*$//')"
   states="$(printf '%s\n' "$section" | sed -nE 's/^- Required states: ?(.*)/\1/p' | head -n 1 | sed -E 's/[[:space:]]*<!--.*$//')"
+  devices="$(printf '%s\n' "$section" | sed -nE 's/^- Devices: ?(.*)/\1/p' | head -n 1 | sed -E 's/[[:space:]]*<!--.*$//')"
+  [ -n "$devices" ] || devices="iphone-15"
   [ -n "$frames" ] && [ -n "$states" ] || return 0
   old_ifs="$IFS"; IFS=','
   for f in $frames; do
     f="$(printf '%s' "$f" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     [ -n "$f" ] || continue
-    local inner="$IFS"; IFS=','
     for s in $states; do
-      IFS="$inner"
       s="$(printf '%s' "$s" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
       [ -n "$s" ] || continue
-      printf '%s|%s\n' "$f" "$s"
-      IFS=','
+      for d in $devices; do
+        d="$(printf '%s' "$d" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        [ -n "$d" ] || continue
+        printf '%s|%s|%s\n' "$f" "$s" "$d"
+      done
     done
-    IFS=','
   done
   IFS="$old_ifs"
 }
@@ -122,11 +126,11 @@ run_visual_capture() {
     log "visual-capture: SKIP — no simulator/diff tooling or NIGHT_SHIFT_VISUAL_CAPTURE!=1; design fidelity stays static-only (the viewer renders reports if/when emitted)"
     return 0
   fi
-  local screens tol screen state ref shot diff_img pct objs="" line
+  local screens tol screen state device ref shot diff_img pct objs="" line
   screens="$(visual_capture_screens "$spec")"
   [ -n "$screens" ] || { log "visual-capture: no Design Contract frames/states; nothing to capture"; return 0; }
   tol="$(visual_capture_tolerance "$spec")"
-  while IFS='|' read -r screen state; do
+  while IFS='|' read -r screen state device; do
     [ -n "$screen" ] || continue
     ref="design/${screen}-${state}.png"
     shot="screenshots/${candidate}/${screen}-${state}.png"
