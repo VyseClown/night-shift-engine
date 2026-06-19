@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # shellcheck shell=bash
 # Design-fidelity visual capture — CONTRACT SCAFFOLD (Phase 2).
 #
@@ -102,19 +103,46 @@ visual_assemble_screen() {
     }'
 }
 
-# ── STUBS: the only simulator/tool-dependent steps. A real deployment replaces
-# these; both return non-zero here so run_visual_capture cleanly degrades. ──
+# ── Gated implementations: return 2 when tooling is absent so run_visual_capture
+# degrades cleanly (CI / fixtures are unaffected). ──
 
-# Would boot a simulator/emulator, navigate to <screen>/<state>, and write a PNG
-# to $3. Returns 2 = "not implemented in this environment".
+# Capture <screen> <state> <device> -> PNG at $4. Requires xcrun. Returns 2 when
+# unavailable so run_visual_capture degrades cleanly.
 __visual_capture_screenshot() {
-  return 2  # requires xcrun simctl / adb screencap on a real machine
+  local screen="$1" state="$2" device="$3" out="$4"
+  command -v xcrun >/dev/null 2>&1 || return 2
+  local udid; udid="$(xcrun simctl list devices available | grep -oE '\(([0-9A-Fa-f-]{36})\)' | head -n1 | tr -d '()')"
+  [ -n "$udid" ] || return 2
+  xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
+  xcrun simctl status_bar "$udid" override \
+    --time "2026-06-18T09:41:00" --batteryState charged --batteryLevel 100 \
+    --cellularBars 4 --wifiBars 3 >/dev/null 2>&1 || true
+  xcrun simctl openurl "$udid" \
+    "${NIGHT_SHIFT_PREVIEW_SCHEME:-nightshift}://preview?screen=${screen}&state=${state}&device=${device}" >/dev/null 2>&1 || return 2
+  mkdir -p "$(dirname "$out")"
+  xcrun simctl io "$udid" screenshot "$out" >/dev/null 2>&1 || return 2
+  [ -s "$out" ]
 }
 
-# Would pixel-diff $1 (reference) vs $2 (screenshot), write a diff image to $3,
-# and print the difference percentage. Returns 2 = "not implemented".
+# Diff <reference> <screenshot> <diff_out>; prints diff_pct (0-100). Requires
+# odiff. Returns 2 when unavailable.
 __visual_pixel_diff() {
-  return 2  # requires an image-diff tool (e.g. odiff / pixelmatch)
+  local reference="$1" screenshot="$2" diff_out="$3"
+  command -v "${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" >/dev/null 2>&1 || return 2
+  mkdir -p "$(dirname "$diff_out")"
+  local outp pct
+  outp="$("${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" --parsable-stdout "$reference" "$screenshot" "$diff_out" 2>/dev/null)"
+  # Prefer an explicit percentage token (e.g. "5.60%") if the tool prints one;
+  # otherwise fall back to the first bare number. NOTE: the exact
+  # `--parsable-stdout` numeric format must be confirmed against the installed
+  # odiff during the Task 12 real-run smoke and this extraction adjusted if needed.
+  pct="$(printf '%s' "$outp" | grep -oE '[0-9]+(\.[0-9]+)?%' | head -n1 | tr -d '%')"
+  [ -n "$pct" ] || pct="$(printf '%s' "$outp" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
+  # Fail closed: an unparseable result must NOT silently become 0% (a false PASS).
+  # Returning non-zero makes run_visual_capture log + skip this screen instead.
+  [ -n "$pct" ] || return 2
+  printf '%s' "$pct"
 }
 
 # Orchestrator. No-op SKIP unless capture is available; otherwise drives the
@@ -133,10 +161,10 @@ run_visual_capture() {
   tol="$(visual_capture_tolerance "$spec")"
   while IFS='|' read -r screen state device; do
     [ -n "$screen" ] || continue
-    ref="design/${screen}-${state}.png"
-    shot="screenshots/${candidate}/${screen}-${state}.png"
-    diff_img="diffs/${candidate}/${screen}-${state}.png"
-    if ! __visual_capture_screenshot "$screen" "$state" "$out_dir/$shot"; then
+    ref="design/${screen}-${state}-${device}.png"
+    shot="screenshots/${candidate}/${screen}-${state}-${device}.png"
+    diff_img="diffs/${candidate}/${screen}-${state}-${device}.png"
+    if ! __visual_capture_screenshot "$screen" "$state" "$device" "$out_dir/$shot"; then
       log "visual-capture: capture step not implemented; skipping (scaffold only)"
       return 0
     fi
@@ -152,3 +180,15 @@ EOF
   jq -n --arg task "$spec" --argjson screens "[${objs%,}]" \
     '{task: $task, screens: $screens}' >"$out_dir/visual-diff-$(basename "$spec" .md).json"
 }
+
+# When executed directly (not sourced), expose capture/diff as subcommands for the
+# agent's repair loop. Sourcing (the orchestrator's use) skips this block.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  cmd="${1:-}"; shift || true
+  case "$cmd" in
+    capture) __visual_capture_screenshot "$@"; exit $? ;;
+    diff)    __visual_pixel_diff "$@"; exit $? ;;
+    screens) visual_capture_screens "$@"; exit $? ;;
+    *) printf 'usage: visual-capture.sh {capture screen state device out|diff ref shot diffout|screens spec}\n' >&2; exit 64 ;;
+  esac
+fi
