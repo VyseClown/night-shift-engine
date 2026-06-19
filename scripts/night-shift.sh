@@ -60,6 +60,8 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
 VISUAL_CAPTURE="${NIGHT_SHIFT_VISUAL_CAPTURE:-0}"
+# Max auto-repair attempts per screen in the visual_review loop (cost guard).
+VISUAL_MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}"
 # Persona/profile resolution — the persona/track constants (PERSONAS_RN,
 # PERSONAS_WEB, PERSONAS_OPTIONAL, PERSONAS, the floors, DEFAULT_TRACK) and the
 # pure functions that map a spec to its active review set — live in
