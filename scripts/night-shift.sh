@@ -318,7 +318,15 @@ EOF
 }
 
 file_mtime_epoch() {
-  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null
+  # GNU first (Linux/CI), then BSD (macOS). Order matters: GNU `stat -f` means
+  # `--file-system` and treats `%m` as an unknown specifier — it prints the literal
+  # "%m" and EXITS 0, so a BSD-first `stat -f '%m' || stat -c '%Y'` never reaches the
+  # GNU fallback and poisons the caller with non-numeric junk. The numeric guard is
+  # belt-and-suspenders: any non-integer result fails the function so the caller's
+  # `|| now_epoch` fallback fires.
+  local m
+  m="$(stat -c '%Y' "$1" 2>/dev/null)" || m="$(stat -f '%m' "$1" 2>/dev/null)"
+  case "$m" in ''|*[!0-9]*) return 1 ;; *) printf '%s' "$m" ;; esac
 }
 
 recoverable_rate_limit_state() {
