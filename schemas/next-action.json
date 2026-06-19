@@ -10,6 +10,7 @@
         "RUN_PERSONAS",
         "CREATE_CANDIDATE",
         "REQUEST_OBSERVER",
+        "RUN_VISUAL",
         "NEXT_TASK",
         "BLOCKED",
         "COMPLETE"

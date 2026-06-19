@@ -141,7 +141,7 @@ json_schema_basic() {
       jq -e '
         type == "object" and
         ((keys | sort) == ["action","artifacts","reason","stage","task"]) and
-        (.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","NEXT_TASK","BLOCKED","COMPLETE")) and
+        (.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","RUN_VISUAL","NEXT_TASK","BLOCKED","COMPLETE")) and
         (.task | type == "string" and length > 0) and
         (.stage | type == "string" and length > 0) and
         (.reason | type == "string" and length > 0) and
