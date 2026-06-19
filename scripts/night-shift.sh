@@ -11,6 +11,7 @@ EXPLICIT_SPEC=0
 FIXTURE_TEST=0
 DRY_RUN=0
 FULL_PERSONA_LIVE_TEST=0
+LIST_OPTIONAL_PERSONAS=0
 MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
 MAX_STAGE_SECONDS="${NIGHT_SHIFT_MAX_STAGE_SECONDS:-3600}"
 MAX_TASK_TURNS="${NIGHT_SHIFT_MAX_TASK_TURNS:-36}"
@@ -93,6 +94,7 @@ Usage:
   scripts/night-shift.sh --project PATH [--spec PATH]
   scripts/night-shift.sh --fixture-test --dry-run
   scripts/night-shift.sh --fixture-test [--full-persona-live-test]
+  scripts/night-shift.sh --list-optional-personas   # JSON manifest, no run
 
 Claude runs the entire flow: stage-scoped primary sessions implement (a fresh
 session per stage scope — plan, implement, observe — handing off through files
@@ -124,6 +126,7 @@ while [ "$#" -gt 0 ]; do
     --fixture-test) FIXTURE_TEST=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --full-persona-live-test) FULL_PERSONA_LIVE_TEST=1; shift ;;
+    --list-optional-personas) LIST_OPTIONAL_PERSONAS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -132,6 +135,35 @@ done
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required executable not found: $1"
 }
+
+# Read-only manifest of the optional review personas and their auto-activating
+# contract headings. The single source of truth is PERSONAS_OPTIONAL +
+# optional_contract_heading (scripts/lib/personas.sh, sourced above), so adding a
+# persona there flows through here with no extra edit. Consumed by the viewer to
+# render its optional-persona toggles. `contractHeading` has no `##` prefix; the
+# heading as it appears in a spec is `## <contractHeading>`.
+emit_optional_personas_manifest() {
+  local first=1 name heading old_ifs
+  printf '{\n  "optional_personas": [\n'
+  old_ifs="$IFS"; IFS='|'
+  for name in $PERSONAS_OPTIONAL; do
+    IFS="$old_ifs"
+    heading="$(optional_contract_heading "$name")" || { IFS='|'; continue; }
+    [ "$first" -eq 1 ] || printf ',\n'
+    first=0
+    printf '    {"name": %s, "contractHeading": %s}' \
+      "$(printf '%s' "$name" | jq -R .)" "$(printf '%s' "$heading" | jq -R .)"
+    IFS='|'
+  done
+  IFS="$old_ifs"
+  printf '\n  ]\n}\n'
+}
+
+if [ "$LIST_OPTIONAL_PERSONAS" -eq 1 ]; then
+  require_command jq
+  emit_optional_personas_manifest
+  exit 0
+fi
 
 json_schema_basic() {
   local kind="$1" file="$2"
@@ -521,6 +553,7 @@ run_dry_fixtures() {
   fixture_assert "schema accepts optional persona records" fixture_optional_persona_schema "$root"
   fixture_assert "added optional persona unions via field" fixture_optional_persona_added_field "$root"
   fixture_assert "added optional persona auto-activates via its section" fixture_optional_persona_added_section "$root"
+  fixture_assert "optional-personas manifest lists all four with headings" fixture_optional_personas_manifest "$root"
   fixture_assert "explicit Personas list overrides the profile (floor kept)" fixture_explicit_personas_override "$root"
   fixture_assert "explicit Personas list may name an optional reviewer" fixture_explicit_personas_with_optional "$root"
   fixture_assert "explicit Personas list rejects an off-track name" fixture_explicit_personas_unknown "$root"
@@ -1455,6 +1488,22 @@ fixture_optional_persona_added_section() {
 - Endpoint: GET /thing'
   active="$(resolve_active_personas "$spec")" || return 1
   printf '%s' "$active" | grep -q "API Contract Reviewer" || return 1
+  return 0
+}
+
+fixture_optional_personas_manifest() {
+  local out
+  # The --list-optional-personas manifest is valid JSON, lists every optional
+  # persona, and pairs each with its contract heading (consumed by the viewer).
+  out="$(emit_optional_personas_manifest)" || return 1
+  printf '%s' "$out" | jq -e . >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.optional_personas | length == 4' >/dev/null 2>&1 || return 1
+  printf '%s' "$out" \
+    | jq -e '[.optional_personas[].name] | index("Security Reviewer") != null' \
+      >/dev/null 2>&1 || return 1
+  printf '%s' "$out" \
+    | jq -e '.optional_personas[] | select(.name=="Product Reviewer") | .contractHeading == "Product Contract"' \
+      >/dev/null 2>&1 || return 1
   return 0
 }
 
