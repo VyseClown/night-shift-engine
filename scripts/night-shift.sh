@@ -559,6 +559,7 @@ run_dry_fixtures() {
   fixture_assert "added optional persona auto-activates via its section" fixture_optional_persona_added_section "$root"
   fixture_assert "optional-personas manifest lists all four with headings" fixture_optional_personas_manifest "$root"
   fixture_assert "preflight reports ready only on a valid spec + feature branch" fixture_preflight_report "$root"
+  fixture_assert "evidence verify matches on exit status, ignores command-string transcription" fixture_evidence_exit_status_match "$root"
   fixture_assert "explicit Personas list overrides the profile (floor kept)" fixture_explicit_personas_override "$root"
   fixture_assert "explicit Personas list may name an optional reviewer" fixture_explicit_personas_with_optional "$root"
   fixture_assert "explicit Personas list rejects an off-track name" fixture_explicit_personas_unknown "$root"
@@ -1565,6 +1566,24 @@ fixture_preflight_report() {
   return 0
 }
 
+fixture_evidence_exit_status_match() {
+  local root="$1" ev="$root/ev.json" wf="$root/wf.json"
+  # Command strings differ only by an escaped semicolon, exit statuses match → MATCH
+  # (the exact transcription case that wrongly blocked a correct run).
+  printf '%s\n' '{"baseline":[{"command":"find . -exec node --check {} ;","exit_status":0}]}' >"$ev"
+  printf '%s\n' '[{"command":"find . -exec node --check {} \\;","exit_status":0}]' >"$wf"
+  evidence_exit_status_matches "$ev" baseline "$wf" || return 1
+  # Same command, different exit status → NO match (real regression still blocks).
+  printf '%s\n' '{"baseline":[{"command":"x","exit_status":1}]}' >"$ev"
+  printf '%s\n' '[{"command":"x","exit_status":0}]' >"$wf"
+  evidence_exit_status_matches "$ev" baseline "$wf" && return 1
+  # Different command count → NO match.
+  printf '%s\n' '{"baseline":[{"command":"x","exit_status":0}]}' >"$ev"
+  printf '%s\n' '[{"command":"x","exit_status":0},{"command":"y","exit_status":0}]' >"$wf"
+  evidence_exit_status_matches "$ev" baseline "$wf" && return 1
+  return 0
+}
+
 fixture_explicit_personas_override() {
   local root="$1" spec="$root/explicit.md" active count
   # An explicit `- Personas:` list overrides the profile: the active set is the
@@ -2393,6 +2412,20 @@ validation_not_regressed() {
         ($base.exit_status > 0 and $final.exit_status == $base.exit_status))
       end)
   ' "$final" >/dev/null
+}
+
+# True when the exit_status sequence the primary echoed under `.<field>` of its
+# execution-evidence matches the wrapper-owned `<wrapper_file>` exit_status sequence
+# (same values, order, and count). Command STRINGS are intentionally not compared:
+# the wrapper owns and runs every validation command, so matching exit statuses is
+# the integrity signal — an LLM-transcribed command string (e.g. `\;`→`;`) must not
+# block a correct run. A malformed/unreadable file yields non-zero (treated as a
+# mismatch, which fails safe).
+evidence_exit_status_matches() {
+  local evidence="$1" field="$2" wrapper_file="$3"
+  jq -e --slurpfile w "$wrapper_file" --arg f "$field" '
+    [ .[$f][] | .exit_status ] == [ $w[0][] | .exit_status ]
+  ' "$evidence" >/dev/null 2>&1
 }
 
 validate_spec_project() {
@@ -3245,35 +3278,30 @@ EOF
   [ -n "$evidence" ] || block_run "candidate requires schema-valid execution evidence"
   [ "$(jq -r '.task' "$evidence")" = "$SPEC" ] ||
     block_run "execution evidence task does not match current spec"
-  test_command="$(jq -r '.test_first.command' "$evidence")"
-  [ "$test_command" = "$(jq -r '.command' "$RUN_ROOT/validated/test-first-failing.json")" ] ||
-    block_run "test-first command differs from wrapper-owned failing command"
+  # Run the passing check with the WRAPPER's own failing command (not the primary's
+  # echoed string), so a primary-supplied command never drives control flow.
+  test_command="$(jq -r '.command' "$RUN_ROOT/validated/test-first-failing.json")"
   run_test_command passing "$test_command" "$RUN_ROOT/validated/test-first-passing.json" "$validation_worktree"
   [ "$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-passing.json")" -eq 0 ] ||
     block_run "test-first command still fails after implementation"
+  # Verify by exit status only — command strings are wrapper-owned, so an
+  # LLM-transcribed command (e.g. `\;`→`;`) must not block a correct run.
   jq -e --slurpfile failing "$RUN_ROOT/validated/test-first-failing.json" \
     --slurpfile passing "$RUN_ROOT/validated/test-first-passing.json" '
-      .test_first.command == $failing[0].command and
       .test_first.failing_exit_status == $failing[0].exit_status and
       .test_first.passing_exit_status == $passing[0].exit_status
     ' "$evidence" >/dev/null ||
-    block_run "primary test-first evidence does not match wrapper-owned executions"
-  jq -e --slurpfile baseline "$RUN_ROOT/validated/baseline.json" '
-    [.baseline[] | {command,exit_status}] ==
-    [$baseline[0][] | {command,exit_status}]
-  ' "$evidence" >/dev/null ||
-    block_run "primary baseline evidence does not match wrapper-owned baseline"
+    block_run "primary test-first evidence does not match wrapper-owned executions (exit statuses)"
+  evidence_exit_status_matches "$evidence" baseline "$RUN_ROOT/validated/baseline.json" ||
+    block_run "primary baseline evidence does not match wrapper-owned baseline (exit statuses)"
   final_commands="$(extract_validation_commands "$SPEC" "Final validation commands")"
   run_validation_commands final "$RUN_ROOT/validated/final.json" "$final_commands" "$validation_worktree" ||
     block_run "final validation commands are missing or could not run"
   assert_tools_available "$RUN_ROOT/validated/final.json" "final"
   validation_not_regressed "$RUN_ROOT/validated/baseline.json" "$RUN_ROOT/validated/final.json" ||
     block_run "final validation introduced a new or worsened failure"
-  jq -e --slurpfile final "$RUN_ROOT/validated/final.json" '
-    [.final_validation[] | {command,exit_status}] ==
-    [$final[0][] | {command,exit_status}]
-  ' "$evidence" >/dev/null ||
-    block_run "primary final evidence does not match wrapper-owned validation"
+  evidence_exit_status_matches "$evidence" final_validation "$RUN_ROOT/validated/final.json" ||
+    block_run "primary final evidence does not match wrapper-owned validation (exit statuses)"
   git -C "$PROJECT" worktree remove --force "$validation_worktree" >/dev/null ||
     block_run "candidate passed but validation worktree cleanup failed"
   state_set 'del(.validation_worktree)'
