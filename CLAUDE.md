@@ -50,8 +50,11 @@ engine/workflow git here at the root.
   Free pre-flight: append `--fixture-test --dry-run` (deterministic fixtures).
 - **Viewer**: server `cd night-shift-viewer/server && NSV_ALLOW_EDIT=1 NSV_ALLOW_LAUNCH=1 NSV_ALLOW_REAL=1 npm run dev:real`;
   web `cd ../web && npm run dev`; open http://127.0.0.1:5173. `NSV_ALLOW_REAL` = real
-  paid runs, `NSV_ALLOW_EDIT` = spec editor. The viewer scans `rn-sandbox`,
-  `web-app`, `nightshift-demo` only.
+  paid runs, `NSV_ALLOW_EDIT` = spec editor. The viewer **auto-discovers**
+  target repos under `~/work`: any sibling that is its own git repo and has opted
+  in by gitignoring `.night-shift/` (or already has a `.night-shift/` run dir).
+  Override with `NSV_PROJECT_DIRS=/abs/a:/abs/b`. A repo that does not gitignore
+  `.night-shift/` is intentionally skipped (a run there would commit artifacts).
 - A target project must gitignore `.night-shift/` and be on the spec's feature
   branch before a run. `NEXT_TASK` only continues to same-project TODO specs,
   and only on runs started *without* `--spec` (the engine picks the task from
