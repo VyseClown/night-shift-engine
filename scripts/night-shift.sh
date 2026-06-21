@@ -12,6 +12,7 @@ FIXTURE_TEST=0
 DRY_RUN=0
 FULL_PERSONA_LIVE_TEST=0
 LIST_OPTIONAL_PERSONAS=0
+PREFLIGHT=0
 MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
 MAX_STAGE_SECONDS="${NIGHT_SHIFT_MAX_STAGE_SECONDS:-3600}"
 MAX_TASK_TURNS="${NIGHT_SHIFT_MAX_TASK_TURNS:-36}"
@@ -95,6 +96,7 @@ Usage:
   scripts/night-shift.sh --fixture-test --dry-run
   scripts/night-shift.sh --fixture-test [--full-persona-live-test]
   scripts/night-shift.sh --list-optional-personas   # JSON manifest, no run
+  scripts/night-shift.sh --preflight --project PATH --spec PATH  # JSON readiness, no run
 
 Claude runs the entire flow: stage-scoped primary sessions implement (a fresh
 session per stage scope — plan, implement, observe — handing off through files
@@ -127,6 +129,7 @@ while [ "$#" -gt 0 ]; do
     --dry-run) DRY_RUN=1; shift ;;
     --full-persona-live-test) FULL_PERSONA_LIVE_TEST=1; shift ;;
     --list-optional-personas) LIST_OPTIONAL_PERSONAS=1; shift ;;
+    --preflight) PREFLIGHT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -555,6 +558,7 @@ run_dry_fixtures() {
   fixture_assert "added optional persona unions via field" fixture_optional_persona_added_field "$root"
   fixture_assert "added optional persona auto-activates via its section" fixture_optional_persona_added_section "$root"
   fixture_assert "optional-personas manifest lists all four with headings" fixture_optional_personas_manifest "$root"
+  fixture_assert "preflight reports ready only on a valid spec + feature branch" fixture_preflight_report "$root"
   fixture_assert "explicit Personas list overrides the profile (floor kept)" fixture_explicit_personas_override "$root"
   fixture_assert "explicit Personas list may name an optional reviewer" fixture_explicit_personas_with_optional "$root"
   fixture_assert "explicit Personas list rejects an off-track name" fixture_explicit_personas_unknown "$root"
@@ -1533,6 +1537,34 @@ fixture_optional_personas_manifest() {
   return 0
 }
 
+fixture_preflight_report() {
+  local root="$1" repo="$root/pf-repo" spec out
+  spec="$repo/spec.md"
+  rm -rf "$repo"; mkdir -p "$repo"
+  git -C "$repo" init -q -b main >/dev/null 2>&1 || return 1
+  git -C "$repo" config user.email t@t >/dev/null 2>&1
+  git -C "$repo" config user.name test >/dev/null 2>&1
+  printf '.night-shift/\n' >"$repo/.gitignore"
+  fixture_write_min_spec "$spec"   # valid rn spec: base main, feature feat/x
+  git -C "$repo" add -A >/dev/null 2>&1
+  git -C "$repo" commit -qm init >/dev/null 2>&1 || return 1
+  # On the base branch: valid spec but NOT ready (wrong branch).
+  out="$(emit_preflight "$repo" "$spec")" || return 1
+  printf '%s' "$out" | jq -e . >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.spec.valid == true' >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.branch.onBase == true and .branch.onFeature == false' >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.ready == false' >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.blockers | any(test("feature branch"))' >/dev/null 2>&1 || return 1
+  # Move onto the feature branch (clean tree, .night-shift ignored) → ready.
+  git -C "$repo" checkout -q -b feat/x >/dev/null 2>&1 || return 1
+  out="$(emit_preflight "$repo" "$spec")" || return 1
+  printf '%s' "$out" | jq -e '.branch.onFeature == true' >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.tree.clean == true and .gitignore.nightShiftIgnored == true' >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.ready == true and (.blockers | length == 0)' >/dev/null 2>&1 || return 1
+  rm -rf "$repo"
+  return 0
+}
+
 fixture_explicit_personas_override() {
   local root="$1" spec="$root/explicit.md" active count
   # An explicit `- Personas:` list overrides the profile: the active set is the
@@ -2233,6 +2265,75 @@ check_branch_and_worktree() {
     /^branch / { if (substr($0,8) == branch && path != project) print path }
   ')"
   [ -z "$conflicts" ]
+}
+
+# Read-only launch-readiness report for a (project, spec): is the spec valid, is
+# the project on the spec's feature branch, is the tree clean, is .night-shift
+# ignored, any worktree conflict. Reuses validate_spec + the check_branch_and_worktree
+# field logic as a REPORT (never a guard / never mutates). Emits JSON, exit 0. The
+# viewer renders this as a checklist before a (paid) run. Single source of truth.
+emit_preflight() {
+  local proj="$1" spec="$2"
+  local base feature current spec_valid spec_errors dirty nightignored
+  local on_feature on_base worktree_conflict blockers_json conflicts
+
+  # Spec validity: validate_spec prints its missing-field list to stderr and
+  # returns non-zero; capture stderr and turn the "- <field>" lines into an array.
+  local verr
+  if verr="$(validate_spec "$spec" 2>&1 >/dev/null)"; then
+    spec_valid=true
+  else
+    spec_valid=false
+  fi
+  spec_errors="$(printf '%s\n' "$verr" | sed -nE 's/^- (.*)/\1/p' | jq -R . | jq -sc .)"
+
+  base="$(sed -nE 's/^- Base branch: `([^`]+)`.*/\1/p' "$spec" | head -n 1)"
+  feature="$(sed -nE 's/^- Feature branch: `([^`]+)`.*/\1/p' "$spec" | head -n 1)"
+  current="$(git -C "$proj" branch --show-current 2>/dev/null || true)"
+  [ "$current" = "$feature" ] && [ -n "$feature" ] && on_feature=true || on_feature=false
+  [ "$current" = "$base" ] && [ -n "$base" ] && on_base=true || on_base=false
+
+  conflicts="$(git -C "$proj" worktree list --porcelain 2>/dev/null | awk -v project="$proj" -v branch="refs/heads/$feature" '
+    /^worktree / { path=substr($0,10) }
+    /^branch / { if (substr($0,8) == branch && path != project) print path }
+  ' || true)"
+  [ -z "$conflicts" ] && worktree_conflict=false || worktree_conflict=true
+
+  dirty="$(git -C "$proj" status --porcelain=v1 2>/dev/null | wc -l | tr -d ' ')"
+  [ -n "$dirty" ] || dirty=0
+  if git -C "$proj" check-ignore -q .night-shift/ 2>/dev/null; then
+    nightignored=true
+  else
+    nightignored=false
+  fi
+
+  # Blockers (newline list → JSON array). ready = no blockers.
+  local b=""
+  [ "$spec_valid" = true ] || b="${b}spec invalid"$'\n'
+  [ "$on_feature" = true ] || b="${b}not on feature branch ${feature:-?}"$'\n'
+  [ "$dirty" -eq 0 ] || b="${b}working tree dirty"$'\n'
+  [ "$nightignored" = true ] || b="${b}.night-shift not gitignored"$'\n'
+  [ "$worktree_conflict" = false ] || b="${b}feature branch checked out in another worktree"$'\n'
+  blockers_json="$(printf '%s' "$b" | sed -e '/^$/d' | jq -R . | jq -sc .)"
+  local ready=false
+  [ -z "$b" ] && ready=true
+
+  jq -n \
+    --argjson spec_valid "$spec_valid" --argjson spec_errors "$spec_errors" \
+    --arg base "$base" --arg feature "$feature" --arg current "$current" \
+    --argjson on_feature "$on_feature" --argjson on_base "$on_base" \
+    --argjson worktree_conflict "$worktree_conflict" \
+    --argjson dirty "$dirty" --argjson nightignored "$nightignored" \
+    --argjson ready "$ready" --argjson blockers "$blockers_json" \
+    '{
+      spec: { valid: $spec_valid, errors: $spec_errors },
+      branch: { base: $base, feature: $feature, current: $current,
+                onFeature: $on_feature, onBase: $on_base, worktreeConflict: $worktree_conflict },
+      tree: { clean: ($dirty == 0), dirtyCount: $dirty },
+      gitignore: { nightShiftIgnored: $nightignored },
+      ready: $ready,
+      blockers: $blockers
+    }'
 }
 
 extract_validation_commands() {
@@ -3595,6 +3696,16 @@ main_run() {
 }
 
 require_command jq
+if [ "$PREFLIGHT" -eq 1 ]; then
+  require_command git
+  [ -n "$PROJECT" ] || die "--preflight requires --project"
+  [ -n "$SPEC" ] || die "--preflight requires --spec"
+  [ -e "$SPEC" ] || die "spec not found: $SPEC"
+  git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "project is not a Git repository: $PROJECT"
+  emit_preflight "$PROJECT" "$SPEC"
+  exit 0
+fi
 if [ "$FIXTURE_TEST" -eq 1 ]; then
   run_dry_fixtures
   if [ "$DRY_RUN" -eq 0 ]; then run_live_fixtures; fi
