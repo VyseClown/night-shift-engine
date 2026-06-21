@@ -8,11 +8,12 @@ This file is the entry point for any AI agent (Claude Code, Codex, or subagent) 
 
 ## What This Workspace Is
 
-A multi-project development environment spanning two **tracks**: **React Native**
-(mobile, iOS/Android — Expo or bare) and **web** (Next.js / React). The shared
-stack is TypeScript; the developer works in Ghostty on macOS (Apple Silicon).
-Each spec declares its track (`- Track: rn | web`, default `rn`), which selects
-the review persona set and the validation checklist below. See the per-project
+A multi-project development environment spanning three **tracks**: **React
+Native** (mobile, iOS/Android — Expo or bare), **web** (Next.js / React), and
+**node** (plain Node / CLI / backend repos with no UI surface). The shared stack
+is TypeScript; the developer works in Ghostty on macOS (Apple Silicon). Each spec
+declares its track (`- Track: rn | web | node`, default `rn`), which selects the
+review persona set and the validation checklist below. See the per-project
 `CLAUDE.md` for a project's exact stack and commands.
 
 ---
@@ -170,6 +171,19 @@ npm run build                  # 4. Build (catches RSC/route/type errors)
 npm run test:e2e               # 5. E2E (when the change has user-facing flow impact)
 ```
 
+**Node / CLI / backend track (`Track: node`):**
+
+For plain Node/CLI/backend repos that are neither RN nor web (no UI surface). The
+exact tools vary per project — defer to the project's `CLAUDE.md` and the spec's
+own validation commands; these are sensible defaults.
+
+```bash
+npx tsc --noEmit               # 1. Type errors (skip for plain-JS projects)
+npm run lint                   # 2. Lint warnings (eslint or the project's linter)
+node --test                    # 3. Test suite (or npm test / the project's runner)
+npm run build                  # 4. Build/package (only if the project produces one)
+```
+
 If any step fails: fix it, re-run from step 1. Do not commit with failures.
 
 ---
@@ -191,7 +205,11 @@ which of those personas review the plan and implementation (see the chosen file
 for the profile→persona table). The mandatory floor runs in every profile and
 differs by track: for `rn` it is React Native Architect, TypeScript & Code
 Quality Expert, and Human Advocate; for `web` it is Web Architect, TypeScript &
-Code Quality Expert, and Human Advocate. `full` runs all six in the track. Each
+Code Quality Expert, and Human Advocate; for `node` it is Backend & Data Expert,
+TypeScript & Code Quality Expert, and Human Advocate. `full` runs the whole track
+set (six for `rn`/`web`, four for `node`); the `node` track has no UI surface, so
+it carries no UX/accessibility persona and offers only the `full` and `logic`
+profiles. Each
 active persona owns its corresponding documentation assessment. Every finding is
 a blocker; progress requires an approval from each active persona. Approvals do
 not expire: a re-review round re-runs only the personas with open findings (each

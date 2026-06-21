@@ -529,6 +529,7 @@ run_dry_fixtures() {
   fixture_assert "web spec validates without native permission lines" fixture_spec_validation_web "$root"
   fixture_assert "review profile resolves to floor + scoped personas" fixture_review_profile "$root"
   fixture_assert "web track resolves to web personas + floor" fixture_review_profile_web "$root"
+  fixture_assert "node track resolves to backend personas, no UX, no UI profiles" fixture_review_profile_node "$root"
   fixture_assert "persona gate enforces the active profile set" fixture_profile_gate "$root"
   fixture_assert "re-review rounds require only pending blockers" fixture_review_round_subset "$root"
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
@@ -1049,6 +1050,31 @@ fixture_review_profile_web() {
   # A missing Track field defaults to rn, so the rn-only native profile resolves.
   spec="$root/notrack.md"; printf -- '- Review Profile: native\n' >"$spec"
   resolve_active_personas "$spec" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+fixture_review_profile_node() {
+  local root="$1" set spec
+  # node `full` = the whole node set (4): Backend & Data Expert stands in for the
+  # architecture role; there is NO UX/accessibility persona (no UI surface).
+  set="$(profile_personas full node)" || return 1
+  [ "$(printf '%s' "$set" | tr '|' '\n' | grep -c .)" -eq 4 ] || return 1
+  printf '%s' "$set" | grep -q "Backend & Data Expert" || return 1
+  printf '%s' "$set" | grep -q "Performance Expert" || return 1
+  printf '%s' "$set" | grep -q "UX" && return 1
+  # node `logic` = floor + Performance Expert; floor includes the backend expert.
+  set="$(profile_personas logic node)" || return 1
+  printf '%s' "$set" | grep -q "Backend & Data Expert" || return 1
+  printf '%s' "$set" | grep -q "Performance Expert" || return 1
+  # UI-/data-specific profiles are not valid on the node track.
+  profile_personas frontend node && return 1
+  profile_personas native node && return 1
+  profile_personas data node && return 1
+  # node exposes exactly the two generic profiles.
+  [ "$(valid_profiles_for_track node)" = "full, logic" ] || return 1
+  # A spec declaring Track: node resolves to the node set (4 for full).
+  spec="$root/node.md"; printf -- '- Track: node\n- Review Profile: full\n' >"$spec"
+  [ "$(resolve_active_personas "$spec" | tr '|' '\n' | grep -c .)" -eq 4 ] || return 1
   return 0
 }
 
@@ -2174,7 +2200,7 @@ validate_spec() {
         if persona_set "$track" >/dev/null 2>&1; then
           missing="${missing}\n- valid Review Profile for track ${track} (one of: $(valid_profiles_for_track "$track"))"
         else
-          missing="${missing}\n- valid Track (one of: rn, web)"
+          missing="${missing}\n- valid Track (one of: rn, web, node)"
         fi ;;
     esac
   else

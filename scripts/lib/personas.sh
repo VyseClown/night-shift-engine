@@ -9,13 +9,19 @@
 # state beyond the constants below — which is why it carries the bulk of the
 # deterministic fixture suite.
 
-# Persona sets per track. A spec's `- Track:` field (rn | web, default rn)
-# selects which set and floor apply, so a React Native spec and a web spec each
-# get reviewers that fit their stack. PERSONAS (the union) is used ONLY for the
-# persona-review schema membership check; the per-track sets + floors below drive
-# which personas a spec actually runs (see profile_personas/resolve_active_personas).
+# Persona sets per track. A spec's `- Track:` field (rn | web | node, default rn)
+# selects which set and floor apply, so a React Native spec, a web spec and a
+# plain Node/CLI/backend spec each get reviewers that fit their stack. PERSONAS
+# (the union) is used ONLY for the persona-review schema membership check; the
+# per-track sets + floors below drive which personas a spec actually runs (see
+# profile_personas/resolve_active_personas).
 PERSONAS_RN="Mobile UX Designer|React Native Architect|Mobile Domain Expert|TypeScript & Code Quality Expert|Performance Expert|Human Advocate"
 PERSONAS_WEB="Web UX & Accessibility Designer|Web Architect|Backend & Data Expert|TypeScript & Code Quality Expert|Performance Expert|Human Advocate"
+# The `node` track is for plain Node / CLI / backend repos that are neither RN
+# nor web (no UI surface, so no UX/accessibility persona). It reuses existing
+# personas — Backend & Data Expert stands in for the architecture role — so it
+# adds nothing to the PERSONAS union or the persona-review schema enum.
+PERSONAS_NODE="Backend & Data Expert|TypeScript & Code Quality Expert|Performance Expert|Human Advocate"
 # Optional, cross-track personas. They never run unless a spec opts in (an
 # `- Optional reviewers:` field listing them, or a matching contract section —
 # see optional_contract_heading / resolve_active_personas). They add nothing to
@@ -31,6 +37,7 @@ PERSONAS="Mobile UX Designer|React Native Architect|Mobile Domain Expert|Web UX 
 # the resolver asserts it at runtime.
 PERSONA_FLOOR_RN="React Native Architect|TypeScript & Code Quality Expert|Human Advocate"
 PERSONA_FLOOR_WEB="Web Architect|TypeScript & Code Quality Expert|Human Advocate"
+PERSONA_FLOOR_NODE="Backend & Data Expert|TypeScript & Code Quality Expert|Human Advocate"
 # Default track for specs that omit the `- Track:` field (backward compatible:
 # every existing React Native spec keeps resolving to the RN persona set).
 DEFAULT_TRACK="rn"
@@ -39,25 +46,28 @@ DEFAULT_TRACK="rn"
 # list. An unknown track returns non-zero so callers can reject it.
 persona_set() {
   case "$1" in
-    rn)  printf '%s' "$PERSONAS_RN" ;;
-    web) printf '%s' "$PERSONAS_WEB" ;;
-    *)   return 1 ;;
+    rn)   printf '%s' "$PERSONAS_RN" ;;
+    web)  printf '%s' "$PERSONAS_WEB" ;;
+    node) printf '%s' "$PERSONAS_NODE" ;;
+    *)    return 1 ;;
   esac
 }
 
 persona_floor() {
   case "$1" in
-    rn)  printf '%s' "$PERSONA_FLOOR_RN" ;;
-    web) printf '%s' "$PERSONA_FLOOR_WEB" ;;
-    *)   return 1 ;;
+    rn)   printf '%s' "$PERSONA_FLOOR_RN" ;;
+    web)  printf '%s' "$PERSONA_FLOOR_WEB" ;;
+    node) printf '%s' "$PERSONA_FLOOR_NODE" ;;
+    *)    return 1 ;;
   esac
 }
 
 valid_profiles_for_track() {
   case "$1" in
-    rn)  printf 'full, frontend, logic, native' ;;
-    web) printf 'full, frontend, logic, data' ;;
-    *)   return 1 ;;
+    rn)   printf 'full, frontend, logic, native' ;;
+    web)  printf 'full, frontend, logic, data' ;;
+    node) printf 'full, logic' ;;
+    *)    return 1 ;;
   esac
 }
 
@@ -209,7 +219,7 @@ resolve_active_personas() {
   local file="$1" profile track set floor persona old_ifs optional explicit
   track="$(spec_track "$file")"
   persona_set "$track" >/dev/null 2>&1 ||
-    { printf 'unknown Track "%s"; valid: rn, web\n' "$track" >&2; return 1; }
+    { printf 'unknown Track "%s"; valid: rn, web, node\n' "$track" >&2; return 1; }
   floor="$(persona_floor "$track")"
   # Explicit per-spec override. A `- Personas:` field names the exact specialists
   # to run; the active set is the floor plus those names. The Review Profile is

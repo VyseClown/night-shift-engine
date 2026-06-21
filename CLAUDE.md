@@ -76,10 +76,14 @@ engine/workflow git here at the root.
   absent any of these it cleanly SKIPs. The viewer renders the per-screen
   reference/implementation/diff images, diff%, analysis, and attempt history.
 
-> **Note:** the night-shift workflow is two-track. A spec declares `- Track: rn`
-> or `- Track: web` (default `rn`), which selects the review persona set
-> (`docs/review-personas.md` vs `docs/review-personas-web.md`), the spec template
+> **Note:** the night-shift workflow is multi-track. A spec declares `- Track: rn`,
+> `- Track: web`, or `- Track: node` (default `rn`), which selects the review
+> persona set (`docs/review-personas.md` for `rn`, `docs/review-personas-web.md`
+> for `web`; `node` reuses existing backend personas — Backend & Data Expert,
+> TypeScript & Code Quality Expert, Performance Expert, Human Advocate — with no
+> UX persona and only the `full`/`logic` profiles), the spec template
 > (`specs/_template.md` vs `specs/_template-web.md`), and the matching Validation
 > Checklist in `AGENTS.md`. `rn-sandbox` is the `rn` track; `web-app` is the
-> `web` track. Always use each project's own `CLAUDE.md` for its real commands.
-> The night-shift process rules in `AGENTS.md` apply to both tracks.
+> `web` track; plain Node/CLI repos (e.g. `slack-status`) are the `node` track.
+> Always use each project's own `CLAUDE.md` for its real commands. The night-shift
+> process rules in `AGENTS.md` apply to all tracks.
