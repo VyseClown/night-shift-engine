@@ -13,6 +13,7 @@ DRY_RUN=0
 FULL_PERSONA_LIVE_TEST=0
 LIST_OPTIONAL_PERSONAS=0
 PREFLIGHT=0
+RESUME=0
 MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
 MAX_STAGE_SECONDS="${NIGHT_SHIFT_MAX_STAGE_SECONDS:-3600}"
 MAX_TASK_TURNS="${NIGHT_SHIFT_MAX_TASK_TURNS:-36}"
@@ -97,6 +98,7 @@ Usage:
   scripts/night-shift.sh --fixture-test [--full-persona-live-test]
   scripts/night-shift.sh --list-optional-personas   # JSON manifest, no run
   scripts/night-shift.sh --preflight --project PATH --spec PATH  # JSON readiness, no run
+  scripts/night-shift.sh --project PATH [--spec PATH] --resume    # resume a preserved blocked run
 
 Claude runs the entire flow: stage-scoped primary sessions implement (a fresh
 session per stage scope — plan, implement, observe — handing off through files
@@ -130,6 +132,7 @@ while [ "$#" -gt 0 ]; do
     --full-persona-live-test) FULL_PERSONA_LIVE_TEST=1; shift ;;
     --list-optional-personas) LIST_OPTIONAL_PERSONAS=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
+    --resume) RESUME=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -381,6 +384,17 @@ recoverable_rate_limit_state() {
   fi
 }
 
+# True when an explicit `--resume` may re-enter a logic-blocked run: status is
+# "blocked", it is NOT a rate-limit block (no rate_limit_reset_at), and a session_id
+# is present. The primary match is enforced by the caller. Operator-gated — never
+# consulted unless --resume was passed, so a recurring block cannot auto-loop.
+resumable_blocked_state() {
+  local state="$1"
+  [ "$(jq -r '.status' "$state")" = "blocked" ] || return 1
+  [ "$(jq -r '.rate_limit_reset_at // empty' "$state")" = "" ] || return 1
+  [ -n "$(jq -r '.session_id // empty' "$state")" ] || return 1
+}
+
 wait_for_rate_limit_reset() {
   local raw="$1" reference reset_epoch deadline now wait_seconds stage_active task_active
   reference="$(file_mtime_epoch "$raw")" || reference="$(now_epoch)"
@@ -560,6 +574,7 @@ run_dry_fixtures() {
   fixture_assert "optional-personas manifest lists all four with headings" fixture_optional_personas_manifest "$root"
   fixture_assert "preflight reports ready only on a valid spec + feature branch" fixture_preflight_report "$root"
   fixture_assert "evidence verify matches on exit status, ignores command-string transcription" fixture_evidence_exit_status_match "$root"
+  fixture_assert "resumable_blocked_state gates --resume to logic-blocked, session-bearing state" fixture_resume_blocked "$root"
   fixture_assert "explicit Personas list overrides the profile (floor kept)" fixture_explicit_personas_override "$root"
   fixture_assert "explicit Personas list may name an optional reviewer" fixture_explicit_personas_with_optional "$root"
   fixture_assert "explicit Personas list rejects an off-track name" fixture_explicit_personas_unknown "$root"
@@ -1563,6 +1578,23 @@ fixture_preflight_report() {
   printf '%s' "$out" | jq -e '.tree.clean == true and .gitignore.nightShiftIgnored == true' >/dev/null 2>&1 || return 1
   printf '%s' "$out" | jq -e '.ready == true and (.blockers | length == 0)' >/dev/null 2>&1 || return 1
   rm -rf "$repo"
+  return 0
+}
+
+fixture_resume_blocked() {
+  local root="$1" state="$root/rb-state.json"
+  # blocked, not rate-limit, session present → resumable via --resume.
+  printf '%s\n' '{"status":"blocked","session_id":"sid-1","block_reason":"primary baseline evidence does not match wrapper-owned baseline (exit statuses)"}' >"$state"
+  resumable_blocked_state "$state" || return 1
+  # blocked but no session_id → not resumable (can't safely re-enter).
+  printf '%s\n' '{"status":"blocked","block_reason":"x"}' >"$state"
+  resumable_blocked_state "$state" && return 1
+  # rate-limit block (rate_limit_reset_at set) → handled by the rate-limit path, not this one.
+  printf '%s\n' '{"status":"blocked","session_id":"sid-1","rate_limit_reset_at":"2026-01-01T00:00:00Z"}' >"$state"
+  resumable_blocked_state "$state" && return 1
+  # running → not a blocked-resume case at all.
+  printf '%s\n' '{"status":"running","session_id":"sid-1"}' >"$state"
+  resumable_blocked_state "$state" && return 1
   return 0
 }
 
@@ -2591,7 +2623,7 @@ initialize_run() {
 }
 
 recover_run() {
-  local status recovery_raw pt
+  local status recovery_raw pt resume_block=0
   RUN_ROOT="$PROJECT/.night-shift"
   STATE="$RUN_ROOT/state.json"
   [ -f "$STATE" ] || return 1
@@ -2603,7 +2635,13 @@ recover_run() {
     block_run "state field .primary_turns is not a valid integer; state may be corrupt"
   recovery_raw="$RUN_ROOT/raw/primary-$(( pt + 1 )).json"
   if [ "$status" != "running" ]; then
-    recoverable_rate_limit_state "$STATE" "$recovery_raw" || return 1
+    if recoverable_rate_limit_state "$STATE" "$recovery_raw"; then
+      :
+    elif [ "$RESUME" -eq 1 ] && resumable_blocked_state "$STATE"; then
+      resume_block=1
+    else
+      return 1
+    fi
   fi
   [ "$(jq -r '.primary' "$STATE")" = "$PRIMARY" ] ||
     die "existing run belongs to primary $(jq -r '.primary' "$STATE")"
@@ -2617,7 +2655,15 @@ recover_run() {
   cleanup_validation_worktree ||
     die "could not clean the interrupted candidate validation worktree"
   log "recovering run $RUN_ID at stage $(jq -r '.stage' "$STATE") with explicit session $(jq -r '.session_id' "$STATE")"
-  if [ "$status" != "running" ]; then
+  if [ "$resume_block" -eq 1 ]; then
+    # Operator-initiated --resume of a logic-blocked run: clear the block and rebase
+    # the clocks. plan/implementation approvals and the recorded stage are kept, so
+    # the primary re-enters that stage and retries only the step that blocked.
+    log "resuming blocked run $RUN_ID at stage $(jq -r '.stage' "$STATE") (--resume); clearing block_reason"
+    state_set '.status="running" | del(.block_reason) |
+      .stage_started_at=$now | .task_started_at=$now | .stage_started[.stage]=$now | .updated_at=$iso' \
+      --argjson now "$(now_epoch)" --arg iso "$(now_iso)"
+  elif [ "$status" != "running" ]; then
     wait_for_rate_limit_reset "$recovery_raw"
   else
     # Normal resume: the gap since the run was interrupted must not count against
@@ -3693,6 +3739,10 @@ main_run() {
   if recover_run; then
     :
   else
+    # --resume must never silently fall through to a fresh run: if recovery found
+    # nothing resumable, that is an operator error, not a cue to start over.
+    [ "$RESUME" -eq 0 ] ||
+      die "--resume: no resumable blocked run for this project (state missing, not blocked, rate-limited, or session/primary mismatch)"
     if [ -z "$SPEC" ]; then
       SPEC="$(select_task_from_todo "$WORKSPACE_ROOT/TODO.md")" ||
         die "no unfinished bug or feature entry in TODO.md and no --spec supplied"
