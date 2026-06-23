@@ -113,6 +113,7 @@ run_dry_fixtures() {
   fixture_assert "persona collection skips non-persona artifacts" fixture_persona_collect "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
+  fixture_assert "set_stage resets review_round at scope boundaries (GH #18)" fixture_stage_round_reset "$root"
   fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
   fixture_assert "visual_review prompt signals engine-invoked RUN_VISUAL (no agent capture)" fixture_visual_review_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
@@ -853,6 +854,33 @@ fixture_stage_session_reset() {
   printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"session_id":"sess-3"}\n' >"$STATE"
   set_stage implementation >/dev/null 2>&1
   [ "$(jq -r '.session_id' "$STATE")" = "sess-3" ] || return 1
+  return 0
+}
+
+# Regression for GH #18: persona review rounds are numbered per stage scope, so
+# review_round must reset to 0 (and any carried pending blockers drop) when the
+# stage SCOPE changes — otherwise a plan re-review round leaves the counter ahead
+# and the implementation gate reads an empty round dir, blocking the run forever.
+fixture_stage_round_reset() {
+  local root="$1" dir="$root/round-reset"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" RUN_ROOT="$dir" SESSION_SCOPE=stage
+  # Cross-scope (plan_review -> implementation) resets the round + drops pending.
+  printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"review_round":2,"pending_personas":"Human Advocate","pending_stage":"plan"}\n' >"$STATE"
+  set_stage implementation >/dev/null 2>&1
+  [ "$(jq -r '.review_round' "$STATE")" = "0" ] || return 1
+  [ "$(jq -r '.pending_personas // "gone"' "$STATE")" = "gone" ] || return 1
+  [ "$(jq -r '.pending_stage // "gone"' "$STATE")" = "gone" ] || return 1
+  # Same-scope (implementation -> implementation_review) preserves the round so an
+  # in-stage re-review increments correctly.
+  printf '{"stage":"implementation","stage_turns":1,"stage_counters":{},"review_round":1}\n' >"$STATE"
+  set_stage implementation_review >/dev/null 2>&1
+  [ "$(jq -r '.review_round' "$STATE")" = "1" ] || return 1
+  # Scope-based, NOT session-based: legacy run mode still resets on a scope change.
+  SESSION_SCOPE=run
+  printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"review_round":2}\n' >"$STATE"
+  set_stage implementation >/dev/null 2>&1
+  [ "$(jq -r '.review_round' "$STATE")" = "0" ] || return 1
   return 0
 }
 
