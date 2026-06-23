@@ -18,6 +18,11 @@ MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
 MAX_STAGE_SECONDS="${NIGHT_SHIFT_MAX_STAGE_SECONDS:-3600}"
 MAX_TASK_TURNS="${NIGHT_SHIFT_MAX_TASK_TURNS:-36}"
 MAX_TASK_SECONDS="${NIGHT_SHIFT_MAX_TASK_SECONDS:-10800}"
+# Cap on consecutive malformed or absent primary signals. A primary stuck
+# emitting junk would otherwise burn up to MAX_TASK_TURNS paid turns before any
+# stop; this fails fast. The counter resets on the first valid signal, so a
+# healthy run (which produces a valid signal almost every turn) never trips it.
+MAX_MALFORMED_SIGNALS="${NIGHT_SHIFT_MAX_MALFORMED_SIGNALS:-5}"
 RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
 # Sanity ceiling on a rate-limit wait. A genuine session limit resets within a
 # few hours; a wait longer than this almost certainly means the reset time was
@@ -485,6 +490,13 @@ limit_exceeded() {
     [ "$stage_elapsed" -ge "$MAX_STAGE_SECONDS" ] ||
     [ "$task_turns" -ge "$MAX_TASK_TURNS" ] ||
     [ "$task_elapsed" -ge "$MAX_TASK_SECONDS" ]
+}
+
+# Pure predicate: true when the consecutive malformed/absent-signal count has
+# reached the cap and the run should block. Extracted (like limit_exceeded) so
+# the loop's abort decision is unit-testable without the live model loop.
+malformed_cap_reached() {
+  [ "$1" -ge "$MAX_MALFORMED_SIGNALS" ]
 }
 
 # A command that exits 127 was not found; missing tooling must never look like a
@@ -994,7 +1006,8 @@ initialize_run() {
       base_commit:$base,base_branch:$branch,baseline_status:$baseline_status,
       plan_approved:false,implementation_approved:false,
       candidate_verified:false,baseline_complete:false,
-      stage_counters:{planning:0},stage_started:{planning:$epoch}
+      stage_counters:{planning:0},stage_started:{planning:$epoch},
+      malformed_signal_consecutive:0
     }' \
     --arg run_id "$RUN_ID" --arg primary "$PRIMARY" --arg observer "$OBSERVER" \
     --arg task "$SPEC" --argjson epoch "$(now_epoch)" --arg iso "$(now_iso)" \
@@ -2167,16 +2180,31 @@ main_run() {
   fi
   trap 'block_run "run interrupted by signal"' HUP INT TERM
 
+  local malformed_n rc
   while :; do
     invoke_primary
     if validate_signal; then
+      # Valid signal: clear the consecutive-malformed counter (only write when
+      # nonzero to avoid a needless state churn on the common path), then act.
+      malformed_n="$(state_int '.malformed_signal_consecutive // 0')" || malformed_n=0
+      [ "$malformed_n" -eq 0 ] ||
+        state_set '.malformed_signal_consecutive=0 | .updated_at=$now' --arg now "$(now_iso)"
       handle_signal
     else
       rc=$?
+      # Malformed (rc=1) or absent (rc=2) signal: count it and abort once a
+      # primary has produced MAX_MALFORMED_SIGNALS in a row with no valid signal
+      # between, instead of grinding the whole turn budget on junk.
+      malformed_n="$(state_int '.malformed_signal_consecutive // 0')" || malformed_n=0
+      malformed_n=$((malformed_n + 1))
+      state_set '.malformed_signal_consecutive=$n | .updated_at=$now' \
+        --argjson n "$malformed_n" --arg now "$(now_iso)"
+      ! malformed_cap_reached "$malformed_n" ||
+        block_run "primary produced $malformed_n consecutive malformed/absent signals (cap $MAX_MALFORMED_SIGNALS); aborting to avoid burning the turn budget"
       if [ "$rc" -eq 1 ]; then
-        log "primary signal malformed; continuing same explicit session for correction"
+        log "primary signal malformed ($malformed_n/$MAX_MALFORMED_SIGNALS consecutive); continuing same explicit session for correction"
       else
-        log "primary produced no signal; continuing same explicit session"
+        log "primary produced no signal ($malformed_n/$MAX_MALFORMED_SIGNALS consecutive); continuing same explicit session"
       fi
     fi
   done
