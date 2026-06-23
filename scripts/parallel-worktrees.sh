@@ -38,9 +38,9 @@ die() { printf '[parallel] ERROR: %s\n' "$*" >&2; exit 1; }
 # ---- args -----------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
-    --project)       PROJECT="$2"; shift 2 ;;
-    --jobs)          JOBS="$2";    shift 2 ;;
-    --worktree-root) WT_ROOT="$2"; shift 2 ;;
+    --project)       [ $# -ge 2 ] || die "--project requires a value";       PROJECT="$2"; shift 2 ;;
+    --jobs)          [ $# -ge 2 ] || die "--jobs requires a value";          JOBS="$2";    shift 2 ;;
+    --worktree-root) [ $# -ge 2 ] || die "--worktree-root requires a value"; WT_ROOT="$2"; shift 2 ;;
     --prune)         PRUNE=1;      shift ;;
     --dry-run)       DRY_RUN=1;    shift ;;
     -h|--help)       grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -82,6 +82,12 @@ run_one() {
 
   # Create (or reuse) the worktree on the spec's feature branch.
   if [ -d "$wt" ]; then
+    # A git worktree always has a `.git` gitfile at its root; a stale plain
+    # directory (e.g. from a partially-removed worktree) does not. Checking
+    # `rev-parse --is-inside-work-tree` would wrongly pass when WT_ROOT itself
+    # sits inside an enclosing repo (the default <project>/../.ns-worktrees does).
+    [ -e "$wt/.git" ] \
+      || { log "FAIL $wt exists but is not a git worktree; remove it or use --worktree-root"; return 3; }
     log "reuse worktree $wt"
   elif git -C "$PROJECT" show-ref --verify --quiet "refs/heads/$feature"; then
     git -C "$PROJECT" worktree add "$wt" "$feature"            >>"$logf" 2>&1 \
@@ -100,6 +106,12 @@ run_one() {
   log "[$feature] launching run -> $logf"
   NIGHT_SHIFT_ACCEPT_COSTS=YES "$ENGINE" --project "$wt" --spec "$spec" >>"$logf" 2>&1
 }
+
+# Heal stale registrations: if a worktree dir was removed out-of-band (rm -rf,
+# external cleanup) git still lists it and `worktree add` would fail with
+# "missing but already registered". prune only drops entries whose dir is gone,
+# so a worktree a live instance is using is never touched.
+git -C "$PROJECT" worktree prune 2>/dev/null || true
 
 # ---- bounded fan-out (bash 3.2: parallel indexed arrays, poll to reap) -----
 PIDS=()
