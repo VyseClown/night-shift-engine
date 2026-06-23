@@ -604,6 +604,7 @@ run_dry_fixtures() {
   fixture_assert "device_registry_prune reclaims stale locks + orphan clones" fixture_device_prune "$root"
   fixture_assert "run_visual_capture registry mode claims, caches, releases" fixture_visual_capture_registry_claim "$root"
   fixture_assert "registry-off: no claim, no artifacts" fixture_visual_registry_off_no_artifacts "$root"
+  fixture_assert "visual_review prunes the registry only in registry mode" fixture_visual_prune_guarded "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1974,6 +1975,24 @@ fixture_visual_registry_off_no_artifacts() {
     _ns_reg=0; _ns_cache_dir=""
     [ -z "$(__visual_udid_for_label iphone-15)" ] || exit 1
     [ -d "$stub/reg" ] && exit 1
+    exit 0
+  )
+}
+
+fixture_visual_prune_guarded() {
+  local root="$1"
+  (
+    # Shadow the real prune with a marker writer.
+    device_registry_prune() { printf 'pruned\n' >"$root/pruned.marker"; }
+    # Registry OFF: guard must NOT call prune.
+    rm -f "$root/pruned.marker"
+    ( unset NIGHT_SHIFT_DEVICE_REGISTRY
+      [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune; true )
+    [ -f "$root/pruned.marker" ] && exit 1
+    # Registry ON: guard MUST call prune.
+    NIGHT_SHIFT_DEVICE_REGISTRY=1
+    [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune
+    [ -f "$root/pruned.marker" ] || exit 1
     exit 0
   )
 }
@@ -3771,6 +3790,7 @@ visual_stage_enabled() {
 # concern, not the gate's -- a failing report still goes to the observer as evidence.
 run_visual() {
   local report
+  [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune
   report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
   [ -s "$report" ] ||
     block_run "RUN_VISUAL but $report is missing or empty"
