@@ -132,9 +132,9 @@ __visual_resolve_udid() {
 # Capture <screen> <state> <device> -> PNG at $4. Requires xcrun. Returns 2 when
 # unavailable so run_visual_capture degrades cleanly.
 __visual_capture_screenshot() {
-  local screen="$1" state="$2" device="$3" out="$4"
+  local screen="$1" state="$2" device="$3" out="$4" udid="${5:-}"
   command -v xcrun >/dev/null 2>&1 || return 2
-  local udid; udid="$(__visual_resolve_udid "$device")"
+  [ -n "$udid" ] || udid="$(__visual_resolve_udid "$device")"
   [ -n "$udid" ] || return 2
   xcrun simctl boot "$udid" >/dev/null 2>&1 || true
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true

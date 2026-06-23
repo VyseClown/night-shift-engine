@@ -595,6 +595,7 @@ run_dry_fixtures() {
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
+  fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
   fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
@@ -1328,6 +1329,39 @@ fixture_visual_pick_udid() {
   [ "$(printf '%s' "$js2" | __visual_pick_udid iphone-15-pro-max)" = "DDD" ] || return 1
   # no label match -> first Booted
   [ "$(printf '%s' "$js" | __visual_pick_udid no-such-device)" = "AAA" ] || return 1
+}
+
+fixture_visual_capture_udid_arg() {
+  local root="$1" d="$root/vcu"
+  mkdir -p "$d/bin"
+  # Minimal xcrun: log the udid passed to `simctl boot`, succeed otherwise.
+  # `simctl io ... screenshot <out>` writes a 1-byte file so capture returns 0.
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+log="$d/boot.log"
+shift  # drop "simctl"
+case "\$1" in
+  boot) printf 'boot %s\n' "\$2" >>"\$log" ;;
+  io)   printf x >"\${!#}" ;;   # last arg is the screenshot output path
+esac
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun"
+  (
+    export PATH="$d/bin:$PATH" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0
+    # Sentinel resolver: if internal resolution is (wrongly) used with an explicit
+    # udid, the boot log would contain RESOLVED-SENTINEL.
+    __visual_resolve_udid() { printf 'RESOLVED-SENTINEL\n'; }
+    # (a) explicit udid is used, resolver NOT consulted.
+    __visual_capture_screenshot home default iphone-15 "$d/a.png" EXPLICIT-UDID || exit 1
+    grep -q 'boot EXPLICIT-UDID' "$d/boot.log" || exit 1
+    grep -q 'RESOLVED-SENTINEL' "$d/boot.log" && exit 1
+    # (b) no explicit udid -> resolver used.
+    : >"$d/boot.log"
+    __visual_capture_screenshot home default iphone-15 "$d/b.png" || exit 1
+    grep -q 'boot RESOLVED-SENTINEL' "$d/boot.log" || exit 1
+    exit 0
+  )
 }
 
 fixture_observer_cost_capture() {
