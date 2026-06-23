@@ -596,6 +596,7 @@ run_dry_fixtures() {
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
+  fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1802,6 +1803,23 @@ fixture_device_registry_root() {
   # Override env wins.
   [ "$(NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$root/reg" device_registry_root)" = "$root/reg" ] || return 1
   return 0
+}
+
+fixture_device_try_claim() {
+  local root="$1" stub="$root/dtc"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    # candidates returns both UDIDs for the label.
+    [ "$(device_candidates iphone-15 | tr '\n' ',' )" = "UDID-AAA,UDID-BBB," ] || exit 1
+    # first claim of AAA succeeds; a second claim of AAA fails (held).
+    device_try_claim UDID-AAA run-A false || exit 1
+    device_try_claim UDID-AAA run-B false && exit 1
+    # a stale lock (dead PID) is reclaimable.
+    printf '99998\n' >"$stub/reg/UDID-AAA.lock/pid"
+    device_try_claim UDID-AAA run-C false || exit 1
+    exit 0
+  )
 }
 
 # ---------------------------------------------------------------------------
