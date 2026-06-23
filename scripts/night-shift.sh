@@ -599,6 +599,8 @@ run_dry_fixtures() {
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
   fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
   fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
+  fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
+  fixture_assert "device_registry_prune reclaims stale locks + orphan clones" fixture_device_prune "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1855,6 +1857,45 @@ JSON
     [ "$b" = "UDID-CLONE-ns-run-B" ] || exit 1     # stub clone udid
     grep -q "clone UDID-AAA ns-run-B" "$stub/calls.log" || exit 1
     [ "$(cat "$stub/reg/$b.lock/clone")" = "true" ] || exit 1
+    exit 0
+  )
+}
+
+fixture_device_release() {
+  local root="$1" stub="$root/drl"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
+    device_try_claim UDID-AAA run-A false || exit 1     # real device
+    device_release UDID-AAA
+    [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1          # lock removed
+    grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1   # NOT deleted (real)
+    device_try_claim UDID-CLONE-x run-B true || exit 1  # a clone
+    device_release UDID-CLONE-x
+    grep -q "delete UDID-CLONE-x" "$stub/calls.log" || exit 1  # clone deleted
+    exit 0
+  )
+}
+
+fixture_device_prune() {
+  local root="$1" stub="$root/dpr"
+  fixture_make_simctl_stub "$stub"
+  # devices list contains an orphan ns-* clone with NO lock.
+  cat >"$stub/devices.json" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "iPhone 15", "udid": "UDID-AAA", "state": "Shutdown", "isAvailable": true },
+  { "name": "ns-run-OLD", "udid": "UDID-ORPHAN", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    mkdir -p "$stub/reg/UDID-AAA.lock"; printf '99998\n' >"$stub/reg/UDID-AAA.lock/pid"
+    printf 'false\n' >"$stub/reg/UDID-AAA.lock/clone"      # stale real lock
+    device_registry_prune
+    grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1  # non-clone stale lock must NOT be deleted
+    [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1             # stale lock reclaimed
+    grep -q "delete UDID-ORPHAN" "$stub/calls.log" || exit 1  # orphan clone deleted
     exit 0
   )
 }

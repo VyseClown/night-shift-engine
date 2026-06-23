@@ -71,3 +71,38 @@ device_claim() {
     sleep "$poll"
   done
 }
+
+# Release a claimed device: delete it if it was a clone; remove the lock only if
+# we own it (PID match), mirroring release_lock.
+device_release() {
+  local udid="$1" reg lock
+  reg="$(device_registry_root)"; lock="$reg/$udid.lock"
+  [ -d "$lock" ] || return 0
+  [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ] || return 0
+  if [ "$(cat "$lock/clone" 2>/dev/null)" = "true" ]; then
+    xcrun simctl delete "$udid" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$lock"
+}
+
+# Startup self-heal: reclaim dead-PID locks (deleting their clones) and delete
+# orphan ns-* clones that have no live lock. Same idea as the worktree prune.
+device_registry_prune() {
+  local reg lock udid js
+  reg="$(device_registry_root)"
+  [ -d "$reg" ] || return 0
+  for lock in "$reg"/*.lock; do
+    [ -d "$lock" ] || continue
+    if lock_is_stale "$lock"; then
+      udid="$(basename "$lock" .lock)"
+      [ "$(cat "$lock/clone" 2>/dev/null)" = "true" ] && xcrun simctl delete "$udid" >/dev/null 2>&1 || true
+      rm -rf "$lock"
+    fi
+  done
+  js="$(xcrun simctl list devices -j 2>/dev/null)" || return 0
+  printf '%s' "$js" | jq -r '[.devices[][]? | select(.name|startswith("ns-")) | .udid] | .[]' \
+    | while IFS= read -r udid; do
+        [ -n "$udid" ] || continue
+        [ -d "$reg/$udid.lock" ] || xcrun simctl delete "$udid" >/dev/null 2>&1 || true
+      done
+}
