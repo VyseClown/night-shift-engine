@@ -150,6 +150,17 @@ run_dry_fixtures() {
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
+  fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
+  fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
+  fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
+  fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
+  fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
+  fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
+  fixture_assert "device_registry_prune reclaims stale locks + orphan clones" fixture_device_prune "$root"
+  fixture_assert "prune skips clones being created (live marker), sweeps stale ones" fixture_device_prune_creation_race "$root"
+  fixture_assert "run_visual_capture registry mode claims, caches, releases" fixture_visual_capture_registry_claim "$root"
+  fixture_assert "registry-off: no claim, no artifacts" fixture_visual_registry_off_no_artifacts "$root"
+  fixture_assert "visual_review prunes the registry only in registry mode" fixture_visual_prune_guarded "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1718,4 +1729,250 @@ live_persona_checks() {
     IFS='|'
   done
   IFS="$old_ifs"
+}
+
+# --- RN visual_review device-registry fixtures (PR #10) ---
+fixture_device_registry_root() {
+  local root="$1"
+  # Default root is under $HOME/.night-shift/devices.
+  case "$(device_registry_root)" in */.night-shift/devices) ;; *) return 1 ;; esac
+  # Override env wins.
+  [ "$(NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$root/reg" device_registry_root)" = "$root/reg" ] || return 1
+  return 0
+}
+
+fixture_make_simctl_stub() {
+  local dir="$1"
+  mkdir -p "$dir/bin"
+  cat >"$dir/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+log="$dir/calls.log"
+shift  # drop "simctl"
+case "\$1 \$2 \$3" in
+  "list devices available") cat "$dir/devices.json"; exit 0 ;;
+  "list devices -j"*)        cat "$dir/devices.json"; exit 0 ;;
+esac
+case "\$1" in
+  list)   cat "$dir/devices.json"; exit 0 ;;
+  clone)  printf 'clone %s %s\n' "\$2" "\$3" >>"\$log"; printf 'UDID-CLONE-%s\n' "\$3"; exit 0 ;;
+  delete) printf 'delete %s\n' "\$2" >>"\$log"; exit 0 ;;
+  *)      exit 0 ;;
+esac
+STUB
+  chmod +x "$dir/bin/xcrun"
+}
+
+fixture_write_devices_json() {
+  cat >"$1" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "iPhone 15", "udid": "UDID-AAA", "state": "Shutdown", "isAvailable": true },
+  { "name": "iPhone 15", "udid": "UDID-BBB", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+}
+
+fixture_device_try_claim() {
+  local root="$1" stub="$root/dtc"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    # candidates returns both UDIDs for the label.
+    [ "$(device_candidates iphone-15 | tr '\n' ',' )" = "UDID-AAA,UDID-BBB," ] || exit 1
+    # first claim of AAA succeeds; a second claim of AAA fails (held).
+    device_try_claim UDID-AAA run-A false || exit 1
+    device_try_claim UDID-AAA run-B false && exit 1
+    # a stale lock (dead PID) is reclaimable.
+    printf '99998\n' >"$stub/reg/UDID-AAA.lock/pid"
+    device_try_claim UDID-AAA run-C false || exit 1
+    exit 0
+  )
+}
+
+fixture_device_claim_distinct() {
+  local root="$1" stub="$root/dcd"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
+    local a b
+    a="$(device_claim iphone-15 run-A)" || exit 1
+    b="$(device_claim iphone-15 run-B)" || exit 1
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ] || exit 1   # two real devices
+    exit 0
+  )
+}
+
+fixture_device_claim_clone_on_exhaustion() {
+  local root="$1" stub="$root/dce"
+  fixture_make_simctl_stub "$stub"
+  # Only ONE matching device, so the 2nd claim must clone.
+  cat >"$stub/devices.json" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "iPhone 15", "udid": "UDID-AAA", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
+    device_claim iphone-15 run-A >/dev/null || exit 1
+    local b; b="$(device_claim iphone-15 run-B)" || exit 1
+    [ "$b" = "UDID-CLONE-ns-nightshift-run-B-iphone-15" ] || exit 1     # stub clone udid
+    grep -q "clone UDID-AAA ns-nightshift-run-B-iphone-15" "$stub/calls.log" || exit 1
+    [ "$(cat "$stub/reg/$b.lock/clone")" = "true" ] || exit 1
+    exit 0
+  )
+}
+
+fixture_device_release() {
+  local root="$1" stub="$root/drl"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
+    device_try_claim UDID-AAA run-A false || exit 1     # real device
+    device_release UDID-AAA
+    [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1          # lock removed
+    grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1   # NOT deleted (real)
+    device_try_claim UDID-CLONE-x run-B true || exit 1  # a clone
+    device_release UDID-CLONE-x
+    grep -q "delete UDID-CLONE-x" "$stub/calls.log" || exit 1  # clone deleted
+    exit 0
+  )
+}
+
+fixture_device_prune() {
+  local root="$1" stub="$root/dpr"
+  fixture_make_simctl_stub "$stub"
+  # devices list contains an orphan ns-nightshift-* clone with NO lock,
+  # and a user-owned sim named ns-personal that must NOT be deleted.
+  cat >"$stub/devices.json" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "iPhone 15", "udid": "UDID-AAA", "state": "Shutdown", "isAvailable": true },
+  { "name": "ns-nightshift-OLD", "udid": "UDID-ORPHAN", "state": "Shutdown", "isAvailable": true },
+  { "name": "ns-personal", "udid": "UDID-USER", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    mkdir -p "$stub/reg/UDID-AAA.lock"; printf '99998\n' >"$stub/reg/UDID-AAA.lock/pid"
+    printf 'false\n' >"$stub/reg/UDID-AAA.lock/clone"      # stale real lock
+    device_registry_prune
+    grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1  # non-clone stale lock must NOT be deleted
+    [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1             # stale lock reclaimed
+    grep -q "delete UDID-ORPHAN" "$stub/calls.log" || exit 1  # orphan clone deleted
+    grep -q "delete UDID-USER" "$stub/calls.log" && exit 1    # user sim must NOT be deleted
+    exit 0
+  )
+}
+
+fixture_device_prune_creation_race() {
+  local root="$1" stub="$root/dpc"
+  fixture_make_simctl_stub "$stub"
+  cat >"$stub/devices.json" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "ns-nightshift-Z-iphone-15", "udid": "UDID-CREATING", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    mkdir -p "$stub/reg/.creating-ns-nightshift-Z-iphone-15"
+    printf '%s\n' "$$" >"$stub/reg/.creating-ns-nightshift-Z-iphone-15/pid"
+    device_registry_prune                                   # live marker -> must NOT delete
+    grep -q "delete UDID-CREATING" "$stub/calls.log" 2>/dev/null && exit 1
+    printf '99998\n' >"$stub/reg/.creating-ns-nightshift-Z-iphone-15/pid"
+    device_registry_prune                                   # stale marker -> deletes
+    grep -q "delete UDID-CREATING" "$stub/calls.log" || exit 1
+    exit 0
+  )
+}
+
+fixture_visual_capture_udid_arg() {
+  local root="$1" d="$root/vcu"
+  mkdir -p "$d/bin"
+  # Minimal xcrun: log the udid passed to `simctl boot`, succeed otherwise.
+  # `simctl io ... screenshot <out>` writes a 1-byte file so capture returns 0.
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+log="$d/boot.log"
+shift  # drop "simctl"
+case "\$1" in
+  boot) printf 'boot %s\n' "\$2" >>"\$log" ;;
+  io)   printf x >"\${!#}" ;;   # last arg is the screenshot output path
+esac
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun"
+  (
+    export PATH="$d/bin:$PATH" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0
+    # Sentinel resolver: if internal resolution is (wrongly) used with an explicit
+    # udid, the boot log would contain RESOLVED-SENTINEL.
+    __visual_resolve_udid() { printf 'RESOLVED-SENTINEL\n'; }
+    # (a) explicit udid is used, resolver NOT consulted.
+    __visual_capture_screenshot home default iphone-15 "$d/a.png" EXPLICIT-UDID || exit 1
+    grep -q 'boot EXPLICIT-UDID' "$d/boot.log" || exit 1
+    grep -q 'RESOLVED-SENTINEL' "$d/boot.log" && exit 1
+    # (b) no explicit udid -> resolver used.
+    : >"$d/boot.log"
+    __visual_capture_screenshot home default iphone-15 "$d/b.png" || exit 1
+    grep -q 'boot RESOLVED-SENTINEL' "$d/boot.log" || exit 1
+    exit 0
+  )
+}
+
+fixture_visual_capture_registry_claim() {
+  local root="$1" stub="$root/vcr"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_REGISTRY=1 NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0 RUN_ID=run-A
+    _ns_reg=1
+    _ns_cache_dir="$(mktemp -d /tmp/ns-vcr-XXXXXX)"
+    _ns_release_all() {
+      local u
+      if [ -f "${_ns_cache_dir}/claimed" ]; then
+        while IFS= read -r u; do
+          [ -n "$u" ] && device_release "$u"
+        done <"${_ns_cache_dir}/claimed"
+      fi
+      rm -rf "${_ns_cache_dir}"
+    }
+    local u; u="$(__visual_udid_for_label iphone-15)"
+    [ -n "$u" ] || exit 1
+    [ -d "$stub/reg/$u.lock" ] || exit 1
+    # second call for same label reuses the SAME udid (cache hit, no new claim).
+    [ "$(__visual_udid_for_label iphone-15)" = "$u" ] || exit 1
+    _ns_release_all
+    [ -d "$stub/reg/$u.lock" ] && exit 1
+    exit 0
+  )
+}
+
+fixture_visual_registry_off_no_artifacts() {
+  local root="$1" stub="$root/vroff"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    _ns_reg=0; _ns_cache_dir=""
+    [ -z "$(__visual_udid_for_label iphone-15)" ] || exit 1
+    [ -d "$stub/reg" ] && exit 1
+    exit 0
+  )
+}
+
+fixture_visual_prune_guarded() {
+  local root="$1"
+  (
+    # Shadow the real prune with a marker writer.
+    device_registry_prune() { printf 'pruned\n' >"$root/pruned.marker"; }
+    # Registry OFF: guard must NOT call prune.
+    rm -f "$root/pruned.marker"
+    ( unset NIGHT_SHIFT_DEVICE_REGISTRY
+      [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune; true )
+    [ -f "$root/pruned.marker" ] && exit 1
+    # Registry ON: guard MUST call prune.
+    NIGHT_SHIFT_DEVICE_REGISTRY=1
+    [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune
+    [ -f "$root/pruned.marker" ] || exit 1
+    exit 0
+  )
 }

@@ -76,6 +76,13 @@ engine/workflow git here at the root.
   absent any of these it cleanly SKIPs. The viewer renders the per-screen
   reference/implementation/diff images, diff%, analysis, and attempt history.
 
+> For **parallel** visual_review across worktrees, set `NIGHT_SHIFT_DEVICE_REGISTRY=1`
+> (the `scripts/parallel-worktrees.sh` wrapper sets it automatically for `--jobs>1`). Each
+> concurrent run then claims a dedicated iOS simulator from a machine-global registry at
+> `~/.night-shift/devices/`, cloning `ns-<run-id>` devices when the matching pool is
+> exhausted and pruning them on the next registry-mode run. A single run is unaffected.
+> Requires pre-bundled preview builds (no Metro).
+
 > **Note:** the night-shift workflow is multi-track. A spec declares `- Track: rn`,
 > `- Track: web`, or `- Track: node` (default `rn`), which selects the review
 > persona set (`docs/review-personas.md` for `rn`, `docs/review-personas-web.md`

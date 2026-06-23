@@ -85,6 +85,10 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # are available to the run and the fixtures.
 # shellcheck source=scripts/lib/visual-capture.sh
 . "$NIGHT_SHIFT_LIB/visual-capture.sh"
+# Opt-in device registry for parallel visual_review (inert unless
+# NIGHT_SHIFT_DEVICE_REGISTRY=1). See scripts/lib/device-registry.sh.
+# shellcheck source=scripts/lib/device-registry.sh
+. "$NIGHT_SHIFT_LIB/device-registry.sh"
 # Ignored, dependency directories the isolated validation worktree needs but git
 # does not track. They are symlinked from the project so RN tooling works without
 # reinstalling or triggering npx downloads. Override with NIGHT_SHIFT_DEPENDENCY_LINKS.
@@ -1868,6 +1872,7 @@ visual_stage_enabled() {
 # concern, not the gate's -- a failing report still goes to the observer as evidence.
 run_visual() {
   local report
+  [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune
   report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
   [ -s "$report" ] ||
     block_run "RUN_VISUAL but $report is missing or empty"

@@ -104,7 +104,11 @@ run_one() {
   fi
 
   log "[$feature] launching run -> $logf"
-  NIGHT_SHIFT_ACCEPT_COSTS=YES "$ENGINE" --project "$wt" --spec "$spec" >>"$logf" 2>&1
+  # With >1 concurrent run, enable the device registry so each visual_review
+  # claims a dedicated simulator. A single-job run leaves it off (unchanged).
+  local registry_env=""
+  if [ "$JOBS" -gt 1 ]; then registry_env="NIGHT_SHIFT_DEVICE_REGISTRY=1"; fi
+  NIGHT_SHIFT_ACCEPT_COSTS=YES $registry_env "$ENGINE" --project "$wt" --spec "$spec" >>"$logf" 2>&1
 }
 
 # Heal stale registrations: if a worktree dir was removed out-of-band (rm -rf,
