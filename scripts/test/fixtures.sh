@@ -516,14 +516,28 @@ SH
   pct="$(NIGHT_SHIFT_VISUAL_DIFF_TOOL="$tool" __visual_pixel_diff "$ref" "$shot" "$out")" || return 1
   # 99.37% -> 0.9937 (fraction), not the raw count.
   awk -v p="$pct" 'BEGIN{ exit !(p > 0.9936 && p < 0.9938) }' || return 1
-  # A "0;0.00" (identical) must yield 0.
+  # The percentage must be normalized with a '.' decimal point even in a
+  # comma-decimal locale, or the value is invalid JSON for `jq --argjson`.
+  case "$pct" in *,*) return 1 ;; esac
+  # Identical images: real odiff prints NOTHING and exits 0 → diff_pct must be 0
+  # (a pass), not an unparseable SKIP. (The old fixture wrongly assumed "0;0.00".)
   cat >"$tool" <<'SH'
 #!/usr/bin/env bash
-printf '0;0.00\n'
+exit 0
 SH
   chmod +x "$tool"
   pct="$(NIGHT_SHIFT_VISUAL_DIFF_TOOL="$tool" __visual_pixel_diff "$ref" "$shot" "$out")" || return 1
   awk -v p="$pct" 'BEGIN{ exit !(p == 0) }' || return 1
+  # A comma-decimal locale must still yield dot-formatted, valid-JSON output
+  # (best-effort: where pt_BR.UTF-8 is absent this falls back to C and still holds).
+  cat >"$root/diff97.sh" <<'SH'
+#!/usr/bin/env bash
+printf '100;97.00\n'; exit 22
+SH
+  chmod +x "$root/diff97.sh"
+  pct="$(LC_ALL=pt_BR.UTF-8 NIGHT_SHIFT_VISUAL_DIFF_TOOL="$root/diff97.sh" __visual_pixel_diff "$ref" "$shot" "$out" 2>/dev/null)" || return 1
+  case "$pct" in *,*) return 1 ;; esac          # never a comma
+  awk -v p="$pct" 'BEGIN{ exit !(p > 0.9699 && p < 0.9701) }' || return 1
 }
 
 fixture_visual_assemble_report() {
