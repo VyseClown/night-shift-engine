@@ -21,26 +21,19 @@ device_candidates() {
     | map(select(.label==$d)) | .[].udid'
 }
 
-# Try to claim one UDID via an atomic mkdir lock. $3 = "true" if a clone.
-# Reclaims a lock whose owner PID is dead (lock_is_stale, from night-shift.sh).
+# Try to claim one UDID. $3 = "true" if a clone. Ownership is taken atomically
+# via atomic_lock_acquire (night-shift.sh): an O_EXCL pid file, so there is no
+# window where the lock dir exists without an owner pid for a concurrent claimant
+# to misjudge as stale. A dead owner is reclaimed there. Metadata (run_id/clone)
+# is written only after we own the lock.
 device_try_claim() {
   local udid="$1" run_id="$2" clone="$3" reg lock
   reg="$(device_registry_root)"; mkdir -p "$reg"
   lock="$reg/$udid.lock"
-  if mkdir "$lock" 2>/dev/null; then
-    printf '%s\n' "$$"     >"$lock/pid"
-    printf '%s\n' "$run_id">"$lock/run_id"
-    printf '%s\n' "$clone" >"$lock/clone"
+  if atomic_lock_acquire "$lock"; then
+    printf '%s\n' "$run_id" >"$lock/run_id"
+    printf '%s\n' "$clone"  >"$lock/clone"
     return 0
-  fi
-  if lock_is_stale "$lock"; then
-    rm -rf "$lock"
-    if mkdir "$lock" 2>/dev/null; then
-      printf '%s\n' "$$"      >"$lock/pid"
-      printf '%s\n' "$run_id" >"$lock/run_id"
-      printf '%s\n' "$clone"  >"$lock/clone"
-      return 0
-    fi
   fi
   return 1
 }
@@ -65,8 +58,7 @@ device_claim() {
     if [ -n "$src" ]; then
       local clone_name="ns-nightshift-${run_id}-${label}"
       local creating="$reg/.creating-${clone_name}"
-      if mkdir "$creating" 2>/dev/null; then
-        printf '%s\n' "$$" >"$creating/pid"
+      if atomic_lock_acquire "$creating"; then
         clone_udid="$(xcrun simctl clone "$src" "$clone_name" 2>/dev/null)" || clone_udid=""
         if [ -n "$clone_udid" ] && device_try_claim "$clone_udid" "$run_id" true; then
           rm -rf "$creating"; printf '%s\n' "$clone_udid"; return 0
