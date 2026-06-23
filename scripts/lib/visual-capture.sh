@@ -199,6 +199,28 @@ __visual_pixel_diff() {
   printf '%s' "$pct"
 }
 
+# In registry mode, return a claimed UDID for <label> (cached for the run via
+# $_ns_cache_dir files — survives $() subshell boundaries), or empty on
+# acquisition timeout (caller SKIPs). In default mode (_ns_reg != 1) returns
+# empty so __visual_capture_screenshot resolves internally — unchanged behavior.
+__visual_udid_for_label() {
+  local label="$1" run_id="${RUN_ID:-$$}" cache_file claim_file u
+  [ "${_ns_reg:-0}" = "1" ] || { printf ''; return 0; }
+  # Use a file-based cache so claims survive $() subshell boundaries.
+  cache_file="${_ns_cache_dir}/label/${label}"
+  if [ -f "$cache_file" ]; then
+    # Cache hit: reuse the previously claimed UDID.
+    cat "$cache_file"; return 0
+  fi
+  u="$(device_claim "$label" "$run_id")"
+  if [ -n "$u" ]; then
+    mkdir -p "${_ns_cache_dir}/label"
+    printf '%s' "$u" >"$cache_file"
+    printf '%s\n' "$u" >>"${_ns_cache_dir}/claimed"
+  fi
+  printf '%s\n' "$u"
+}
+
 # Orchestrator. No-op SKIP unless capture is available; otherwise drives the
 # scaffolded capture→diff→assemble→emit pipeline and writes one
 # visual-diff-<spec>.json into $out_dir. Never blocks a run — an unavailable or
@@ -209,6 +231,19 @@ run_visual_capture() {
     log "visual-capture: SKIP — no simulator/diff tooling or NIGHT_SHIFT_VISUAL_CAPTURE!=1; design fidelity stays static-only (the viewer renders reports if/when emitted)"
     return 0
   fi
+  # Registry mode: claim devices per distinct label, release all on return.
+  local _ns_reg=0 _ns_cache_dir=""
+  [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && _ns_reg=1
+  if [ "$_ns_reg" = "1" ]; then
+    _ns_cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/ns-vcr-XXXXXX")"
+  fi
+  _ns_release_all() {
+    [ -n "$_ns_cache_dir" ] || return 0
+    local u
+    [ -f "$_ns_cache_dir/claimed" ] && while IFS= read -r u; do [ -n "$u" ] && device_release "$u"; done <"$_ns_cache_dir/claimed"
+    rm -rf "$_ns_cache_dir"
+  }
+  trap '_ns_release_all' RETURN
   local screens tol screen state device ref shot diff_img pct objs="" line
   screens="$(visual_capture_screens "$spec")"
   [ -n "$screens" ] || { log "visual-capture: no Design Contract frames/states; nothing to capture"; return 0; }
@@ -218,7 +253,12 @@ run_visual_capture() {
     ref="design/${screen}-${state}-${device}.png"
     shot="screenshots/${candidate}/${screen}-${state}-${device}.png"
     diff_img="diffs/${candidate}/${screen}-${state}-${device}.png"
-    if ! __visual_capture_screenshot "$screen" "$state" "$device" "$out_dir/$shot"; then
+    local _udid; _udid="$(__visual_udid_for_label "$device")"
+    if [ "$_ns_reg" = "1" ] && [ -z "$_udid" ]; then
+      log "visual-capture: no simulator available for '$device' within timeout; SKIP"
+      return 0
+    fi
+    if ! __visual_capture_screenshot "$screen" "$state" "$device" "$out_dir/$shot" "$_udid"; then
       log "visual-capture: capture step not implemented; skipping (scaffold only)"
       return 0
     fi

@@ -602,6 +602,8 @@ run_dry_fixtures() {
   fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
   fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
   fixture_assert "device_registry_prune reclaims stale locks + orphan clones" fixture_device_prune "$root"
+  fixture_assert "run_visual_capture registry mode claims, caches, releases" fixture_visual_capture_registry_claim "$root"
+  fixture_assert "registry-off: no claim, no artifacts" fixture_visual_registry_off_no_artifacts "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1930,6 +1932,48 @@ JSON
     grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1  # non-clone stale lock must NOT be deleted
     [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1             # stale lock reclaimed
     grep -q "delete UDID-ORPHAN" "$stub/calls.log" || exit 1  # orphan clone deleted
+    exit 0
+  )
+}
+
+fixture_visual_capture_registry_claim() {
+  local root="$1" stub="$root/vcr"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_REGISTRY=1 NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0 RUN_ID=run-A
+    _ns_reg=1
+    _ns_cache_dir="$(mktemp -d /tmp/ns-vcr-XXXXXX)"
+    _ns_release_all() {
+      local u
+      if [ -f "${_ns_cache_dir}/claimed" ]; then
+        while IFS= read -r u; do
+          [ -n "$u" ] && device_release "$u"
+        done <"${_ns_cache_dir}/claimed"
+      fi
+      rm -rf "${_ns_cache_dir}"
+    }
+    local u; u="$(__visual_udid_for_label iphone-15)"
+    [ -n "$u" ] || exit 1
+    [ -d "$stub/reg/$u.lock" ] || exit 1
+    # second call for same label reuses the SAME udid (cache hit, no new claim).
+    [ "$(__visual_udid_for_label iphone-15)" = "$u" ] || exit 1
+    _ns_release_all
+    [ -d "$stub/reg/$u.lock" ] && exit 1
+    exit 0
+  )
+}
+
+# Assert that with registry OFF, __visual_udid_for_label returns empty and
+# creates no registry dir — confirming the "default mode creates nothing" guarantee.
+fixture_visual_registry_off_no_artifacts() {
+  local root="$1" stub="$root/vroff"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    _ns_reg=0; _ns_cache_dir=""
+    [ -z "$(__visual_udid_for_label iphone-15)" ] || exit 1
+    [ -d "$stub/reg" ] && exit 1
     exit 0
   )
 }
