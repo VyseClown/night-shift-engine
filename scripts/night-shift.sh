@@ -1805,6 +1805,50 @@ fixture_device_registry_root() {
 }
 
 # ---------------------------------------------------------------------------
+# Fixture helper: build a fake `xcrun` shim for device-registry fixtures.
+# $1 = directory to hold the shim, its JSON, and a call log.
+# Writes $1/bin/xcrun. The stub answers:
+#   simctl list devices available -j  -> $1/devices.json
+#   simctl list devices -j            -> $1/devices.json
+#   simctl clone <src> <name>         -> prints a new udid, appends to calls.log
+#   simctl delete <udid>              -> records "delete <udid>" in $1/calls.log
+# Caller sets $1/devices.json before invoking the function under test.
+# ---------------------------------------------------------------------------
+fixture_make_simctl_stub() {
+  local dir="$1"
+  mkdir -p "$dir/bin"
+  cat >"$dir/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+log="$dir/calls.log"
+shift  # drop "simctl"
+case "\$1 \$2 \$3" in
+  "list devices available") cat "$dir/devices.json"; exit 0 ;;
+  "list devices -j"*)        cat "$dir/devices.json"; exit 0 ;;
+esac
+case "\$1" in
+  list)   cat "$dir/devices.json"; exit 0 ;;
+  clone)  printf 'clone %s %s\n' "\$2" "\$3" >>"\$log"; printf 'UDID-CLONE-%s\n' "\$3"; exit 0 ;;
+  delete) printf 'delete %s\n' "\$2" >>"\$log"; exit 0 ;;
+  *)      exit 0 ;;
+esac
+STUB
+  chmod +x "$dir/bin/xcrun"
+}
+
+# ---------------------------------------------------------------------------
+# Fixture helper: write a canned two-device JSON list to $1.
+# Both devices are labelled "iphone-15" (name "iPhone 15").
+# ---------------------------------------------------------------------------
+fixture_write_devices_json() {
+  cat >"$1" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "iPhone 15", "udid": "UDID-AAA", "state": "Shutdown", "isAvailable": true },
+  { "name": "iPhone 15", "udid": "UDID-BBB", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+}
+
+# ---------------------------------------------------------------------------
 # F2 fixture: state_int validation
 # ---------------------------------------------------------------------------
 fixture_state_int() {
