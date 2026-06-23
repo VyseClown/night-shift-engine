@@ -68,8 +68,9 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
 VISUAL_CAPTURE="${NIGHT_SHIFT_VISUAL_CAPTURE:-0}"
-# Max auto-repair attempts per screen in the visual_review loop (cost guard).
-VISUAL_MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}"
+# (NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS / per-screen auto-repair attempts removed with
+# the agent-driven repair loop: visual_review is now engine-invoked single-pass
+# measure+report; the observer drives any repair via a fresh implement cycle.)
 # Persona/profile resolution — the persona/track constants (PERSONAS_RN,
 # PERSONAS_WEB, PERSONAS_OPTIONAL, PERSONAS, the floors, DEFAULT_TRACK) and the
 # pure functions that map a spec to its active review set — live in
@@ -769,51 +770,14 @@ $SPEC. "artifacts" lists only project-relative files (no absolute paths, no
   List that evidence file in artifacts.
 - REQUEST_OBSERVER: list the candidate evidence, relevant tests, and docs the
   fresh observer needs. The wrapper runs the observer; do not run it yourself.
-- RUN_VISUAL: only from the visual_review stage. Prove every screen in the spec's
-  ## Design Contract is pixel-perfect to its Figma reference, auto-repairing the RN
-  code until each is within tolerance, then emit the report. The app is already
-  running on a booted iOS simulator with the preview harness. Procedure:
-    1. Targets: bash $NIGHT_SHIFT_LIB/visual-capture.sh screens $SPEC
-       prints one "screen|state|device" line per target. The per-screen tolerance
-       is the Design Contract's "- Tolerance:" (default 0.10).
-    2. For each target, export its Figma reference frame as a PNG to the ABSOLUTE
-       path $RUN_ROOT/validated/design/<screen>-<state>-<device>.png using the
-       Figma MCP (match the frame to the screen/state and the device pixel size);
-       read its design tokens/measurements for diagnosis.
-    3. Capture the harness (ABSOLUTE output path):
-       bash $NIGHT_SHIFT_LIB/visual-capture.sh capture <screen> <state> <device> \
-         $RUN_ROOT/validated/screenshots/<screen>-<state>-<device>.png
-    4. Diff (ABSOLUTE paths; prints diff_pct):
-       bash $NIGHT_SHIFT_LIB/visual-capture.sh diff \
-         $RUN_ROOT/validated/design/<screen>-<state>-<device>.png \
-         $RUN_ROOT/validated/screenshots/<screen>-<state>-<device>.png \
-         $RUN_ROOT/validated/diffs/<screen>-<state>-<device>.png
-       If diff_pct <= tolerance the screen passes. Otherwise read the reference,
-       screenshot, diff image and Figma tokens, edit the RN screen to close the
-       gap, reload/rebuild the running app, and re-capture/re-diff. At most
-       $VISUAL_MAX_ATTEMPTS attempts per screen; record every attempt.
-    5. Build each screen object (paths here are RELATIVE to validated/, e.g.
-       design/<name>.png — NOT absolute):
-       bash $NIGHT_SHIFT_LIB/visual-capture.sh assemble-screen <screen> <state> \
-         <device> design/<n>.png screenshots/<n>.png <diff_pct> <tolerance> \
-         diffs/<n>.png "<analysis>" '<attempts JSON array>' \
-         >> $RUN_ROOT/control/visual-screens.jsonl
-       <analysis> is your written diagnosis; the attempts array holds objects
-       {attempt,diff_pct,pass,analysis,screenshot,diff_image} (screenshot/diff_image
-       relative to validated/). A screen that never reaches tolerance is pass:false
-       with a final analysis explaining why — never fake a pass.
-    6. Assemble the report:
-       bash $NIGHT_SHIFT_LIB/visual-capture.sh report $SPEC \
-         $RUN_ROOT/control/visual-screens.jsonl \
-         > $RUN_ROOT/validated/visual-diff-<NAME>.json
-       where <NAME> is $SPEC with its directory and .md suffix removed (e.g.
-       specs/login.md -> login).
-    7. If you edited RN code while repairing, re-run the spec's final validation
-       commands (they must stay green) and refresh the candidate commit so the
-       observer reviews the repaired code.
-  "artifacts" may be an empty array for RUN_VISUAL — the wrapper reads the report
-  from its canonical path. If capture/diff tooling is unavailable, do not fake
-  results: emit BLOCKED with the reason.
+- RUN_VISUAL: only from the visual_review stage. The ENGINE itself runs the
+  design-fidelity capture (Figma reference -> iOS-simulator screenshot -> pixel
+  diff) and produces + validates $RUN_ROOT/validated/visual-diff-<NAME>.json, then
+  hands the candidate and report to the observer. You do NOT run capture, edit
+  screens, or write the report yourself — simply signal RUN_VISUAL with an empty
+  "artifacts" array to let the engine perform the capture step. (If the capture
+  tooling is unavailable the engine cleanly skips and proceeds; per-screen
+  pass/fail is the observer's concern.)
 - NEXT_TASK: only after observer APPROVE. First check off the completed entry in
   $WORKSPACE_ROOT/TODO.md, then signal NEXT_TASK.
 - COMPLETE: only after observer APPROVE with no remaining TODO entries.
@@ -1368,21 +1332,31 @@ visual_stage_enabled() {
   grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
 }
 
-# The visual_review stage handler. The primary (fresh 'visual' scope session) runs
-# the Figma-MCP -> capture -> diff -> repair loop using scripts/lib/visual-capture.sh
-# and writes a valid visual-diff-<spec>.json into validated/. This wrapper only
-# gates that a valid report exists, then advances to the observer (which reviews the
-# post-repair candidate + the report). Per-screen pass/fail is the observer's
-# concern, not the gate's -- a failing report still goes to the observer as evidence.
+# The visual_review stage handler. Engine-invoked: the engine itself runs the
+# design-fidelity capture (Figma reference -> iOS-simulator screenshot -> pixel
+# diff) via scripts/lib/visual-capture.sh, producing validated/visual-diff-<spec>.json,
+# then advances to the observer (which reviews the candidate + the report; per-screen
+# pass/fail is the observer's concern, a failing report still flows as evidence).
+# run_visual_capture cleanly SKIPs — writing no report, returning 0 — when the
+# simulator/diff tooling or Design-Contract frames are absent; we then proceed
+# without blocking. Only a present-but-malformed report is a hard error. In
+# registry mode the capture claims and releases a dedicated simulator within this
+# (engine) process, so its RETURN trap frees the device even on an early exit here.
 run_visual() {
-  local report
+  local report candidate
   [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune
+  candidate="$(jq -r '.candidate // .candidate_commits[-1] // empty' "$STATE")"
+  [ -n "$candidate" ] || block_run "visual_review reached without a candidate commit"
+  run_visual_capture "$SPEC" "$candidate" "$RUN_ROOT/validated" || true
   report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
-  [ -s "$report" ] ||
-    block_run "RUN_VISUAL but $report is missing or empty"
-  jq -e '.task and (.screens | type=="array" and length>0)' "$report" >/dev/null 2>&1 ||
-    block_run "RUN_VISUAL but visual-diff report is malformed"
-  log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass); handing to observer"
+  case "$(visual_report_status "$report")" in
+    valid)
+      log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass); handing to observer" ;;
+    absent)
+      log "visual_review: no visual-diff report produced (capture skipped or tooling unavailable); proceeding to observer" ;;
+    malformed)
+      block_run "visual_review produced a malformed visual-diff report" ;;
+  esac
   set_stage observer_review
 }
 
