@@ -144,6 +144,7 @@ run_dry_fixtures() {
   fixture_assert "preserved rate-limit block is recoverable" fixture_rate_limit_recovery "$root"
   fixture_assert "runaway rate-limit wait hits the cap" fixture_rate_limit_cap "$root"
   fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
+  fixture_assert "atomic lock: O_EXCL pid gate, no mkdir-write window, reclaims dead/pid-less" fixture_atomic_lock "$root"
   fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
   fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
   fixture_assert "malformed-signal cap predicate blocks only at/over the cap" fixture_malformed_cap "$root"
@@ -1354,6 +1355,30 @@ fixture_run_lock() {
   printf '%s\n' "$$" >"$lockdir/pid"
   lock_is_stale "$lockdir" && return 1   # live PID → NOT stale (should return 1 = live)
 
+  return 0
+}
+
+# atomic_lock_acquire: ownership is the O_EXCL pid file, so there is no
+# mkdir->write-pid window. Verifies: fresh acquire wins; a second acquire while
+# we (a live PID) hold it fails; a dead-PID lock is reclaimed; and a pid-LESS
+# lock dir (the previously-racy state) is acquirable rather than dual-owned.
+fixture_atomic_lock() {
+  local root="$1" lock="$root/atomic-test/run.lock"
+  rm -rf "$root/atomic-test"; mkdir -p "$root/atomic-test"
+  # (a) fresh acquire wins and records our pid.
+  atomic_lock_acquire "$lock" || return 1
+  [ "$(cat "$lock/pid")" = "$$" ] || return 1
+  # (b) re-acquire while we hold it (live pid) fails — no double ownership.
+  atomic_lock_acquire "$lock" && return 1
+  # (c) dead-pid lock is reclaimed.
+  printf '99998\n' >"$lock/pid"
+  atomic_lock_acquire "$lock" || return 1
+  [ "$(cat "$lock/pid")" = "$$" ] || return 1
+  # (d) a pid-LESS lock dir (formerly the racy mid-creation state) is acquirable:
+  # the dir alone never confers ownership, only the O_EXCL pid file does.
+  rm -f "$lock/pid"
+  atomic_lock_acquire "$lock" || return 1
+  [ "$(cat "$lock/pid")" = "$$" ] || return 1
   return 0
 }
 

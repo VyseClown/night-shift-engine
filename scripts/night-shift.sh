@@ -913,23 +913,33 @@ lock_is_stale() {
   return 0                                                       # process dead → stale
 }
 
-acquire_lock() {
-  local lockdir="$PROJECT/.night-shift/run.lock"
-  # Ensure the parent .night-shift directory exists before we try to mkdir the
-  # lock subdirectory; initialize_run may not have run yet at this point.
-  mkdir -p "$PROJECT/.night-shift"
-  if mkdir "$lockdir" 2>/dev/null; then
-    # We created the lock — record our PID so release_lock can verify ownership.
-    printf '%s\n' "$$" >"$lockdir/pid"
+# Atomically take ownership of <lockdir> for this process. Returns 0 iff we now
+# own it. The ownership token is the pid FILE, created with O_EXCL via `set -C`
+# (noclobber) — so a lock is never observable without its owner pid. This closes
+# the mkdir->write-pid window a plain `mkdir` gate leaves: a concurrent claimant
+# can no longer see a freshly-created, pid-less dir and wrongly judge it stale.
+# The dir is just a metadata container (run_id/clone live beside pid); `mkdir -p`
+# on it is idempotent and confers nothing. A stale pid (dead owner) is reclaimed;
+# the reclaim's re-create is also O_EXCL, so only one racing reclaimer wins.
+atomic_lock_acquire() {
+  local lockdir="$1"
+  mkdir -p "$lockdir" 2>/dev/null || return 1
+  if ( set -C; printf '%s\n' "$$" >"$lockdir/pid" ) 2>/dev/null; then
     return 0
   fi
-  # Lock dir already exists; decide if it is live or stale.
   if lock_is_stale "$lockdir"; then
-    # Stale lock from a crashed run — reclaim it so recovery can proceed.
-    log "stale run lock found (crashed process); reclaiming for this run"
-    rm -rf "$lockdir"
-    mkdir "$lockdir" || die "could not reclaim stale run lock at $lockdir"
-    printf '%s\n' "$$" >"$lockdir/pid"
+    rm -f "$lockdir/pid"
+    ( set -C; printf '%s\n' "$$" >"$lockdir/pid" ) 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+acquire_lock() {
+  local lockdir="$PROJECT/.night-shift/run.lock"
+  # Ensure the parent .night-shift directory exists before we try to take the
+  # lock; initialize_run may not have run yet at this point.
+  mkdir -p "$PROJECT/.night-shift"
+  if atomic_lock_acquire "$lockdir"; then
     return 0
   fi
   # Another live process holds the lock — refuse to proceed.
