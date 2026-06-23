@@ -84,6 +84,13 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project ~/work/<proj> --sp
 by accident (not a billing switch). On a Claude Pro/Max login runs consume plan
 **usage limits**; with `ANTHROPIC_API_KEY` set they are **billed per token**.
 
+A run is bounded so it can't burn cost unattended: per-stage and per-task turn/time
+budgets (`NIGHT_SHIFT_MAX_STAGE_TURNS` / `…_TASK_TURNS` / `…_STAGE_SECONDS` /
+`…_TASK_SECONDS`), and a cap on consecutive malformed/absent primary signals
+(`NIGHT_SHIFT_MAX_MALFORMED_SIGNALS`, default 5) that fails fast instead of
+grinding the whole turn budget on junk. Hitting any limit blocks the run for
+manual review rather than continuing.
+
 ## Model tiering (cost)
 
 The engine spends the strong model only where judgment matters. All knobs accept
@@ -106,12 +113,37 @@ session), so it is constant within a scope and resumes never re-pass it.
 scripts/night-shift.sh           orchestrator
 scripts/lib/personas.sh          persona / track / profile / optional resolution
 scripts/lib/visual-capture.sh    opt-in design-fidelity scaffold (inert without a simulator)
+scripts/lib/device-registry.sh   opt-in device registry for parallel rn visual_review
+scripts/test/fixtures.sh         the deterministic + live fixture suite (sourced under --fixture-test)
+scripts/parallel-worktrees.sh    wrapper for fan-out night-shift runs across worktrees
+.github/workflows/ci.yml         CI: shellcheck (pinned) + the fixture suite
+.shellcheckrc                    repo-wide shellcheck config (categorical false positives only)
 schemas/                         machine-readable coordination / review contracts
 specs/                           one markdown file per feature (the contract)
 docs/                            review personas + environment setup
 TODO.md  CHANGELOG.md  NIGHT_SHIFT_REVIEW.md   work queue / log / observer ledger
 night-shift-viewer/              dashboard + gated launcher (own repo, git-ignored here)
 ```
+
+## Tests & CI
+
+The engine self-tests with a large **deterministic fixture suite** (no model
+calls, no network) plus a smaller **live** suite that does make paid calls:
+
+```sh
+scripts/night-shift.sh --fixture-test --dry-run                    # deterministic only — free
+NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --fixture-test # also runs the live (paid) fixtures
+```
+
+Fixtures live in [`scripts/test/fixtures.sh`](./scripts/test/fixtures.sh),
+sourced by the orchestrator only under `--fixture-test`.
+
+CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) runs on every push
+to `main` and every PR: a **Shellcheck** job (pinned shellcheck `0.11.0`, linting
+all `scripts/**/*.sh` at default severity, honoring [`.shellcheckrc`](./.shellcheckrc))
+and a **Fixture tests** job (the deterministic suite). The version is pinned so a
+green local lint matches CI; `.shellcheckrc` disables only categorical false
+positives, and intentional cases carry visible inline pragmas.
 
 ## Visual fidelity (opt-in)
 
