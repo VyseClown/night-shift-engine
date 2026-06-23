@@ -114,7 +114,7 @@ run_dry_fixtures() {
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "fresh stage session gets the file-handoff note" fixture_handoff_prompt "$root"
-  fixture_assert "visual_review prompt carries the RUN_VISUAL procedure" fixture_visual_review_prompt "$root"
+  fixture_assert "visual_review prompt signals engine-invoked RUN_VISUAL (no agent capture)" fixture_visual_review_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
@@ -151,6 +151,7 @@ run_dry_fixtures() {
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
+  fixture_assert "visual report status: absent/malformed/valid classification" fixture_visual_report_status "$root"
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
@@ -891,6 +892,22 @@ fixture_visual_pick_udid() {
   [ "$(printf '%s' "$js" | __visual_pick_udid no-such-device)" = "AAA" ] || return 1
 }
 
+# visual_report_status classifies the engine-invoked visual_review report: a
+# missing/empty file is 'absent' (capture skipped -> proceed), a present-but-bad
+# file is 'malformed' (-> block), and a well-formed report is 'valid'.
+fixture_visual_report_status() {
+  local root="$1" d="$root/vrs"
+  rm -rf "$d"; mkdir -p "$d"
+  [ "$(visual_report_status "$d/none.json")" = "absent" ] || return 1   # no file
+  : >"$d/empty.json"
+  [ "$(visual_report_status "$d/empty.json")" = "absent" ] || return 1  # empty file
+  printf '{"nope":true}\n' >"$d/bad.json"
+  [ "$(visual_report_status "$d/bad.json")" = "malformed" ] || return 1 # bad shape
+  printf '{"task":"specs/x.md","screens":[{"pass":true}]}\n' >"$d/ok.json"
+  [ "$(visual_report_status "$d/ok.json")" = "valid" ] || return 1      # well-formed
+  return 0
+}
+
 fixture_observer_cost_capture() {
   # The observer raw is written to "$raw.$attempt" by validated_observer_retry, so
   # the cost must be recorded from THAT path (the original glob/`$raw` both missed
@@ -977,12 +994,14 @@ fixture_visual_review_prompt() {
   fixture_write_min_spec "$SPEC"
   printf '{"stage":"visual_review","stage_turns":0,"primary_turns":2,"session_id":null}\n' >"$STATE"
   primary_prompt "$prompt"
+  # Engine-invoked visual_review: the prompt tells the primary the ENGINE runs the
+  # capture and to simply signal RUN_VISUAL (no agent-driven capture/repair steps).
   grep -q "RUN_VISUAL: only from the visual_review stage" "$prompt" || return 1
-  grep -q "visual-capture.sh capture" "$prompt" || return 1
-  grep -q "visual-capture.sh diff" "$prompt" || return 1
-  grep -q "assemble-screen" "$prompt" || return 1
-  grep -q "visual-capture.sh report" "$prompt" || return 1
-  grep -q "Figma MCP" "$prompt" || return 1
+  grep -q "The ENGINE itself runs" "$prompt" || return 1
+  grep -q "signal RUN_VISUAL with an empty" "$prompt" || return 1
+  grep -q "You do NOT run capture" "$prompt" || return 1
+  # The obsolete agent-driven procedure must be gone.
+  ! grep -q "assemble-screen" "$prompt" || return 1
   return 0
 }
 

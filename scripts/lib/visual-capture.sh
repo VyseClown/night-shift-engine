@@ -221,6 +221,22 @@ __visual_udid_for_label() {
   printf '%s\n' "$u"
 }
 
+# Classify a visual-diff report at $1, for the engine-invoked visual_review:
+#   absent    — no/empty file: capture cleanly SKIPped (tooling or frames absent);
+#               the stage proceeds without blocking.
+#   malformed — present but fails the schema shape: a real error → block.
+#   valid     — a well-formed report with at least one screen.
+# Pure (reads only $1); the fixture exercises all three branches.
+visual_report_status() {
+  local report="$1"
+  [ -s "$report" ] || { printf 'absent\n'; return 0; }
+  if jq -e '.task and (.screens | type=="array" and length>0)' "$report" >/dev/null 2>&1; then
+    printf 'valid\n'
+  else
+    printf 'malformed\n'
+  fi
+}
+
 # Orchestrator. No-op SKIP unless capture is available; otherwise drives the
 # scaffolded capture→diff→assemble→emit pipeline and writes one
 # visual-diff-<spec>.json into $out_dir. Never blocks a run — an unavailable or
