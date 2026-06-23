@@ -14,21 +14,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ubuntu-latest typically ships shellcheck and jq already; the || true
-      # prevents a failure if apt tries to "reinstall" an already-present package
-      # at an incompatible version — just let whatever is present be used.
-      - name: Ensure shellcheck and jq are available
+      # Pin shellcheck so "green locally" == "green in CI". Ubuntu's apt build
+      # lags (0.9.0) and reports findings newer versions don't, so an unpinned
+      # install drifts. Bump SC_VERSION deliberately, in sync with what the
+      # repo-root .shellcheckrc + inline pragmas were validated against.
+      - name: Install shellcheck (pinned)
+        env:
+          SC_VERSION: "0.11.0"
         run: |
-          command -v shellcheck || { sudo apt-get update && sudo apt-get install -y shellcheck; }
-          command -v jq         || sudo apt-get install -y jq
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${SC_VERSION}/shellcheck-v${SC_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ
+          sudo install "shellcheck-v${SC_VERSION}/shellcheck" /usr/local/bin/shellcheck
 
-      # Run at --severity=error to catch real bugs (undefined vars, bad
-      # redirects, command-injection risks, etc.) while ignoring style nits.
-      # This keeps CI green on a large script without drowning the signal in
-      # noise. Tighten to --severity=warning or drop the flag altogether once
-      # the existing style warnings have been cleaned up.
-      - name: Shellcheck (error-level only)
-        run: shellcheck --severity=error scripts/night-shift.sh scripts/lib/*.sh
+      # Full-coverage lint of every scripts/**/*.sh (orchestrator, libs, extracted
+      # fixtures, worktree wrapper) at default severity. The style/false-positive
+      # noise that previously forced --severity=error is now handled precisely by
+      # the repo-root .shellcheckrc (categorical false positives only) plus visible
+      # inline pragmas — so this is the "tighten once cleaned up" follow-through.
+      # `find -exec {} +` passes all files robustly (no word-split / IFS quirks).
+      - name: Shellcheck
+        run: |
+          shellcheck --version
+          find scripts -name '*.sh' -type f -exec shellcheck -s bash {} +
 
   # ── Job B: Deterministic fixture suite ─────────────────────────────────────
   fixtures:
