@@ -80,6 +80,10 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # are available to the run and the fixtures.
 # shellcheck source=scripts/lib/visual-capture.sh
 . "$NIGHT_SHIFT_LIB/visual-capture.sh"
+# Opt-in device registry for parallel visual_review (inert unless
+# NIGHT_SHIFT_DEVICE_REGISTRY=1). See scripts/lib/device-registry.sh.
+# shellcheck source=scripts/lib/device-registry.sh
+. "$NIGHT_SHIFT_LIB/device-registry.sh"
 # Ignored, dependency directories the isolated validation worktree needs but git
 # does not track. They are symlinked from the project so RN tooling works without
 # reinstalling or triggering npx downloads. Override with NIGHT_SHIFT_DEPENDENCY_LINKS.
@@ -591,6 +595,7 @@ run_dry_fixtures() {
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
+  fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1784,6 +1789,18 @@ fixture_run_lock() {
   printf '%s\n' "$$" >"$lockdir/pid"
   lock_is_stale "$lockdir" && return 1   # live PID → NOT stale (should return 1 = live)
 
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Fixture: device_registry_root honours default + override
+# ---------------------------------------------------------------------------
+fixture_device_registry_root() {
+  local root="$1"
+  # Default root is under $HOME/.night-shift/devices.
+  case "$(device_registry_root)" in */.night-shift/devices) ;; *) return 1 ;; esac
+  # Override env wins.
+  [ "$(NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$root/reg" device_registry_root)" = "$root/reg" ] || return 1
   return 0
 }
 
