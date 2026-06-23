@@ -857,6 +857,9 @@ evidence_exit_status_matches() {
 validate_spec_project() {
   local file="$1" proj="${2:-$PROJECT}" declared main
   declared="$(sed -nE 's/^- Project path: `([^`]+)`.*/\1/p' "$file" | head -n 1)"
+  # The spec literally contains "~/…"; the case matches that text and expands it
+  # manually (it is data read from the spec, not a path for the shell to expand).
+  # shellcheck disable=SC2088
   case "$declared" in
     "~/"*) declared="$HOME/${declared#\~/}" ;;
     /*) ;;
@@ -1355,6 +1358,8 @@ invoke_primary() {
     # feature branch and the wrapper forbids push/merge/destructive Git ops and
     # excludes pre-existing dirt from candidate commits.
     if [ -z "$session" ]; then
+      # model_flag must word-split into `--model X` (or vanish when empty).
+      # shellcheck disable=SC2046
       (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
         --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
     else
@@ -1839,6 +1844,8 @@ invoke_observer_once() {
   # and hangs, producing nothing. Instead the prompt asks the observer to end its
   # reply with a fenced ```json verdict block, which extract_claude_structured
   # pulls out; json_schema_basic then enforces the strict contract.
+  # model_flag intentionally word-splits into `--model X` (or nothing).
+  # shellcheck disable=SC2046
   (cd "$neutral" && claude -p $(model_flag "$OBSERVER_MODEL") --output-format json \
     "$(observer_prompt "$context" "$candidate")") >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
@@ -2054,6 +2061,8 @@ start_next_task() {
   done <<EOF
 $(list_unchecked_specs "$WORKSPACE_ROOT/TODO.md")
 EOF
+  # complete_run exits; the trailing `return` is defensive only.
+  # shellcheck disable=SC2317
   [ -n "$next_spec" ] || { complete_run; return; }
   validate_spec "$next_spec" || block_run "next TODO spec is incomplete"
   SPEC="$next_spec"

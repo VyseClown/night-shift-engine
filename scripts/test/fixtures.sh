@@ -1,4 +1,13 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2318,SC2329,SC2034,SC2030,SC2031,SC2333
+# ^ Test-scaffolding-wide suppressions (THIS file only — kept ON for production):
+#   fixtures are dispatched indirectly via fixture_assert "$fn" (SC2329 "never
+#   invoked"); single-line `local root="$1" x="$root/…"` resolves $root to the
+#   outer run_dry_fixtures local of the same name, not the just-declared one
+#   (SC2318 — works by dynamic scoping, fine for fixtures); save/restore and
+#   assertion locals are read back conditionally (SC2034); assertions run inside
+#   subshells (SC2030/SC2031); multi-line `[ ] && [ ] && [ ]` chains are genuine
+#   ANDs (SC2333 false positive).
 # Test fixtures for scripts/night-shift.sh.
 # Sourced by the orchestrator only when --fixture-test is passed.
 # All fixture_* functions, run_dry_fixtures, run_live_fixtures, fixture_assert,
