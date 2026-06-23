@@ -1891,8 +1891,8 @@ JSON
            NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
     device_claim iphone-15 run-A >/dev/null || exit 1
     local b; b="$(device_claim iphone-15 run-B)" || exit 1
-    [ "$b" = "UDID-CLONE-ns-run-B" ] || exit 1     # stub clone udid
-    grep -q "clone UDID-AAA ns-run-B" "$stub/calls.log" || exit 1
+    [ "$b" = "UDID-CLONE-ns-nightshift-run-B" ] || exit 1     # stub clone udid
+    grep -q "clone UDID-AAA ns-nightshift-run-B" "$stub/calls.log" || exit 1
     [ "$(cat "$stub/reg/$b.lock/clone")" = "true" ] || exit 1
     exit 0
   )
@@ -1918,11 +1918,13 @@ fixture_device_release() {
 fixture_device_prune() {
   local root="$1" stub="$root/dpr"
   fixture_make_simctl_stub "$stub"
-  # devices list contains an orphan ns-* clone with NO lock.
+  # devices list contains an orphan ns-nightshift-* clone with NO lock,
+  # and a user-owned sim named ns-personal that must NOT be deleted.
   cat >"$stub/devices.json" <<'JSON'
 { "devices": { "iOS-17": [
   { "name": "iPhone 15", "udid": "UDID-AAA", "state": "Shutdown", "isAvailable": true },
-  { "name": "ns-run-OLD", "udid": "UDID-ORPHAN", "state": "Shutdown", "isAvailable": true }
+  { "name": "ns-nightshift-OLD", "udid": "UDID-ORPHAN", "state": "Shutdown", "isAvailable": true },
+  { "name": "ns-personal", "udid": "UDID-USER", "state": "Shutdown", "isAvailable": true }
 ] } }
 JSON
   (
@@ -1933,6 +1935,7 @@ JSON
     grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1  # non-clone stale lock must NOT be deleted
     [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1             # stale lock reclaimed
     grep -q "delete UDID-ORPHAN" "$stub/calls.log" || exit 1  # orphan clone deleted
+    grep -q "delete UDID-USER" "$stub/calls.log" && exit 1    # user sim must NOT be deleted
     exit 0
   )
 }
