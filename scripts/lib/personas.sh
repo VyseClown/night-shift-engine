@@ -30,6 +30,9 @@ PERSONAS_NODE="Backend & Data Expert|TypeScript & Code Quality Expert|Performanc
 # PERSONAS union below + the persona-review.json enum, and document it in
 # docs/review-personas.md.
 PERSONAS_OPTIONAL="Product Reviewer|Design Fidelity Reviewer|Security Reviewer|API Contract Reviewer"
+# Consumed by night-shift.sh (the sourcing script) for the persona-review schema
+# membership check; per-file shellcheck cannot see that cross-file use.
+# shellcheck disable=SC2034
 PERSONAS="Mobile UX Designer|React Native Architect|Mobile Domain Expert|Web UX & Accessibility Designer|Web Architect|Backend & Data Expert|TypeScript & Code Quality Expert|Performance Expert|Human Advocate|Product Reviewer|Design Fidelity Reviewer|Security Reviewer|API Contract Reviewer"
 # Personas that ALWAYS run, regardless of the spec's review profile. They guard
 # correctness and safety so per-spec cost cutting cannot drop them. Every named

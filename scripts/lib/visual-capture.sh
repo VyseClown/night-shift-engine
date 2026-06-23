@@ -209,7 +209,7 @@ run_visual_capture() {
     log "visual-capture: SKIP — no simulator/diff tooling or NIGHT_SHIFT_VISUAL_CAPTURE!=1; design fidelity stays static-only (the viewer renders reports if/when emitted)"
     return 0
   fi
-  local screens tol screen state device ref shot diff_img pct objs="" line
+  local screens tol screen state device ref shot diff_img pct objs=""
   screens="$(visual_capture_screens "$spec")"
   [ -n "$screens" ] || { log "visual-capture: no Design Contract frames/states; nothing to capture"; return 0; }
   tol="$(visual_capture_tolerance "$spec")"
