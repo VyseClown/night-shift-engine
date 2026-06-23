@@ -550,6 +550,7 @@ run_dry_fixtures() {
   fixture_assert "persona gate enforces the active profile set" fixture_profile_gate "$root"
   fixture_assert "re-review rounds require only pending blockers" fixture_review_round_subset "$root"
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
+  fixture_assert "observer temp dir cleanup is scoped, removing, and idempotent" fixture_observer_tmp_cleanup "$root"
   fixture_assert "observer cost is recorded from the retry's .attempt raw" fixture_observer_cost_capture "$root"
   fixture_assert "persona collection skips non-persona artifacts" fixture_persona_collect "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
@@ -1163,6 +1164,22 @@ fixture_cost_ledger() {
     "$ledger" >/dev/null || return 1
   # The raw files themselves are still compacted away.
   [ ! -d "$dir/raw" ] || return 1
+  return 0
+}
+
+fixture_observer_tmp_cleanup() {
+  local root="$1" dir="$root/obs-tmp"
+  mkdir -p "$dir"
+  local TMPDIR="$dir"
+  # No RUN_ID → no-op, returns success and removes nothing dangerous.
+  local RUN_ID=""
+  cleanup_observer_tmp || return 1
+  # With a RUN_ID, the per-run neutral dir is removed; calling again is idempotent.
+  RUN_ID="testrun"
+  mkdir -p "$dir/night-shift-observer-$RUN_ID"
+  cleanup_observer_tmp || return 1
+  [ ! -e "$dir/night-shift-observer-$RUN_ID" ] || return 1
+  cleanup_observer_tmp || return 1
   return 0
 }
 
@@ -2112,8 +2129,15 @@ compact_success() {
   ledger="$archive/costs.jsonl"
   [ -f "$run_dir/cost-ledger.jsonl" ] && cp "$run_dir/cost-ledger.jsonl" "$ledger"
   if [ -s "$ledger" ]; then
-    jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd) | add), records: length}' \
-      "$ledger" >>"$ledger" 2>/dev/null || true
+    # Compute the TOTAL row into a temp first, then append: reading and appending
+    # the same file in one pipeline (jq ... "$ledger" >>"$ledger") has undefined
+    # ordering and could silently drop the row. The append is best-effort.
+    local total_tmp="$ledger.total.$$"
+    if jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd) | add), records: length}' \
+      "$ledger" >"$total_tmp" 2>/dev/null; then
+      cat "$total_tmp" >>"$ledger"
+    fi
+    rm -f "$total_tmp"
   fi
   for entry in "$run_dir"/* "$run_dir"/.[!.]* "$run_dir"/..?*; do
     [ -e "$entry" ] || continue
@@ -2474,7 +2498,7 @@ validate_spec_project() {
 
 resolve_artifact() {
   local rel="$1" resolved
-  case "$rel" in /*|*"../"*|../*|*/..) return 1 ;; esac
+  case "$rel" in /*|*"../"*|*/..) return 1 ;; esac
   [ -f "$PROJECT/$rel" ] || return 1
   resolved="$(canonical_file "$PROJECT/$rel")" || return 1
   case "$resolved" in "$PROJECT"/*) printf '%s\n' "$resolved" ;; *) return 1 ;; esac
@@ -2914,8 +2938,14 @@ EOF
 }
 
 invoke_primary() {
-  local prompt="$RUN_ROOT/prompts/primary-$(jq -r '.primary_turns + 1' "$STATE").txt"
-  local raw="$RUN_ROOT/raw/primary-$(jq -r '.primary_turns + 1' "$STATE").json"
+  # Declare then assign separately so a jq failure on $STATE is not masked by
+  # local's own (always-zero) exit status — the discipline used in enforce_limits
+  # and state_int.
+  local turn prompt raw
+  turn="$(jq -r '.primary_turns + 1' "$STATE")" ||
+    block_run "could not read .primary_turns from state; state may be corrupt"
+  prompt="$RUN_ROOT/prompts/primary-$turn.txt"
+  raw="$RUN_ROOT/raw/primary-$turn.json"
   local session emitted rc model
   # Consecutive 429-without-success counter. Persisted in state so recovery
   # after a crash picks up the count; reset to 0 on the first clean turn.
@@ -3077,6 +3107,7 @@ expected_action() {
 block_run() {
   local reason="$1"
   cleanup_validation_worktree >/dev/null 2>&1 || reason="$reason; validation worktree cleanup also failed"
+  cleanup_observer_tmp
   # Record the blocked status best-effort: if state.json is corrupt, state_set
   # itself calls die — which would exit BEFORE this block_run's die with the
   # real reason. Guard the state write so its failure is tolerated and the
@@ -3101,6 +3132,14 @@ cleanup_validation_worktree() {
     return 1
   fi
   state_set 'del(.validation_worktree)'
+}
+
+# Remove the neutral cwd the observer ran from (see invoke_observer_once). It is
+# per-RUN_ID and reused across observer attempts, so it is only cleaned at the
+# run's terminal paths (block_run / complete_run). Best-effort and idempotent.
+cleanup_observer_tmp() {
+  [ -n "${RUN_ID:-}" ] || return 0
+  rm -rf "${TMPDIR:-/tmp}/night-shift-observer-$RUN_ID" 2>/dev/null || true
 }
 
 validate_signal() {
@@ -3611,6 +3650,7 @@ complete_run() {
   jq '{run_id,status,primary,observer,task,base_commit,candidate_commits,
     primary_turns,review_round,finding_ids,started_at,completed_at}' "$STATE" >"$summary"
   compact_success "$RUN_ROOT" "$RUN_ID"
+  cleanup_observer_tmp
   log "run $RUN_ID complete; compact archive: $RUN_ROOT/archive/$RUN_ID"
   exit 0
 }
