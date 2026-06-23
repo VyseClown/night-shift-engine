@@ -153,6 +153,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
   fixture_assert "visual report status: absent/malformed/valid classification" fixture_visual_report_status "$root"
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
+  fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
   fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
@@ -497,6 +498,32 @@ fixture_visual_capture_skips() {
   run_visual_capture "$root/spec.md" abc123 "$out" >/dev/null 2>&1 || return 1
   [ -z "$(find "$out" -name 'visual-diff-*.json' 2>/dev/null)" ] || return 1
   return 0
+}
+
+# Regression for GH #16: real `odiff --parsable-stdout` prints "<count>;<pct>"
+# (0–100). __visual_pixel_diff must return the PERCENTAGE as a 0–1 fraction
+# (0.9937), never the pixel COUNT (3142353) the old first-bare-number parse grabbed.
+fixture_visual_pixel_diff_parse() {
+  local root="$1" tool="$root/fakeodiff.sh" ref="$root/ref.png" shot="$root/shot.png" out="$root/diff.png" pct
+  cat >"$tool" <<'SH'
+#!/usr/bin/env bash
+# Mimic the installed odiff: emit "<diffPixelCount>;<diffPercentage>", exit 22 (differs).
+printf '3142353;99.37\n'
+exit 22
+SH
+  chmod +x "$tool"
+  : >"$ref"; : >"$shot"
+  pct="$(NIGHT_SHIFT_VISUAL_DIFF_TOOL="$tool" __visual_pixel_diff "$ref" "$shot" "$out")" || return 1
+  # 99.37% -> 0.9937 (fraction), not the raw count.
+  awk -v p="$pct" 'BEGIN{ exit !(p > 0.9936 && p < 0.9938) }' || return 1
+  # A "0;0.00" (identical) must yield 0.
+  cat >"$tool" <<'SH'
+#!/usr/bin/env bash
+printf '0;0.00\n'
+SH
+  chmod +x "$tool"
+  pct="$(NIGHT_SHIFT_VISUAL_DIFF_TOOL="$tool" __visual_pixel_diff "$ref" "$shot" "$out")" || return 1
+  awk -v p="$pct" 'BEGIN{ exit !(p == 0) }' || return 1
 }
 
 fixture_visual_assemble_report() {
