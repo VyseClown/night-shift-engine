@@ -138,6 +138,7 @@ parallel-worktrees.sh (--jobs 2)
 |---|---|---|
 | `NIGHT_SHIFT_DEVICE_REGISTRY` | `0` | Master opt-in. `1` enables claim/lock/clone/prune. The wrapper sets it for `--jobs > 1`. |
 | `NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT` | `300` | Seconds to poll for a free device before the clean SKIP. |
+| `NIGHT_SHIFT_DEVICE_POLL_SECONDS` | `5` | Seconds between device-acquisition poll attempts inside `device_claim`. |
 | `NIGHT_SHIFT_DEVICE_REGISTRY_DIR` | `~/.night-shift/devices` | Registry root (tests point this at a temp dir). |
 
 ## Testing
