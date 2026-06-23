@@ -135,6 +135,7 @@ run_dry_fixtures() {
   fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
   fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
   fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
+  fixture_assert "malformed-signal cap predicate blocks only at/over the cap" fixture_malformed_cap "$root"
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
   fixture_assert "block_run state write failure does not suppress original reason" fixture_block_run_hardening "$root"
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
@@ -1432,6 +1433,21 @@ fixture_rate_limit_consecutive() {
   consecutive_429=$((cap + 1))
   [ "$consecutive_429" -lt "$cap" ] && return 1    # cap+1 -lt cap is false → block expected
 
+  return 0
+}
+
+# Drives the REAL production predicate malformed_cap_reached at its boundaries:
+# below the cap must NOT block; at/over the cap must block. Exercises production
+# code (not a re-implemented comparison), so it fails if the operator/direction
+# in malformed_cap_reached is ever wrong.
+fixture_malformed_cap() {
+  local cap="$MAX_MALFORMED_SIGNALS"
+  # 0 and cap-1 are below threshold → predicate false (continue, do not block).
+  ! malformed_cap_reached 0 || return 1
+  ! malformed_cap_reached "$((cap - 1))" || return 1
+  # cap and cap+1 are at/over threshold → predicate true (block).
+  malformed_cap_reached "$cap" || return 1
+  malformed_cap_reached "$((cap + 1))" || return 1
   return 0
 }
 
