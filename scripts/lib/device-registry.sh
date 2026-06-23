@@ -44,3 +44,30 @@ device_try_claim() {
   fi
   return 1
 }
+
+# Claim a device for <label>, cloning a matching one if all are taken. Polls up
+# to NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT seconds, then prints empty + returns 1
+# (caller SKIPs). Prints the claimed UDID on success.
+device_claim() {
+  local label="$1" run_id="$2"
+  local timeout="${NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT:-300}"
+  local poll="${NIGHT_SHIFT_DEVICE_POLL_SECONDS:-5}"
+  local deadline udid src clone_udid
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    for udid in $(device_candidates "$label" 2>/dev/null); do
+      if device_try_claim "$udid" "$run_id" false; then
+        printf '%s\n' "$udid"; return 0
+      fi
+    done
+    src="$(device_candidates "$label" 2>/dev/null | head -n 1)"
+    if [ -n "$src" ]; then
+      clone_udid="$(xcrun simctl clone "$src" "ns-$run_id" 2>/dev/null)" || clone_udid=""
+      if [ -n "$clone_udid" ] && device_try_claim "$clone_udid" "$run_id" true; then
+        printf '%s\n' "$clone_udid"; return 0
+      fi
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || { printf ''; return 1; }
+    sleep "$poll"
+  done
+}

@@ -597,6 +597,8 @@ run_dry_fixtures() {
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
+  fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
+  fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -1818,6 +1820,41 @@ fixture_device_try_claim() {
     # a stale lock (dead PID) is reclaimable.
     printf '99998\n' >"$stub/reg/UDID-AAA.lock/pid"
     device_try_claim UDID-AAA run-C false || exit 1
+    exit 0
+  )
+}
+
+fixture_device_claim_distinct() {
+  local root="$1" stub="$root/dcd"
+  fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
+    local a b
+    a="$(device_claim iphone-15 run-A)" || exit 1
+    b="$(device_claim iphone-15 run-B)" || exit 1
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ] || exit 1   # two real devices
+    exit 0
+  )
+}
+
+fixture_device_claim_clone_on_exhaustion() {
+  local root="$1" stub="$root/dce"
+  fixture_make_simctl_stub "$stub"
+  # Only ONE matching device, so the 2nd claim must clone.
+  cat >"$stub/devices.json" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "iPhone 15", "udid": "UDID-AAA", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg" \
+           NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
+    device_claim iphone-15 run-A >/dev/null || exit 1
+    local b; b="$(device_claim iphone-15 run-B)" || exit 1
+    [ "$b" = "UDID-CLONE-ns-run-B" ] || exit 1     # stub clone udid
+    grep -q "clone UDID-AAA ns-run-B" "$stub/calls.log" || exit 1
+    [ "$(cat "$stub/reg/$b.lock/clone")" = "true" ] || exit 1
     exit 0
   )
 }
