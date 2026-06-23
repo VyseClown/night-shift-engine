@@ -1,0 +1,21 @@
+# ShellCheck config for the night-shift engine.
+# Target shell is bash (macOS bash 3.2+ locally, bash on Linux CI). Only these
+# three codes are disabled repo-wide — each is a categorical false positive in
+# this codebase (80+ sites combined). Every other check stays ON so the CI gate
+# still catches real bugs; localized intentional cases use inline pragmas.
+
+# jq filter strings are single-quoted on purpose: `$x` inside them is a jq
+# variable bound by --arg / --argjson, NOT a shell variable. Expansion is
+# intentionally avoided, so SC2016 ("expressions don't expand in single quotes")
+# is always wrong here.
+disable=SC2016
+
+# NOTE: SC2318 (single-line `local a=$1 b=$a`) is NOT disabled here — it is a
+# real bug in production code, so the gate keeps it ON. Its only occurrences are
+# in scripts/test/fixtures.sh (which works by dynamic scoping); the suppression
+# is scoped to that file's own header directive, not repo-wide.
+
+# The atomic-write idiom `jq ... >"$tmp" && mv "$tmp" "$dst" || die` is used
+# throughout: the `||` branch firing on EITHER a failed write or a failed move is
+# the intended fail-closed behavior, not the if/else mix-up SC2015 warns about.
+disable=SC2015

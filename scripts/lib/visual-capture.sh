@@ -204,7 +204,7 @@ __visual_pixel_diff() {
 # acquisition timeout (caller SKIPs). In default mode (_ns_reg != 1) returns
 # empty so __visual_capture_screenshot resolves internally — unchanged behavior.
 __visual_udid_for_label() {
-  local label="$1" run_id="${RUN_ID:-$$}" cache_file claim_file u
+  local label="$1" run_id="${RUN_ID:-$$}" cache_file u
   [ "${_ns_reg:-0}" = "1" ] || { printf ''; return 0; }
   # Use a file-based cache so claims survive $() subshell boundaries.
   cache_file="${_ns_cache_dir}/label/${label}"
@@ -237,6 +237,7 @@ run_visual_capture() {
   if [ "$_ns_reg" = "1" ]; then
     _ns_cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/ns-vcr-XXXXXX")"
   fi
+  # shellcheck disable=SC2329  # invoked indirectly via the RETURN trap below
   _ns_release_all() {
     [ -n "$_ns_cache_dir" ] || return 0
     local u
@@ -244,7 +245,7 @@ run_visual_capture() {
     rm -rf "$_ns_cache_dir"
   }
   trap '_ns_release_all' RETURN
-  local screens tol screen state device ref shot diff_img pct objs="" line
+  local screens tol screen state device ref shot diff_img pct objs=""
   screens="$(visual_capture_screens "$spec")"
   [ -n "$screens" ] || { log "visual-capture: no Design Contract frames/states; nothing to capture"; return 0; }
   tol="$(visual_capture_tolerance "$spec")"
