@@ -185,14 +185,31 @@ __visual_pixel_diff() {
       cp "$reference" "$ref_use" 2>/dev/null && sips -z "$h" "$w" "$ref_use" >/dev/null 2>&1 || ref_use="$reference"
     fi
   fi
-  local outp pct
+  local outp pct rc
   outp="$("${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" --parsable-stdout "$ref_use" "$screenshot" "$diff_out" 2>/dev/null)"
-  # Prefer an explicit percentage token (e.g. "5.60%") if the tool prints one;
-  # otherwise fall back to the first bare number. NOTE: the exact
-  # `--parsable-stdout` numeric format must be confirmed against the installed
-  # odiff during the Task 12 real-run smoke and this extraction adjusted if needed.
-  pct="$(printf '%s' "$outp" | grep -oE '[0-9]+(\.[0-9]+)?%' | head -n1 | tr -d '%')"
-  [ -n "$pct" ] || pct="$(printf '%s' "$outp" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
+  rc=$?
+  # Identical images: real `odiff --parsable-stdout` prints NOTHING and exits 0.
+  # That is a perfect match → diff_pct 0 (a pass), NOT an unparseable SKIP.
+  if [ "$rc" -eq 0 ] && [ -z "$outp" ]; then
+    printf '0'
+    return 0
+  fi
+  # Otherwise `odiff --parsable-stdout` prints "<diffPixelCount>;<diffPercentage>" —
+  # e.g. "3142353;99.37" (exit 22) — where the percentage is 0–100 (confirmed
+  # against odiff on a real run; see GH #16). The report's diff_pct is a 0–1
+  # FRACTION (schema + `pass == diff_pct <= tolerance`, default tolerance 0.10), so
+  # take the percentage field and divide by 100. Do NOT fall back to the first bare
+  # number: that grabbed the pixel COUNT (3142353), a nonsensical diff_pct + broken
+  # pass decision. A "NN%" literal (other diff tools) is the only fallback, also
+  # normalized to 0–1. `LC_ALL=C` forces a '.' decimal point so the value stays
+  # valid JSON for `jq --argjson` in any locale (a comma-decimal locale otherwise
+  # yields "0,99" → invalid JSON).
+  pct="$(printf '%s' "$outp" | LC_ALL=C awk -F';' 'NF>1 && $2 ~ /^[0-9]+(\.[0-9]+)?$/ { printf "%.6f", $2/100; exit }')"
+  if [ -z "$pct" ]; then
+    local lit
+    lit="$(printf '%s' "$outp" | grep -oE '[0-9]+(\.[0-9]+)?%' | head -n1 | tr -d '%')"
+    [ -z "$lit" ] || pct="$(LC_ALL=C awk -v p="$lit" 'BEGIN{ printf "%.6f", p/100 }')"
+  fi
   # Fail closed: an unparseable result must NOT silently become 0% (a false PASS).
   # Returning non-zero makes run_visual_capture log + skip this screen instead.
   [ -n "$pct" ] || return 2
