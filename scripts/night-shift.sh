@@ -602,6 +602,7 @@ run_dry_fixtures() {
   fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
   fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
   fixture_assert "device_registry_prune reclaims stale locks + orphan clones" fixture_device_prune "$root"
+  fixture_assert "prune skips clones being created (live marker), sweeps stale ones" fixture_device_prune_creation_race "$root"
   fixture_assert "run_visual_capture registry mode claims, caches, releases" fixture_visual_capture_registry_claim "$root"
   fixture_assert "registry-off: no claim, no artifacts" fixture_visual_registry_off_no_artifacts "$root"
   fixture_assert "visual_review prunes the registry only in registry mode" fixture_visual_prune_guarded "$root"
@@ -1891,8 +1892,8 @@ JSON
            NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT=0
     device_claim iphone-15 run-A >/dev/null || exit 1
     local b; b="$(device_claim iphone-15 run-B)" || exit 1
-    [ "$b" = "UDID-CLONE-ns-nightshift-run-B" ] || exit 1     # stub clone udid
-    grep -q "clone UDID-AAA ns-nightshift-run-B" "$stub/calls.log" || exit 1
+    [ "$b" = "UDID-CLONE-ns-nightshift-run-B-iphone-15" ] || exit 1     # stub clone udid
+    grep -q "clone UDID-AAA ns-nightshift-run-B-iphone-15" "$stub/calls.log" || exit 1
     [ "$(cat "$stub/reg/$b.lock/clone")" = "true" ] || exit 1
     exit 0
   )
@@ -1936,6 +1937,27 @@ JSON
     [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1             # stale lock reclaimed
     grep -q "delete UDID-ORPHAN" "$stub/calls.log" || exit 1  # orphan clone deleted
     grep -q "delete UDID-USER" "$stub/calls.log" && exit 1    # user sim must NOT be deleted
+    exit 0
+  )
+}
+
+fixture_device_prune_creation_race() {
+  local root="$1" stub="$root/dpc"
+  fixture_make_simctl_stub "$stub"
+  cat >"$stub/devices.json" <<'JSON'
+{ "devices": { "iOS-17": [
+  { "name": "ns-nightshift-Z-iphone-15", "udid": "UDID-CREATING", "state": "Shutdown", "isAvailable": true }
+] } }
+JSON
+  (
+    export PATH="$stub/bin:$PATH" NIGHT_SHIFT_DEVICE_REGISTRY_DIR="$stub/reg"
+    mkdir -p "$stub/reg/.creating-ns-nightshift-Z-iphone-15"
+    printf '%s\n' "$$" >"$stub/reg/.creating-ns-nightshift-Z-iphone-15/pid"
+    device_registry_prune                                   # live marker -> must NOT delete
+    grep -q "delete UDID-CREATING" "$stub/calls.log" 2>/dev/null && exit 1
+    printf '99998\n' >"$stub/reg/.creating-ns-nightshift-Z-iphone-15/pid"
+    device_registry_prune                                   # stale marker -> deletes
+    grep -q "delete UDID-CREATING" "$stub/calls.log" || exit 1
     exit 0
   )
 }

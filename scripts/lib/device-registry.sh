@@ -52,7 +52,8 @@ device_claim() {
   local label="$1" run_id="$2"
   local timeout="${NIGHT_SHIFT_DEVICE_ACQUIRE_TIMEOUT:-300}"
   local poll="${NIGHT_SHIFT_DEVICE_POLL_SECONDS:-5}"
-  local deadline udid src clone_udid
+  local reg deadline udid src clone_udid clone_name creating
+  reg="$(device_registry_root)"
   deadline=$(( $(date +%s) + timeout ))
   while :; do
     for udid in $(device_candidates "$label" 2>/dev/null); do
@@ -62,9 +63,15 @@ device_claim() {
     done
     src="$(device_candidates "$label" 2>/dev/null | head -n 1)"
     if [ -n "$src" ]; then
-      clone_udid="$(xcrun simctl clone "$src" "ns-nightshift-$run_id" 2>/dev/null)" || clone_udid=""
-      if [ -n "$clone_udid" ] && device_try_claim "$clone_udid" "$run_id" true; then
-        printf '%s\n' "$clone_udid"; return 0
+      local clone_name="ns-nightshift-${run_id}-${label}"
+      local creating="$reg/.creating-${clone_name}"
+      if mkdir "$creating" 2>/dev/null; then
+        printf '%s\n' "$$" >"$creating/pid"
+        clone_udid="$(xcrun simctl clone "$src" "$clone_name" 2>/dev/null)" || clone_udid=""
+        if [ -n "$clone_udid" ] && device_try_claim "$clone_udid" "$run_id" true; then
+          rm -rf "$creating"; printf '%s\n' "$clone_udid"; return 0
+        fi
+        rm -rf "$creating"
       fi
     fi
     [ "$(date +%s)" -lt "$deadline" ] || { printf ''; return 1; }
@@ -99,10 +106,16 @@ device_registry_prune() {
       rm -rf "$lock"
     fi
   done
+  for lock in "$reg"/.creating-*; do
+    [ -d "$lock" ] || continue
+    lock_is_stale "$lock" && rm -rf "$lock"
+  done
   js="$(xcrun simctl list devices -j 2>/dev/null)" || return 0
-  printf '%s' "$js" | jq -r '[.devices[][]? | select(.name|startswith("ns-nightshift-")) | .udid] | .[]' \
-    | while IFS= read -r udid; do
+  printf '%s' "$js" | jq -r '[.devices[][]? | select(.name|startswith("ns-nightshift-")) | "\(.udid)\t\(.name)"] | .[]' \
+    | while IFS="$(printf '\t')" read -r udid name; do
         [ -n "$udid" ] || continue
-        [ -d "$reg/$udid.lock" ] || xcrun simctl delete "$udid" >/dev/null 2>&1 || true
+        [ -d "$reg/$udid.lock" ] && continue
+        [ -d "$reg/.creating-$name" ] && continue
+        xcrun simctl delete "$udid" >/dev/null 2>&1 || true
       done
 }
