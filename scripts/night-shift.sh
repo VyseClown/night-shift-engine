@@ -574,6 +574,7 @@ run_dry_fixtures() {
   fixture_assert "added optional persona auto-activates via its section" fixture_optional_persona_added_section "$root"
   fixture_assert "optional-personas manifest lists all four with headings" fixture_optional_personas_manifest "$root"
   fixture_assert "preflight reports ready only on a valid spec + feature branch" fixture_preflight_report "$root"
+  fixture_assert "spec project guard accepts a worktree of the declared project" fixture_spec_project_worktree "$root"
   fixture_assert "evidence verify matches on exit status, ignores command-string transcription" fixture_evidence_exit_status_match "$root"
   fixture_assert "resumable_blocked_state gates --resume to logic-blocked, session-bearing state" fixture_resume_blocked "$root"
   fixture_assert "explicit Personas list overrides the profile (floor kept)" fixture_explicit_personas_override "$root"
@@ -1579,12 +1580,18 @@ fixture_preflight_report() {
   git -C "$repo" config user.name test >/dev/null 2>&1
   printf '.night-shift/\n' >"$repo/.gitignore"
   fixture_write_min_spec "$spec"   # valid rn spec: base main, feature feat/x
+  # Point the spec's Project path at this repo so the project-match guard passes;
+  # the template's placeholder (~/work/app) would otherwise block readiness.
+  local repo_c; repo_c="$(canonical_dir "$repo")" || return 1
+  local tmp="$spec.tmp"
+  sed "s|^- Project path: .*|- Project path: \`$repo_c\`|" "$spec" >"$tmp" && mv "$tmp" "$spec"
   git -C "$repo" add -A >/dev/null 2>&1
   git -C "$repo" commit -qm init >/dev/null 2>&1 || return 1
-  # On the base branch: valid spec but NOT ready (wrong branch).
+  # On the base branch: valid spec, project matches, but NOT ready (wrong branch).
   out="$(emit_preflight "$repo" "$spec")" || return 1
   printf '%s' "$out" | jq -e . >/dev/null 2>&1 || return 1
   printf '%s' "$out" | jq -e '.spec.valid == true' >/dev/null 2>&1 || return 1
+  printf '%s' "$out" | jq -e '.spec.projectMatch == true' >/dev/null 2>&1 || return 1
   printf '%s' "$out" | jq -e '.branch.onBase == true and .branch.onFeature == false' >/dev/null 2>&1 || return 1
   printf '%s' "$out" | jq -e '.ready == false' >/dev/null 2>&1 || return 1
   printf '%s' "$out" | jq -e '.blockers | any(test("feature branch"))' >/dev/null 2>&1 || return 1
@@ -1595,6 +1602,37 @@ fixture_preflight_report() {
   printf '%s' "$out" | jq -e '.tree.clean == true and .gitignore.nightShiftIgnored == true' >/dev/null 2>&1 || return 1
   printf '%s' "$out" | jq -e '.ready == true and (.blockers | length == 0)' >/dev/null 2>&1 || return 1
   rm -rf "$repo"
+  return 0
+}
+
+# The project guard must accept a spec run from inside a git WORKTREE of the
+# declared project (what scripts/parallel-worktrees.sh does), while still
+# rejecting an unrelated repo.
+fixture_spec_project_worktree() {
+  local root="$1" repo="$root/spw-repo" wt="$root/spw-wt" other="$root/spw-other" spec repo_c tmp
+  rm -rf "$repo" "$wt" "$other"; mkdir -p "$repo" "$other"
+  git -C "$repo" init -q -b main >/dev/null 2>&1 || return 1
+  git -C "$repo" config user.email t@t >/dev/null 2>&1
+  git -C "$repo" config user.name test >/dev/null 2>&1
+  git -C "$other" init -q -b main >/dev/null 2>&1 || return 1
+  spec="$repo/spec.md"
+  fixture_write_min_spec "$spec"
+  repo_c="$(canonical_dir "$repo")" || return 1
+  tmp="$spec.tmp"
+  sed "s|^- Project path: .*|- Project path: \`$repo_c\`|" "$spec" >"$tmp" && mv "$tmp" "$spec"
+  git -C "$repo" add -A >/dev/null 2>&1
+  git -C "$repo" commit -qm init >/dev/null 2>&1 || return 1
+  # (a) direct match: proj IS the declared project.
+  validate_spec_project "$spec" "$repo" || return 1
+  # (b) a linked worktree of the project is accepted (the new behavior).
+  git -C "$repo" worktree add -q "$wt" -b feat/wt >/dev/null 2>&1 || return 1
+  validate_spec_project "$spec" "$wt" || { git -C "$repo" worktree remove --force "$wt" 2>/dev/null; return 1; }
+  # (c) an unrelated repo is still rejected.
+  if validate_spec_project "$spec" "$other"; then
+    git -C "$repo" worktree remove --force "$wt" 2>/dev/null; return 1
+  fi
+  git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+  rm -rf "$repo" "$wt" "$other"
   return 0
 }
 
@@ -2362,6 +2400,12 @@ emit_preflight() {
   fi
   spec_errors="$(printf '%s\n' "$verr" | sed -nE 's/^- (.*)/\1/p' | jq -R . | jq -sc .)"
 
+  # Does the spec's declared Project path match --project (or a worktree of it)?
+  # The live run enforces this (validate_spec_project); preflight must report it
+  # too, or --dry-run gives a false green that the real run then blocks on.
+  local project_match
+  if validate_spec_project "$spec" "$proj" 2>/dev/null; then project_match=true; else project_match=false; fi
+
   base="$(sed -nE 's/^- Base branch: `([^`]+)`.*/\1/p' "$spec" | head -n 1)"
   feature="$(sed -nE 's/^- Feature branch: `([^`]+)`.*/\1/p' "$spec" | head -n 1)"
   current="$(git -C "$proj" branch --show-current 2>/dev/null || true)"
@@ -2385,6 +2429,7 @@ emit_preflight() {
   # Blockers (newline list → JSON array). ready = no blockers.
   local b=""
   [ "$spec_valid" = true ] || b="${b}spec invalid"$'\n'
+  [ "$project_match" = true ] || b="${b}spec Project path does not match --project"$'\n'
   [ "$on_feature" = true ] || b="${b}not on feature branch ${feature:-?}"$'\n'
   [ "$dirty" -eq 0 ] || b="${b}working tree dirty"$'\n'
   [ "$nightignored" = true ] || b="${b}.night-shift not gitignored"$'\n'
@@ -2395,13 +2440,14 @@ emit_preflight() {
 
   jq -n \
     --argjson spec_valid "$spec_valid" --argjson spec_errors "$spec_errors" \
+    --argjson project_match "$project_match" \
     --arg base "$base" --arg feature "$feature" --arg current "$current" \
     --argjson on_feature "$on_feature" --argjson on_base "$on_base" \
     --argjson worktree_conflict "$worktree_conflict" \
     --argjson dirty "$dirty" --argjson nightignored "$nightignored" \
     --argjson ready "$ready" --argjson blockers "$blockers_json" \
     '{
-      spec: { valid: $spec_valid, errors: $spec_errors },
+      spec: { valid: $spec_valid, errors: $spec_errors, projectMatch: $project_match },
       branch: { base: $base, feature: $feature, current: $current,
                 onFeature: $on_feature, onBase: $on_base, worktreeConflict: $worktree_conflict },
       tree: { clean: ($dirty == 0), dirtyCount: $dirty },
@@ -2485,7 +2531,7 @@ evidence_exit_status_matches() {
 }
 
 validate_spec_project() {
-  local file="$1" declared
+  local file="$1" proj="${2:-$PROJECT}" declared main
   declared="$(sed -nE 's/^- Project path: `([^`]+)`.*/\1/p' "$file" | head -n 1)"
   case "$declared" in
     "~/"*) declared="$HOME/${declared#\~/}" ;;
@@ -2493,7 +2539,18 @@ validate_spec_project() {
     *) declared="$WORKSPACE_ROOT/$declared" ;;
   esac
   declared="$(canonical_dir "$declared")" || return 1
-  [ "$declared" = "$PROJECT" ]
+  proj="$(canonical_dir "$proj")" || return 1
+  [ "$declared" = "$proj" ] && return 0
+  # Accept a git worktree whose MAIN working tree is the declared project: a
+  # worktree of the project IS the project (same repo + history, just a different
+  # branch and working dir). `git worktree list` always lists the main working
+  # tree first, so its path is the canonical project root. This lets a per-feature
+  # worktree run a spec without weakening the guard's intent — the spec still only
+  # runs against the project it declares, never a different one.
+  main="$(git -C "$proj" worktree list --porcelain 2>/dev/null | sed -n '1{s/^worktree //;p;}')"
+  [ -n "$main" ] || return 1
+  main="$(canonical_dir "$main")" || return 1
+  [ "$declared" = "$main" ]
 }
 
 resolve_artifact() {
