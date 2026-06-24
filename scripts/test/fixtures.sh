@@ -137,6 +137,7 @@ run_dry_fixtures() {
   fixture_assert "spec project guard accepts a worktree of the declared project" fixture_spec_project_worktree "$root"
   fixture_assert "evidence verify matches on exit status, ignores command-string transcription" fixture_evidence_exit_status_match "$root"
   fixture_assert "resumable_blocked_state gates --resume to logic-blocked, session-bearing state" fixture_resume_blocked "$root"
+  fixture_assert "supervisor auto-resumes transient blocks, escalates a repeated stuck one" fixture_supervisor_decision "$root"
   fixture_assert "explicit Personas list overrides the profile (floor kept)" fixture_explicit_personas_override "$root"
   fixture_assert "explicit Personas list may name an optional reviewer" fixture_explicit_personas_with_optional "$root"
   fixture_assert "explicit Personas list rejects an off-track name" fixture_explicit_personas_unknown "$root"
@@ -279,6 +280,25 @@ fixture_cleanup_recovery() {
 #   (b) status == "blocked" but session ID mismatch — could be a different Claude session
 #   (c) state or raw file missing — both must exist or we return 1
 # All three must return 1.  If recoverable_rate_limit_state were changed to accept any
+# The auto-resume supervisor's decision policy (scripts/lib/supervisor.sh): resume
+# transient blocks, but escalate when a block repeats with no progress (stuck) or
+# the resume cap is hit. Pure — exercised directly.
+fixture_supervisor_decision() {
+  # shellcheck source=scripts/lib/supervisor.sh
+  . "$NIGHT_SHIFT_LIB/supervisor.sh" 2>/dev/null || return 1
+  # First block (no history) → resume.
+  [ "$(supervisor_next "R" "P" "" "" 0 5)" = "resume" ] || return 1
+  # Same reason AND no progress since last block → genuinely stuck → escalate.
+  [ "$(supervisor_next "R" "P" "R" "P" 1 5)" = "escalate:stuck" ] || return 1
+  # Same reason but progress advanced (new commit/task) → resume.
+  [ "$(supervisor_next "R" "Pnew" "R" "P" 1 5)" = "resume" ] || return 1
+  # A different block reason → resume.
+  [ "$(supervisor_next "R2" "P" "R" "P" 1 5)" = "resume" ] || return 1
+  # Resume cap reached → escalate regardless.
+  case "$(supervisor_next "R" "P" "" "" 5 5)" in escalate:resume-cap-*) ;; *) return 1 ;; esac
+  return 0
+}
+
 # running state it would break (a); a missing session check would break (b).
 fixture_state_recovery() {
   local root="$1"
