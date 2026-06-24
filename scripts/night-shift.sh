@@ -1045,26 +1045,43 @@ extract_claude_structured() {
   return 1
 }
 
+# Normalize a near-miss persona-review record to the canonical schema shape so the
+# round gate (which reads .status) accepts a genuine APPROVE/BLOCK result instead
+# of rejecting it with a confusing downstream message ("BLOCK by <empty>"). The
+# primary occasionally writes `verdict` for the schema's `status`, and omits the
+# always-empty `commit`/`documentation_changes` on a clean APPROVE. Pure: reads $1,
+# prints normalized JSON; a non-record (review bundle, plan doc) passes through and
+# then fails json_schema_basic, exactly as before. (GH #20)
+normalize_persona_result() {
+  jq '
+    (if (has("verdict") and (has("status") | not)) then (.status = .verdict | del(.verdict)) else . end)
+    | (if has("commit") then . else .commit = null end)
+    | (if has("documentation_changes") then . else .documentation_changes = [] end)
+  ' "$1"
+}
+
 # Copies the persona-review artifacts listed in a RUN_PERSONAS signal into the
 # round result dir. Each artifact is resolved for safety first (an unsafe or
-# missing path is fatal — path-traversal guard). Artifacts that do not validate as
-# persona-review records are SKIPPED, not fatal: the primary also lists non-persona
-# deliverables it produced (the review bundle, the plan doc), and the exact-set +
-# count + stage gate in run_personas is the real enforcement. Mirrors how
-# verify_candidate picks the execution-evidence file out of a mixed artifact list.
-# Returns non-zero only on an unsafe/missing path or a copy failure.
+# missing path is fatal — path-traversal guard). Each is normalized (verdict→status
+# etc.) then validated; artifacts that still do not validate as persona-review
+# records are SKIPPED, not fatal: the primary also lists non-persona deliverables it
+# produced (the review bundle, the plan doc), and the exact-set + count + stage gate
+# in run_personas is the real enforcement. The normalized result is written into the
+# round dir, overwriting any malformed copy the primary placed there directly (which
+# previously lingered and made the gate miscount). Returns non-zero only on an
+# unsafe/missing path or a write failure.
 collect_persona_results() {
-  local signal="$1" result_dir="$2" artifact out dst
+  local signal="$1" result_dir="$2" artifact out dst tmp
   while IFS= read -r artifact; do
     [ -n "$artifact" ] || continue
     out="$(resolve_artifact "$artifact")" || return 1
-    # Skip (don't fail on) artifacts that aren't persona-review records — the
-    # review bundle and plan doc are listed alongside the real results.
-    json_schema_basic persona-review "$out" || continue
-    dst="$result_dir/$(basename "$out")"
-    # The primary may have written the artifact directly into $result_dir; in that
-    # case the copy is a no-op (and BSD cp would fail with "are identical").
-    [ "$out" -ef "$dst" ] || cp "$out" "$dst" || return 1
+    tmp="$result_dir/.collect-$$.json"
+    if normalize_persona_result "$out" >"$tmp" 2>/dev/null && json_schema_basic persona-review "$tmp"; then
+      dst="$result_dir/$(basename "$out")"
+      mv "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+    else
+      rm -f "$tmp"
+    fi
   done <<EOF
 $(jq -r '.artifacts[]' "$signal")
 EOF

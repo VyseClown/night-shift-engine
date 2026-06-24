@@ -111,6 +111,7 @@ run_dry_fixtures() {
   fixture_assert "observer temp dir cleanup is scoped, removing, and idempotent" fixture_observer_tmp_cleanup "$root"
   fixture_assert "observer cost is recorded from the retry's .attempt raw" fixture_observer_cost_capture "$root"
   fixture_assert "persona collection skips non-persona artifacts" fixture_persona_collect "$root"
+  fixture_assert "persona collection normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "set_stage resets review_round at scope boundaries (GH #18)" fixture_stage_round_reset "$root"
@@ -817,6 +818,33 @@ fixture_persona_collect() {
   # An unsafe/absolute path anywhere in the list is still fatal (traversal guard).
   printf '{"artifacts":["/etc/hosts","a.json"]}\n' >"$signal"
   collect_persona_results "$signal" "$result_dir" && return 1
+  return 0
+}
+
+# GH #20: a primary result written with `verdict` instead of the schema's `status`
+# (and omitting the always-empty commit/documentation_changes on a clean APPROVE)
+# is normalized to the canonical shape on collection, so the round gate accepts it.
+fixture_persona_normalize() {
+  local root="$1" result_dir signal
+  local PROJECT="$root/normalize"
+  result_dir="$PROJECT/.night-shift/out"
+  signal="$PROJECT/signal.json"
+  mkdir -p "$PROJECT" "$result_dir"
+  # The primary slip: `verdict` not `status`, and omitted empty fields.
+  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"APPROVE","findings":[]}\n' >"$PROJECT/ha.json"
+  # A canonical result is left untouched.
+  printf '{"persona":"React Native Architect","stage":"implementation","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/rn.json"
+  printf '{"artifacts":["ha.json","rn.json"]}\n' >"$signal"
+  collect_persona_results "$signal" "$result_dir" || return 1
+  # Both collected; the verdict one now carries a canonical, schema-valid status.
+  [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || return 1
+  [ "$(jq -r '.status' "$result_dir/ha.json")" = "APPROVE" ] || return 1
+  [ "$(jq -r 'has("verdict")' "$result_dir/ha.json")" = "false" ] || return 1
+  json_schema_basic persona-review "$result_dir/ha.json" || return 1
+  [ "$(jq -r '.status' "$result_dir/rn.json")" = "APPROVE" ] || return 1
+  # Faithful, not masking: a verdict BLOCK maps to status BLOCK.
+  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"BLOCK","findings":[{"id":"HA-001","evidence":"x","required_change":"y"}]}\n' >"$PROJECT/blk.json"
+  [ "$(normalize_persona_result "$PROJECT/blk.json" | jq -r '.status')" = "BLOCK" ] || return 1
   return 0
 }
 
