@@ -142,19 +142,35 @@ __visual_capture_screenshot() {
     --time "2026-06-18T09:41:00" --batteryState charged --batteryLevel 100 \
     --cellularBars 4 --wifiBars 3 >/dev/null 2>&1 || true
   mkdir -p "$(dirname "$out")"
-  # Drive the app into preview mode. Preferred: a prompt-free cold launch with a
-  # launch argument (NIGHT_SHIFT_PREVIEW_BUNDLE_ID set) the app reads into preview
-  # mode — deterministic, no custom-scheme "Open in app?" confirmation. Fallback:
-  # a custom-scheme deep link (may show that confirmation on newer iOS).
+  # Drive the app into preview mode. Three modes, most to least prompt-proof:
+  #   (1) file   — NIGHT_SHIFT_PREVIEW_FILE + _BUNDLE_ID: write "<screen>:<state>"
+  #       into the app's document dir, then cold-launch. The app reads it on boot.
+  #       Prompt-free AND needs no native launch-arg support — works with a JS-only
+  #       preview harness. The robust default on newer iOS (see below).
+  #   (2) launcharg — _BUNDLE_ID only: cold-launch with a --nightshift-preview arg
+  #       the (natively-instrumented) app reads. Prompt-free but needs native code.
+  #   (3) openurl — neither set: a custom-scheme deep link. Simplest, but iOS 16+
+  #       shows an "Open in app?" confirmation that blocks unattended capture.
   local bid="${NIGHT_SHIFT_PREVIEW_BUNDLE_ID:-}"
-  if [ -n "$bid" ]; then
-    # Cold-launch into preview mode: terminate any running instance, then launch
-    # with the preview arg (portable — avoids the --terminate-existing flag, which
-    # some simctl versions reject).
+  local pfile="${NIGHT_SHIFT_PREVIEW_FILE:-}"
+  if [ -n "$bid" ] && [ -n "$pfile" ]; then
+    # (1) file-driven cold launch.
+    local data
+    data="$(xcrun simctl get_app_container "$udid" "$bid" data 2>/dev/null)" || return 2
+    [ -n "$data" ] || return 2
+    mkdir -p "$data/Documents" || return 2
+    printf '%s:%s' "$screen" "$state" >"$data/Documents/$pfile" || return 2
+    xcrun simctl terminate "$udid" "$bid" >/dev/null 2>&1 || true
+    xcrun simctl launch "$udid" "$bid" >/dev/null 2>&1 || return 2
+  elif [ -n "$bid" ]; then
+    # (2) launch-arg cold launch: terminate any running instance, then launch with
+    # the preview arg (portable — avoids the --terminate-existing flag, which some
+    # simctl versions reject).
     xcrun simctl terminate "$udid" "$bid" >/dev/null 2>&1 || true
     xcrun simctl launch "$udid" "$bid" \
       --nightshift-preview "${screen}:${state}" >/dev/null 2>&1 || return 2
   else
+    # (3) custom-scheme deep link.
     xcrun simctl openurl "$udid" \
       "${NIGHT_SHIFT_PREVIEW_SCHEME:-nightshift}://preview?screen=${screen}&state=${state}&device=${device}" >/dev/null 2>&1 || return 2
   fi
