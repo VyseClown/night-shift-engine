@@ -288,7 +288,9 @@ run_visual_capture() {
   fi
   # shellcheck disable=SC2329  # invoked indirectly via the RETURN trap below
   _ns_release_all() {
-    [ -n "$_ns_cache_dir" ] || return 0
+    # Defensive default: under `set -u` the RETURN trap can fire after the local
+    # has left scope (non-registry runs), where _ns_cache_dir is empty anyway.
+    [ -n "${_ns_cache_dir:-}" ] || return 0
     local u
     [ -f "$_ns_cache_dir/claimed" ] && while IFS= read -r u; do [ -n "$u" ] && device_release "$u"; done <"$_ns_cache_dir/claimed"
     rm -rf "$_ns_cache_dir"
