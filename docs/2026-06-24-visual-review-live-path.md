@@ -71,20 +71,44 @@ prompt-proof:
 # 1. build + install the preview-enabled Release app on the matrix sims (engine
 #    never builds native): EXPO_PUBLIC_PREVIEW=1 npx expo run:ios --configuration Release …
 #    then xcrun simctl install <other sims> <app>
-# 2. references need a Figma token:
-export FIGMA_TOKEN=<personal access token>
-scripts/visual-review.sh --project ~/work/water-tracker-app --drive file --no-build
+# 2. stage references. Either the Figma REST API (export FIGMA_TOKEN; default path)
+#    OR — what we used here — the Figma MCP (no token): download each frame node via
+#    mcp__figma__download_figma_images, fan each out to design/<Screen>-<state>-<device>.png,
+#    then pass --no-refs so visual-review.sh reuses the staged refs.
+scripts/visual-review.sh --project ~/work/water-tracker-app --drive file --no-build --no-refs \
+  --spec specs/visual-review-validation.md
 ```
 
-Verified 2026-06-24: file-drive cold launch renders the **seeded** Home/default
-(1200 ml / 60% ring, seeded "Today" timeline) on iPhone 13 mini, prompt-free, no
-Metro. Producing the `visual-diff-*.json` reports across the 3 sims is gated only
-on `FIGMA_TOKEN` for reference export.
+## Result (2026-06-24, end-to-end)
+
+Produced real reports across **all 3 sims** (iphone-13-mini / iphone-16 /
+iphone-16-pro-max): `visual-diff-visual-review-validation.json`, 21 screens
+(7 frames × default × 3 devices), with screenshots + odiff diff images. The
+file-drive cold launch renders the **seeded** previews (e.g. Home/default = 1200 ml
+/ 60% ring, seeded timeline), prompt-free, no Metro — confirmed by eye.
+
+**0/21 within the 0.12 tolerance — but for a real reason, not a capture fault:**
+- Content screens diff **0.13–0.24**, consistent across all 3 devices.
+- Splash diffs **~0.96** (the app ships a placeholder splash; the Figma frame is a
+  full branded screen).
+- Inspecting ref-vs-impl: the night-shift build implemented a **coherent app with
+  its own design system** (circular fill ring, quick-add, "Today" timeline) that
+  **structurally diverges from the generic Figma _community_ frames** referenced in
+  the Design Contracts (half-gauge, "Go To Dashboard", named-user mock copy). The
+  odiff overlay shows differences spread across the whole layout — genuine design
+  divergence, not antialiasing/scaling noise.
+
+Takeaway: the **capture/diff half is proven and trustworthy**. The over-tolerance
+result is a true design-fidelity signal — the implementation does not pixel-match
+these community frames. "Fixing" would mean redesigning the screens to the
+community template (a product decision, not a capture bug).
 
 ## Status
 
 - App `feat/water-tracker`: `1f16634` harness, `5bf714e` test relocation,
   `ca30ba6` file-driven boot.
-- Engine: `--drive file` + fixture (this change) — to be PR'd off `main`.
-- Open: release-bundle smoke gate (failure mode 2); the diff reports themselves
-  (need `FIGMA_TOKEN`).
+- Engine PR #24 (`feat/visual-review-file-drive`): `--drive file` + fixture, and a
+  `set -u` RETURN-trap guard surfaced by the first real run.
+- Open follow-ups: release-bundle smoke gate (failure mode 2, recommended, not
+  done); decide whether the design divergence from the community frames is
+  acceptable or warrants screen-level rework.
