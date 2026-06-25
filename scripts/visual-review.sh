@@ -78,6 +78,7 @@ while [ "$#" -gt 0 ]; do
     --preview-file) PREVIEW_FILE="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --no-refs)  NO_REFS=1; shift ;;
+    --repair=*)      REPAIR=1; MAX_ATTEMPTS="${1#--repair=}"; shift ;;
     --repair)        REPAIR=1; case "${2:-}" in ''|--*) : ;; *) MAX_ATTEMPTS="$2"; shift ;; esac; shift ;;
     --repair-shared) REPAIR_SHARED=1; shift ;;
     -h|--help) sed -n '4,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
