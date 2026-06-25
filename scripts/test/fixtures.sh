@@ -175,6 +175,7 @@ run_dry_fixtures() {
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
+  fixture_assert "visual-review --drive maestro + --maestro-dir documented; bogus --drive rejected" fixture_visual_review_maestro_args "$root"
   fixture_assert "visual-repair helpers (devices/node/key/label) in shared lib" fixture_visual_repair_helpers "$root"
   fixture_assert "visual_repair_for_spec builds TSV + parameterizes paths by candidate_label" fixture_visual_repair_for_spec "$root"
   fixture_assert "run_visual: VISUAL_REPAIR constant + lib sourced + repair branch gated" fixture_run_visual_repair_gate "$root"
@@ -2365,6 +2366,13 @@ fixture_visual_review_repair_args() {
   # unknown drive still rejected (regression guard); capture so pipefail doesn't mask grep's exit
   out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$root" --drive bogus 2>&1 || true)"
   printf '%s\n' "$out" | grep -qi "unknown --drive" || return 1
+  return 0
+}
+
+fixture_visual_review_maestro_args() {
+  "$WORKSPACE_ROOT/scripts/visual-review.sh" --help 2>&1 | grep -q -- '--drive maestro\|--maestro-dir' || return 1
+  out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$1" --drive bogus 2>&1 || true)"
+  printf '%s' "$out" | grep -qi "unknown --drive" || return 1
   return 0
 }
 

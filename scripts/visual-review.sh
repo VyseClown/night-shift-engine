@@ -26,6 +26,10 @@
 #                       file — write "<screen>:<state>" into the app's document dir
 #                         and cold-launch (prompt-free; app reads it on boot). Needs
 #                         the project's file-driven preview boot.
+#                       maestro — run a Maestro flow per screen-state
+#                         ($NIGHT_SHIFT_MAESTRO_DIR/<Screen>-<state>.yaml) to drive
+#                         the REAL app to the scenario; no preview harness needed.
+#   --maestro-dir DIR maestro flows dir for --drive maestro (default <project>/.maestro)
 #   --preview-file N  target filename for --drive file (default nightshift-preview.txt)
 #   --no-build        skip the build/install stage (reuse the installed app)
 #   --no-refs         skip Figma export (reuse already-staged references)
@@ -65,7 +69,7 @@ die() { log "ERROR: $*"; exit 2; }
 . "$SCRIPT_DIR/lib/visual-repair.sh"
 
 # ---- args -------------------------------------------------------------------
-PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="openurl" PREVIEW_FILE=""
+PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="openurl" PREVIEW_FILE="" MAESTRO_DIR=""
 REPAIR=0 MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" REPAIR_SHARED=0
 SPECS=()
 while [ "$#" -gt 0 ]; do
@@ -75,6 +79,7 @@ while [ "$#" -gt 0 ]; do
     --scheme)  SCHEME="${2:-}"; shift 2 ;;
     --out)     OUT="${2:-}"; shift 2 ;;
     --drive)   DRIVE="${2:-}"; shift 2 ;;
+    --maestro-dir) MAESTRO_DIR="${2:-}"; shift 2 ;;
     --preview-file) PREVIEW_FILE="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --no-refs)  NO_REFS=1; shift ;;
@@ -86,7 +91,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-case "$DRIVE" in openurl|file) : ;; *) die "unknown --drive '$DRIVE' (expected: openurl | file)" ;; esac
+case "$DRIVE" in openurl|file|maestro) : ;; *) die "unknown --drive '$DRIVE' (expected: openurl | file | maestro)" ;; esac
 [ -n "$PROJECT" ] || die "--project is required"
 PROJECT="$(cd "$PROJECT" 2>/dev/null && pwd)" || die "project not found: $PROJECT"
 [ -f "$PROJECT/app.json" ] || die "no app.json under $PROJECT (is this an Expo app?)"
@@ -118,7 +123,12 @@ case "$DRIVE" in
     export NIGHT_SHIFT_PREVIEW_FILE="${PREVIEW_FILE:-nightshift-preview.txt}"
     log "drive=file (prompt-free): writes $NIGHT_SHIFT_PREVIEW_FILE into $BUNDLE_ID's docs, then simctl launch"
     ;;
-  *) die "unknown --drive '$DRIVE' (expected: openurl | file)" ;;
+  maestro)
+    export NIGHT_SHIFT_MAESTRO_DIR="${MAESTRO_DIR:-$PROJECT/.maestro}"
+    command -v maestro >/dev/null 2>&1 || log "WARN: maestro not on PATH — every screen will SKIP"
+    log "drive=maestro: runs \$NIGHT_SHIFT_MAESTRO_DIR/<Screen>-<state>.yaml against the real app (no preview harness)"
+    ;;
+  *) die "unknown --drive '$DRIVE' (expected: openurl | file | maestro)" ;;
 esac
 
 if [ "$REPAIR" -eq 1 ]; then
