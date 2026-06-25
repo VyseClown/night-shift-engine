@@ -308,7 +308,7 @@ if [ "$REPAIR" -eq 1 ]; then
   }
   visual_repair_run "$OUT/_fail.tsv" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" repair_one
   log "repair: final authoritative pass…"
-  review_spec "${SPECS[0]}"
+  rc=0; for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
   repair_metro_stop; trap - EXIT
   log "repair: done. Edited files (uncommitted):"; git -C "$PROJECT" status --porcelain | sed 's/^/  /' >&2
 fi

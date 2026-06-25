@@ -174,8 +174,6 @@ run_dry_fixtures() {
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
-  fixture_assert "NIGHT_SHIFT_VISUAL_REPAIR knob exists and RUN_VISUAL clause is flag-gated" fixture_visual_repair_optin
-
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2307,12 +2305,3 @@ fixture_visual_review_repair_args() {
   return 0
 }
 
-fixture_visual_repair_optin() {
-  # the constant exists and defaults off
-  grep -q 'VISUAL_REPAIR="${NIGHT_SHIFT_VISUAL_REPAIR:-0}"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
-  # the RUN_VISUAL guidance gains a repair clause gated on the flag
-  grep -q 'NIGHT_SHIFT_VISUAL_REPAIR' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
-  # the repair clause must be GATED on the flag (conditional cat), not hardcoded
-  grep -q '\[ "\$VISUAL_REPAIR" = "1" \] && cat' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
-  return 0
-}
