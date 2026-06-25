@@ -122,7 +122,7 @@ case "$DRIVE" in
 esac
 
 if [ "$REPAIR" -eq 1 ]; then
-  [ "$DRIVE" = "file" ] || { DRIVE=file; export NIGHT_SHIFT_PREVIEW_BUNDLE_ID="$BUNDLE_ID" NIGHT_SHIFT_PREVIEW_FILE="${PREVIEW_FILE:-nightshift-preview.txt}"; }
+  [ "$DRIVE" = "file" ] || { DRIVE="file"; export NIGHT_SHIFT_PREVIEW_BUNDLE_ID="$BUNDLE_ID" NIGHT_SHIFT_PREVIEW_FILE="${PREVIEW_FILE:-nightshift-preview.txt}"; }
   log "REPAIR ON (≤${MAX_ATTEMPTS}/screen): spawns PAID claude sessions and EDITS screen code (left uncommitted)."
 fi
 
@@ -195,10 +195,12 @@ repair_metro_stop() {
 }
 
 # ---- repair agent + validate ------------------------------------------------
+# shellcheck disable=SC2329  # invoked indirectly as an injected function name
 repair_validate() {
   ( cd "$1" && npx tsc --noEmit >/dev/null 2>&1 && npx eslint . --max-warnings 0 >/dev/null 2>&1 )
 }
 
+# shellcheck disable=SC2329  # invoked indirectly as an injected function name
 repair_agent() {
   local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
   local key node allow result
@@ -294,8 +296,9 @@ if [ "$REPAIR" -eq 1 ]; then
   repair_metro_start "$first_dev"
   report="$OUT/$(basename "${SPECS[0]}" .md)/visual-diff-$(basename "${SPECS[0]}" .md).json"
   jq -r '.screens[]|select(.pass|not)|[.diff_pct,.screen,.state,.device]|@tsv' "$report" >"$OUT/_fail.tsv"
+  # shellcheck disable=SC2329  # invoked indirectly via visual_repair_run
   repair_one() {
-    local sc="$1" st="$2" dv="$3" rd="$OUT/$(basename "${SPECS[0]}" .md)"
+    local sc="$1" st="$2" dv="$3" rd; rd="$OUT/$(basename "${SPECS[0]}" .md)"
     eval "REPAIR_NODE_$sc=\"$(node_id_for "${SPECS[0]}" "$sc")\""
     visual_repair_screen "$PROJECT" "$OUT/_rsnap" "$rd" "$sc" "$st" "$dv" \
       "$rd/design/$sc-$st-$dv.png" "$rd/screenshots/review/$sc-$st-$dv.png" \
