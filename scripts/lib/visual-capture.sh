@@ -143,7 +143,9 @@ __visual_capture_screenshot() {
     --time "2026-06-18T09:41:00" --batteryState charged --batteryLevel 100 \
     --cellularBars 4 --wifiBars 3 >/dev/null 2>&1 || true
   mkdir -p "$(dirname "$out")"
-  # Drive the app into preview mode. Three modes, most to least prompt-proof:
+  # Drive the app into the target scenario. Four modes (maestro, then preview file/launcharg/openurl):
+  #   (0) maestro — NIGHT_SHIFT_MAESTRO_DIR: run a per-screen-state Maestro flow
+  #       (<dir>/<Screen>-<state>.yaml) to navigate the REAL app; no preview harness.
   #   (1) file   — NIGHT_SHIFT_PREVIEW_FILE + _BUNDLE_ID: write "<screen>:<state>"
   #       into the app's document dir, then cold-launch. The app reads it on boot.
   #       Prompt-free AND needs no native launch-arg support — works with a JS-only
@@ -152,9 +154,19 @@ __visual_capture_screenshot() {
   #       the (natively-instrumented) app reads. Prompt-free but needs native code.
   #   (3) openurl — neither set: a custom-scheme deep link. Simplest, but iOS 16+
   #       shows an "Open in app?" confirmation that blocks unattended capture.
+  local mdir="${NIGHT_SHIFT_MAESTRO_DIR:-}"
   local bid="${NIGHT_SHIFT_PREVIEW_BUNDLE_ID:-}"
   local pfile="${NIGHT_SHIFT_PREVIEW_FILE:-}"
-  if [ -n "$bid" ] && [ -n "$pfile" ]; then
+  if [ -n "$mdir" ]; then
+    # (0) maestro — drive the REAL app to the scenario via a per-screen-state flow,
+    # then the shared status-bar override + screenshot below capture it. The flow is
+    # self-contained (launchApp + navigation, no screenshot). Missing maestro or a
+    # missing flow returns 2 (clean SKIP). Takes precedence over the preview modes.
+    command -v maestro >/dev/null 2>&1 || return 2
+    local flow="$mdir/${screen}-${state}.yaml"
+    [ -f "$flow" ] || return 2
+    maestro --device "$udid" test "$flow" >/dev/null 2>&1 || return 2
+  elif [ -n "$bid" ] && [ -n "$pfile" ]; then
     # (1) file-driven cold launch.
     local data
     data="$(xcrun simctl get_app_container "$udid" "$bid" data 2>/dev/null)" || return 2
