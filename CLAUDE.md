@@ -110,6 +110,16 @@ engine/workflow git here at the root.
 > Knobs: `NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS` (default 3), `NIGHT_SHIFT_VISUAL_REPAIR_SHARED=1`
 > (also edit `src/ui`), `NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP` (default 30).
 
+> **Maestro capture drive (`--drive maestro`).** An alternative to the seeded preview
+> harness: instead of a preview route, write a Maestro flow per screen-state at
+> `$NIGHT_SHIFT_MAESTRO_DIR/<Screen>-<state>.yaml` (default `<project>/.maestro`) that
+> drives the **real** app to the scenario matching the Figma frame
+> (`launchApp` + taps/input/scroll, **no `takeScreenshot`** — the pipeline screenshots).
+> Run `scripts/visual-review.sh --project <app> --drive maestro` against a normal
+> build (no `EXPO_PUBLIC_PREVIEW`/preview route). A missing flow or missing `maestro`
+> on PATH cleanly SKIPs that spec's capture (never blocks), so author a flow for every
+> screen-state in the matrix. Sample: `docs/examples/maestro/Home-default.yaml`.
+
 > **Note:** the night-shift workflow is multi-track. A spec declares `- Track: rn`,
 > `- Track: web`, or `- Track: node` (default `rn`), which selects the review
 > persona set (`docs/review-personas.md` for `rn`, `docs/review-personas-web.md`

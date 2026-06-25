@@ -157,6 +157,8 @@ run_dry_fixtures() {
   fixture_assert "visual report status: absent/malformed/valid classification" fixture_visual_report_status "$root"
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
+  fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
+  fixture_assert "visual capture pins status bar with a simctl-valid HH:MM time" fixture_visual_capture_statusbar_time "$root"
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
@@ -174,6 +176,7 @@ run_dry_fixtures() {
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
+  fixture_assert "visual-review --drive maestro + --maestro-dir documented; bogus --drive rejected" fixture_visual_review_maestro_args "$root"
   fixture_assert "visual-repair helpers (devices/node/key/label) in shared lib" fixture_visual_repair_helpers "$root"
   fixture_assert "visual_repair_for_spec builds TSV + parameterizes paths by candidate_label" fixture_visual_repair_for_spec "$root"
   fixture_assert "run_visual: VISUAL_REPAIR constant + lib sourced + repair branch gated" fixture_run_visual_repair_gate "$root"
@@ -2135,6 +2138,110 @@ STUB
   )
 }
 
+fixture_visual_capture_maestro() {
+  local root="$1" d="$root/vmae"
+  mkdir -p "$d/bin" "$d/flows"
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+log="$d/calls.log"
+shift  # drop "simctl"
+case "\$1" in
+  io)      printf x >"\${!#}" ;;
+  *)       printf 'xcrun %s\n' "\$*" >>"\$log" ;;
+esac
+exit 0
+STUB
+  cat >"$d/bin/maestro" <<STUB
+#!/usr/bin/env bash
+printf 'maestro %s\n' "\$*" >>"$d/calls.log"
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun" "$d/bin/maestro"
+  : >"$d/flows/Home-default.yaml"
+  # (a) maestro mode: flow present -> maestro test runs that flow, screenshot written,
+  #     NO openurl/launch from the preview modes.
+  (
+    export PATH="$d/bin:/usr/bin:/bin" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_MAESTRO_DIR="$d/flows"
+    __visual_capture_screenshot Home default iphone-15 "$d/shot.png" UDID-X || exit 1
+    grep -q "maestro --device UDID-X test $d/flows/Home-default.yaml" "$d/calls.log" || exit 1
+    grep -q '^xcrun openurl' "$d/calls.log" && exit 1
+    grep -q '^xcrun launch' "$d/calls.log" && exit 1
+    [ -s "$d/shot.png" ] || exit 1
+  ) || return 1
+  # (b) missing flow -> return 2 (clean SKIP).
+  (
+    export PATH="$d/bin:/usr/bin:/bin" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_MAESTRO_DIR="$d/flows"
+    __visual_capture_screenshot Missing default iphone-15 "$d/m.png" UDID-X; [ "$?" -eq 2 ]
+  ) || return 1
+  # (c) maestro absent on PATH -> return 2 (PATH excludes the stub + real ~/.maestro).
+  (
+    export PATH="/usr/bin:/bin" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_MAESTRO_DIR="$d/flows"
+    # xcrun must still be present for the earlier guards; use the stub dir for it only.
+    PATH="$d/binx:$PATH"; mkdir -p "$d/binx"; cp "$d/bin/xcrun" "$d/binx/xcrun"
+    __visual_capture_screenshot Home default iphone-15 "$d/n.png" UDID-X; [ "$?" -eq 2 ]
+  ) || return 1
+  # (d) precedence: NIGHT_SHIFT_MAESTRO_DIR wins over preview env -> maestro, not file.
+  : >"$d/calls.log"
+  (
+    export PATH="$d/bin:/usr/bin:/bin" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_MAESTRO_DIR="$d/flows" \
+           NIGHT_SHIFT_PREVIEW_BUNDLE_ID=com.example.app NIGHT_SHIFT_PREVIEW_FILE=p.txt
+    __visual_capture_screenshot Home default iphone-15 "$d/p.png" UDID-X || exit 1
+    grep -q "^maestro " "$d/calls.log" || exit 1
+    grep -q 'get_app_container' "$d/calls.log" && exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# Regression guard: the status-bar override must pass a plain HH:MM clock to simctl.
+# iOS 26's simctl rejects an ISO datetime (e.g. 2026-06-18T09:41:00) as "non-ISO
+# date/time string", which the override's `|| true` silently swallows — leaving the
+# real wall-clock time and making every capture non-deterministic. The xcrun stub
+# here mimics that: it rejects a non-HH:MM --time (exit 22) so an ISO datetime would
+# never get logged. Asserts the override was accepted AND carries an HH:MM time.
+fixture_visual_capture_statusbar_time() {
+  local root="$1" d="$root/vsb"
+  mkdir -p "$d/bin"
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+log="$d/calls.log"
+shift  # drop "simctl"
+case "\$1" in
+  status_bar)
+    prev=""
+    for a in "\$@"; do
+      if [ "\$prev" = "--time" ]; then
+        case "\$a" in
+          [0-9]:[0-9][0-9]|[0-9][0-9]:[0-9][0-9]) : ;;
+          *) echo "Invalid, non-ISO date/time string" >&2; exit 22 ;;
+        esac
+      fi
+      prev="\$a"
+    done
+    printf 'status_bar %s\n' "\$*" >>"\$log" ;;
+  io) printf x >"\${!#}" ;;
+  *)  : ;;
+esac
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun"
+  (
+    export PATH="$d/bin:$PATH" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_PREVIEW_SCHEME=nightshift
+    # openurl mode (no maestro/preview env). The override must use an HH:MM time or
+    # the stub (like iOS 26) rejects it and it never reaches the log.
+    __visual_capture_screenshot Home default iphone-15 "$d/shot.png" UDID-X || exit 1
+    grep -Eq 'override .*--time (0?[0-9]|1[0-9]|2[0-3]):[0-9][0-9]' "$d/calls.log" || exit 1
+    grep -Eq -- '--time [0-9]{4}-' "$d/calls.log" && exit 1   # not an ISO datetime
+    [ -s "$d/shot.png" ] || exit 1
+    exit 0
+  )
+}
+
 fixture_visual_capture_registry_claim() {
   local root="$1" stub="$root/vcr"
   fixture_make_simctl_stub "$stub"; fixture_write_devices_json "$stub/devices.json"
@@ -2305,6 +2412,13 @@ fixture_visual_review_repair_args() {
   # unknown drive still rejected (regression guard); capture so pipefail doesn't mask grep's exit
   out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$root" --drive bogus 2>&1 || true)"
   printf '%s\n' "$out" | grep -qi "unknown --drive" || return 1
+  return 0
+}
+
+fixture_visual_review_maestro_args() {
+  "$WORKSPACE_ROOT/scripts/visual-review.sh" --help 2>&1 | grep -q -- '--drive maestro\|--maestro-dir' || return 1
+  out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$1" --drive bogus 2>&1 || true)"
+  printf '%s' "$out" | grep -qi "unknown --drive" || return 1
   return 0
 }
 
