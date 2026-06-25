@@ -139,8 +139,12 @@ __visual_capture_screenshot() {
   [ -n "$udid" ] || return 2
   xcrun simctl boot "$udid" >/dev/null 2>&1 || true
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
+  # --time must be a plain HH:MM clock string: iOS 26's simctl rejects an ISO
+  # datetime ("non-ISO date/time string", exit 22), which the `|| true` would
+  # swallow — silently leaving the real wall-clock time and making captures
+  # non-deterministic. HH:MM is accepted across simctl versions.
   xcrun simctl status_bar "$udid" override \
-    --time "2026-06-18T09:41:00" --batteryState charged --batteryLevel 100 \
+    --time "09:41" --batteryState charged --batteryLevel 100 \
     --cellularBars 4 --wifiBars 3 >/dev/null 2>&1 || true
   mkdir -p "$(dirname "$out")"
   # Drive the app into the target scenario. Four modes (maestro, then preview file/launcharg/openurl):
