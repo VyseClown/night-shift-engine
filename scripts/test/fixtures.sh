@@ -174,6 +174,7 @@ run_dry_fixtures() {
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
+  fixture_assert "NIGHT_SHIFT_VISUAL_REPAIR knob exists and RUN_VISUAL clause is flag-gated" fixture_visual_repair_optin
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -2303,5 +2304,13 @@ fixture_visual_review_repair_args() {
   # unknown drive still rejected (regression guard); capture so pipefail doesn't mask grep's exit
   out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$root" --drive bogus 2>&1 || true)"
   printf '%s\n' "$out" | grep -qi "unknown --drive" || return 1
+  return 0
+}
+
+fixture_visual_repair_optin() {
+  # the constant exists and defaults off
+  grep -q 'VISUAL_REPAIR="${NIGHT_SHIFT_VISUAL_REPAIR:-0}"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  # the RUN_VISUAL guidance gains a repair clause gated on the flag
+  grep -q 'NIGHT_SHIFT_VISUAL_REPAIR' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   return 0
 }

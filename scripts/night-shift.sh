@@ -68,6 +68,10 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
 VISUAL_CAPTURE="${NIGHT_SHIFT_VISUAL_CAPTURE:-0}"
+# Opt-in visual auto-repair (in-loop). OFF by default: when 1, the visual_review
+# stage runs a bounded per-screen repair (implement session edits -> re-capture)
+# before completing, instead of leaving all repair to the observer cycle.
+VISUAL_REPAIR="${NIGHT_SHIFT_VISUAL_REPAIR:-0}"
 # (NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS / per-screen auto-repair attempts removed with
 # the agent-driven repair loop: visual_review is now engine-invoked single-pass
 # measure+report; the observer drives any repair via a fresh implement cycle.)
@@ -779,6 +783,16 @@ $SPEC. "artifacts" lists only project-relative files (no absolute paths, no
   "artifacts" array to let the engine perform the capture step. (If the capture
   tooling is unavailable the engine cleanly skips and proceeds; per-screen
   pass/fail is the observer's concern.)
+$( [ "$VISUAL_REPAIR" = "1" ] && cat <<'RC'
+- VISUAL REPAIR IS ON: if the engine's visual-diff report marks screens over
+  tolerance and attempts remain (NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS, default 3), edit
+  ONLY the over-tolerance screens' feature modules (src/features/**; src/ui/** only
+  if NIGHT_SHIFT_VISUAL_REPAIR_SHARED=1) toward the Figma frame + its Dev Mode specs
+  (mcp__figma__get_figma_data) and pinned comments (Figma REST, if FIGMA_TOKEN),
+  keep tsc/eslint clean, then signal RUN_VISUAL again to re-capture. Do not exceed
+  the attempt budget; leave residual gaps to the observer.
+RC
+)
 - NEXT_TASK: only after observer APPROVE. First check off the completed entry in
   $WORKSPACE_ROOT/TODO.md, then signal NEXT_TASK.
 - COMPLETE: only after observer APPROVE with no remaining TODO entries.
