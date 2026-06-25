@@ -3,6 +3,11 @@
 Read and follow `AGENTS.md` first. For autonomous or overnight work, also read
 and follow `AGENT_LOOP.md`.
 
+> **Which command for my task?** See `docs/COMMAND-PLAYBOOK.md` — a task → command
+> index (Figma export via MCP, RN visual-fidelity review/auto-fix, in-loop repair,
+> Maestro-driven capture + flow generation, running a night-shift, Figma→web
+> component conversion) with the exact command and prerequisites for each.
+
 Do not switch roles with reviewers or the observer, and do not use implicit
 session selectors. The engine deliberately tiers models by role to spend the
 strongest model only where judgment matters: the primary **plans** on
