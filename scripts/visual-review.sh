@@ -31,6 +31,10 @@
 #   --no-refs         skip Figma export (reuse already-staged references)
 #   --out DIR         where to write screenshots/diffs/reports
 #                     (default: <project>/.night-shift/visual-review)
+#   --repair[=N]      after the report, auto-repair over-tolerance screens (N
+#                     attempts/screen, default 3). Implies --drive file; edits are
+#                     left UNCOMMITTED for review. Off by default.
+#   --repair-shared   allow repair edits to src/ui (shared) as well as src/features
 #   -h, --help
 #
 # Prerequisites:
@@ -57,9 +61,12 @@ die() { log "ERROR: $*"; exit 2; }
 # run_visual_capture, __visual_*). It expects a `log` in scope — defined above.
 # shellcheck source=scripts/lib/visual-capture.sh
 . "$SCRIPT_DIR/lib/visual-capture.sh"
+# shellcheck source=scripts/lib/visual-repair.sh
+. "$SCRIPT_DIR/lib/visual-repair.sh"
 
 # ---- args -------------------------------------------------------------------
 PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="openurl" PREVIEW_FILE=""
+REPAIR=0 MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" REPAIR_SHARED=0
 SPECS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -71,11 +78,14 @@ while [ "$#" -gt 0 ]; do
     --preview-file) PREVIEW_FILE="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --no-refs)  NO_REFS=1; shift ;;
+    --repair)        REPAIR=1; case "${2:-}" in ''|--*) : ;; *) MAX_ATTEMPTS="$2"; shift ;; esac; shift ;;
+    --repair-shared) REPAIR_SHARED=1; shift ;;
     -h|--help) sed -n '4,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
+case "$DRIVE" in openurl|file) : ;; *) die "unknown --drive '$DRIVE' (expected: openurl | file)" ;; esac
 [ -n "$PROJECT" ] || die "--project is required"
 PROJECT="$(cd "$PROJECT" 2>/dev/null && pwd)" || die "project not found: $PROJECT"
 [ -f "$PROJECT/app.json" ] || die "no app.json under $PROJECT (is this an Expo app?)"
@@ -109,6 +119,11 @@ case "$DRIVE" in
     ;;
   *) die "unknown --drive '$DRIVE' (expected: openurl | file)" ;;
 esac
+
+if [ "$REPAIR" -eq 1 ]; then
+  [ "$DRIVE" = "file" ] || { DRIVE=file; export NIGHT_SHIFT_PREVIEW_BUNDLE_ID="$BUNDLE_ID" NIGHT_SHIFT_PREVIEW_FILE="${PREVIEW_FILE:-nightshift-preview.txt}"; }
+  log "REPAIR ON (≤${MAX_ATTEMPTS}/screen): spawns PAID claude sessions and EDITS screen code (left uncommitted)."
+fi
 
 # ---- which specs ------------------------------------------------------------
 # Default: every spec that targets THIS project and declares a Design Contract.
