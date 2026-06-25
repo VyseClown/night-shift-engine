@@ -99,6 +99,17 @@ engine/workflow git here at the root.
 > breaks the Release bundle while passing tsc/eslint/jest. See
 > `docs/2026-06-24-visual-review-live-path.md`.
 
+> **In-loop auto-repair (opt-in).** Set `NIGHT_SHIFT_VISUAL_REPAIR=1` to have the
+> engine's `visual_review` stage auto-repair over-tolerance screens during a build:
+> it captures, repairs the failing screens (the shared `claude -p` repair agent +
+> Metro fast-reload), commits a `fix(visual): auto-repair …` commit on the project's
+> feature branch, points the candidate at it, and hands the repaired tip to the
+> observer. Requires the project's preview dev build/Metro; cleanly **skips** (proceeds
+> to the observer unrepaired, never blocks) if the harness/tooling is unavailable, and
+> never runs on `main`/`master`. Default OFF — when unset, `visual_review` is unchanged.
+> Knobs: `NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS` (default 3), `NIGHT_SHIFT_VISUAL_REPAIR_SHARED=1`
+> (also edit `src/ui`), `NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP` (default 30).
+
 > **Note:** the night-shift workflow is multi-track. A spec declares `- Track: rn`,
 > `- Track: web`, or `- Track: node` (default `rn`), which selects the review
 > persona set (`docs/review-personas.md` for `rn`, `docs/review-personas-web.md`
