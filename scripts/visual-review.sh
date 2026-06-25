@@ -145,11 +145,7 @@ log "reviewing ${#SPECS[@]} spec(s) against $PROJECT (scheme=$SCHEME)"
 
 # ---- stage 1: build + install on the device matrix --------------------------
 # Devices the matrix needs = the union of every reviewed spec's `- Devices:`.
-matrix_devices() {
-  local f
-  for f in "${SPECS[@]}"; do visual_capture_screens "$f" | awk -F'|' '{print $3}'; done | sort -u
-}
-device_label_to_name() { printf '%s' "$1" | sed -E 's/-/ /g' | sed -E 's/\b(.)/\u\1/g'; }
+matrix_devices() { local f; for f in "${SPECS[@]}"; do visual_repair_devices "$f"; done | sort -u; }
 
 build_and_install() {
   log "stage 1/4: build + install"
@@ -171,71 +167,7 @@ build_and_install() {
   done < <(matrix_devices)
 }
 
-# ---- Metro fast-reload harness (for repair) ---------------------------------
-_REPAIR_METRO_PID=""
-repair_metro_start() {
-  local device="$1"
-  if [ "$NO_BUILD" -ne 1 ]; then
-    log "repair: building dev client on '$device' (slow, once)…"
-    ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo run:ios --device "$device" >/dev/null 2>&1 ) \
-      || die "repair: dev build failed; build manually then re-run with --no-build"
-  fi
-  log "repair: starting Metro (EXPO_PUBLIC_PREVIEW=1)…"
-  ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo start >/tmp/visual-repair-metro.log 2>&1 ) &
-  _REPAIR_METRO_PID=$!
-  # wait for the bundler port
-  local i=0; until curl -s http://localhost:8081/status >/dev/null 2>&1; do
-    i=$((i+1)); [ "$i" -ge 30 ] && { log "WARN: Metro did not come up after 60s"; break; }; sleep 2; done
-}
-repair_metro_stop() {
-  [ -n "$_REPAIR_METRO_PID" ] || return 0
-  kill "$_REPAIR_METRO_PID" 2>/dev/null || true
-  pkill -f "expo start" 2>/dev/null || true
-  _REPAIR_METRO_PID=""
-}
-
-# ---- repair agent + validate ------------------------------------------------
-# shellcheck disable=SC2329  # invoked indirectly as an injected function name
-repair_validate() {
-  ( cd "$1" && npx tsc --noEmit >/dev/null 2>&1 && npx eslint . --max-warnings 0 >/dev/null 2>&1 )
-}
-
-# shellcheck disable=SC2329  # invoked indirectly as an injected function name
-repair_agent() {
-  local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
-  local key node allow prompt result
-  key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
-  allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
-  prompt="You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
-FIRST use the Read tool to OPEN AND VIEW the images so you can see the pixels: reference=$ref  current screenshot=$shot  diff overlay (red = differences)=$diff_img.  current diff=$pct, target tolerance=$tol.
-Pull the Figma design for node $node in file $key via mcp__figma__get_figma_data — its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments the MCP exposes — and treat them as requirements. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
-Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
-When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}."
-  # The prompt MUST go via stdin: the variadic --allowed-tools otherwise swallows a
-  # positional prompt ("Input must be provided…") and the agent silently no-ops.
-  # Tools are comma-separated — a single space-joined string is parsed as ONE
-  # (invalid) tool name, leaving the agent with no tools. (Proven by the smoke.)
-  result="$(cd "$PROJECT" && printf '%s' "$prompt" | claude -p --output-format json \
-    --allowed-tools "Read,Edit,Write,Bash(npx tsc*),Bash(npx eslint*),mcp__figma__get_figma_data" 2>/dev/null)"
-  printf '%s' "$result" | jq -r '.result // "{}"' 2>/dev/null | grep -o '{.*}' | tail -n1
-  [ -n "$result" ]
-}
-
 # ---- stage 2: stage Figma reference images ----------------------------------
-# Resolve a screen's Figma node id from the spec's
-#   `- Figma node IDs: Home = `1:1548`, Foo = `1:2`` line. Falls back to the spec's
-# single declared node if the screen isn't individually listed.
-node_id_for() {
-  local spec="$1" screen="$2" line id
-  line="$(grep -E '^- Figma node IDs:' "$spec" | head -n1)"
-  id="$(printf '%s' "$line" | grep -oE "${screen}[[:space:]]*=[[:space:]]*\`[0-9I][0-9:I;-]*\`" | grep -oE '`[^`]+`' | tr -d '`' | head -n1)"
-  [ -n "$id" ] || id="$(printf '%s' "$line" | grep -oE '`[0-9I][0-9:I;-]*`' | head -n1 | tr -d '`')"
-  printf '%s' "$id"
-}
-figma_key_for() {
-  sed -nE 's/.*fileKey `([A-Za-z0-9]+)`.*/\1/p' "$1" | head -n1
-}
-
 # Export one Figma node to a PNG via the Figma REST API, with 429 backoff.
 stage_ref() {
   local key="$1" node="$2" out="$3" attempt=0 wait=4 url
@@ -294,26 +226,14 @@ rc=0
 for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
 
 if [ "$REPAIR" -eq 1 ]; then
-  REPAIR_FILEKEY="$(figma_key_for "${SPECS[0]}")"; REPAIR_FALLBACK_NODE="$(node_id_for "${SPECS[0]}" "")"
   trap 'repair_metro_stop' EXIT
-  first_dev="$(device_label_to_name "$(matrix_devices | head -n1)")"
-  repair_metro_start "$first_dev"
-  report="$OUT/$(basename "${SPECS[0]}" .md)/visual-diff-$(basename "${SPECS[0]}" .md).json"
-  jq -r '.screens[]|select(.pass|not)|[.diff_pct,.screen,.state,.device]|@tsv' "$report" >"$OUT/_fail.tsv"
-  # shellcheck disable=SC2329  # invoked indirectly via visual_repair_run
-  repair_one() {
-    local sc="$1" st="$2" dv="$3" rd; rd="$OUT/$(basename "${SPECS[0]}" .md)"
-    eval "REPAIR_NODE_$sc=\"$(node_id_for "${SPECS[0]}" "$sc")\""
-    visual_repair_screen "$PROJECT" "$OUT/_rsnap" "$rd" "$sc" "$st" "$dv" \
-      "$rd/design/$sc-$st-$dv.png" "$rd/screenshots/review/$sc-$st-$dv.png" \
-      "$rd/diffs/review/$sc-$st-$dv.png" "$(visual_capture_tolerance "${SPECS[0]}")" \
-      "$MAX_ATTEMPTS" repair_agent visual_recapture_screen repair_validate \
-      "$([ "$REPAIR_SHARED" -eq 1 ] && echo "src/features/,src/ui/" || echo "src/features/")" >/dev/null
-    printf '%s\n' "$MAX_ATTEMPTS"
-  }
-  visual_repair_run "$OUT/_fail.tsv" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" repair_one
-  log "repair: final authoritative pass…"
-  rc=0; for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
+  iter_dev="$(visual_repair_devices "${SPECS[0]}" | head -n1)"
+  repair_metro_start "$(device_label_to_name "$iter_dev")" || die "repair: could not start Metro"
+  base="$(basename "${SPECS[0]}" .md)"
+  visual_repair_for_spec "${SPECS[0]}" "$PROJECT" "$OUT/$base" "review" \
+    "$OUT/$base/visual-diff-$base.json" "$MAX_ATTEMPTS" \
+    "$([ "$REPAIR_SHARED" -eq 1 ] && echo 'src/features/,src/ui/' || echo 'src/features/')" "$iter_dev"
+  log "repair: final authoritative pass…"; rc=0; for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
   repair_metro_stop; trap - EXIT
   log "repair: done. Edited files (uncommitted):"; git -C "$PROJECT" status --porcelain | sed 's/^/  /' >&2
 fi
