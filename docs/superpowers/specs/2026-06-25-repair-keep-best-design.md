@@ -15,15 +15,22 @@ already has the Figma design; the limiter is the loop policy, not the design dat
 
 ## 2. Goal / non-goals
 
-**Goal:** the loop keeps the **best-scoring** attempt and **always ends on it**
-(never worse than the starting point), and **iterates until improvement stalls**
-(diminishing returns) within a hard cap — pushing each screen as close to the design
-as the agent can get.
+**Goals:**
+1. The loop keeps the **best-scoring** attempt and **always ends on it** (never worse
+   than the starting point), and **iterates until improvement stalls** (diminishing
+   returns) within a hard cap — pushing each screen as close to the design as the
+   agent can get.
+2. Produce a **visible audit trail** so the viewer can show exactly what was done: the
+   report carries a real **baseline ("before") image + a screenshot and diff-overlay
+   per attempt**, and a one-line **"what changed"** for each attempt (and the screen).
+   These populate fields the `visual-diff` schema already defines — **no schema
+   change** — they are simply blank/overwritten today.
 
 **Non-goals (explicitly out of scope this increment):** widening the edit scope for
-structural redesign; richer design grounding / plan-first passes; a new per-screen
-fidelity report format. (These were considered and deferred.) No change to *what* the
-agent is fed or *which* files it may touch.
+structural redesign; richer design *grounding* / plan-first passes (what the agent is
+fed is unchanged); rendering the per-attempt images in the **viewer** — that is the
+follow-on **increment B** (`night-shift-viewer`). No change to *which* files the agent
+may touch.
 
 ## 3. Convergence policy (the change)
 
@@ -42,7 +49,8 @@ Rewrite the body of `visual_repair_screen`'s attempt loop to track a **best** re
     `best_pct=cur`; snapshot the **current** code into `$tmpbase/best`; copy the
     current `shot`/`diff_img` to `best_shot`/`best_diff`; reset `stall=0`.
   - Else: `stall=stall+1`.
-  - Record the attempt in `attempts[]` (unchanged shape).
+  - Record the attempt in `attempts[]` (same schema; its per-attempt `screenshot`/
+    `diff_image` and `analysis` are populated per §3.1/§3.2).
   - **Stop** when: `cur <= tol` (good enough → `passed`); or `stall >= PATIENCE`
     (diminishing returns); or the hard cap `max` is reached.
 - **End on the best.** After the loop, restore `$tmpbase/best` into the project (the
@@ -58,6 +66,45 @@ snapshot + `visual_repair_restore`) is unchanged and independent of best-trackin
 All diff_pct comparisons use `awk` (as the loop already does for `pass`), e.g.
 `improved = (best unset) || (cur <= best - EPSILON)`; never shell numeric `[ ]`
 (diffs are fractions like `0.0903`).
+
+## 3.1 Per-attempt + baseline image preservation (audit trail)
+
+Today the capture writes **one** screenshot file and **one** diff-overlay file per
+screen, overwritten every attempt — so every `attempts[]` row points at the same file
+and the progression is lost. This increment preserves them:
+
+- **Baseline ("before").** Before the loop, copy the incoming pre-repair `shot` and
+  `diff_img` to `<base>.attempt-0.png` (screenshots and diffs dirs respectively), and
+  prepend an `attempt: 0` entry to `attempts[]` with `analysis: "baseline (before
+  repair)"`, its `diff_pct` = the baseline diff, `pass` = (baseline ≤ tol), and
+  `screenshot`/`diff_image` = those `.attempt-0` paths.
+- **Per attempt N (1..).** After the attempt's capture+diff, copy the just-captured
+  `shot`/`diff_img` to `<base>.attempt-N.png` and record **those** paths in the
+  attempt's `screenshot`/`diff_image` (not the shared canonical path). For a
+  scope/validation-reverted attempt, record the pre-edit (snapshot) screenshot if
+  available, else the prior image.
+- **Top-level = best.** The screen's top-level `screenshot`/`diff_image` remain the
+  **best** attempt's images (the canonical path, into which the best is copied at the
+  end — §3 "End on the best"). `reference` is the design image, unchanged.
+
+Path convention: the `.attempt-N` files sit beside the canonical per-screen files and
+are recorded in `attempts[]` using the **same relative path form** the screen's
+top-level `screenshot`/`diff_image` already use (so the viewer's server resolves them
+identically). No schema change — `attempts[].screenshot`/`diff_image` are already
+required fields.
+
+## 3.2 "What changed" analysis
+
+- The repair agent (`repair_agent`, `scripts/lib/visual-repair.sh`) is asked to return
+  a one-line summary of the visual change it made, as `changed` in its JSON result —
+  i.e. `{"changed":"<one concise line>","unmet_brief":[...]}`. (Today it returns only
+  `unmet_brief`.) Figma is still read only via the MCP; the prompt is otherwise
+  unchanged.
+- `visual_repair_screen` extracts `changed` from each `agent_out` and records it as
+  that attempt's `analysis` (replacing the current `""`). The **screen-level**
+  `analysis` is set to the **best** attempt's `changed`.
+- Injected test agents simply return `changed` in their JSON; absent/empty `changed`
+  falls back to `""` (today's behavior), so nothing breaks.
 
 ## 4. Knobs / defaults
 
@@ -101,6 +148,14 @@ file) so "ended on the best attempt's code" is checkable.
   attempts (≈4 total, not 6), report `diff_pct == 0.20`.
 - **converge-on-pass unchanged:** the existing `fixture_visual_repair_loop` still
   passes (a passing attempt still ends the loop and returns success).
+- **audit trail (images + analysis):** with a capture stub that writes a *distinct*
+  byte per attempt to the canonical `shot`, and an agent returning
+  `{"changed":"grew ring","unmet_brief":[]}`, assert the report has an `attempt: 0`
+  baseline entry plus one entry per attempt, each with a **distinct** `screenshot`
+  path ending `.attempt-<N>.png` that **exists on disk**, and `attempts[k].analysis
+  == "grew ring"`; and the screen-level `analysis == "grew ring"` (best attempt's).
+  Assert the top-level `screenshot` is the canonical path holding the **best**
+  attempt's bytes.
 
 Shellcheck default severity (`find scripts -name '*.sh' -exec shellcheck -s bash {} +`
 exit 0); full fixture suite green.
