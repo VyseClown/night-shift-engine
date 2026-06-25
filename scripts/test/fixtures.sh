@@ -168,6 +168,7 @@ run_dry_fixtures() {
   fixture_assert "run_visual_capture registry mode claims, caches, releases" fixture_visual_capture_registry_claim "$root"
   fixture_assert "registry-off: no claim, no artifacts" fixture_visual_registry_off_no_artifacts "$root"
   fixture_assert "visual_review prunes the registry only in registry mode" fixture_visual_prune_guarded "$root"
+  fixture_assert "visual-repair scope-check allows in-scope, rejects out-of-scope" fixture_visual_repair_scope "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -2183,4 +2184,23 @@ fixture_visual_prune_guarded() {
     [ -f "$root/pruned.marker" ] || exit 1
     exit 0
   )
+}
+
+fixture_visual_repair_scope() {
+  local root="$1" proj="$root/scopep"
+  mkdir -p "$proj/src/features/home" "$proj/src/data"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; : >"$proj/src/data/db.ts"
+  git -C "$proj" add -A && git -C "$proj" commit -qm base
+  # in-scope edit only -> pass
+  printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_scope_check "$proj" "src/features/" ) || return 1
+  # out-of-scope edit -> fail
+  printf 'x' >>"$proj/src/data/db.ts"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_scope_check "$proj" "src/features/" ) && return 1
+  # shared opt-in: src/ui allowed when listed
+  mkdir -p "$proj/src/ui"; : >"$proj/src/ui/tokens.ts"; git -C "$proj" add -A; git -C "$proj" commit -qm two
+  printf 'x' >>"$proj/src/ui/tokens.ts"; git -C "$proj" checkout -q -- src/data/db.ts
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_scope_check "$proj" "src/features/" "src/ui/" ) || return 1
+  return 0
 }
