@@ -185,7 +185,7 @@ repair_metro_start() {
   _REPAIR_METRO_PID=$!
   # wait for the bundler port
   local i=0; until curl -s http://localhost:8081/status >/dev/null 2>&1; do
-    i=$((i+1)); [ "$i" -ge 30 ] && break; sleep 2; done
+    i=$((i+1)); [ "$i" -ge 30 ] && { log "WARN: Metro did not come up after 60s"; break; }; sleep 2; done
 }
 repair_metro_stop() {
   [ -n "$_REPAIR_METRO_PID" ] || return 0
