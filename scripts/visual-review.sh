@@ -194,6 +194,29 @@ repair_metro_stop() {
   _REPAIR_METRO_PID=""
 }
 
+# ---- repair agent + validate ------------------------------------------------
+repair_validate() {
+  ( cd "$1" && npx tsc --noEmit >/dev/null 2>&1 && npx eslint . --max-warnings 0 >/dev/null 2>&1 )
+}
+
+repair_agent() {
+  local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
+  local key node allow scope_note tok_note result
+  key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
+  allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
+  [ -n "${FIGMA_TOKEN:-}" ] && tok_note="FIGMA_TOKEN is set: also fetch pinned comments via GET https://api.figma.com/v1/files/$key/comments and treat them as requirements." \
+    || tok_note="FIGMA_TOKEN is NOT set: skip pinned comments; note them as unavailable in unmet_brief context."
+  result="$(cd "$PROJECT" && claude -p --output-format json \
+    --allowedTools "Read Edit Write Bash(npx tsc*) Bash(npx eslint*) mcp__figma__get_figma_data" \
+    "You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
+Reference image: $ref  Current screenshot: $shot  Diff overlay: $diff_img  diff=$pct tolerance=$tol.
+Pull the Figma Dev Mode specs for node $node in file $key via mcp__figma__get_figma_data (sizes, spacing, colors, typography, tokens). $tok_note
+Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
+When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}." 2>/dev/null)"
+  printf '%s' "$result" | jq -r '.result // "{}"' 2>/dev/null | grep -o '{.*}' | tail -n1
+  [ -n "$result" ]
+}
+
 # ---- stage 2: stage Figma reference images ----------------------------------
 # Resolve a screen's Figma node id from the spec's
 #   `- Figma node IDs: Home = `1:1548`, Foo = `1:2`` line. Falls back to the spec's
@@ -265,5 +288,30 @@ review_spec() {
 [ "$NO_BUILD" -eq 1 ] || build_and_install
 rc=0
 for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
+
+if [ "$REPAIR" -eq 1 ]; then
+  REPAIR_FILEKEY="$(figma_key_for "${SPECS[0]}")"; REPAIR_FALLBACK_NODE="$(node_id_for "${SPECS[0]}" "")"
+  trap 'repair_metro_stop' EXIT
+  first_dev="$(device_label_to_name "$(matrix_devices | head -n1)")"
+  repair_metro_start "$first_dev"
+  report="$OUT/$(basename "${SPECS[0]}" .md)/visual-diff-$(basename "${SPECS[0]}" .md).json"
+  jq -r '.screens[]|select(.pass|not)|[.diff_pct,.screen,.state,.device]|@tsv' "$report" >"$OUT/_fail.tsv"
+  repair_one() {
+    local sc="$1" st="$2" dv="$3" rd="$OUT/$(basename "${SPECS[0]}" .md)"
+    eval "REPAIR_NODE_$sc=\"$(node_id_for "${SPECS[0]}" "$sc")\""
+    visual_repair_screen "$PROJECT" "$OUT/_rsnap" "$rd" "$sc" "$st" "$dv" \
+      "$rd/design/$sc-$st-$dv.png" "$rd/screenshots/review/$sc-$st-$dv.png" \
+      "$rd/diffs/review/$sc-$st-$dv.png" "$(visual_capture_tolerance "${SPECS[0]}")" \
+      "$MAX_ATTEMPTS" repair_agent visual_recapture_screen repair_validate \
+      "$([ "$REPAIR_SHARED" -eq 1 ] && echo "src/features/,src/ui/" || echo "src/features/")" >/dev/null
+    printf '%s\n' "$MAX_ATTEMPTS"
+  }
+  visual_repair_run "$OUT/_fail.tsv" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" repair_one
+  log "repair: final authoritative pass…"
+  review_spec "${SPECS[0]}"
+  repair_metro_stop; trap - EXIT
+  log "repair: done. Edited files (uncommitted):"; git -C "$PROJECT" status --porcelain | sed 's/^/  /' >&2
+fi
+
 log "done. reports under $OUT/<spec>/visual-diff-*.json (open in the night-shift viewer)."
 exit "$rc"
