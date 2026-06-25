@@ -156,6 +156,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture resolves sim by device label" fixture_visual_pick_udid "$root"
   fixture_assert "visual report status: absent/malformed/valid classification" fixture_visual_report_status "$root"
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
+  fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
@@ -2076,6 +2077,43 @@ STUB
     : >"$d/boot.log"
     __visual_capture_screenshot home default iphone-15 "$d/b.png" || exit 1
     grep -q 'boot RESOLVED-SENTINEL' "$d/boot.log" || exit 1
+    exit 0
+  )
+}
+
+# File-driven prompt-free capture (NIGHT_SHIFT_PREVIEW_FILE + _BUNDLE_ID): the
+# target "<screen>:<state>" must be written into the app's document dir and the app
+# cold-launched, with NO openurl deep link and NO --nightshift-preview launch arg.
+fixture_visual_capture_file_drive() {
+  local root="$1" d="$root/vfd"
+  mkdir -p "$d/bin" "$d/data"
+  # Minimal xcrun: get_app_container -> our data dir; log launch/openurl args;
+  # io screenshot -> 1-byte file.
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+log="$d/calls.log"
+shift  # drop "simctl"
+case "\$1" in
+  get_app_container) printf '%s\n' "$d/data" ;;
+  launch)  printf 'launch %s\n' "\$*" >>"\$log" ;;
+  openurl) printf 'openurl %s\n' "\$*" >>"\$log" ;;
+  io)      printf x >"\${!#}" ;;
+esac
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun"
+  (
+    export PATH="$d/bin:$PATH" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_PREVIEW_BUNDLE_ID=com.example.app \
+           NIGHT_SHIFT_PREVIEW_FILE=nightshift-preview.txt
+    __visual_capture_screenshot Home empty iphone-15 "$d/shot.png" EXPLICIT-UDID || exit 1
+    # target file written with "<screen>:<state>"
+    [ "$(cat "$d/data/Documents/nightshift-preview.txt" 2>/dev/null)" = "Home:empty" ] || exit 1
+    # cold-launched, prompt-free: launch happened, NO openurl, NO launch arg.
+    grep -q '^launch ' "$d/calls.log" || exit 1
+    grep -q 'nightshift-preview' "$d/calls.log" && exit 1
+    grep -q '^openurl ' "$d/calls.log" && exit 1
+    [ -s "$d/shot.png" ] || exit 1
     exit 0
   )
 }

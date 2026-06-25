@@ -83,6 +83,22 @@ engine/workflow git here at the root.
 > exhausted and pruning them on the next registry-mode run. A single run is unaffected.
 > Requires pre-bundled preview builds (no Metro).
 
+> **Driving the preview on newer iOS (`scripts/visual-review.sh --drive file`).**
+> Capture pushes each screen into the app one of three ways (`__visual_capture_screenshot`,
+> most→least prompt-proof): **file** (`NIGHT_SHIFT_PREVIEW_FILE` + `NIGHT_SHIFT_PREVIEW_BUNDLE_ID`)
+> writes `"<screen>:<state>"` into the app's document dir then cold-launches — prompt-free
+> and needs no native code, so it works with a JS-only harness; **launcharg** (bundle id only)
+> cold-launches with a `--nightshift-preview` arg the app must read natively; **openurl**
+> (default) is a custom-scheme deep link, but **iOS 16+ pops an "Open in app?" confirmation
+> that blocks unattended capture** — so on current simulators use `--drive file`. The app
+> must implement the matching boot path (water-tracker: a `src/preview/bootTarget.ts` reader
+> gated behind `EXPO_PUBLIC_PREVIEW=1`; build the capture app with that env). Also note the
+> capture app must be a **Release/standalone build** (embedded bundle, no Metro) and **no
+> test files may live in expo-router's `app/` dir** — its `require.context` sweeps every
+> `*.ts(x)` into the production bundle, so a stray `*.test.tsx` importing `node:sqlite` etc.
+> breaks the Release bundle while passing tsc/eslint/jest. See
+> `docs/2026-06-24-visual-review-live-path.md`.
+
 > **Note:** the night-shift workflow is multi-track. A spec declares `- Track: rn`,
 > `- Track: web`, or `- Track: node` (default `rn`), which selects the review
 > persona set (`docs/review-personas.md` for `rn`, `docs/review-personas-web.md`

@@ -20,6 +20,13 @@
 #                     $WORKSPACE_ROOT/specs that targets --project AND has a
 #                     `## Design Contract` (repeatable)
 #   --scheme NAME     URL scheme the preview route answers (default: app.json scheme)
+#   --drive MODE      how capture pushes each screen into the app:
+#                       openurl (default) — custom-scheme deep link; iOS 16+ may
+#                         show an "Open in app?" prompt that blocks capture.
+#                       file — write "<screen>:<state>" into the app's document dir
+#                         and cold-launch (prompt-free; app reads it on boot). Needs
+#                         the project's file-driven preview boot.
+#   --preview-file N  target filename for --drive file (default nightshift-preview.txt)
 #   --no-build        skip the build/install stage (reuse the installed app)
 #   --no-refs         skip Figma export (reuse already-staged references)
 #   --out DIR         where to write screenshots/diffs/reports
@@ -52,7 +59,7 @@ die() { log "ERROR: $*"; exit 2; }
 . "$SCRIPT_DIR/lib/visual-capture.sh"
 
 # ---- args -------------------------------------------------------------------
-PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0
+PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="openurl" PREVIEW_FILE=""
 SPECS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -60,6 +67,8 @@ while [ "$#" -gt 0 ]; do
     --spec)    SPECS+=("${2:-}"); shift 2 ;;
     --scheme)  SCHEME="${2:-}"; shift 2 ;;
     --out)     OUT="${2:-}"; shift 2 ;;
+    --drive)   DRIVE="${2:-}"; shift 2 ;;
+    --preview-file) PREVIEW_FILE="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --no-refs)  NO_REFS=1; shift ;;
     -h|--help) sed -n '4,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -84,6 +93,22 @@ mkdir -p "$OUT/design"
 # Capture must be enabled + tooling present, or run_visual_capture no-ops.
 export NIGHT_SHIFT_VISUAL_CAPTURE=1
 export NIGHT_SHIFT_PREVIEW_SCHEME="$SCHEME"
+
+# Drive mode (how capture pushes each screen into the app):
+#   openurl (default) — custom-scheme deep link; iOS 16+ may show an "Open in app?"
+#     confirmation that blocks unattended capture.
+#   file              — write "<screen>:<state>" into the app's document dir and
+#     cold-launch (prompt-free; the app reads it on boot). Needs the app's
+#     file-driven preview boot (built with EXPO_PUBLIC_PREVIEW=1 for this project).
+case "$DRIVE" in
+  openurl) : ;;
+  file)
+    export NIGHT_SHIFT_PREVIEW_BUNDLE_ID="$BUNDLE_ID"
+    export NIGHT_SHIFT_PREVIEW_FILE="${PREVIEW_FILE:-nightshift-preview.txt}"
+    log "drive=file (prompt-free): writes $NIGHT_SHIFT_PREVIEW_FILE into $BUNDLE_ID's docs, then simctl launch"
+    ;;
+  *) die "unknown --drive '$DRIVE' (expected: openurl | file)" ;;
+esac
 
 # ---- which specs ------------------------------------------------------------
 # Default: every spec that targets THIS project and declares a Design Contract.
