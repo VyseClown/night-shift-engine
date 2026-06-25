@@ -226,26 +226,14 @@ rc=0
 for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
 
 if [ "$REPAIR" -eq 1 ]; then
-  REPAIR_FILEKEY="$(figma_key_for "${SPECS[0]}")"; REPAIR_FALLBACK_NODE="$(node_id_for "${SPECS[0]}" "")"
   trap 'repair_metro_stop' EXIT
-  first_dev="$(device_label_to_name "$(matrix_devices | head -n1)")"
-  repair_metro_start "$first_dev" || die "repair: could not start Metro"
-  report="$OUT/$(basename "${SPECS[0]}" .md)/visual-diff-$(basename "${SPECS[0]}" .md).json"
-  jq -r '.screens[]|select(.pass|not)|[.diff_pct,.screen,.state,.device]|@tsv' "$report" >"$OUT/_fail.tsv"
-  # shellcheck disable=SC2329  # invoked indirectly via visual_repair_run
-  repair_one() {
-    local sc="$1" st="$2" dv="$3" rd; rd="$OUT/$(basename "${SPECS[0]}" .md)"
-    eval "REPAIR_NODE_$sc=\"$(node_id_for "${SPECS[0]}" "$sc")\""
-    visual_repair_screen "$PROJECT" "$OUT/_rsnap" "$rd" "$sc" "$st" "$dv" \
-      "$rd/design/$sc-$st-$dv.png" "$rd/screenshots/review/$sc-$st-$dv.png" \
-      "$rd/diffs/review/$sc-$st-$dv.png" "$(visual_capture_tolerance "${SPECS[0]}")" \
-      "$MAX_ATTEMPTS" repair_agent visual_recapture_screen repair_validate \
-      "$([ "$REPAIR_SHARED" -eq 1 ] && echo "src/features/,src/ui/" || echo "src/features/")" >/dev/null
-    printf '%s\n' "$MAX_ATTEMPTS"
-  }
-  visual_repair_run "$OUT/_fail.tsv" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" repair_one
-  log "repair: final authoritative pass…"
-  rc=0; for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
+  iter_dev="$(visual_repair_devices "${SPECS[0]}" | head -n1)"
+  repair_metro_start "$(device_label_to_name "$iter_dev")" || die "repair: could not start Metro"
+  base="$(basename "${SPECS[0]}" .md)"
+  visual_repair_for_spec "${SPECS[0]}" "$PROJECT" "$OUT/$base" "review" \
+    "$OUT/$base/visual-diff-$base.json" "$MAX_ATTEMPTS" \
+    "$([ "$REPAIR_SHARED" -eq 1 ] && echo 'src/features/,src/ui/' || echo 'src/features/')" "$iter_dev"
+  log "repair: final authoritative pass…"; rc=0; for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
   repair_metro_stop; trap - EXIT
   log "repair: done. Edited files (uncommitted):"; git -C "$PROJECT" status --porcelain | sed 's/^/  /' >&2
 fi
