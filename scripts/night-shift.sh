@@ -68,6 +68,11 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
 VISUAL_CAPTURE="${NIGHT_SHIFT_VISUAL_CAPTURE:-0}"
+# Opt-in in-loop visual auto-repair. OFF by default: when 1, the visual_review stage
+# repairs over-tolerance screens (engine-invoked) and commits a fix(visual) commit
+# before handing the repaired tip to the observer. Requires the project's dev
+# build/Metro; cleanly skips (proceeds unrepaired) if unavailable.
+VISUAL_REPAIR="${NIGHT_SHIFT_VISUAL_REPAIR:-0}"
 # (NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS / per-screen auto-repair attempts removed with
 # the agent-driven repair loop: visual_review is now engine-invoked single-pass
 # measure+report; the observer drives any repair via a fresh implement cycle.)
@@ -86,6 +91,8 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # are available to the run and the fixtures.
 # shellcheck source=scripts/lib/visual-capture.sh
 . "$NIGHT_SHIFT_LIB/visual-capture.sh"
+# shellcheck source=scripts/lib/visual-repair.sh
+. "$NIGHT_SHIFT_LIB/visual-repair.sh"
 # Opt-in device registry for parallel visual_review (inert unless
 # NIGHT_SHIFT_DEVICE_REGISTRY=1). See scripts/lib/device-registry.sh.
 # shellcheck source=scripts/lib/device-registry.sh
@@ -1381,13 +1388,48 @@ run_visual() {
   report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
   case "$(visual_report_status "$report")" in
     valid)
-      log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass); handing to observer" ;;
+      log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass)"
+      run_visual_inloop_repair "$report" "$candidate" ;;
     absent)
       log "visual_review: no visual-diff report produced (capture skipped or tooling unavailable); proceeding to observer" ;;
     malformed)
       block_run "visual_review produced a malformed visual-diff report" ;;
   esac
   set_stage observer_review
+}
+
+# Engine-invoked in-loop repair. No-op unless NIGHT_SHIFT_VISUAL_REPAIR=1, capture
+# tooling is available, and the report has over-tolerance screens. On any harness
+# failure it logs and returns (the run proceeds to the observer unrepaired).
+run_visual_inloop_repair() {
+  local report="$1" candidate="$2"
+  [ "$VISUAL_REPAIR" = "1" ] && visual_capture_available || return 0
+  local over; over="$(jq -r '[.screens[]|select(.pass|not)]|length' "$report")"
+  [ "$over" -gt 0 ] || { log "visual_review: all screens within tolerance; no repair needed"; return 0; }
+  local branch; branch="$(git -C "$PROJECT" branch --show-current)"
+  case "$branch" in main|master|'') log "visual_review: refusing to auto-repair on '$branch'; skipping repair"; return 0 ;; esac
+  local iter_dev; iter_dev="$(visual_repair_devices "$SPEC" | head -n1)"
+  NO_BUILD="${NIGHT_SHIFT_VISUAL_REPAIR_NO_BUILD:-0}"
+  repair_metro_start "$(device_label_to_name "$iter_dev")" || { log "visual_review: repair harness unavailable; proceeding unrepaired"; return 0; }
+  visual_repair_for_spec "$SPEC" "$PROJECT" "$RUN_ROOT/validated" "$candidate" "$report" \
+    "${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" \
+    "$([ "${NIGHT_SHIFT_VISUAL_REPAIR_SHARED:-0}" = "1" ] && echo 'src/features/,src/ui/' || echo 'src/features/')" \
+    "$iter_dev"
+  repair_metro_stop
+  if git -C "$PROJECT" diff --quiet && git -C "$PROJECT" diff --cached --quiet; then
+    log "visual_review: repair made no edits; proceeding unrepaired"; return 0
+  fi
+  local screens; screens="$(jq -r '[.screens[]|select(.pass|not)|.screen]|unique|join(", ")' "$report")"
+  git -C "$PROJECT" add -A
+  git -C "$PROJECT" commit -q -m "fix(visual): auto-repair $screens" || { log "visual_review: repair commit failed; proceeding"; return 0; }
+  local newsha; newsha="$(git -C "$PROJECT" rev-parse HEAD)"
+  state_set '
+    .candidate_commits = ((.candidate_commits + [$c])
+      | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)) |
+    .candidate=$c | .updated_at=$now
+  ' --arg c "$newsha" --arg now "$(now_iso)"
+  run_visual_capture "$SPEC" "$newsha" "$RUN_ROOT/validated"
+  log "visual_review: auto-repaired ($screens); committed $newsha; refreshed report for observer"
 }
 
 run_observer() {
