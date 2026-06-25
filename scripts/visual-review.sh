@@ -145,11 +145,7 @@ log "reviewing ${#SPECS[@]} spec(s) against $PROJECT (scheme=$SCHEME)"
 
 # ---- stage 1: build + install on the device matrix --------------------------
 # Devices the matrix needs = the union of every reviewed spec's `- Devices:`.
-matrix_devices() {
-  local f
-  for f in "${SPECS[@]}"; do visual_capture_screens "$f" | awk -F'|' '{print $3}'; done | sort -u
-}
-device_label_to_name() { printf '%s' "$1" | sed -E 's/-/ /g' | sed -E 's/\b(.)/\u\1/g'; }
+matrix_devices() { local f; for f in "${SPECS[@]}"; do visual_repair_devices "$f"; done | sort -u; }
 
 build_and_install() {
   log "stage 1/4: build + install"
@@ -222,20 +218,6 @@ When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you cou
 }
 
 # ---- stage 2: stage Figma reference images ----------------------------------
-# Resolve a screen's Figma node id from the spec's
-#   `- Figma node IDs: Home = `1:1548`, Foo = `1:2`` line. Falls back to the spec's
-# single declared node if the screen isn't individually listed.
-node_id_for() {
-  local spec="$1" screen="$2" line id
-  line="$(grep -E '^- Figma node IDs:' "$spec" | head -n1)"
-  id="$(printf '%s' "$line" | grep -oE "${screen}[[:space:]]*=[[:space:]]*\`[0-9I][0-9:I;-]*\`" | grep -oE '`[^`]+`' | tr -d '`' | head -n1)"
-  [ -n "$id" ] || id="$(printf '%s' "$line" | grep -oE '`[0-9I][0-9:I;-]*`' | head -n1 | tr -d '`')"
-  printf '%s' "$id"
-}
-figma_key_for() {
-  sed -nE 's/.*fileKey `([A-Za-z0-9]+)`.*/\1/p' "$1" | head -n1
-}
-
 # Export one Figma node to a PNG via the Figma REST API, with 429 backoff.
 stage_ref() {
   local key="$1" node="$2" out="$3" attempt=0 wait=4 url

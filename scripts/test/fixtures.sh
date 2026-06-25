@@ -174,6 +174,7 @@ run_dry_fixtures() {
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
+  fixture_assert "visual-repair helpers (devices/node/key/label) in shared lib" fixture_visual_repair_helpers "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2302,6 +2303,25 @@ fixture_visual_review_repair_args() {
   # unknown drive still rejected (regression guard); capture so pipefail doesn't mask grep's exit
   out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$root" --drive bogus 2>&1 || true)"
   printf '%s\n' "$out" | grep -qi "unknown --drive" || return 1
+  return 0
+}
+
+fixture_visual_repair_helpers() {
+  local root="$1" spec="$root/s.md"
+  cat >"$spec" <<'SPEC'
+## Design Contract
+- Figma file: X, fileKey `ABC123`
+- Frames: Home, SetGoal
+- Figma node IDs: Home = `1:10`, SetGoal = `1:20`
+- Devices: iphone-16, iphone-13-mini
+- Required states: default
+SPEC
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
+    [ "$(device_label_to_name iphone-16)" = "iPhone 16" ] || exit 1
+    [ "$(figma_key_for "$spec")" = "ABC123" ] || exit 1
+    [ "$(node_id_for "$spec" SetGoal)" = "1:20" ] || exit 1
+    [ "$(visual_repair_devices "$spec" | sort | paste -sd, -)" = "iphone-13-mini,iphone-16" ] || exit 1
+  ) || return 1
   return 0
 }
 

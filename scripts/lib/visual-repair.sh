@@ -98,6 +98,24 @@ visual_repair_screen() {
   [ "$passed" = "1" ]
 }
 
+# Spec/Figma helpers (shared by both repair surfaces).
+device_label_to_name() { printf '%s' "$1" | sed -E 's/-/ /g' | sed -E 's/\b(.)/\u\1/g'; }
+
+# Per-spec capture device labels (e.g. iphone-16) from the Design Contract.
+visual_repair_devices() { visual_capture_screens "$1" | awk -F'|' '{print $3}' | sort -u; }
+
+# Resolve a screen's Figma node id from the spec's `- Figma node IDs:` line, else
+# the spec's single declared node.
+node_id_for() {
+  local spec="$1" screen="$2" line id
+  line="$(grep -E '^- Figma node IDs:' "$spec" | head -n1)"
+  id="$(printf '%s' "$line" | grep -oE "${screen}[[:space:]]*=[[:space:]]*\`[0-9I][0-9:I;-]*\`" | grep -oE '`[^`]+`' | tr -d '`' | head -n1)"
+  [ -n "$id" ] || id="$(printf '%s' "$line" | grep -oE '`[0-9I][0-9:I;-]*`' | head -n1 | tr -d '`')"
+  printf '%s' "$id"
+}
+
+figma_key_for() { sed -nE 's/.*fileKey `([A-Za-z0-9]+)`.*/\1/p' "$1" | head -n1; }
+
 # Process failing screens worst-diff first, stopping at the global attempt cap.
 # repair_one_fn returns the number of attempts it consumed on its stdout's last
 # line (an integer); if it prints nothing numeric, 1 is assumed.
