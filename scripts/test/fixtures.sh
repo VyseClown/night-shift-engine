@@ -170,6 +170,7 @@ run_dry_fixtures() {
   fixture_assert "visual_review prunes the registry only in registry mode" fixture_visual_prune_guarded "$root"
   fixture_assert "visual-repair scope-check allows in-scope, rejects out-of-scope" fixture_visual_repair_scope "$root"
   fixture_assert "visual_repair_snapshot/restore round-trips in-scope trees" fixture_visual_repair_snapshot "$root"
+  fixture_assert "visual repair loop: converge on pass" fixture_visual_repair_loop "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -2214,5 +2215,48 @@ fixture_visual_repair_snapshot() {
   printf 'edited' >"$proj/src/features/home/HomeScreen.tsx"
   ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_restore "$proj" "$tmp" "src/features/" ) || return 1
   [ "$(cat "$proj/src/features/home/HomeScreen.tsx")" = "orig" ] || return 1
+  return 0
+}
+
+fixture_visual_repair_loop() {
+  local root="$1" proj="$root/loopp" out="$root/loopout"
+  mkdir -p "$proj/src/features/home" "$out/design" "$out/diffs"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; git -C "$proj" add -A; git -C "$proj" commit -qm base
+  : >"$out/design/Home-default-iphone-15.png"; : >"$out/shot.png"; : >"$out/diff.png"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
+    log() { :; }
+    # agent makes an in-scope edit and reports one unmet item
+    _agent() { printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"; printf '{"unmet_brief":["spacing"]}'; }
+    _validate_ok() { return 0; }
+    # capture: stub diff sequence via a global counter -> first 0.3 (fail), then 0.05 (pass)
+    _N=0
+    _capture() { :; }
+    _diffseq() { _N=$((_N+1)); [ "$_N" -ge 2 ] && printf '0.05' || printf '0.30'; }
+    # Override the diff used by the loop by exporting a pluggable hook:
+    NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
+    obj="$(visual_repair_screen "$proj" "$root/lt" "$out" Home default iphone-15 \
+        "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" \
+        0.10 3 _agent _capture _validate_ok "src/features/")"
+    # ends passing (0.05 <= 0.10), with a 2-entry attempts[] and the unmet item
+    printf '%s' "$obj" | jq -e '.pass == true and (.attempts|length)==2 and (.unmet_brief==["spacing"])' >/dev/null || exit 1
+    exit 0
+  ) || return 1
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    _agent(){ printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"; printf '{}'; }
+    _cap(){ :; }; _ok(){ return 0; }; _bad(){ return 1; }
+    _hi(){ printf '0.30'; }; NIGHT_SHIFT_VISUAL_DIFF_FN=_hi
+    # never converges -> 3 attempts, returns 1
+    obj="$(visual_repair_screen "$proj" "$root/lt2" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _ok "src/features/")" && exit 1
+    printf '%s' "$obj" | jq -e '(.attempts|length)==3 and .pass==false' >/dev/null || exit 1
+    # validation fails -> edit reverted, file back to committed state
+    git -C "$proj" checkout -q -- src/features/home/HomeScreen.tsx
+    visual_repair_screen "$proj" "$root/lt3" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _bad "src/features/" >/dev/null
+    [ -z "$(git -C "$proj" status --porcelain)" ] || exit 1
+    exit 0
+  ) || return 1
   return 0
 }

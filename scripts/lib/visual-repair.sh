@@ -49,3 +49,51 @@ visual_repair_restore() {
     cp -R "$tmpdir/$p" "$project/$p"
   done
 }
+
+# Re-diff a screenshot against a reference; honors an injectable hook for tests.
+visual_repair_diff() {
+  local ref="$1" shot="$2" diff_out="$3"
+  if [ -n "${NIGHT_SHIFT_VISUAL_DIFF_FN:-}" ]; then
+    "$NIGHT_SHIFT_VISUAL_DIFF_FN" "$ref" "$shot" "$diff_out"
+  else
+    __visual_pixel_diff "$ref" "$shot" "$diff_out"
+  fi
+}
+
+# Bounded per-screen repair. Prints the final screen object; returns 0 if it ends
+# within tolerance, else 1.
+visual_repair_screen() {
+  local project="$1" tmpbase="$2" out_dir="$3" screen="$4" state="$5" device="$6" \
+    ref="$7" shot="$8" diff_img="$9" tol="${10}" max="${11}" agent_fn="${12}" \
+    capture_fn="${13}" validate_fn="${14}" allow_csv="${15}"
+  local IFS_OLD="$IFS"; IFS=','; read -r -a allow <<<"$allow_csv"; IFS="$IFS_OLD"
+  local attempts="[]" unmet="[]" cur="" n=0 snap="$tmpbase/snap" passed=0 agent_out
+  local _pct_file="$tmpbase/_pct"
+  mkdir -p "$tmpbase"
+  while [ "$n" -lt "$max" ]; do
+    n=$((n+1))
+    visual_repair_snapshot "$project" "$snap" "${allow[@]}"
+    agent_out="$("$agent_fn" "$screen" "$state" "$ref" "$shot" "$diff_img" "$cur" "$tol" "$out_dir" 2>/dev/null || printf '{}')"
+    unmet="$(printf '%s' "$agent_out" | jq -c '.unmet_brief // []' 2>/dev/null || printf '[]')"
+    # scope + validation gate; revert this attempt on failure and stop.
+    if ! visual_repair_scope_check "$project" "${allow[@]}" || ! "$validate_fn" "$project"; then
+      log "visual-repair: $screen attempt $n failed scope/validation; reverting"
+      visual_repair_restore "$project" "$snap" "${allow[@]}"
+      attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --arg s "$shot" --arg d "$diff_img" \
+        '. + [{attempt:$a, diff_pct:0, pass:false, analysis:"reverted: scope/validation failed", screenshot:$s, diff_image:$d}]')"
+      break
+    fi
+    "$capture_fn" "$screen" "$state" "$device" "$shot"
+    visual_repair_diff "$ref" "$shot" "$diff_img" >"$_pct_file" 2>/dev/null || printf '1' >"$_pct_file"
+    cur="$(cat "$_pct_file")"
+    local pass; pass="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
+    attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --argjson p "$cur" --argjson ps "$pass" \
+      --arg s "$shot" --arg d "$diff_img" \
+      '. + [{attempt:$a, diff_pct:$p, pass:$ps, analysis:"", screenshot:$s, diff_image:$d}]')"
+    if [ "$pass" = "true" ]; then passed=1; break; fi
+  done
+  # If cur is still empty (e.g. early break before any diff ran), default to 1.
+  [ -n "$cur" ] || cur="1"
+  visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$cur" "$tol" "$diff_img" "" "$attempts" "$unmet"
+  [ "$passed" = "1" ]
+}
