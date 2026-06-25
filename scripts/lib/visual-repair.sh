@@ -182,6 +182,31 @@ When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you cou
   [ -n "$result" ]
 }
 
+# Per-spec repair orchestration shared by both surfaces. candidate_label is the only
+# path difference between them (standalone: "review"; in-loop: the candidate SHA).
+# Assumes Metro/the dev build is already up (the caller manages repair_metro_*).
+visual_repair_for_spec() {
+  local spec="$1" project="$2" out_dir="$3" candidate_label="$4" report="$5" \
+        max="$6" allow_csv="$7"
+  REPAIR_FILEKEY="$(figma_key_for "$spec")"
+  REPAIR_FALLBACK_NODE="$(node_id_for "$spec" "")"
+  case "$allow_csv" in *src/ui*) REPAIR_SHARED=1 ;; *) REPAIR_SHARED=0 ;; esac
+  local fail="$out_dir/_fail.tsv"
+  jq -r '.screens[]|select(.pass|not)|[.diff_pct,.screen,.state,.device]|@tsv' "$report" >"$fail"
+  # shellcheck disable=SC2329  # invoked indirectly via visual_repair_run
+  _repair_one() {
+    local sc="$1" st="$2" dv="$3"
+    eval "REPAIR_NODE_$sc=\"$(node_id_for "$spec" "$sc")\""
+    visual_repair_screen "$project" "$out_dir/_rsnap" "$out_dir" "$sc" "$st" "$dv" \
+      "$out_dir/design/$sc-$st-$dv.png" "$out_dir/screenshots/$candidate_label/$sc-$st-$dv.png" \
+      "$out_dir/diffs/$candidate_label/$sc-$st-$dv.png" "$(visual_capture_tolerance "$spec")" \
+      "$max" repair_agent visual_recapture_screen repair_validate "$allow_csv" >/dev/null
+    printf '%s\n' "$max"
+  }
+  visual_repair_run "$fail" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" _repair_one
+  unset -f _repair_one
+}
+
 # Process failing screens worst-diff first, stopping at the global attempt cap.
 # repair_one_fn returns the number of attempts it consumed on its stdout's last
 # line (an integer); if it prints nothing numeric, 1 is assumed.

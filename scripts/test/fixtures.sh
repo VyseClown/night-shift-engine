@@ -175,6 +175,7 @@ run_dry_fixtures() {
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
   fixture_assert "visual-repair helpers (devices/node/key/label) in shared lib" fixture_visual_repair_helpers "$root"
+  fixture_assert "visual_repair_for_spec builds TSV + parameterizes paths by candidate_label" fixture_visual_repair_for_spec "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2322,6 +2323,34 @@ SPEC
     [ "$(node_id_for "$spec" SetGoal)" = "1:20" ] || exit 1
     [ "$(visual_repair_devices "$spec" | sort | paste -sd, -)" = "iphone-13-mini,iphone-16" ] || exit 1
   ) || return 1
+  return 0
+}
+
+fixture_visual_repair_for_spec() {
+  local root="$1" spec="$root/s.md" out="$root/out"
+  mkdir -p "$out"
+  cat >"$spec" <<'SPEC'
+## Design Contract
+- Figma file: X, fileKey `K1`
+- Frames: Home
+- Figma node IDs: Home = `1:9`
+- Devices: iphone-16
+- Required states: default
+- Tolerance: 0.12
+SPEC
+  # a report with one failing screen
+  cat >"$out/visual-diff-s.json" <<'JSON'
+{"task":"s","screens":[{"screen":"Home","state":"default","device":"iphone-16","reference":"r","screenshot":"s","diff_pct":0.4,"tolerance":0.12,"pass":false,"analysis":"","diff_image":null,"attempts":[],"unmet_brief":[]}]}
+JSON
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    # stub the screen loop to record the paths it is handed
+    visual_repair_screen() { printf '%s|%s\n' "$8" "$9" >>"$out/paths.log"; }   # $8=shot $9=diff_img
+    visual_repair_run() { local tsv="$1" cap="$2" fn="$3" l; while IFS=$'\t' read -r _ s st d; do "$fn" "$s" "$st" "$d" >/dev/null; done <"$tsv"; }
+    visual_capture_tolerance() { printf '0.12'; }
+    visual_repair_for_spec "$spec" "$root/proj" "$out" "CAND7" "$out/visual-diff-s.json" 3 "src/features/" iphone-16
+  )
+  # the failing-TSV was built and the screen path used candidate_label=CAND7
+  grep -q "screenshots/CAND7/Home-default-iphone-16.png|.*diffs/CAND7/Home-default-iphone-16.png" "$out/paths.log" || return 1
   return 0
 }
 
