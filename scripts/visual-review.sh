@@ -171,6 +171,29 @@ build_and_install() {
   done < <(matrix_devices)
 }
 
+# ---- Metro fast-reload harness (for repair) ---------------------------------
+_REPAIR_METRO_PID=""
+repair_metro_start() {
+  local device="$1"
+  if [ "$NO_BUILD" -ne 1 ]; then
+    log "repair: building dev client on '$device' (slow, once)…"
+    ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo run:ios --device "$device" >/dev/null 2>&1 ) \
+      || die "repair: dev build failed; build manually then re-run with --no-build"
+  fi
+  log "repair: starting Metro (EXPO_PUBLIC_PREVIEW=1)…"
+  ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo start >/tmp/visual-repair-metro.log 2>&1 ) &
+  _REPAIR_METRO_PID=$!
+  # wait for the bundler port
+  local i=0; until curl -s http://localhost:8081/status >/dev/null 2>&1; do
+    i=$((i+1)); [ "$i" -ge 30 ] && break; sleep 2; done
+}
+repair_metro_stop() {
+  [ -n "$_REPAIR_METRO_PID" ] || return 0
+  kill "$_REPAIR_METRO_PID" 2>/dev/null || true
+  pkill -f "expo start" 2>/dev/null || true
+  _REPAIR_METRO_PID=""
+}
+
 # ---- stage 2: stage Figma reference images ----------------------------------
 # Resolve a screen's Figma node id from the spec's
 #   `- Figma node IDs: Home = `1:1548`, Foo = `1:2`` line. Falls back to the spec's
