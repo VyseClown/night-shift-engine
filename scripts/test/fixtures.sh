@@ -158,6 +158,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
+  fixture_assert "visual capture maestro-drive times out a hung flow (no infinite hang)" fixture_visual_capture_maestro_timeout "$root"
   fixture_assert "visual capture pins status bar with a simctl-valid HH:MM time" fixture_visual_capture_statusbar_time "$root"
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
@@ -2193,6 +2194,36 @@ STUB
     grep -q "^maestro " "$d/calls.log" || exit 1
     grep -q 'get_app_container' "$d/calls.log" && exit 1
     exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_visual_capture_maestro_timeout() {
+  local root="$1" d="$root/vmt"
+  mkdir -p "$d/bin" "$d/flows"
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+shift
+case "\$1" in io) printf x >"\${!#}" ;; esac
+exit 0
+STUB
+  cat >"$d/bin/maestro" <<'STUB'
+#!/usr/bin/env bash
+sleep 30   # simulate a hung xcodebuild UI-test run
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun" "$d/bin/maestro"
+  : >"$d/flows/Home-default.yaml"
+  (
+    export PATH="$d/bin:/usr/bin:/bin" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_MAESTRO_DIR="$d/flows" NIGHT_SHIFT_MAESTRO_TIMEOUT=2
+    local start end rc
+    start="$(date +%s)"
+    __visual_capture_screenshot Home default iphone-15 "$d/shot.png" UDID-X; rc=$?
+    end="$(date +%s)"
+    # timed out -> clean SKIP (rc 2), and it did NOT hang for the full 30s.
+    [ "$rc" -eq 2 ] || exit 1
+    [ "$((end - start))" -lt 12 ] || exit 1
   ) || return 1
   return 0
 }
