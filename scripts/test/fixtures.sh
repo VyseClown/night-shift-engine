@@ -169,6 +169,7 @@ run_dry_fixtures() {
   fixture_assert "registry-off: no claim, no artifacts" fixture_visual_registry_off_no_artifacts "$root"
   fixture_assert "visual_review prunes the registry only in registry mode" fixture_visual_prune_guarded "$root"
   fixture_assert "visual-repair scope-check allows in-scope, rejects out-of-scope" fixture_visual_repair_scope "$root"
+  fixture_assert "visual_repair_snapshot/restore round-trips in-scope trees" fixture_visual_repair_snapshot "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -2202,5 +2203,16 @@ fixture_visual_repair_scope() {
   mkdir -p "$proj/src/ui"; : >"$proj/src/ui/tokens.ts"; git -C "$proj" add -A; git -C "$proj" commit -qm two
   printf 'x' >>"$proj/src/ui/tokens.ts"; git -C "$proj" checkout -q -- src/data/db.ts
   ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_scope_check "$proj" "src/features/" "src/ui/" ) || return 1
+  return 0
+}
+
+fixture_visual_repair_snapshot() {
+  local root="$1" proj="$root/snapp" tmp="$root/snaptmp"
+  mkdir -p "$proj/src/features/home"
+  printf 'orig' >"$proj/src/features/home/HomeScreen.tsx"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_snapshot "$proj" "$tmp" "src/features/" ) || return 1
+  printf 'edited' >"$proj/src/features/home/HomeScreen.tsx"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_restore "$proj" "$tmp" "src/features/" ) || return 1
+  [ "$(cat "$proj/src/features/home/HomeScreen.tsx")" = "orig" ] || return 1
   return 0
 }

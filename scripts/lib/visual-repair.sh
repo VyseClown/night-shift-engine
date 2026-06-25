@@ -25,3 +25,27 @@ visual_repair_scope_check() {
   fi
   return 0
 }
+
+# Copy in-scope trees aside so a failed repair attempt can be reverted.
+visual_repair_snapshot() {
+  local project="$1" tmpdir="$2"; shift 2
+  local p
+  rm -rf "$tmpdir"; mkdir -p "$tmpdir"
+  for p in "$@"; do
+    [ -e "$project/$p" ] || continue
+    mkdir -p "$tmpdir/$(dirname "$p")"
+    cp -R "$project/$p" "$tmpdir/$p"
+  done
+}
+
+# Restore the snapshotted trees over the working copy.
+visual_repair_restore() {
+  local project="$1" tmpdir="$2"; shift 2
+  local p
+  for p in "$@"; do
+    [ -e "$tmpdir/$p" ] || continue
+    rm -rf "$project/$p"
+    mkdir -p "$project/$(dirname "$p")"
+    cp -R "$tmpdir/$p" "$project/$p"
+  done
+}
