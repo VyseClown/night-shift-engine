@@ -181,6 +181,15 @@ __visual_capture_screenshot() {
   [ -s "$out" ]
 }
 
+# Re-capture a single screen via the existing file-drive path. Used by the repair
+# loop after an edit hot-reloads. Returns non-zero if capture fails.
+visual_recapture_screen() {
+  local screen="$1" state="$2" device="$3" out="$4" udid
+  udid="$(__visual_resolve_udid "$device")" || return 2
+  [ -n "$udid" ] || return 2
+  __visual_capture_screenshot "$screen" "$state" "$device" "$out" "$udid"
+}
+
 # Diff <reference> <screenshot> <diff_out>; prints diff_pct (0-100). Requires
 # odiff. Returns 2 when unavailable.
 __visual_pixel_diff() {

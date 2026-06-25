@@ -172,6 +172,7 @@ run_dry_fixtures() {
   fixture_assert "visual_repair_snapshot/restore round-trips in-scope trees" fixture_visual_repair_snapshot "$root"
   fixture_assert "visual repair loop: converge on pass" fixture_visual_repair_loop "$root"
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
+  fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -2270,5 +2271,26 @@ fixture_visual_repair_run() {
     visual_repair_run "$tsv" 99 _one >/dev/null )
   # worst-first: History (0.40), Goal (0.25), Home (0.10)
   [ "$(paste -sd, "$log")" = "History,Goal,Home" ] || return 1
+  return 0
+}
+
+fixture_visual_recapture() {
+  local root="$1" d="$root/rc"; mkdir -p "$d/bin" "$d/data"
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+shift
+case "\$1" in
+  get_app_container) printf '%s\n' "$d/data" ;;
+  io) printf x >"\${!#}" ;;
+esac
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    export PATH="$d/bin:$PATH" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+      NIGHT_SHIFT_PREVIEW_BUNDLE_ID=com.example.app NIGHT_SHIFT_PREVIEW_FILE=p.txt
+    __visual_resolve_udid() { printf 'UDID-X\n'; }
+    visual_recapture_screen Home default iphone-15 "$d/out.png" || exit 1
+    [ -s "$d/out.png" ] || exit 1 ) || return 1
   return 0
 }
