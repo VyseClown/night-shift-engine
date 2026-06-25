@@ -99,7 +99,22 @@ visual_repair_screen() {
 }
 
 # Spec/Figma helpers (shared by both repair surfaces).
-device_label_to_name() { printf '%s' "$1" | sed -E 's/-/ /g' | sed -E 's/\b(.)/\u\1/g'; }
+# label (iphone-16-pro-max) -> simctl device name (iPhone 16 Pro Max). Portable
+# across BSD/GNU (awk toupper/tolower; GNU sed's \u is a no-op on macOS BSD sed).
+device_label_to_name() {
+  printf '%s' "$1" | sed -E 's/-/ /g' | awk '{
+    for (i=1;i<=NF;i++) {
+      w=tolower($i)
+      if (w=="iphone") $i="iPhone"
+      else if (w=="mini") $i="mini"
+      else if (w=="pro") $i="Pro"
+      else if (w=="max") $i="Max"
+      else if (w ~ /^[0-9]+$/) { }
+      else $i=toupper(substr($i,1,1)) substr($i,2)
+    }
+    print
+  }'
+}
 
 # Per-spec capture device labels (e.g. iphone-16) from the Design Contract.
 visual_repair_devices() { visual_capture_screens "$1" | awk -F'|' '{print $3}' | sort -u; }
