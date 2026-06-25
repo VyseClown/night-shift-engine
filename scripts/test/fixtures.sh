@@ -158,6 +158,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
+  fixture_assert "visual capture maestro-drive times out a hung flow (no infinite hang)" fixture_visual_capture_maestro_timeout "$root"
   fixture_assert "visual capture pins status bar with a simctl-valid HH:MM time" fixture_visual_capture_statusbar_time "$root"
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
@@ -173,6 +174,7 @@ run_dry_fixtures() {
   fixture_assert "visual-repair scope-check allows in-scope, rejects out-of-scope" fixture_visual_repair_scope "$root"
   fixture_assert "visual_repair_snapshot/restore round-trips in-scope trees" fixture_visual_repair_snapshot "$root"
   fixture_assert "visual repair loop: converge on pass" fixture_visual_repair_loop "$root"
+  fixture_assert "visual repair loop: retries a re-capture whose diff failed" fixture_visual_repair_recapture_retry "$root"
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
@@ -2197,6 +2199,36 @@ STUB
   return 0
 }
 
+fixture_visual_capture_maestro_timeout() {
+  local root="$1" d="$root/vmt"
+  mkdir -p "$d/bin" "$d/flows"
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+shift
+case "\$1" in io) printf x >"\${!#}" ;; esac
+exit 0
+STUB
+  cat >"$d/bin/maestro" <<'STUB'
+#!/usr/bin/env bash
+sleep 30   # simulate a hung xcodebuild UI-test run
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun" "$d/bin/maestro"
+  : >"$d/flows/Home-default.yaml"
+  (
+    export PATH="$d/bin:/usr/bin:/bin" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+           NIGHT_SHIFT_MAESTRO_DIR="$d/flows" NIGHT_SHIFT_MAESTRO_TIMEOUT=2
+    local start end rc
+    start="$(date +%s)"
+    __visual_capture_screenshot Home default iphone-15 "$d/shot.png" UDID-X; rc=$?
+    end="$(date +%s)"
+    # timed out -> clean SKIP (rc 2), and it did NOT hang for the full 30s.
+    [ "$rc" -eq 2 ] || exit 1
+    [ "$((end - start))" -lt 12 ] || exit 1
+  ) || return 1
+  return 0
+}
+
 # Regression guard: the status-bar override must pass a plain HH:MM clock to simctl.
 # iOS 26's simctl rejects an ISO datetime (e.g. 2026-06-18T09:41:00) as "non-ISO
 # date/time string", which the override's `|| true` silently swallows — leaving the
@@ -2368,6 +2400,35 @@ fixture_visual_repair_loop() {
     git -C "$proj" checkout -q -- src/features/home/HomeScreen.tsx
     visual_repair_screen "$proj" "$root/lt3" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _bad "src/features/" >/dev/null
     [ -z "$(git -C "$proj" status --porcelain)" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_visual_repair_recapture_retry() {
+  local root="$1" proj="$root/rrp" out="$root/rrout"
+  mkdir -p "$proj/src/features/home" "$out/design"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; git -C "$proj" add -A; git -C "$proj" commit -qm base
+  : >"$out/design/Home-default-iphone-15.png"; : >"$out/shot.png"; : >"$out/diff.png"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
+    log() { :; }
+    _agent() { printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"; printf '{}'; }
+    _cap() { :; }
+    _ok() { return 0; }
+    # diff fails on the FIRST call (bad capture), succeeds (0.02) on the retry.
+    _N=0
+    _difffail1() { _N=$((_N+1)); if [ "$_N" -ge 2 ]; then printf '0.02'; return 0; else return 1; fi; }
+    export NIGHT_SHIFT_VISUAL_RECAPTURE_SETTLE=0
+    NIGHT_SHIFT_VISUAL_DIFF_FN=_difffail1
+    obj="$(visual_repair_screen "$proj" "$root/rt" "$out" Home default iphone-15 \
+        "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" \
+        0.10 3 _agent _cap _ok "src/features/")"
+    # The retry happened: attempt 1 records the SUCCEEDED 0.02 (not the 1.0 sentinel)
+    # and the loop passes in a single attempt.
+    printf '%s' "$obj" | jq -e '.pass==true and (.attempts|length)==1 and (.attempts[0].diff_pct==0.02)' >/dev/null || exit 1
     exit 0
   ) || return 1
   return 0

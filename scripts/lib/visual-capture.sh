@@ -130,6 +130,22 @@ __visual_resolve_udid() {
   printf '%s' "$js" | __visual_pick_udid "$device"
 }
 
+# Run a command under a timeout without GNU `timeout` (absent on macOS): background
+# the command, start a watchdog that TERM-then-KILLs it after $1 seconds, and return
+# the command's exit status (a watchdog kill surfaces as non-zero).
+__visual_run_timeout() {
+  local secs="$1"; shift
+  "$@" &
+  local cmd_pid=$!
+  ( sleep "$secs"; kill -TERM "$cmd_pid" 2>/dev/null; sleep 3; kill -KILL "$cmd_pid" 2>/dev/null ) &
+  local wd_pid=$!
+  wait "$cmd_pid" 2>/dev/null
+  local rc=$?
+  kill "$wd_pid" 2>/dev/null
+  wait "$wd_pid" 2>/dev/null
+  return "$rc"
+}
+
 # Capture <screen> <state> <device> -> PNG at $4. Requires xcrun. Returns 2 when
 # unavailable so run_visual_capture degrades cleanly.
 __visual_capture_screenshot() {
@@ -169,7 +185,9 @@ __visual_capture_screenshot() {
     command -v maestro >/dev/null 2>&1 || return 2
     local flow="$mdir/${screen}-${state}.yaml"
     [ -f "$flow" ] || return 2
-    maestro --device "$udid" test "$flow" >/dev/null 2>&1 || return 2
+    # Bound the UI-test run: a hung xcodebuild driver must SKIP, not freeze the loop.
+    __visual_run_timeout "${NIGHT_SHIFT_MAESTRO_TIMEOUT:-180}" \
+      maestro --device "$udid" test "$flow" >/dev/null 2>&1 || return 2
   elif [ -n "$bid" ] && [ -n "$pfile" ]; then
     # (1) file-driven cold launch.
     local data
