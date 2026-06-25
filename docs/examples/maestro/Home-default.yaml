@@ -1,0 +1,15 @@
+# Sample Maestro flow for the night-shift `--drive maestro` capture mode.
+# Convention: <NIGHT_SHIFT_MAESTRO_DIR>/<Screen>-<state>.yaml (here: Home / default).
+# The flow only NAVIGATES the real app to the exact scenario the Figma frame depicts.
+# It MUST NOT take a screenshot — the visual-review pipeline pins the status bar
+# (09:41) and runs `simctl io screenshot` after this flow completes.
+appId: com.vyseclown.watertracker
+---
+- launchApp
+# Confirm we landed on Home and it has settled (replace with this screen's anchor):
+- assertVisible: "Good Morning"
+# Add the steps that reproduce the Figma scenario, e.g.:
+#   - tapOn: "+250 ml"
+#   - inputText: "Custom"
+#   - scroll
+# Do NOT add `takeScreenshot` — the pipeline captures the result.
