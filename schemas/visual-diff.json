@@ -14,7 +14,7 @@
         "additionalProperties": false,
         "required": [
           "screen", "state", "device", "reference", "screenshot",
-          "diff_pct", "tolerance", "pass", "analysis", "attempts", "diff_image"
+          "diff_pct", "tolerance", "pass", "analysis", "attempts", "diff_image", "unmet_brief"
         ],
         "properties": {
           "screen": { "type": "string", "minLength": 1 },
@@ -42,6 +42,10 @@
                 "diff_image": { "type": ["string", "null"], "minLength": 1 }
               }
             }
+          },
+          "unmet_brief": {
+            "type": "array",
+            "items": { "type": "string" }
           }
         }
       }

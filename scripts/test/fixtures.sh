@@ -168,7 +168,12 @@ run_dry_fixtures() {
   fixture_assert "run_visual_capture registry mode claims, caches, releases" fixture_visual_capture_registry_claim "$root"
   fixture_assert "registry-off: no claim, no artifacts" fixture_visual_registry_off_no_artifacts "$root"
   fixture_assert "visual_review prunes the registry only in registry mode" fixture_visual_prune_guarded "$root"
-
+  fixture_assert "visual-repair scope-check allows in-scope, rejects out-of-scope" fixture_visual_repair_scope "$root"
+  fixture_assert "visual_repair_snapshot/restore round-trips in-scope trees" fixture_visual_repair_snapshot "$root"
+  fixture_assert "visual repair loop: converge on pass" fixture_visual_repair_loop "$root"
+  fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
+  fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
+  fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -469,19 +474,19 @@ fixture_review_fields_scoped() {
 
 fixture_visual_diff_schema() {
   local root="$1" good="$root/vd-good.json" bad="$root/vd-bad.json" badkey="$root/vd-key.json"
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$good"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null,"unmet_brief":[]}]}' >"$good"
   json_schema_basic visual-diff "$good" || return 1
   # pass=true but diff_pct > tolerance → inconsistent → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$bad"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null,"unmet_brief":[]}]}' >"$bad"
   json_schema_basic visual-diff "$bad" && return 1
   # missing a per-screen key → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true,"analysis":"","attempts":[]}]}' >"$badkey"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"unmet_brief":[]}]}' >"$badkey"
   json_schema_basic visual-diff "$badkey" && return 1
   # A non-empty attempts array with a malformed entry (non-integer attempt) is rejected.
-  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":"one","diff_pct":0.0,"pass":true,"analysis":"","screenshot":"a.png","diff_image":null}]}]}' >"$root/badattempt.json"
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":"one","diff_pct":0.0,"pass":true,"analysis":"","screenshot":"a.png","diff_image":null}],"unmet_brief":[]}]}' >"$root/badattempt.json"
   ! json_schema_basic visual-diff "$root/badattempt.json" || return 1
   # A well-formed non-empty attempts array is still accepted.
-  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":1,"diff_pct":0.0,"pass":true,"analysis":"ok","screenshot":"a.png","diff_image":null}]}]}' >"$root/goodattempt.json"
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":1,"diff_pct":0.0,"pass":true,"analysis":"ok","screenshot":"a.png","diff_image":null}],"unmet_brief":[]}]}' >"$root/goodattempt.json"
   json_schema_basic visual-diff "$root/goodattempt.json" || return 1
   return 0
 }
@@ -510,6 +515,15 @@ fixture_visual_assemble_screen() {
   # The assembled object is a valid screen inside a report.
   printf '{"task":"t","screens":[%s]}\n' "$obj" >"$root/asm.json"
   json_schema_basic visual-diff "$root/asm.json" || return 1
+  # unmet_brief defaults to [] and is always present
+  obj="$(visual_assemble_screen Home default iphone-15 d.png s.png 0.05 0.1 di.png "" "[]")"
+  printf '%s' "$obj" | jq -e '.unmet_brief == []' >/dev/null || return 1
+  # and round-trips a provided list
+  obj="$(visual_assemble_screen Home default iphone-15 d.png s.png 0.05 0.1 di.png "" "[]" '["button 44pt"]')"
+  printf '%s' "$obj" | jq -e '.unmet_brief == ["button 44pt"]' >/dev/null || return 1
+  printf '%s\n' "$obj" >"$root/asm_brief.json"
+  printf '{"task":"t","screens":[%s]}' "$obj" >"$root/asm_brief_full.json"
+  json_schema_basic visual-diff "$root/asm_brief_full.json" || return 1
   return 0
 }
 
@@ -2175,3 +2189,119 @@ fixture_visual_prune_guarded() {
     exit 0
   )
 }
+
+fixture_visual_repair_scope() {
+  local root="$1" proj="$root/scopep"
+  mkdir -p "$proj/src/features/home" "$proj/src/data"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; : >"$proj/src/data/db.ts"
+  git -C "$proj" add -A && git -C "$proj" commit -qm base
+  # in-scope edit only -> pass
+  printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_scope_check "$proj" "src/features/" ) || return 1
+  # out-of-scope edit -> fail
+  printf 'x' >>"$proj/src/data/db.ts"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_scope_check "$proj" "src/features/" ) && return 1
+  # shared opt-in: src/ui allowed when listed
+  mkdir -p "$proj/src/ui"; : >"$proj/src/ui/tokens.ts"; git -C "$proj" add -A; git -C "$proj" commit -qm two
+  printf 'x' >>"$proj/src/ui/tokens.ts"; git -C "$proj" checkout -q -- src/data/db.ts
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_scope_check "$proj" "src/features/" "src/ui/" ) || return 1
+  return 0
+}
+
+fixture_visual_repair_snapshot() {
+  local root="$1" proj="$root/snapp" tmp="$root/snaptmp"
+  mkdir -p "$proj/src/features/home"
+  printf 'orig' >"$proj/src/features/home/HomeScreen.tsx"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_snapshot "$proj" "$tmp" "src/features/" ) || return 1
+  printf 'edited' >"$proj/src/features/home/HomeScreen.tsx"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; visual_repair_restore "$proj" "$tmp" "src/features/" ) || return 1
+  [ "$(cat "$proj/src/features/home/HomeScreen.tsx")" = "orig" ] || return 1
+  return 0
+}
+
+fixture_visual_repair_loop() {
+  local root="$1" proj="$root/loopp" out="$root/loopout"
+  mkdir -p "$proj/src/features/home" "$out/design" "$out/diffs"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; git -C "$proj" add -A; git -C "$proj" commit -qm base
+  : >"$out/design/Home-default-iphone-15.png"; : >"$out/shot.png"; : >"$out/diff.png"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
+    log() { :; }
+    # agent makes an in-scope edit and reports one unmet item
+    _agent() { printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"; printf '{"unmet_brief":["spacing"]}'; }
+    _validate_ok() { return 0; }
+    # capture: stub diff sequence via a global counter -> first 0.3 (fail), then 0.05 (pass)
+    _N=0
+    _capture() { :; }
+    _diffseq() { _N=$((_N+1)); [ "$_N" -ge 2 ] && printf '0.05' || printf '0.30'; }
+    # Override the diff used by the loop by exporting a pluggable hook:
+    NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
+    obj="$(visual_repair_screen "$proj" "$root/lt" "$out" Home default iphone-15 \
+        "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" \
+        0.10 3 _agent _capture _validate_ok "src/features/")"
+    # ends passing (0.05 <= 0.10), with a 2-entry attempts[] and the unmet item
+    printf '%s' "$obj" | jq -e '.pass == true and (.attempts|length)==2 and (.unmet_brief==["spacing"])' >/dev/null || exit 1
+    exit 0
+  ) || return 1
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    _agent(){ printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"; printf '{}'; }
+    _cap(){ :; }; _ok(){ return 0; }; _bad(){ return 1; }
+    _hi(){ printf '0.30'; }; NIGHT_SHIFT_VISUAL_DIFF_FN=_hi
+    # never converges -> 3 attempts, returns 1
+    obj="$(visual_repair_screen "$proj" "$root/lt2" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _ok "src/features/")" && exit 1
+    printf '%s' "$obj" | jq -e '(.attempts|length)==3 and .pass==false' >/dev/null || exit 1
+    # validation fails -> edit reverted, file back to committed state
+    git -C "$proj" checkout -q -- src/features/home/HomeScreen.tsx
+    visual_repair_screen "$proj" "$root/lt3" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _bad "src/features/" >/dev/null
+    [ -z "$(git -C "$proj" status --porcelain)" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_visual_repair_run() {
+  local root="$1" tsv="$root/fail.tsv" log="$root/order.log"
+  printf '0.10\tHome\tdefault\tiphone-15\n0.40\tHistory\tdefault\tiphone-15\n0.25\tGoal\tdefault\tiphone-15\n' >"$tsv"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    _one(){ printf '%s\n' "$1" >>"$log"; }   # records processing order
+    visual_repair_run "$tsv" 99 _one >/dev/null )
+  # worst-first: History (0.40), Goal (0.25), Home (0.10)
+  [ "$(paste -sd, "$log")" = "History,Goal,Home" ] || return 1
+  return 0
+}
+
+fixture_visual_recapture() {
+  local root="$1" d="$root/rc"; mkdir -p "$d/bin" "$d/data"
+  cat >"$d/bin/xcrun" <<STUB
+#!/usr/bin/env bash
+shift
+case "\$1" in
+  get_app_container) printf '%s\n' "$d/data" ;;
+  io) printf x >"\${!#}" ;;
+esac
+exit 0
+STUB
+  chmod +x "$d/bin/xcrun"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    export PATH="$d/bin:$PATH" NIGHT_SHIFT_VISUAL_SETTLE_SECONDS=0 \
+      NIGHT_SHIFT_PREVIEW_BUNDLE_ID=com.example.app NIGHT_SHIFT_PREVIEW_FILE=p.txt
+    __visual_resolve_udid() { printf 'UDID-X\n'; }
+    visual_recapture_screen Home default iphone-15 "$d/out.png" || exit 1
+    [ -s "$d/out.png" ] || exit 1 ) || return 1
+  return 0
+}
+
+fixture_visual_review_repair_args() {
+  local root="$1" out
+  # --help text documents --repair
+  "$WORKSPACE_ROOT/scripts/visual-review.sh" --help 2>&1 | grep -q -- '--repair' || return 1
+  # unknown drive still rejected (regression guard); capture so pipefail doesn't mask grep's exit
+  out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$root" --drive bogus 2>&1 || true)"
+  printf '%s\n' "$out" | grep -qi "unknown --drive" || return 1
+  return 0
+}
+

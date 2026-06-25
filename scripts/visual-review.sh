@@ -31,6 +31,10 @@
 #   --no-refs         skip Figma export (reuse already-staged references)
 #   --out DIR         where to write screenshots/diffs/reports
 #                     (default: <project>/.night-shift/visual-review)
+#   --repair[=N]      after the report, auto-repair over-tolerance screens (N
+#                     attempts/screen, default 3). Implies --drive file; edits are
+#                     left UNCOMMITTED for review. Off by default.
+#   --repair-shared   allow repair edits to src/ui (shared) as well as src/features
 #   -h, --help
 #
 # Prerequisites:
@@ -57,9 +61,12 @@ die() { log "ERROR: $*"; exit 2; }
 # run_visual_capture, __visual_*). It expects a `log` in scope — defined above.
 # shellcheck source=scripts/lib/visual-capture.sh
 . "$SCRIPT_DIR/lib/visual-capture.sh"
+# shellcheck source=scripts/lib/visual-repair.sh
+. "$SCRIPT_DIR/lib/visual-repair.sh"
 
 # ---- args -------------------------------------------------------------------
 PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="openurl" PREVIEW_FILE=""
+REPAIR=0 MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" REPAIR_SHARED=0
 SPECS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -71,11 +78,15 @@ while [ "$#" -gt 0 ]; do
     --preview-file) PREVIEW_FILE="${2:-}"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --no-refs)  NO_REFS=1; shift ;;
+    --repair=*)      REPAIR=1; MAX_ATTEMPTS="${1#--repair=}"; shift ;;
+    --repair)        REPAIR=1; case "${2:-}" in ''|--*) : ;; *) MAX_ATTEMPTS="$2"; shift ;; esac; shift ;;
+    --repair-shared) REPAIR_SHARED=1; shift ;;
     -h|--help) sed -n '4,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
+case "$DRIVE" in openurl|file) : ;; *) die "unknown --drive '$DRIVE' (expected: openurl | file)" ;; esac
 [ -n "$PROJECT" ] || die "--project is required"
 PROJECT="$(cd "$PROJECT" 2>/dev/null && pwd)" || die "project not found: $PROJECT"
 [ -f "$PROJECT/app.json" ] || die "no app.json under $PROJECT (is this an Expo app?)"
@@ -109,6 +120,11 @@ case "$DRIVE" in
     ;;
   *) die "unknown --drive '$DRIVE' (expected: openurl | file)" ;;
 esac
+
+if [ "$REPAIR" -eq 1 ]; then
+  [ "$DRIVE" = "file" ] || { DRIVE="file"; export NIGHT_SHIFT_PREVIEW_BUNDLE_ID="$BUNDLE_ID" NIGHT_SHIFT_PREVIEW_FILE="${PREVIEW_FILE:-nightshift-preview.txt}"; }
+  log "REPAIR ON (≤${MAX_ATTEMPTS}/screen): spawns PAID claude sessions and EDITS screen code (left uncommitted)."
+fi
 
 # ---- which specs ------------------------------------------------------------
 # Default: every spec that targets THIS project and declares a Design Contract.
@@ -153,6 +169,52 @@ build_and_install() {
     xcrun simctl install "$name" "$app" >/dev/null 2>&1 &&
       log "  installed on $name" || log "  WARN: could not install on $name"
   done < <(matrix_devices)
+}
+
+# ---- Metro fast-reload harness (for repair) ---------------------------------
+_REPAIR_METRO_PID=""
+repair_metro_start() {
+  local device="$1"
+  if [ "$NO_BUILD" -ne 1 ]; then
+    log "repair: building dev client on '$device' (slow, once)…"
+    ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo run:ios --device "$device" >/dev/null 2>&1 ) \
+      || die "repair: dev build failed; build manually then re-run with --no-build"
+  fi
+  log "repair: starting Metro (EXPO_PUBLIC_PREVIEW=1)…"
+  ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo start >/tmp/visual-repair-metro.log 2>&1 ) &
+  _REPAIR_METRO_PID=$!
+  # wait for the bundler port
+  local i=0; until curl -s http://localhost:8081/status >/dev/null 2>&1; do
+    i=$((i+1)); [ "$i" -ge 30 ] && { log "WARN: Metro did not come up after 60s"; break; }; sleep 2; done
+}
+repair_metro_stop() {
+  [ -n "$_REPAIR_METRO_PID" ] || return 0
+  kill "$_REPAIR_METRO_PID" 2>/dev/null || true
+  pkill -f "expo start" 2>/dev/null || true
+  _REPAIR_METRO_PID=""
+}
+
+# ---- repair agent + validate ------------------------------------------------
+# shellcheck disable=SC2329  # invoked indirectly as an injected function name
+repair_validate() {
+  ( cd "$1" && npx tsc --noEmit >/dev/null 2>&1 && npx eslint . --max-warnings 0 >/dev/null 2>&1 )
+}
+
+# shellcheck disable=SC2329  # invoked indirectly as an injected function name
+repair_agent() {
+  local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
+  local key node allow result
+  key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
+  allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
+  result="$(cd "$PROJECT" && claude -p --output-format json \
+    --allowedTools "Read Edit Write Bash(npx tsc*) Bash(npx eslint*) mcp__figma__get_figma_data" \
+    "You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
+Reference image: $ref  Current screenshot: $shot  Diff overlay: $diff_img  diff=$pct tolerance=$tol.
+Pull the Figma design for node $node in file $key via mcp__figma__get_figma_data — its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments the MCP exposes — and treat them as requirements. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
+Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
+When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}." 2>/dev/null)"
+  printf '%s' "$result" | jq -r '.result // "{}"' 2>/dev/null | grep -o '{.*}' | tail -n1
+  [ -n "$result" ]
 }
 
 # ---- stage 2: stage Figma reference images ----------------------------------
@@ -226,5 +288,31 @@ review_spec() {
 [ "$NO_BUILD" -eq 1 ] || build_and_install
 rc=0
 for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
+
+if [ "$REPAIR" -eq 1 ]; then
+  REPAIR_FILEKEY="$(figma_key_for "${SPECS[0]}")"; REPAIR_FALLBACK_NODE="$(node_id_for "${SPECS[0]}" "")"
+  trap 'repair_metro_stop' EXIT
+  first_dev="$(device_label_to_name "$(matrix_devices | head -n1)")"
+  repair_metro_start "$first_dev"
+  report="$OUT/$(basename "${SPECS[0]}" .md)/visual-diff-$(basename "${SPECS[0]}" .md).json"
+  jq -r '.screens[]|select(.pass|not)|[.diff_pct,.screen,.state,.device]|@tsv' "$report" >"$OUT/_fail.tsv"
+  # shellcheck disable=SC2329  # invoked indirectly via visual_repair_run
+  repair_one() {
+    local sc="$1" st="$2" dv="$3" rd; rd="$OUT/$(basename "${SPECS[0]}" .md)"
+    eval "REPAIR_NODE_$sc=\"$(node_id_for "${SPECS[0]}" "$sc")\""
+    visual_repair_screen "$PROJECT" "$OUT/_rsnap" "$rd" "$sc" "$st" "$dv" \
+      "$rd/design/$sc-$st-$dv.png" "$rd/screenshots/review/$sc-$st-$dv.png" \
+      "$rd/diffs/review/$sc-$st-$dv.png" "$(visual_capture_tolerance "${SPECS[0]}")" \
+      "$MAX_ATTEMPTS" repair_agent visual_recapture_screen repair_validate \
+      "$([ "$REPAIR_SHARED" -eq 1 ] && echo "src/features/,src/ui/" || echo "src/features/")" >/dev/null
+    printf '%s\n' "$MAX_ATTEMPTS"
+  }
+  visual_repair_run "$OUT/_fail.tsv" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" repair_one
+  log "repair: final authoritative pass…"
+  rc=0; for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
+  repair_metro_stop; trap - EXIT
+  log "repair: done. Edited files (uncommitted):"; git -C "$PROJECT" status --porcelain | sed 's/^/  /' >&2
+fi
+
 log "done. reports under $OUT/<spec>/visual-diff-*.json (open in the night-shift viewer)."
 exit "$rc"

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# visual-repair.sh — surface-agnostic bounded auto-repair loop for the
+# design-fidelity pipeline. Sourced by scripts/visual-review.sh (standalone) and
+# scripts/night-shift.sh (in-loop). The agent, capture, and validate steps are
+# INJECTED as function names so each caller (and the fixtures) supplies its own.
+# Expects a `log` function in scope (callers define it).
+
+# Return 0 iff every changed path in <project>'s working tree begins with one of
+# the allow-prefixes; else print offenders and return 1.
+visual_repair_scope_check() {
+  local project="$1"; shift
+  local offenders="" line path p ok
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"            # strip the 2-char status + space
+    ok=0
+    for p in "$@"; do case "$path" in "$p"*) ok=1; break ;; esac; done
+    [ "$ok" = "1" ] || offenders="$offenders$path"$'\n'
+  done < <(git -C "$project" status --porcelain 2>/dev/null)
+  if [ -n "$offenders" ]; then
+    printf 'visual-repair: out-of-scope edits:\n%s' "$offenders" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Copy in-scope trees aside so a failed repair attempt can be reverted.
+visual_repair_snapshot() {
+  local project="$1" tmpdir="$2"; shift 2
+  local p
+  rm -rf "$tmpdir"; mkdir -p "$tmpdir"
+  for p in "$@"; do
+    [ -e "$project/$p" ] || continue
+    mkdir -p "$tmpdir/$(dirname "$p")"
+    cp -R "$project/$p" "$tmpdir/$p"
+  done
+}
+
+# Restore the snapshotted trees over the working copy.
+visual_repair_restore() {
+  local project="$1" tmpdir="$2"; shift 2
+  local p
+  for p in "$@"; do
+    [ -e "$tmpdir/$p" ] || continue
+    rm -rf "${project:?}/$p"
+    mkdir -p "$project/$(dirname "$p")"
+    cp -R "$tmpdir/$p" "$project/$p"
+  done
+}
+
+# Re-diff a screenshot against a reference; honors an injectable hook for tests.
+visual_repair_diff() {
+  local ref="$1" shot="$2" diff_out="$3"
+  if [ -n "${NIGHT_SHIFT_VISUAL_DIFF_FN:-}" ]; then
+    "$NIGHT_SHIFT_VISUAL_DIFF_FN" "$ref" "$shot" "$diff_out"
+  else
+    __visual_pixel_diff "$ref" "$shot" "$diff_out"
+  fi
+}
+
+# Bounded per-screen repair. Prints the final screen object; returns 0 if it ends
+# within tolerance, else 1.
+visual_repair_screen() {
+  local project="$1" tmpbase="$2" out_dir="$3" screen="$4" state="$5" device="$6" \
+    ref="$7" shot="$8" diff_img="$9" tol="${10}" max="${11}" agent_fn="${12}" \
+    capture_fn="${13}" validate_fn="${14}" allow_csv="${15}"
+  local IFS_OLD="$IFS"; IFS=','; read -r -a allow <<<"$allow_csv"; IFS="$IFS_OLD"
+  local attempts="[]" unmet="[]" cur="" n=0 snap="$tmpbase/snap" passed=0 agent_out
+  local _pct_file="$tmpbase/_pct"
+  mkdir -p "$tmpbase"
+  while [ "$n" -lt "$max" ]; do
+    n=$((n+1))
+    visual_repair_snapshot "$project" "$snap" "${allow[@]}"
+    agent_out="$("$agent_fn" "$screen" "$state" "$ref" "$shot" "$diff_img" "$cur" "$tol" "$out_dir" 2>/dev/null || printf '{}')"
+    unmet="$(printf '%s' "$agent_out" | jq -c '.unmet_brief // []' 2>/dev/null || printf '[]')"
+    # scope + validation gate; revert this attempt on failure and stop.
+    if ! visual_repair_scope_check "$project" "${allow[@]}" || ! "$validate_fn" "$project"; then
+      log "visual-repair: $screen attempt $n failed scope/validation; reverting"
+      visual_repair_restore "$project" "$snap" "${allow[@]}"
+      attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --arg s "$shot" --arg d "$diff_img" \
+        '. + [{attempt:$a, diff_pct:0, pass:false, analysis:"reverted: scope/validation failed", screenshot:$s, diff_image:$d}]')"
+      break
+    fi
+    "$capture_fn" "$screen" "$state" "$device" "$shot"
+    visual_repair_diff "$ref" "$shot" "$diff_img" >"$_pct_file" 2>/dev/null || printf '1' >"$_pct_file"
+    cur="$(cat "$_pct_file")"
+    local pass; pass="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
+    attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --argjson p "$cur" --argjson ps "$pass" \
+      --arg s "$shot" --arg d "$diff_img" \
+      '. + [{attempt:$a, diff_pct:$p, pass:$ps, analysis:"", screenshot:$s, diff_image:$d}]')"
+    if [ "$pass" = "true" ]; then passed=1; break; fi
+  done
+  # If cur is still empty (e.g. early break before any diff ran), default to 1.
+  [ -n "$cur" ] || cur="1"
+  visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$cur" "$tol" "$diff_img" "" "$attempts" "$unmet"
+  [ "$passed" = "1" ]
+}
+
+# Process failing screens worst-diff first, stopping at the global attempt cap.
+# repair_one_fn returns the number of attempts it consumed on its stdout's last
+# line (an integer); if it prints nothing numeric, 1 is assumed.
+visual_repair_run() {
+  local tsv="$1" cap="$2" repair_one_fn="$3" used=0 screen state device out
+  while IFS=$'\t' read -r _ screen state device; do
+    [ -n "$screen" ] || continue
+    [ "$used" -lt "$cap" ] || { log "visual-repair: global cap $cap reached; stopping"; break; }
+    out="$("$repair_one_fn" "$screen" "$state" "$device" 2>/dev/null | tail -n1)"
+    case "$out" in (''|*[!0-9]*) out=1 ;; esac
+    used=$((used + out))
+  done < <(sort -t"$(printf '\t')" -k1,1 -rn "$tsv")
+}
