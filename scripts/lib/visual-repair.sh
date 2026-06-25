@@ -83,8 +83,17 @@ visual_repair_screen() {
         '. + [{attempt:$a, diff_pct:0, pass:false, analysis:"reverted: scope/validation failed", screenshot:$s, diff_image:$d}]')"
       break
     fi
-    "$capture_fn" "$screen" "$state" "$device" "$shot"
-    visual_repair_diff "$ref" "$shot" "$diff_img" >"$_pct_file" 2>/dev/null || printf '1' >"$_pct_file"
+    # Capture + diff, with one retry if the diff COMPUTATION fails (a bad/blank
+    # screenshot — e.g. captured while Metro was still rebuilding). A diff that
+    # succeeds (even high) is a real signal and is not retried.
+    local _try=0 _dok=0
+    while [ "$_try" -lt 2 ]; do
+      _try=$((_try+1))
+      "$capture_fn" "$screen" "$state" "$device" "$shot"
+      if visual_repair_diff "$ref" "$shot" "$diff_img" >"$_pct_file" 2>/dev/null; then _dok=1; break; fi
+      [ "$_try" -lt 2 ] && { log "visual-repair: $screen re-capture diff failed; retrying after settle"; sleep "${NIGHT_SHIFT_VISUAL_RECAPTURE_SETTLE:-5}"; }
+    done
+    [ "$_dok" = "1" ] || printf '1' >"$_pct_file"
     cur="$(cat "$_pct_file")"
     local pass; pass="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
     attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --argjson p "$cur" --argjson ps "$pass" \
