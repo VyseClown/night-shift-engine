@@ -6,7 +6,7 @@
 
 **Architecture:** A new sourced lib `scripts/lib/visual-repair.sh` holds the surface-agnostic bounded loop (snapshot → agent edit → scope check → validate → re-capture → diff → record attempt, ≤ N). The agent, capture, and validate steps are **injected as function names** so each surface (standalone spawned `claude -p`; in-loop implement session) and the fixtures supply their own. Repair runs against a Metro dev build (`EXPO_PUBLIC_PREVIEW=1`) so JS edits hot-reload and the existing file-drive cold-launch re-captures in seconds.
 
-**Tech Stack:** Bash (sourced libs, `set -uo pipefail`, shellcheck-clean), `jq`, `xcrun simctl`, `odiff`, Expo/Metro, `claude -p`, the Figma MCP (agent-only) + Figma REST. Tests are deterministic fixtures in `scripts/test/fixtures.sh` run via the engine's fixture suite.
+**Tech Stack:** Bash (sourced libs, `set -uo pipefail`, shellcheck-clean), `jq`, `xcrun simctl`, `odiff`, Expo/Metro, `claude -p`, the Figma MCP (agent-only — `mcp__figma__get_figma_data`; no `FIGMA_TOKEN`/REST). Tests are deterministic fixtures in `scripts/test/fixtures.sh` run via the engine's fixture suite.
 
 **Spec:** `docs/superpowers/specs/2026-06-24-visual-auto-repair-design.md`.
 
@@ -655,7 +655,7 @@ git commit -m "feat(visual-review): Metro fast-reload harness for repair"
 
 > Integration glue (spawns `claude -p`); verified by Task 11's real smoke.
 
-- [ ] **Step 1: Implement the agent + validate.** Add to `scripts/visual-review.sh`. The prompt hands the agent the images, numbers, Figma `fileKey`+`nodeId`, the token-availability flag, and the scope rules; it must use the Figma MCP for Dev Mode specs and (if `FIGMA_TOKEN`) the REST comments endpoint:
+- [ ] **Step 1: Implement the agent + validate.** Add to `scripts/visual-review.sh`. The prompt hands the agent the images, numbers, Figma `fileKey`+`nodeId`, and the scope rules; it fetches the design **only through the Figma MCP** (`mcp__figma__get_figma_data` — Dev Mode specs + any annotations/comments the MCP exposes). **No `FIGMA_TOKEN` / REST.**
 
 ```bash
 repair_validate() {
@@ -664,16 +664,14 @@ repair_validate() {
 
 repair_agent() {
   local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
-  local key node allow scope_note tok_note result
+  local key node allow result
   key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
   allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
-  [ -n "${FIGMA_TOKEN:-}" ] && tok_note="FIGMA_TOKEN is set: also fetch pinned comments via GET https://api.figma.com/v1/files/$key/comments and treat them as requirements." \
-    || tok_note="FIGMA_TOKEN is NOT set: skip pinned comments; note them as unavailable in unmet_brief context."
   result="$(cd "$PROJECT" && claude -p --output-format json \
     --allowedTools "Read Edit Write Bash(npx tsc*) Bash(npx eslint*) mcp__figma__get_figma_data" \
     "You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
 Reference image: $ref  Current screenshot: $shot  Diff overlay: $diff_img  diff=$pct tolerance=$tol.
-Pull the Figma Dev Mode specs for node $node in file $key via mcp__figma__get_figma_data (sizes, spacing, colors, typography, tokens). $tok_note
+Pull the Figma design for node $node in file $key via mcp__figma__get_figma_data — its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments the MCP exposes — and treat them as requirements. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
 Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
 When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}." 2>/dev/null)"
   printf '%s' "$result" | jq -r '.result // "{}"' 2>/dev/null | grep -o '{.*}' | tail -n1
@@ -762,7 +760,7 @@ $( [ "$VISUAL_REPAIR" = "1" ] && cat <<'RC'
   tolerance and attempts remain (NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS, default 3), edit
   ONLY the over-tolerance screens' feature modules (src/features/**; src/ui/** only
   if NIGHT_SHIFT_VISUAL_REPAIR_SHARED=1) toward the Figma frame + its Dev Mode specs
-  (mcp__figma__get_figma_data) and pinned comments (Figma REST, if FIGMA_TOKEN),
+  and any annotations/comments via the Figma MCP (mcp__figma__get_figma_data; no token),
   keep tsc/eslint clean, then signal RUN_VISUAL again to re-capture. Do not exceed
   the attempt budget; leave residual gaps to the observer.
 RC
@@ -794,10 +792,10 @@ git commit -m "feat(night-shift): opt-in in-loop visual_review repair clause"
 
 - [ ] **Step 2: Run repair.**
 
-Run:
+Run (Figma is reached via the MCP — ensure the Figma MCP is registered at user
+scope so the spawned `claude -p` repair agent inherits it; no token):
 ```bash
 cd ~/work
-FIGMA_TOKEN=$(cat ~/.config/figma-token 2>/dev/null) \
 scripts/visual-review.sh --project ~/work/water-tracker-app --repair=3 \
   --spec specs/visual-review-validation.md
 ```

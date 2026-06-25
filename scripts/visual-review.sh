@@ -201,16 +201,14 @@ repair_validate() {
 
 repair_agent() {
   local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
-  local key node allow scope_note tok_note result
+  local key node allow result
   key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
   allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
-  [ -n "${FIGMA_TOKEN:-}" ] && tok_note="FIGMA_TOKEN is set: also fetch pinned comments via GET https://api.figma.com/v1/files/$key/comments and treat them as requirements." \
-    || tok_note="FIGMA_TOKEN is NOT set: skip pinned comments; note them as unavailable in unmet_brief context."
   result="$(cd "$PROJECT" && claude -p --output-format json \
     --allowedTools "Read Edit Write Bash(npx tsc*) Bash(npx eslint*) mcp__figma__get_figma_data" \
     "You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
 Reference image: $ref  Current screenshot: $shot  Diff overlay: $diff_img  diff=$pct tolerance=$tol.
-Pull the Figma Dev Mode specs for node $node in file $key via mcp__figma__get_figma_data (sizes, spacing, colors, typography, tokens). $tok_note
+Pull the Figma design for node $node in file $key via mcp__figma__get_figma_data — its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments the MCP exposes — and treat them as requirements. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
 Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
 When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}." 2>/dev/null)"
   printf '%s' "$result" | jq -r '.result // "{}"' 2>/dev/null | grep -o '{.*}' | tail -n1

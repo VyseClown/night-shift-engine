@@ -103,11 +103,12 @@ over-tolerance screen with:
 - **Images**: the Figma reference PNG, the current screenshot, the odiff overlay.
 - **Numbers**: current `diff_pct`, `tolerance`.
 - **Design brief inputs**: the frame `fileKey` + `nodeId` (parsed by bash from the
-  Design Contract) and whether `FIGMA_TOKEN` is set. The agent assembles the brief
-  itself: **Dev Mode specs** via `mcp__figma__get_figma_data` (sizes, spacing,
-  colors, typography, tokens — no token needed); **pinned comments** via the Figma
-  REST API `GET /v1/files/:key/comments` **only if `FIGMA_TOKEN` is set** (else it
-  notes comments were unavailable). MCP rate-limit (429) is retried with backoff.
+  Design Contract). The agent assembles the brief itself **entirely through the
+  Figma MCP** — `mcp__figma__get_figma_data` for the node's **Dev Mode specs**
+  (sizes, spacing, colors, typography, tokens) **and any annotations/comments the
+  MCP exposes**. Figma is accessed ONLY via the MCP — never a `FIGMA_TOKEN` or the
+  Figma REST API. MCP rate-limit (429) is retried with backoff; any datum the MCP
+  does not surface is simply noted in `unmet_brief`.
 - **The screen's source** and the project's design tokens.
 - **Rules**: edit only within the screen's feature module
   (`src/features/<screen>/**`); shared `src/ui/**` only when
@@ -200,7 +201,10 @@ a small follow-up, not part of this engine spec.
 | `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` | implement model (`sonnet`) | Standalone repair-agent model |
 | `--repair-shared` / `NIGHT_SHIFT_VISUAL_REPAIR_SHARED=1` | off | Allow edits to `src/ui/**` |
 | `NIGHT_SHIFT_VISUAL_REPAIR_SETTLE` | 5s | Fast-Refresh settle before re-capture |
-| `FIGMA_TOKEN` | unset | Enables pinned-comments fetch (graceful skip if unset) |
+
+Figma is accessed only through the Figma MCP (`mcp__figma__get_figma_data`) — no
+`FIGMA_TOKEN` / REST. The MCP must be available to the spawned `claude -p` repair
+agent (register at user scope).
 
 ## 7. Guardrails
 
@@ -222,9 +226,8 @@ a small follow-up, not part of this engine spec.
 - `attempts[]` and `unmet_brief` assembly into a schema-valid report;
 - validation-gate failure reverts the scoped edits and stops that screen;
 - out-of-scope edit detection fails the attempt;
-- brief-input plumbing: fileKey/nodeId parsed and passed; `FIGMA_TOKEN`
-  present/absent toggles the comments path (mock the agent's report of
-  "comments unavailable").
+- brief-input plumbing: fileKey/nodeId parsed and passed to the agent (which
+  fetches the design via the Figma MCP).
 
 **Real smoke** (manual, documented): a deliberately-perturbed but **closeable-gap**
 screen (e.g. a known spacing/color offset from its Figma frame) repaired to within
