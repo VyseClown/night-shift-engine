@@ -97,3 +97,17 @@ visual_repair_screen() {
   visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$cur" "$tol" "$diff_img" "" "$attempts" "$unmet"
   [ "$passed" = "1" ]
 }
+
+# Process failing screens worst-diff first, stopping at the global attempt cap.
+# repair_one_fn returns the number of attempts it consumed on its stdout's last
+# line (an integer); if it prints nothing numeric, 1 is assumed.
+visual_repair_run() {
+  local tsv="$1" cap="$2" repair_one_fn="$3" used=0 line pct screen state device out
+  while IFS=$'\t' read -r pct screen state device; do
+    [ -n "$screen" ] || continue
+    [ "$used" -lt "$cap" ] || { log "visual-repair: global cap $cap reached; stopping"; break; }
+    out="$("$repair_one_fn" "$screen" "$state" "$device" 2>/dev/null | tail -n1)"
+    case "$out" in (''|*[!0-9]*) out=1 ;; esac
+    used=$((used + out))
+  done < <(sort -t"$(printf '\t')" -k1,1 -rn "$tsv")
+}

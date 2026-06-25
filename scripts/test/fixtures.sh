@@ -171,6 +171,7 @@ run_dry_fixtures() {
   fixture_assert "visual-repair scope-check allows in-scope, rejects out-of-scope" fixture_visual_repair_scope "$root"
   fixture_assert "visual_repair_snapshot/restore round-trips in-scope trees" fixture_visual_repair_snapshot "$root"
   fixture_assert "visual repair loop: converge on pass" fixture_visual_repair_loop "$root"
+  fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
 
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -2258,5 +2259,16 @@ fixture_visual_repair_loop() {
     [ -z "$(git -C "$proj" status --porcelain)" ] || exit 1
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_visual_repair_run() {
+  local root="$1" tsv="$root/fail.tsv" log="$root/order.log"
+  printf '0.10\tHome\tdefault\tiphone-15\n0.40\tHistory\tdefault\tiphone-15\n0.25\tGoal\tdefault\tiphone-15\n' >"$tsv"
+  ( . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    _one(){ printf '%s\n' "$1" >>"$log"; }   # records processing order
+    visual_repair_run "$tsv" 99 _one >/dev/null )
+  # worst-first: History (0.40), Goal (0.25), Home (0.10)
+  [ "$(paste -sd, "$log")" = "History,Goal,Home" ] || return 1
   return 0
 }
