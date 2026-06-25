@@ -279,7 +279,7 @@ json_schema_basic() {
         ((keys | sort) == ["screens","task"]) and
         (.task | type == "string" and length > 0) and
         (.screens | type == "array" and length > 0 and all(.[];
-          ((keys | sort) == ["analysis","attempts","device","diff_image","diff_pct","pass","reference","screen","screenshot","state","tolerance"]) and
+          ((keys | sort) == ["analysis","attempts","device","diff_image","diff_pct","pass","reference","screen","screenshot","state","tolerance","unmet_brief"]) and
           (.screen | type == "string" and length > 0) and
           (.state | type == "string" and length > 0) and
           (.device | type == "string" and length > 0) and
@@ -298,6 +298,7 @@ json_schema_basic() {
             (.screenshot | type == "string" and length > 0) and
             (.diff_image == null or (.diff_image | type == "string" and length > 0)))) and
           (.diff_image == null or (.diff_image | type == "string" and length > 0)) and
+          (.unmet_brief | type == "array" and all(.[]; type == "string")) and
           (.pass == (.diff_pct <= .tolerance))))
       ' "$file" >/dev/null 2>&1
       ;;

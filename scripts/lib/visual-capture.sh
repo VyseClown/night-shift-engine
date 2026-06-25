@@ -84,22 +84,23 @@ visual_capture_tolerance() {
 }
 
 # Pure: emit one screen object for the report. pass is derived, never trusted from
-# input: pass == (diff_pct <= tolerance). `attempts` is a JSON array string.
+# input: pass == (diff_pct <= tolerance). `attempts` and `unmet_brief` are JSON array strings.
 visual_assemble_screen() {
   local screen="$1" state="$2" device="$3" reference="$4" screenshot="$5" \
-    diff_pct="$6" tolerance="$7" diff_image="$8" analysis="${9:-}" attempts="${10:-[]}"
+    diff_pct="$6" tolerance="$7" diff_image="$8" analysis="${9:-}" attempts="${10:-[]}" \
+    unmet_brief="${11:-[]}"
   jq -nc \
     --arg screen "$screen" --arg state "$state" --arg device "$device" \
     --arg reference "$reference" --arg screenshot "$screenshot" \
     --argjson diff_pct "$diff_pct" --argjson tolerance "$tolerance" \
     --arg diff_image "$diff_image" --arg analysis "$analysis" \
-    --argjson attempts "$attempts" '
+    --argjson attempts "$attempts" --argjson unmet_brief "$unmet_brief" '
     {
       screen: $screen, state: $state, device: $device, reference: $reference,
       screenshot: $screenshot, diff_pct: $diff_pct, tolerance: $tolerance,
       pass: ($diff_pct <= $tolerance), analysis: $analysis,
       diff_image: (if $diff_image == "" then null else $diff_image end),
-      attempts: $attempts
+      attempts: $attempts, unmet_brief: $unmet_brief
     }'
 }
 

@@ -469,19 +469,19 @@ fixture_review_fields_scoped() {
 
 fixture_visual_diff_schema() {
   local root="$1" good="$root/vd-good.json" bad="$root/vd-bad.json" badkey="$root/vd-key.json"
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$good"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"design/Home-default.png","screenshot":"shots/Home-default.png","diff_pct":0.05,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null,"unmet_brief":[]}]}' >"$good"
   json_schema_basic visual-diff "$good" || return 1
   # pass=true but diff_pct > tolerance → inconsistent → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null}]}' >"$bad"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0.5,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"diff_image":null,"unmet_brief":[]}]}' >"$bad"
   json_schema_basic visual-diff "$bad" && return 1
   # missing a per-screen key → rejected.
-  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true,"analysis":"","attempts":[]}]}' >"$badkey"
+  printf '%s\n' '{"task":"specs/x.md","screens":[{"screen":"Home","state":"default","device":"iphone-15","reference":"r","screenshot":"s","diff_pct":0,"tolerance":0.1,"pass":true,"analysis":"","attempts":[],"unmet_brief":[]}]}' >"$badkey"
   json_schema_basic visual-diff "$badkey" && return 1
   # A non-empty attempts array with a malformed entry (non-integer attempt) is rejected.
-  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":"one","diff_pct":0.0,"pass":true,"analysis":"","screenshot":"a.png","diff_image":null}]}]}' >"$root/badattempt.json"
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":"one","diff_pct":0.0,"pass":true,"analysis":"","screenshot":"a.png","diff_image":null}],"unmet_brief":[]}]}' >"$root/badattempt.json"
   ! json_schema_basic visual-diff "$root/badattempt.json" || return 1
   # A well-formed non-empty attempts array is still accepted.
-  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":1,"diff_pct":0.0,"pass":true,"analysis":"ok","screenshot":"a.png","diff_image":null}]}]}' >"$root/goodattempt.json"
+  printf '%s' '{"task":"t","screens":[{"screen":"S","state":"default","device":"iphone-15","reference":"r.png","screenshot":"s.png","diff_pct":0.0,"tolerance":0.1,"pass":true,"analysis":"","diff_image":null,"attempts":[{"attempt":1,"diff_pct":0.0,"pass":true,"analysis":"ok","screenshot":"a.png","diff_image":null}],"unmet_brief":[]}]}' >"$root/goodattempt.json"
   json_schema_basic visual-diff "$root/goodattempt.json" || return 1
   return 0
 }
@@ -510,6 +510,15 @@ fixture_visual_assemble_screen() {
   # The assembled object is a valid screen inside a report.
   printf '{"task":"t","screens":[%s]}\n' "$obj" >"$root/asm.json"
   json_schema_basic visual-diff "$root/asm.json" || return 1
+  # unmet_brief defaults to [] and is always present
+  obj="$(visual_assemble_screen Home default iphone-15 d.png s.png 0.05 0.1 di.png "" "[]")"
+  printf '%s' "$obj" | jq -e '.unmet_brief == []' >/dev/null || return 1
+  # and round-trips a provided list
+  obj="$(visual_assemble_screen Home default iphone-15 d.png s.png 0.05 0.1 di.png "" "[]" '["button 44pt"]')"
+  printf '%s' "$obj" | jq -e '.unmet_brief == ["button 44pt"]' >/dev/null || return 1
+  printf '%s\n' "$obj" >"$root/asm_brief.json"
+  printf '{"task":"t","screens":[%s]}' "$obj" >"$root/asm_brief_full.json"
+  json_schema_basic visual-diff "$root/asm_brief_full.json" || return 1
   return 0
 }
 
