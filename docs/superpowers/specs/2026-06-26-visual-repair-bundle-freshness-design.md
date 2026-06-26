@@ -6,6 +6,11 @@ engine-owned Metro, `visual-review.sh --repair` (and the in-loop repair) still r
 an **identical** screenshot every attempt, so the keep-best loop never sees the agent's
 edits, stalls, and restores the baseline.
 
+> **Revision (post-review, PR #37):** §4 reworked after code review caught three flaws in
+> the first draft — a reset fallback that silently no-ops when Metro was reused, a fallback
+> that could trigger a native rebuild, and Metro logic placed in the surface-agnostic
+> `visual-capture.sh`. The mechanism below is the corrected design.
+
 ## 1. Problem (proven)
 
 The repair loop (`scripts/lib/visual-repair.sh::visual_repair_screen`) is a bounded
@@ -73,61 +78,112 @@ causes — the cheap path handles (a)/(c), the reset fallback handles (b).
 
 ## 4. Mechanism: adaptive poll-then-reset
 
-A freshness step runs **between** the agent's gate-passing edit and the cold-launch
-re-capture. It lives in the RN/Metro-specific capture lib (so the loop stays
-surface-agnostic), invoked by `visual_recapture_screen` before the cold launch — which
-means **both** standalone `--repair` and in-loop `run_visual_inloop_repair` get it, since
-both inject the same `capture_fn`.
+All Metro-specific freshness logic lives in **`scripts/lib/visual-repair.sh`** — the same
+file as `repair_metro_start`/`repair_metro_stop`/`metro_is_up` and the RN-specific
+`repair_agent`/`_repair_one`. **`scripts/lib/visual-capture.sh` is NOT touched**: it stays
+the surface-agnostic, directly-invokable capture scaffold whose `__visual_*` helpers
+"return 2 when tooling is absent so run_visual_capture degrades cleanly". (This is the
+correction to the first draft, which wrongly placed `__visual_bundle_hash`/
+`__visual_force_fresh_bundle` in `visual-capture.sh` and had them call back into
+`visual-repair.sh` — a reversed dependency that would crash `visual-capture.sh`'s standalone
+`capture`/`diff` dispatch.)
+
+The loop is reached through a **new injected `capture_fn`**, `repair_recapture_screen`,
+instead of the bare `visual_recapture_screen`. So the surface-agnostic loop
+(`visual_repair_screen`) is unchanged, the first-pass capture path is unchanged, and only
+the *repair* re-capture gains freshness — no `NIGHT_SHIFT_VISUAL_REPAIR_RECAPTURE` guard
+inside `visual_recapture_screen` is needed.
 
 ```
-__visual_force_fresh_bundle(prev_hash) -> new_hash:
-  1. touch the in-scope edited sources + trigger a Metro reload
-  2. poll GET :$PORT/index.bundle?platform=ios&dev=true, hashing the served bytes,
-     every $POLL_INTERVAL s, until the hash != prev_hash OR $POLL_TIMEOUT elapses
-  3. on timeout -> reset Metro (repair_metro_stop + repair_metro_start with cache
-     cleared) and re-read the bundle once
-  4. return the (new) served-bundle hash for the next attempt's prev_hash
+repair_recapture_screen(screen, state, device, out):     # injected as capture_fn (visual-repair.sh)
+  __visual_force_fresh_bundle                              # 1. make Metro serve fresh JS
+  visual_recapture_screen(screen, state, device, out)      # 2. the existing, untouched capture
+
+__visual_force_fresh_bundle:                               # visual-repair.sh
+  prev = read $PREVHASH_FILE
+  touch the in-scope edited sources + GET :$PORT/reload    # cheap triggers
+  poll GET :$PORT/index.bundle?platform=ios&dev=true, hashing the bytes,
+       until hash != prev OR a wall-clock deadline ($POLL_TIMEOUT) passes
+  if still unchanged -> repair_metro_reset                 # reliable fallback
+  write the resulting hash back to $PREVHASH_FILE
 ```
 
-`visual_recapture_screen` threads `prev_hash` across attempts (via a per-screen file under
-the loop's tmp dir, mirroring the existing `_pct_file` pattern) and only then does the
-existing terminate→launch→settle→screenshot. The first-pass capture (`run_visual_capture`)
-is untouched: there is no prior edit to reflect, so no freshness step.
+### 4.1 The reset fallback that actually resets (fixes the no-op)
 
-**Fast path stays cheap** (poll sees the change → no Metro restart). **Reliable path stays
-reliable** (timeout → reset re-reads disk). The reset fallback reuses the existing
-`repair_metro_start`/`repair_metro_stop` harness from PR #36.
+The first draft's fallback (`repair_metro_stop` + `repair_metro_start`) silently no-ops when
+Metro was *reused*: PR #36's `repair_metro_stop` only kills an **engine-started** Metro
+(`_REPAIR_METRO_STARTED=1`), and `repair_metro_start` early-returns when `metro_is_up`. So a
+reused Metro is never stopped, stays up, and the restart reuses it again — `--reset-cache`
+never runs.
 
-### New env knobs (all defaulted; documented in CLAUDE.md if added)
+The corrected fallback is a dedicated `repair_metro_reset` that **guarantees** a fresh,
+cache-cleared Metro on **this run's port**, and is **parallel-safe** by being *port-scoped*
+(never the blanket `pkill -f "expo start"` PR #36 deliberately removed — under
+`NIGHT_SHIFT_DEVICE_REGISTRY` each worktree owns a distinct port, so a port-scoped kill
+touches only this run's Metro):
+
+```bash
+repair_metro_reset() {
+  local device="$1" port="${NIGHT_SHIFT_METRO_PORT:-8081}" pids i=0 _nb
+  repair_metro_stop                                   # kill our tracked PID if we started it
+  pids="$(lsof -ti "tcp:${port}" 2>/dev/null)"        # then any remaining listener on OUR port
+  [ -n "$pids" ] && kill $pids 2>/dev/null || true    # (port-scoped: safe under registry mode)
+  i=0; while metro_is_up && [ "$i" -lt 15 ]; do i=$((i+1)); sleep 1; done   # wait for the port to clear
+  _nb="${NO_BUILD:-0}"; NO_BUILD=1                     # NEVER rebuild native on a reset (fixes #2)
+  NIGHT_SHIFT_METRO_RESET_CACHE=1 repair_metro_start "$device"   # now metro_is_up is false -> starts fresh + --reset-cache
+  NO_BUILD="$_nb"
+}
+```
+
+`repair_metro_start` gains a one-line conditional to honor the flag (a real, intended
+modification — not a pre-existing behavior):
+`[ "${NIGHT_SHIFT_METRO_RESET_CACHE:-0}" = "1" ] && _extra="--reset-cache"`, appended to its
+`expo start`. Because the port is cleared first, the reuse guard now passes through to the
+fresh start. Forcing `NO_BUILD=1` for the reset means `repair_metro_start` never reaches its
+`expo run:ios` build branch, so a poll timeout can **never** kick off a multi-minute native
+rebuild (the first draft's second flaw), and an empty `device` is harmless (it is only read
+by the build branch).
+
+### New env knobs (all defaulted; documented in CLAUDE.md when implemented)
 - `NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT` — seconds to wait for the served bundle to
   change before the reset fallback (default 25).
 - `NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL` — poll cadence (default 2).
-- Reuses `NIGHT_SHIFT_METRO_PORT` (8081), `NIGHT_SHIFT_VISUAL_RECAPTURE_SETTLE`.
+- `NIGHT_SHIFT_METRO_RESET_CACHE` — internal: makes `repair_metro_start` add `--reset-cache`
+  (set only by `repair_metro_reset`).
+- Reuses `NIGHT_SHIFT_METRO_PORT` (already referenced by `metro_is_up`, default 8081) and
+  `NIGHT_SHIFT_VISUAL_RECAPTURE_SETTLE`.
 
 ## 5. Edge cases
 
-- **Metro absent / not on the port** → the freshness step degrades to a clean SKIP exactly
-  as today; the re-capture's existing clean-degrade path applies (no block).
-- **Watcher genuinely misses the edit (cause b)** → poll times out → reset fallback re-reads
-  disk → correct. This is the fallback's whole reason to exist.
+- **Metro absent / not on the port** → `__visual_bundle_hash` returns empty/non-zero;
+  `__visual_force_fresh_bundle` returns non-zero and `repair_recapture_screen` proceeds to
+  the unchanged `visual_recapture_screen`, which clean-degrades exactly as today (no block).
+- **Watcher genuinely misses the edit (cause b)** → poll times out → `repair_metro_reset`
+  re-reads disk → correct. This is the fallback's whole reason to exist.
 - **Agent made no real visual change** (valid: nothing to fix) → bundle hash never changes →
-  after timeout the reset still yields the same pixels → the loop correctly records a
+  after the deadline the reset still yields the same pixels → the loop correctly records a
   non-improvement and stalls (a true negative, not the bug).
-- **Reset fallback can't restart Metro** → re-capture fails → the existing 2-try re-capture
-  retry + clean degrade applies; the attempt records a non-improvement; the loop is never
-  wedged.
+- **Reset can't restart Metro** → `repair_recapture_screen` still calls the existing
+  `visual_recapture_screen`, whose 2-try re-capture retry + clean degrade applies; the
+  attempt records a non-improvement; the loop is never wedged.
+- **Parallel worktrees** (`NIGHT_SHIFT_DEVICE_REGISTRY=1`) → each run has its own port, so
+  the port-scoped kill in `repair_metro_reset` never touches a sibling run's Metro.
 - Multiple screens / global cap 30 unchanged; freshness is per re-capture.
 
 ## 6. Testing
 
-Deterministic fixtures (`scripts/test/fixtures.sh`, no simulator — stub the bundle-hash
-reader + Metro controls on PATH):
-- **fast path:** served-bundle hash changes within the timeout → assert the reset is **not**
-  invoked, capture proceeds.
-- **fallback:** hash never changes → assert the Metro reset fires **exactly once**, then
+Deterministic fixtures (`scripts/test/fixtures.sh`, no simulator — stub `curl`/`lsof` on
+PATH; stub `repair_metro_reset` to record a call):
+- **fast path:** served-bundle hash changes within the deadline → assert `repair_metro_reset`
+  is **not** invoked, capture proceeds.
+- **fallback:** hash never changes → assert `repair_metro_reset` fires **exactly once**, then
   capture proceeds.
-- **clean SKIP:** Metro absent → assert the freshness step returns the unchanged-today
-  degrade path (no block, capture path identical to current).
+- **reset is parallel-safe + no rebuild:** `repair_metro_reset` with a stubbed `lsof`/`kill`
+  + a fake reused Metro asserts (i) it kills the port listener, (ii) it calls
+  `repair_metro_start` with `NO_BUILD` forced to 1 (no `expo run:ios`), (iii)
+  `NIGHT_SHIFT_METRO_RESET_CACHE=1` reaches the `--reset-cache` branch.
+- **clean SKIP:** Metro absent → `__visual_force_fresh_bundle` non-zero, `repair_recapture_screen`
+  still completes via `visual_recapture_screen` (capture path identical to current).
 - Shellcheck default severity (`find scripts -name '*.sh' -exec shellcheck -s bash {} +`
   exit 0); full fixture suite green.
 
@@ -144,7 +200,8 @@ convergence blocker and (ii) the strict-decrease bar is reachable.
 ## 8. Related
 
 - PR #36 (`feat/repair-metro-reuse`) — fixed the Metro *collision*; this fixes the deeper
-  *staleness* it exposed.
+  *staleness* it exposed. The reset path here deliberately reuses #36's `_REPAIR_METRO_STARTED`
+  ownership model and stays port-scoped rather than reviving the blanket `pkill`.
 - `docs/2026-06-24-visual-review-live-path.md` — first end-to-end live capture.
 - `docs/2026-06-25-visual-repair-in-loop-validation.md` — in-loop wiring proven on a
   single-attempt fresh Metro (the case where the bug doesn't yet bite).
