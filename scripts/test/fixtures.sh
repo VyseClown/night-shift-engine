@@ -159,6 +159,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual_stage_ref exports a Figma node via the MCP (claude -p), caches, degrades" fixture_visual_stage_ref "$root"
+  fixture_assert "visual_stage_figma_data caches the node's Figma design data via the MCP" fixture_visual_stage_figma_data "$root"
   fixture_assert "visual_stage_refs_for_spec stages the Design-Contract matrix via the MCP" fixture_visual_stage_refs_for_spec "$root"
   fixture_assert "visual-review.sh exports refs via the MCP, no FIGMA_TOKEN/REST" fixture_visual_review_no_token "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
@@ -2222,6 +2223,36 @@ STUB
   ) || return 1
   # (d) empty key/node -> non-zero.
   ( export PATH="$d/bin:$PATH"; ! visual_stage_ref "" 1:1548 "$d/e.png" || exit 1 ) || return 1
+  return 0
+}
+
+fixture_visual_stage_figma_data() {
+  local root="$1" d="$root/vsfd"
+  mkdir -p "$d/bin"
+  cat >"$d/bin/claude" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$d/argv.log"
+p="\$(cat)"
+out="\$(printf '%s' "\$p" | grep -oE '/[^ ]+\.md' | head -1)"
+[ -n "\$out" ] && printf 'specs\n' >"\$out"
+exit 0
+STUB
+  chmod +x "$d/bin/claude"
+  # (a) fetches + caches the node data, with the flag + get_figma_data tool.
+  (
+    export PATH="$d/bin:$PATH"
+    visual_stage_figma_data ABC123 1:1548 "$d/design/Home-figma.md" || exit 1
+    [ -s "$d/design/Home-figma.md" ] || exit 1
+    grep -q -- '--permission-mode bypassPermissions' "$d/argv.log" || exit 1
+    grep -q 'mcp__figma__get_figma_data' "$d/argv.log" || exit 1
+  ) || return 1
+  # (b) caches: file exists -> returns 0 WITHOUT calling claude.
+  : >"$d/argv.log"
+  ( export PATH="$d/bin:$PATH"; visual_stage_figma_data ABC123 1:1548 "$d/design/Home-figma.md" || exit 1; [ -s "$d/argv.log" ] && exit 1; exit 0 ) || return 1
+  # (c) degrades: no claude -> non-zero, no file.
+  ( export PATH="/usr/bin:/bin"; ! visual_stage_figma_data ABC123 1:1548 "$d/n.md" || exit 1; [ -e "$d/n.md" ] && exit 1; exit 0 ) || return 1
+  # (d) empty key/node -> non-zero.
+  ( export PATH="$d/bin:$PATH"; ! visual_stage_figma_data "" 1:1548 "$d/e.md" || exit 1 ) || return 1
   return 0
 }
 

@@ -173,6 +173,23 @@ node_id_for() {
 
 figma_key_for() { sed -nE 's/.*fileKey `([A-Za-z0-9]+)`.*/\1/p' "$1" | head -n1; }
 
+# Fetch node $node's Figma design data (Dev Mode specs + annotations) via the MCP and
+# write concise design notes to $cache, ONCE — the repair agent then Reads $cache each
+# attempt instead of calling get_figma_data live (cuts Figma API volume; avoids 429).
+# Caches (skips if $cache exists). Degrades cleanly (non-zero) if claude/MCP unavailable.
+visual_stage_figma_data() {
+  local key="$1" node="$2" cache="$3" prompt
+  [ -s "$cache" ] && return 0
+  [ -n "$key" ] && [ -n "$node" ] || return 1
+  command -v claude >/dev/null 2>&1 || return 1
+  mkdir -p "$(dirname "$cache")" || return 1
+  prompt="Call mcp__figma__get_figma_data for node ${node} in file ${key}. Then use the Write tool to write its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments to the file ${cache} as concise design notes. Figma is accessed ONLY through the MCP; never a token or REST. Reply 'done' once the file exists."
+  ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
+      --permission-mode bypassPermissions \
+      --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" >/dev/null 2>&1 ) || true
+  [ -s "$cache" ]
+}
+
 # Stage every Design-Contract screen's Figma reference into $out_dir/design/ via the
 # MCP (visual_stage_ref). Used by both visual-review.sh and the in-loop run_visual.
 visual_stage_refs_for_spec() {
