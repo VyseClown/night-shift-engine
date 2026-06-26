@@ -159,6 +159,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual_stage_ref exports a Figma node via the MCP (claude -p), caches, degrades" fixture_visual_stage_ref "$root"
   fixture_assert "visual_stage_refs_for_spec stages the Design-Contract matrix via the MCP" fixture_visual_stage_refs_for_spec "$root"
+  fixture_assert "visual-review.sh exports refs via the MCP, no FIGMA_TOKEN/REST" fixture_visual_review_no_token "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
   fixture_assert "visual capture maestro-drive times out a hung flow (no infinite hang)" fixture_visual_capture_maestro_timeout "$root"
   fixture_assert "visual capture pins status bar with a simctl-valid HH:MM time" fixture_visual_capture_statusbar_time "$root"
@@ -2677,6 +2678,14 @@ JSON
   )
   # the failing-TSV was built and the screen path used candidate_label=CAND7
   grep -q "screenshots/CAND7/Home-default-iphone-16.png|.*diffs/CAND7/Home-default-iphone-16.png" "$out/paths.log" || return 1
+  return 0
+}
+
+fixture_visual_review_no_token() {
+  local f="$WORKSPACE_ROOT/scripts/visual-review.sh"
+  grep -q "FIGMA_TOKEN" "$f" && return 1
+  grep -q "api.figma.com" "$f" && return 1
+  grep -q "visual_stage_refs_for_spec" "$f" || return 1
   return 0
 }
 
