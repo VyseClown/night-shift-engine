@@ -194,6 +194,7 @@ run_dry_fixtures() {
   fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
   fixture_assert "repair agent runs on the opus knob + reads the cached Figma data (no live get_figma_data)" fixture_repair_agent_cached "$root"
   fixture_assert "repair_metro_start reuses an existing :8081 Metro; stop kills only an engine-started one" fixture_repair_metro "$root"
+  fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2881,6 +2882,14 @@ STUB
     kill -0 "$sp" 2>/dev/null && { kill "$sp" 2>/dev/null; exit 1; }  # engine-started -> killed
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_repair_metro_call_order() {
+  local f="$WORKSPACE_ROOT/scripts/visual-review.sh" sline cline
+  sline="$(grep -n 'repair_metro_start "' "$f" | head -1 | cut -d: -f1)"
+  cline="$(grep -n 'for s in "${SPECS\[@\]}"; do review_spec' "$f" | head -1 | cut -d: -f1)"
+  [ -n "$sline" ] && [ -n "$cline" ] && [ "$sline" -lt "$cline" ] || return 1
   return 0
 }
 

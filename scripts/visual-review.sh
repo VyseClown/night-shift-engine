@@ -207,13 +207,15 @@ review_spec() {
 
 # ---- run --------------------------------------------------------------------
 [ "$NO_BUILD" -eq 1 ] || build_and_install
-rc=0
-for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
-
 if [ "$REPAIR" -eq 1 ]; then
   trap 'repair_metro_stop' EXIT
   iter_dev="$(visual_repair_devices "${SPECS[0]}" | head -n1)"
   repair_metro_start "$(device_label_to_name "$iter_dev")" || die "repair: could not start Metro"
+fi
+rc=0
+for s in "${SPECS[@]}"; do review_spec "$s" || rc=1; done
+
+if [ "$REPAIR" -eq 1 ]; then
   base="$(basename "${SPECS[0]}" .md)"
   visual_repair_for_spec "${SPECS[0]}" "$PROJECT" "$OUT/$base" "review" \
     "$OUT/$base/visual-diff-$base.json" "$MAX_ATTEMPTS" \
