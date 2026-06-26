@@ -82,6 +82,12 @@ engine/workflow git here at the root.
   Requires `xcrun`, `odiff`, a Figma MCP server, and the app's preview harness;
   absent any of these it cleanly SKIPs. The viewer renders the per-screen
   reference/implementation/diff images, diff%, analysis, and attempt history.
+  The repair agent runs on `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` (default `opus` — design
+  fidelity is judgment-heavy; `=sonnet`/`=inherit` overrides). The engine's headless MCP
+  `claude -p` calls (Figma reference export + the per-run `get_figma_data` fetch) run
+  with `--permission-mode bypassPermissions` — MCP tools are otherwise deferred in
+  headless — and the repair flow fetches `get_figma_data` once per run (cached under
+  `design/<screen>-figma.md`) to bound Figma API volume.
 
 > For **parallel** visual_review across worktrees, set `NIGHT_SHIFT_DEVICE_REGISTRY=1`
 > (the `scripts/parallel-worktrees.sh` wrapper sets it automatically for `--jobs>1`). Each
