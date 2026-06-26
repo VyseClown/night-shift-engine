@@ -46,6 +46,7 @@ visual_stage_ref() {
   dir="$(dirname "$out")"; base="$(basename "$out")"; mkdir -p "$dir" || return 1
   prompt="Use the mcp__figma__download_figma_images tool to download fileKey ${key} node ${node} as a PNG (pngScale 2) to localPath \"${dir}\" with fileName \"${base}\" — i.e. exactly the file ${out}. Use ONLY that tool; never a Figma token or REST. Reply 'done' once the file exists."
   ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
+      --permission-mode bypassPermissions \
       --output-format json --allowed-tools "mcp__figma__download_figma_images" >/dev/null 2>&1 ) || true
   [ -s "$out" ]
 }
