@@ -194,6 +194,7 @@ run_dry_fixtures() {
   fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
   fixture_assert "repair agent runs on the opus knob + reads the cached Figma data (no live get_figma_data)" fixture_repair_agent_cached "$root"
   fixture_assert "repair_metro_start reuses an existing :8081 Metro; stop kills only an engine-started one" fixture_repair_metro "$root"
+  fixture_assert "bundle freshness: polls, resets only on timeout, reset is port-scoped + no-rebuild, clean-degrades without Metro" fixture_bundle_freshness "$root"
   fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -2880,6 +2881,75 @@ STUB
     _REPAIR_METRO_STARTED=1; _REPAIR_METRO_PID=$sp
     repair_metro_stop
     kill -0 "$sp" 2>/dev/null && { kill "$sp" 2>/dev/null; exit 1; }  # engine-started -> killed
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_bundle_freshness() {
+  local root="$1" d="$root/bfresh"
+  mkdir -p "$d/bin"
+  # curl serves the contents of $d/served (the "served bundle"); reload/status URLs are no-ops.
+  cat >"$d/bin/curl" <<STUB
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in *index.bundle*) cat "$d/served" 2>/dev/null; exit 0;; esac; done
+exit 0
+STUB
+  chmod +x "$d/bin/curl"
+  export NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT=2 NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL=1
+  export NIGHT_SHIFT_VISUAL_PREVHASH_FILE="$d/prevhash"
+
+  # (a) fast path: a background mutation flips the served bytes within the deadline -> NO reset.
+  printf 'v1' >"$d/served"; printf '%s' "$(printf 'v1' | shasum | awk '{print $1}')" >"$d/prevhash"; : >"$d/reset.log"
+  ( sleep 1; printf 'v2' >"$d/served" ) &
+  (
+    export PATH="$d/bin:$PATH"
+    repair_metro_reset() { echo reset >>"$d/reset.log"; }
+    __visual_force_fresh_bundle || exit 1
+    [ -s "$d/reset.log" ] && exit 1   # reset must NOT have fired
+    exit 0
+  ) || { wait; return 1; }
+  wait
+
+  # (b) fallback: bytes never change within the deadline -> reset fires exactly once.
+  printf 'same' >"$d/served"; printf '%s' "$(printf 'same' | shasum | awk '{print $1}')" >"$d/prevhash"; : >"$d/reset.log"
+  (
+    export PATH="$d/bin:$PATH"
+    repair_metro_reset() { echo reset >>"$d/reset.log"; }
+    __visual_force_fresh_bundle >/dev/null 2>&1 || true
+    [ "$(grep -c reset "$d/reset.log" 2>/dev/null || echo 0)" = "1" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # (c) reset is port-scoped + forces NO_BUILD=1 (no expo run:ios) + sets --reset-cache.
+  : >"$d/lsof.log"; : >"$d/start.log"
+  cat >"$d/bin/lsof" <<STUB
+#!/usr/bin/env bash
+echo lsof "\$@" >>"$d/lsof.log"; echo 4242   # a fake pid holding the port
+STUB
+  chmod +x "$d/bin/lsof"
+  cat >"$d/bin/kill" <<STUB
+#!/usr/bin/env bash
+exit 0
+STUB
+  chmod +x "$d/bin/kill"
+  (
+    export PATH="$d/bin:$PATH" NO_BUILD=0
+    metro_is_up() { return 1; }   # port clears immediately so the wait loop ends
+    repair_metro_start() { echo "start nb=$NO_BUILD rc=${NIGHT_SHIFT_METRO_RESET_CACHE:-0} dev=$1" >>"$d/start.log"; }
+    repair_metro_stop() { :; }
+    repair_metro_reset "iPhone 16" || exit 1
+    grep -q 'tcp:' "$d/lsof.log" || exit 1                         # port-scoped kill
+    grep -q 'start nb=1 rc=1 dev=iPhone 16' "$d/start.log" || exit 1 # NO_BUILD forced 1 + --reset-cache flag
+    exit 0
+  ) || return 1
+
+  # (d) clean degrade: no Metro (curl serves nothing) -> empty hash, non-zero, no crash.
+  rm -f "$d/served" "$d/prevhash";
+  (
+    export PATH="$d/bin:$PATH"
+    repair_metro_reset() { :; }
+    if __visual_force_fresh_bundle >/dev/null 2>&1; then exit 1; fi   # returns non-zero
     exit 0
   ) || return 1
   return 0

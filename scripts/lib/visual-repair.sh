@@ -227,7 +227,8 @@ repair_metro_start() {
     return 0
   fi
   log "repair: starting Metro (EXPO_PUBLIC_PREVIEW=1)…"
-  ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo start >/tmp/visual-repair-metro.log 2>&1 ) &
+  local _extra=""; [ "${NIGHT_SHIFT_METRO_RESET_CACHE:-0}" = "1" ] && _extra="--reset-cache"
+  ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo start $_extra >/tmp/visual-repair-metro.log 2>&1 ) &
   _REPAIR_METRO_PID=$!
   _REPAIR_METRO_STARTED=1
   local i=0; until metro_is_up; do
@@ -238,6 +239,56 @@ repair_metro_stop() {
   [ -n "${_REPAIR_METRO_PID:-}" ] && kill "$_REPAIR_METRO_PID" 2>/dev/null || true
   [ -n "${_REPAIR_METRO_PID:-}" ] && wait "$_REPAIR_METRO_PID" 2>/dev/null || true
   _REPAIR_METRO_PID=""; _REPAIR_METRO_STARTED=0
+}
+
+# Hash Metro's currently-served iOS bundle (empty + non-zero when Metro is unreachable).
+__visual_bundle_hash() {
+  local port="${NIGHT_SHIFT_METRO_PORT:-8081}" body
+  body="$(curl -s "http://localhost:${port}/index.bundle?platform=ios&dev=true" 2>/dev/null)" || return 1
+  [ -n "$body" ] || return 1
+  printf '%s' "$body" | shasum 2>/dev/null | awk '{print $1}'
+}
+
+# Force a fresh, cache-cleared Metro on THIS run's port. Port-scoped (safe under
+# NIGHT_SHIFT_DEVICE_REGISTRY: distinct ports) — never the blanket pkill PR #36 removed.
+# Forces NO_BUILD=1 so it never runs `expo run:ios`; clears the port first so the
+# repair_metro_start reuse-guard falls through to a fresh `--reset-cache` start.
+repair_metro_reset() {
+  local device="$1" port="${NIGHT_SHIFT_METRO_PORT:-8081}" pids i=0 _nb
+  repair_metro_stop
+  pids="$(lsof -ti "tcp:${port}" 2>/dev/null)"
+  # shellcheck disable=SC2086  # word-splitting intentional: $pids is a space-separated PID list
+  [ -n "$pids" ] && kill $pids 2>/dev/null || true
+  while metro_is_up && [ "$i" -lt 15 ]; do i=$((i+1)); sleep 1; done
+  _nb="${NO_BUILD:-0}"; NO_BUILD=1
+  NIGHT_SHIFT_METRO_RESET_CACHE=1 repair_metro_start "$device"
+  NO_BUILD="$_nb"
+}
+
+# Make Metro serve a bundle reflecting on-disk sources, then record its hash. Fast path:
+# touch + reload, poll the served-bundle hash until it differs from the previous attempt
+# (wall-clock deadline NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT). Fallback: repair_metro_reset.
+# Returns non-zero when Metro is unreachable (caller degrades to a plain re-capture).
+__visual_force_fresh_bundle() {
+  local hf="${NIGHT_SHIFT_VISUAL_PREVHASH_FILE:-}" prev="" \
+        timeout="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT:-25}" \
+        interval="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL:-2}" \
+        port="${NIGHT_SHIFT_METRO_PORT:-8081}" deadline h
+  [ -n "$hf" ] && [ -f "$hf" ] && prev="$(cat "$hf")"
+  curl -s -o /dev/null "http://localhost:${port}/reload" 2>/dev/null || true
+  [ -n "${REPAIR_TOUCH_GLOB:-}" ] && find "${REPAIR_TOUCH_GLOB}" -type f -exec touch {} + 2>/dev/null || true
+  deadline=$(( $(date +%s) + timeout ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    h="$(__visual_bundle_hash)" || return 1
+    if [ -n "$h" ] && [ "$h" != "$prev" ]; then [ -n "$hf" ] && printf '%s' "$h" >"$hf"; return 0; fi
+    sleep "$interval"
+  done
+  log "visual-repair: bundle unchanged after ${timeout}s; resetting Metro"
+  repair_metro_reset "${REPAIR_RESET_DEVICE:-}"
+  h="$(__visual_bundle_hash)" || return 1
+  [ -n "$h" ] || return 1
+  [ -n "$hf" ] && printf '%s' "$h" >"$hf"
+  return 0
 }
 
 # ---- repair agent + validate ------------------------------------------------
