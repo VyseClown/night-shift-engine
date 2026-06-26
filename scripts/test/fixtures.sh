@@ -1093,18 +1093,32 @@ fixture_model_flag() {
 }
 
 fixture_stage_model() {
-  # The primary plans on PLAN_MODEL and does all post-plan work (implement, the
-  # observe-request turn, completion) on the cheaper IMPLEMENT_MODEL; the strong
-  # judgment in the observe scope is the separate independent observer.
-  local PLAN_MODEL=opus IMPLEMENT_MODEL=sonnet
+  local root="$1" d="$root/sm"
+  mkdir -p "$d"
+  # The primary plans on PLAN_MODEL and does post-plan work on IMPLEMENT_MODEL;
+  # a ## Design Contract bumps the IMPLEMENT scope to DESIGN_IMPLEMENT_MODEL.
+  local PLAN_MODEL=opus IMPLEMENT_MODEL=sonnet DESIGN_IMPLEMENT_MODEL=opus SPEC=""
+  printf 'Spec\n\n## Test Plan\n- x\n' >"$d/plain.md"
+  printf 'Spec\n\n## Design Contract\n- Figma file: X, fileKey `ABC`\n' >"$d/design.md"
+  # No Design Contract -> implement stays IMPLEMENT_MODEL.
+  SPEC="$d/plain.md"
   [ "$(stage_model plan)" = "opus" ] || return 1
   [ "$(stage_model implement)" = "sonnet" ] || return 1
   [ "$(stage_model observe)" = "sonnet" ] || return 1
   [ "$(stage_model complete)" = "sonnet" ] || return 1
-  # An unrecognized scope falls back to inherit (no forced model).
   [ "$(stage_model bogus)" = "inherit" ] || return 1
-  # inherit values flow straight through (no model pinned).
-  PLAN_MODEL=inherit IMPLEMENT_MODEL=inherit
+  # Empty SPEC also -> IMPLEMENT_MODEL (no contract).
+  SPEC=""
+  [ "$(stage_model implement)" = "sonnet" ] || return 1
+  # Design Contract -> implement bumps to DESIGN_IMPLEMENT_MODEL (opus); other
+  # scopes stay IMPLEMENT_MODEL.
+  SPEC="$d/design.md"
+  [ "$(stage_model implement)" = "opus" ] || return 1
+  [ "$(stage_model visual)" = "sonnet" ] || return 1
+  [ "$(stage_model observe)" = "sonnet" ] || return 1
+  [ "$(stage_model complete)" = "sonnet" ] || return 1
+  # inherit values flow straight through.
+  PLAN_MODEL=inherit IMPLEMENT_MODEL=inherit DESIGN_IMPLEMENT_MODEL=inherit SPEC="$d/plain.md"
   [ "$(stage_model plan)" = "inherit" ] || return 1
   [ "$(stage_model implement)" = "inherit" ] || return 1
   return 0

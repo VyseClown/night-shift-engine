@@ -63,6 +63,10 @@ SESSION_SCOPE="${NIGHT_SHIFT_SESSION_SCOPE:-stage}"
 # the strong backstop that makes a cheaper primary safe.
 PLAN_MODEL="${NIGHT_SHIFT_PLAN_MODEL:-opus}"
 IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
+# Design-fidelity implements (a spec with a ## Design Contract) are judgment-heavy
+# (decompose a Figma design, reuse/build components, reconcile with real state), so
+# the IMPLEMENT scope bumps to this stronger model. inherit/sonnet to override.
+DESIGN_IMPLEMENT_MODEL="${NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL:-opus}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
@@ -657,6 +661,14 @@ model_flag() {
   esac
 }
 
+# True when the spec declares a ## Design Contract (the marker that also activates the
+# Design Fidelity Reviewer + visual_review). Drives the build-from-Figma procedure and
+# the opus implement bump. Independent of VISUAL_CAPTURE (the build is design-directed
+# even when capture tooling is absent). Empty/missing path -> false.
+spec_has_design_contract() {
+  [ -n "${1:-}" ] && grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
+}
+
 # Pure: the model the primary should run on in a given session scope. Planning is
 # low-token, high-leverage judgment (a bad plan poisons the whole implement loop),
 # so it gets PLAN_MODEL; everything after the plan — the implement grind, the
@@ -667,7 +679,10 @@ model_flag() {
 stage_model() {
   case "$1" in
     plan) printf '%s' "$PLAN_MODEL" ;;
-    implement|visual|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
+    implement)
+      if spec_has_design_contract "${SPEC:-}"; then printf '%s' "$DESIGN_IMPLEMENT_MODEL"
+      else printf '%s' "$IMPLEMENT_MODEL"; fi ;;
+    visual|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
     *) printf 'inherit' ;;
   esac
 }
