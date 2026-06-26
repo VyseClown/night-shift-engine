@@ -173,6 +173,20 @@ node_id_for() {
 
 figma_key_for() { sed -nE 's/.*fileKey `([A-Za-z0-9]+)`.*/\1/p' "$1" | head -n1; }
 
+# Stage every Design-Contract screen's Figma reference into $out_dir/design/ via the
+# MCP (visual_stage_ref). Used by both visual-review.sh and the in-loop run_visual.
+visual_stage_refs_for_spec() {
+  local spec="$1" out_dir="$2" key screen state device ref
+  key="$(figma_key_for "$spec")"
+  [ -n "$key" ] || { log "  no fileKey in $spec Design Contract; skipping refs"; return 0; }
+  while IFS='|' read -r screen state device; do
+    [ -n "$screen" ] || continue
+    ref="$out_dir/design/${screen}-${state}-${device}.png"
+    [ -s "$ref" ] && continue
+    visual_stage_ref "$key" "$(node_id_for "$spec" "$screen")" "$ref" || true
+  done < <(visual_capture_screens "$spec")
+}
+
 # ---- Metro fast-reload harness (for repair) ---------------------------------
 _REPAIR_METRO_PID=""
 # shellcheck disable=SC2153  # PROJECT/NO_BUILD are caller-set globals (documented interface)

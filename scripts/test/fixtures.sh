@@ -158,6 +158,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual_stage_ref exports a Figma node via the MCP (claude -p), caches, degrades" fixture_visual_stage_ref "$root"
+  fixture_assert "visual_stage_refs_for_spec stages the Design-Contract matrix via the MCP" fixture_visual_stage_refs_for_spec "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
   fixture_assert "visual capture maestro-drive times out a hung flow (no infinite hang)" fixture_visual_capture_maestro_timeout "$root"
   fixture_assert "visual capture pins status bar with a simctl-valid HH:MM time" fixture_visual_capture_statusbar_time "$root"
@@ -2181,6 +2182,34 @@ STUB
   ) || return 1
   # (d) empty key/node -> non-zero.
   ( export PATH="$d/bin:$PATH"; visual_stage_ref "" 1:1548 "$d/e.png"; [ "$?" -ne 0 ] || exit 1 ) || return 1
+  return 0
+}
+
+fixture_visual_stage_refs_for_spec() {
+  local root="$1" d="$root/vsrs"
+  mkdir -p "$d/bin" "$d/out"
+  cat >"$d/bin/claude" <<STUB
+#!/usr/bin/env bash
+out="\$(cat | grep -oE '/[^ ]+\.png' | head -1)"; [ -n "\$out" ] && printf x >"\$out"; exit 0
+STUB
+  chmod +x "$d/bin/claude"
+  cat >"$d/spec.md" <<'SPEC'
+## Design Contract
+- Figma file: Demo, fileKey `ABC123`
+- Frames: Home
+- Figma node IDs: Home = `1:1548`
+- Devices: iphone-15
+- Required states: default
+- Tolerance: 0.12
+SPEC
+  (
+    export PATH="$d/bin:$PATH"
+    visual_stage_refs_for_spec "$d/spec.md" "$d/out"
+    [ -s "$d/out/design/Home-default-iphone-15.png" ] || exit 1
+  ) || return 1
+  # no fileKey -> returns 0, stages nothing.
+  printf '## Design Contract\n- Frames: Home\n- Devices: iphone-15\n- Required states: default\n' >"$d/nokey.md"
+  ( export PATH="$d/bin:$PATH"; visual_stage_refs_for_spec "$d/nokey.md" "$d/out2" || exit 1; [ -d "$d/out2/design" ] && [ -n "$(ls -A "$d/out2/design" 2>/dev/null)" ] && exit 1; exit 0 ) || return 1
   return 0
 }
 
