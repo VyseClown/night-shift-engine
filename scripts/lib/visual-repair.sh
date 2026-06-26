@@ -183,7 +183,7 @@ visual_stage_figma_data() {
   [ -n "$key" ] && [ -n "$node" ] || return 1
   command -v claude >/dev/null 2>&1 || return 1
   mkdir -p "$(dirname "$cache")" || return 1
-  prompt="Call mcp__figma__get_figma_data for node ${node} in file ${key}. Then use the Write tool to write its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments to the file ${cache} as concise design notes. Figma is accessed ONLY through the MCP; never a token or REST. Reply 'done' once the file exists."
+  prompt="Call mcp__figma__get_figma_data for node ${node} in file ${key}. Then use the Write tool to write its COMPLETE result to the file ${cache} as JSON, VERBATIM — every node, its type, all fills and gradient stops, bounds, text styles, and child/stacking order. Do NOT summarize, omit, or paraphrase (layered/overlapping shapes are SEPARATE child nodes — keep them all). Figma is accessed ONLY through the MCP; never a token or REST. Reply 'done' once the file exists."
   ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
       --permission-mode bypassPermissions \
       --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" >/dev/null 2>&1 ) || true
