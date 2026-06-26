@@ -12,6 +12,12 @@
 !/specs/_template.md
 !/specs/_template-web.md
 
+# Feature design + implementation-plan docs are the spec's counterparts and carry
+# the same per-project/product detail, so they stay LOCAL ONLY too (same rule as
+# /specs/*). Other docs/ — durable engine/validation records — remain tracked.
+/docs/superpowers/specs/
+/docs/superpowers/plans/
+
 # Independent project repos that live alongside the engine (each has its own git).
 /rn-sandbox/
 /web-app/
