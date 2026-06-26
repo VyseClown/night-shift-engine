@@ -178,6 +178,7 @@ run_dry_fixtures() {
   fixture_assert "visual repair: never worse than the pre-repair baseline" fixture_visual_repair_neverworse "$root"
   fixture_assert "visual repair: patience stop on diminishing returns" fixture_visual_repair_patience "$root"
   fixture_assert "visual repair loop: retries a re-capture whose diff failed" fixture_visual_repair_recapture_retry "$root"
+  fixture_assert "visual repair: records baseline + per-attempt images and what-changed" fixture_visual_repair_audit "$root"
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
   fixture_assert "visual-review --repair/--repair-shared flags documented + bogus --drive rejected" fixture_visual_review_repair_args "$root"
@@ -2387,8 +2388,8 @@ fixture_visual_repair_loop() {
     obj="$(visual_repair_screen "$proj" "$root/lt" "$out" Home default iphone-15 \
         "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" \
         0.10 3 _agent _capture _validate_ok "src/features/")"
-    # ends passing (0.05 <= 0.10), with a 2-entry attempts[] and the unmet item
-    printf '%s' "$obj" | jq -e '.pass == true and (.attempts|length)==2 and (.unmet_brief==["spacing"])' >/dev/null || exit 1
+    # ends passing (0.05 <= 0.10), with a 3-entry attempts[] (baseline+2) and the unmet item
+    printf '%s' "$obj" | jq -e '.pass == true and (.attempts|length)==3 and (.unmet_brief==["spacing"])' >/dev/null || exit 1
     exit 0
   ) || return 1
   (
@@ -2399,7 +2400,7 @@ fixture_visual_repair_loop() {
     _hi(){ printf '0.30'; }; NIGHT_SHIFT_VISUAL_DIFF_FN=_hi
     # never converges -> 3 attempts, returns 1
     obj="$(visual_repair_screen "$proj" "$root/lt2" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _ok "src/features/")" && exit 1
-    printf '%s' "$obj" | jq -e '(.attempts|length)==3 and .pass==false' >/dev/null || exit 1
+    printf '%s' "$obj" | jq -e '(.attempts|length)==4 and .pass==false' >/dev/null || exit 1
     # validation fails -> edit reverted, file back to committed state
     git -C "$proj" checkout -q -- src/features/home/HomeScreen.tsx
     visual_repair_screen "$proj" "$root/lt3" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _bad "src/features/" >/dev/null
@@ -2430,7 +2431,7 @@ fixture_visual_repair_keepbest() {
     obj="$(visual_repair_screen "$proj" "$root/kt" "$out" Home default iphone-15 \
         "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.01 3 _agent _cap _ok "src/features/")"
     # best is attempt 2 (0.09): report shows 0.09 and the code is restored to attempt-2's marker.
-    printf '%s' "$obj" | jq -e '.diff_pct==0.09 and (.attempts|length)==3' >/dev/null || exit 1
+    printf '%s' "$obj" | jq -e '.diff_pct==0.09 and (.attempts|length)==4' >/dev/null || exit 1
     [ "$(cat "$proj/src/features/home/HomeScreen.tsx")" = "2" ] || exit 1
     exit 0
   ) || return 1
@@ -2479,7 +2480,7 @@ fixture_visual_repair_patience() {
     NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
     obj="$(visual_repair_screen "$proj" "$root/pt" "$out" Home default iphone-15 \
         "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.01 6 _agent _cap _ok "src/features/")"
-    printf '%s' "$obj" | jq -e '.diff_pct==0.20 and (.attempts|length)==4' >/dev/null || exit 1
+    printf '%s' "$obj" | jq -e '.diff_pct==0.20 and (.attempts|length)==5' >/dev/null || exit 1
     exit 0
   ) || return 1
   return 0
@@ -2623,6 +2624,32 @@ fixture_run_visual_repair_gate() {
   awk '/^run_visual_inloop_repair\(\)/{f=1} f&&/return 0/{print NR; exit}' "$WORKSPACE_ROOT/scripts/night-shift.sh" | head -1 | grep -q '[0-9]' || return 1
   # and the very first guard line references VISUAL_REPAIR
   awk '/^run_visual_inloop_repair\(\)/{f=1} f&&/VISUAL_REPAIR/{print "ok"; exit}' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q ok || return 1
+  return 0
+}
+
+fixture_visual_repair_audit() {
+  local root="$1" proj="$root/aup" out="$root/auout"
+  mkdir -p "$proj/src/features/home" "$out/design"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; git -C "$proj" add -A; git -C "$proj" commit -qm base
+  : >"$out/design/Home-default-iphone-15.png"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    _an=0; _agent(){ _an=$((_an+1)); printf '%s' "$_an" >"$proj/src/features/home/HomeScreen.tsx"; printf '{"changed":"grew ring","unmet_brief":[]}'; }
+    _cn=0; _cap(){ _cn=$((_cn+1)); printf 'shot%s' "$_cn" >"$4"; }   # capture_fn args: screen state device SHOT($4); distinct bytes/attempt
+    _ok(){ return 0; }
+    printf 'base' >"$out/shot.png"; printf 'base' >"$out/diff.png"
+    _seq=(0.40 0.30 0.09 0.12); _i=0; _diffseq(){ printf '%s' "${_seq[$_i]}"; _i=$((_i+1)); return 0; }
+    export NIGHT_SHIFT_VISUAL_REPAIR_PATIENCE=9
+    NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
+    obj="$(visual_repair_screen "$proj" "$root/at" "$out" Home default iphone-15 \
+        "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.01 3 _agent _cap _ok "src/features/")"
+    # baseline attempt-0 + 3 attempts, each a distinct screenshot path that exists; analysis carried.
+    printf '%s' "$obj" | jq -e '(.attempts|length)==4 and (.attempts[0].attempt==0) and (.attempts[0].analysis|test("baseline")) and (.attempts[2].analysis=="grew ring") and .analysis=="grew ring"' >/dev/null || exit 1
+    [ -s "$out/shot.attempt-0.png" ] && [ -s "$out/shot.attempt-1.png" ] && [ -s "$out/shot.attempt-2.png" ] || exit 1
+    [ "$(printf '%s' "$obj" | jq -r '.attempts[2].screenshot')" = "$out/shot.attempt-2.png" ] || exit 1
+    exit 0
+  ) || return 1
   return 0
 }
 

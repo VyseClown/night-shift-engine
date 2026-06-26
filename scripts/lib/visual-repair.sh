@@ -69,7 +69,7 @@ visual_repair_screen() {
   local IFS_OLD="$IFS"; IFS=','; read -r -a allow <<<"$allow_csv"; IFS="$IFS_OLD"
   local attempts="[]" unmet="[]" cur="" n=0 snap="$tmpbase/snap" passed=0 agent_out
   local _pct_file="$tmpbase/_pct"
-  local best_pct="" best_snap="$tmpbase/best" best_shot="$tmpbase/best.shot" best_diff="$tmpbase/best.diff" stall=0
+  local best_pct="" best_snap="$tmpbase/best" best_shot="$tmpbase/best.shot" best_diff="$tmpbase/best.diff" stall=0 best_changed=""
   local epsilon="${NIGHT_SHIFT_VISUAL_REPAIR_EPSILON:-0.005}" patience="${NIGHT_SHIFT_VISUAL_REPAIR_PATIENCE:-2}"
   mkdir -p "$tmpbase"
   # Seed "best" with the pre-repair baseline: if no attempt beats it, end on no change.
@@ -78,11 +78,21 @@ visual_repair_screen() {
     visual_repair_snapshot "$project" "$best_snap" "${allow[@]}"
     cp "$shot" "$best_shot" 2>/dev/null || true; cp "$diff_img" "$best_diff" 2>/dev/null || true
   fi
+  # Baseline ("before") audit entry + image copies (attempt 0).
+  if [ -n "$best_pct" ]; then
+    cp "$shot" "${shot%.png}.attempt-0.png" 2>/dev/null || true
+    cp "$diff_img" "${diff_img%.png}.attempt-0.png" 2>/dev/null || true
+    local _bpass; _bpass="$(LC_ALL=C awk -v p="$best_pct" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
+    attempts="$(printf '%s' "$attempts" | jq -c --argjson p "$best_pct" --argjson ps "$_bpass" \
+      --arg s "${shot%.png}.attempt-0.png" --arg d "${diff_img%.png}.attempt-0.png" \
+      '. + [{attempt:0, diff_pct:$p, pass:$ps, analysis:"baseline (before repair)", screenshot:$s, diff_image:$d}]')"
+  fi
   while [ "$n" -lt "$max" ]; do
     n=$((n+1))
     visual_repair_snapshot "$project" "$snap" "${allow[@]}"
     agent_out="$("$agent_fn" "$screen" "$state" "$ref" "$shot" "$diff_img" "$cur" "$tol" "$out_dir" 2>/dev/null || printf '{}')"
     unmet="$(printf '%s' "$agent_out" | jq -c '.unmet_brief // []' 2>/dev/null || printf '[]')"
+    local changed; changed="$(printf '%s' "$agent_out" | jq -r '.changed // ""' 2>/dev/null || printf '')"
     if ! visual_repair_scope_check "$project" "${allow[@]}" || ! "$validate_fn" "$project"; then
       log "visual-repair: $screen attempt $n failed scope/validation; reverting"
       visual_repair_restore "$project" "$snap" "${allow[@]}"
@@ -99,13 +109,15 @@ visual_repair_screen() {
     done
     [ "$_dok" = "1" ] || printf '1' >"$_pct_file"
     cur="$(cat "$_pct_file")"
+    cp "$shot" "${shot%.png}.attempt-$n.png" 2>/dev/null || true
+    cp "$diff_img" "${diff_img%.png}.attempt-$n.png" 2>/dev/null || true
     local pass; pass="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
     attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --argjson p "$cur" --argjson ps "$pass" \
-      --arg s "$shot" --arg d "$diff_img" \
-      '. + [{attempt:$a, diff_pct:$p, pass:$ps, analysis:"", screenshot:$s, diff_image:$d}]')"
+      --arg an "$changed" --arg s "${shot%.png}.attempt-$n.png" --arg d "${diff_img%.png}.attempt-$n.png" \
+      '. + [{attempt:$a, diff_pct:$p, pass:$ps, analysis:$an, screenshot:$s, diff_image:$d}]')"
     local improved; improved="$(LC_ALL=C awk -v c="$cur" -v b="$best_pct" -v e="$epsilon" 'BEGIN{ if (b=="") print "yes"; else print (c <= b - e)?"yes":"no" }')"
     if [ "$improved" = "yes" ]; then
-      best_pct="$cur"; visual_repair_snapshot "$project" "$best_snap" "${allow[@]}"
+      best_pct="$cur"; best_changed="$changed"; visual_repair_snapshot "$project" "$best_snap" "${allow[@]}"
       cp "$shot" "$best_shot" 2>/dev/null || true; cp "$diff_img" "$best_diff" 2>/dev/null || true
       stall=0
     else
@@ -122,7 +134,7 @@ visual_repair_screen() {
   fi
   [ -n "$cur" ] || cur="1"
   passed="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?1:0}')"
-  visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$cur" "$tol" "$diff_img" "" "$attempts" "$unmet"
+  visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$cur" "$tol" "$diff_img" "$best_changed" "$attempts" "$unmet"
   [ "$passed" = "1" ]
 }
 
@@ -199,7 +211,7 @@ repair_agent() {
 FIRST use the Read tool to OPEN AND VIEW the images so you can see the pixels: reference=$ref  current screenshot=$shot  diff overlay (red = differences)=$diff_img.  current diff=$pct, target tolerance=$tol.
 Pull the Figma design for node $node in file $key via mcp__figma__get_figma_data — its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments the MCP exposes — and treat them as requirements. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
 Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
-When done, print ONLY a JSON object: {\"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}."
+When done, print ONLY a JSON object: {\"changed\":\"<one concise line describing the visual change you made>\", \"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}."
   # The prompt MUST go via stdin: the variadic --allowed-tools otherwise swallows a
   # positional prompt ("Input must be provided…") and the agent silently no-ops.
   # Tools are comma-separated — a single space-joined string is parsed as ONE
