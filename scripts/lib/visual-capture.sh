@@ -34,6 +34,22 @@ visual_capture_available() {
   return 0
 }
 
+# Export a Figma node's PNG to $out via the Figma MCP (no token, no REST). Spawns a
+# cheap `claude -p` whose only tool is mcp__figma__download_figma_images. Caches when
+# $out already exists. Returns non-zero (degrade cleanly) when claude/MCP/download is
+# unavailable, so callers SKIP rather than fail.
+visual_stage_ref() {
+  local key="$1" node="$2" out="$3" dir base prompt
+  [ -s "$out" ] && return 0
+  [ -n "$key" ] && [ -n "$node" ] || return 1
+  command -v claude >/dev/null 2>&1 || { log "  no claude CLI — cannot MCP-export Figma $node"; return 1; }
+  dir="$(dirname "$out")"; base="$(basename "$out")"; mkdir -p "$dir" || return 1
+  prompt="Use the mcp__figma__download_figma_images tool to download fileKey ${key} node ${node} as a PNG (pngScale 2) to localPath \"${dir}\" with fileName \"${base}\" — i.e. exactly the file ${out}. Use ONLY that tool; never a Figma token or REST. Reply 'done' once the file exists."
+  ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
+      --output-format json --allowed-tools "mcp__figma__download_figma_images" >/dev/null 2>&1 ) || true
+  [ -s "$out" ]
+}
+
 # Reads the spec's `## Design Contract` and prints one `screen|state|device` line
 # per (frame × required-state × device) triple — the screens a capture run must
 # cover. Frames come from `- Frames:`, states from `- Required states:`, and

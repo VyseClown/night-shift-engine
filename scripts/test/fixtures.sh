@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2318,SC2329,SC2317,SC2034,SC2030,SC2031,SC2333
+# shellcheck disable=SC2318,SC2329,SC2317,SC2034,SC2030,SC2031,SC2333,SC2181
 # ^ Test-scaffolding-wide suppressions (THIS file only — kept ON for production):
 #   fixtures are dispatched indirectly via fixture_assert "$fn" (SC2329/SC2317
 #   "never invoked"/"unreachable", incl. deliberately stubbed mock functions like
@@ -157,6 +157,7 @@ run_dry_fixtures() {
   fixture_assert "visual report status: absent/malformed/valid classification" fixture_visual_report_status "$root"
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
+  fixture_assert "visual_stage_ref exports a Figma node via the MCP (claude -p), caches, degrades" fixture_visual_stage_ref "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
   fixture_assert "visual capture maestro-drive times out a hung flow (no infinite hang)" fixture_visual_capture_maestro_timeout "$root"
   fixture_assert "visual capture pins status bar with a simctl-valid HH:MM time" fixture_visual_capture_statusbar_time "$root"
@@ -2142,6 +2143,45 @@ STUB
     [ -s "$d/shot.png" ] || exit 1
     exit 0
   )
+}
+
+fixture_visual_stage_ref() {
+  local root="$1" d="$root/vsr"
+  mkdir -p "$d/bin"
+  cat >"$d/bin/claude" <<STUB
+#!/usr/bin/env bash
+printf 'called\n' >>"$d/claude.log"
+p="\$(cat)"   # prompt via stdin
+out="\$(printf '%s' "\$p" | grep -oE '/[^ ]+\.png' | head -1)"
+[ -n "\$out" ] && printf x >"\$out"
+exit 0
+STUB
+  chmod +x "$d/bin/claude"
+  # (a) stages via MCP: out doesn't exist -> claude stub writes it.
+  (
+    export PATH="$d/bin:$PATH"
+    visual_stage_ref ABC123 1:1548 "$d/design/Home-default-iphone-15.png" || exit 1
+    [ -s "$d/design/Home-default-iphone-15.png" ] || exit 1
+    grep -q called "$d/claude.log" || exit 1
+  ) || return 1
+  # (b) caches: out already exists -> returns 0 WITHOUT calling claude.
+  : >"$d/claude.log"
+  (
+    export PATH="$d/bin:$PATH"
+    visual_stage_ref ABC123 1:1548 "$d/design/Home-default-iphone-15.png" || exit 1
+    [ -s "$d/claude.log" ] && exit 1   # claude must NOT have been called
+    exit 0
+  ) || return 1
+  # (c) degrades: no claude on PATH -> non-zero, no file.
+  (
+    export PATH="/usr/bin:/bin"
+    visual_stage_ref ABC123 1:1548 "$d/n.png"; [ "$?" -ne 0 ] || exit 1
+    [ -e "$d/n.png" ] && exit 1
+    exit 0
+  ) || return 1
+  # (d) empty key/node -> non-zero.
+  ( export PATH="$d/bin:$PATH"; visual_stage_ref "" 1:1548 "$d/e.png"; [ "$?" -ne 0 ] || exit 1 ) || return 1
+  return 0
 }
 
 fixture_visual_capture_maestro() {
