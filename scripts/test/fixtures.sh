@@ -119,6 +119,7 @@ run_dry_fixtures() {
   fixture_assert "visual_review prompt signals engine-invoked RUN_VISUAL (no agent capture)" fixture_visual_review_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
+  fixture_assert "primary_prompt carries the build-from-Figma procedure iff a Design Contract" fixture_design_build_note "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
   fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
   fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
@@ -1093,20 +1094,57 @@ fixture_model_flag() {
 }
 
 fixture_stage_model() {
-  # The primary plans on PLAN_MODEL and does all post-plan work (implement, the
-  # observe-request turn, completion) on the cheaper IMPLEMENT_MODEL; the strong
-  # judgment in the observe scope is the separate independent observer.
-  local PLAN_MODEL=opus IMPLEMENT_MODEL=sonnet
+  local root="$1" d="$root/sm"
+  mkdir -p "$d"
+  # The primary plans on PLAN_MODEL and does post-plan work on IMPLEMENT_MODEL;
+  # a ## Design Contract bumps the IMPLEMENT scope to DESIGN_IMPLEMENT_MODEL.
+  local PLAN_MODEL=opus IMPLEMENT_MODEL=sonnet DESIGN_IMPLEMENT_MODEL=opus SPEC=""
+  printf 'Spec\n\n## Test Plan\n- x\n' >"$d/plain.md"
+  printf 'Spec\n\n## Design Contract\n- Figma file: X, fileKey `ABC`\n' >"$d/design.md"
+  # No Design Contract -> implement stays IMPLEMENT_MODEL.
+  SPEC="$d/plain.md"
   [ "$(stage_model plan)" = "opus" ] || return 1
   [ "$(stage_model implement)" = "sonnet" ] || return 1
   [ "$(stage_model observe)" = "sonnet" ] || return 1
   [ "$(stage_model complete)" = "sonnet" ] || return 1
-  # An unrecognized scope falls back to inherit (no forced model).
   [ "$(stage_model bogus)" = "inherit" ] || return 1
-  # inherit values flow straight through (no model pinned).
-  PLAN_MODEL=inherit IMPLEMENT_MODEL=inherit
+  # Empty SPEC also -> IMPLEMENT_MODEL (no contract).
+  SPEC=""
+  [ "$(stage_model implement)" = "sonnet" ] || return 1
+  # Design Contract -> implement bumps to DESIGN_IMPLEMENT_MODEL (opus); other
+  # scopes stay IMPLEMENT_MODEL.
+  SPEC="$d/design.md"
+  [ "$(stage_model implement)" = "opus" ] || return 1
+  [ "$(stage_model visual)" = "sonnet" ] || return 1
+  [ "$(stage_model observe)" = "sonnet" ] || return 1
+  [ "$(stage_model complete)" = "sonnet" ] || return 1
+  # inherit values flow straight through.
+  PLAN_MODEL=inherit IMPLEMENT_MODEL=inherit DESIGN_IMPLEMENT_MODEL=inherit SPEC="$d/plain.md"
   [ "$(stage_model plan)" = "inherit" ] || return 1
   [ "$(stage_model implement)" = "inherit" ] || return 1
+  return 0
+}
+
+fixture_design_build_note() {
+  local root="$1" dir="$root/dbn"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
+  # Design Contract at the implementation stage -> the procedure is present.
+  fixture_write_min_spec "$SPEC" "$(printf '## Design Contract\n- Figma file: X, fileKey `ABC`\n- Frames: Home')"
+  primary_prompt "$dir/p-design.txt"
+  grep -q "Pull the design via the Figma MCP" "$dir/p-design.txt" || return 1
+  grep -q "mcp__figma__get_figma_data" "$dir/p-design.txt" || return 1
+  grep -q "mcp__figma__download_figma_images" "$dir/p-design.txt" || return 1
+  grep -q "annotations" "$dir/p-design.txt" || return 1
+  grep -q "Reuse what exists" "$dir/p-design.txt" || return 1
+  grep -q "real app state" "$dir/p-design.txt" || return 1
+  grep -q "FIGMA_TOKEN" "$dir/p-design.txt" && return 1
+  # No Design Contract -> the procedure is absent.
+  fixture_write_min_spec "$SPEC"
+  primary_prompt "$dir/p-plain.txt"
+  grep -q "Pull the design via the Figma MCP" "$dir/p-plain.txt" && return 1
   return 0
 }
 

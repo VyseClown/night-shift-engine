@@ -71,7 +71,9 @@ engine/workflow git here at the root.
   one ever-growing session every turn; set `=run` for the legacy single pinned
   session. Persona sub-agents default to `sonnet` (`NIGHT_SHIFT_PERSONA_MODEL`).
   Per-role model tiering: `NIGHT_SHIFT_PLAN_MODEL` (default `opus`) for planning,
-  `NIGHT_SHIFT_IMPLEMENT_MODEL` (default `sonnet`) for the implement grind, and
+  `NIGHT_SHIFT_IMPLEMENT_MODEL` (default `sonnet`) for the implement grind,
+  `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL` (default `opus`) for the implement grind of a
+  spec with a `## Design Contract` (judgment-heavy design-fidelity build — Flow B), and
   `NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) for the independent final gate —
   any set to `inherit` to fall back to the CLI's startup model.
 - **Visual fidelity (opt-in):** set `NIGHT_SHIFT_VISUAL_CAPTURE=1` and give an rn

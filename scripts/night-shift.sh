@@ -63,6 +63,10 @@ SESSION_SCOPE="${NIGHT_SHIFT_SESSION_SCOPE:-stage}"
 # the strong backstop that makes a cheaper primary safe.
 PLAN_MODEL="${NIGHT_SHIFT_PLAN_MODEL:-opus}"
 IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
+# Design-fidelity implements (a spec with a ## Design Contract) are judgment-heavy
+# (decompose a Figma design, reuse/build components, reconcile with real state), so
+# the IMPLEMENT scope bumps to this stronger model. inherit/sonnet to override.
+DESIGN_IMPLEMENT_MODEL="${NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL:-opus}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
@@ -135,7 +139,9 @@ on disk to keep cost down; set NIGHT_SHIFT_SESSION_SCOPE=run for one pinned
 session), the spec's review personas (selected by its Track + Review Profile)
 review, and a fresh independent Claude session observes each candidate. Models are
 tiered by role: plan on NIGHT_SHIFT_PLAN_MODEL (default opus), implement/observe-
-request/completion on NIGHT_SHIFT_IMPLEMENT_MODEL (default sonnet), personas on
+request/completion on NIGHT_SHIFT_IMPLEMENT_MODEL (default sonnet) — but the implement
+scope of a ## Design Contract spec bumps to NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL (default
+opus) for design-fidelity work — personas on
 NIGHT_SHIFT_PERSONA_MODEL (default sonnet), and the observer on
 NIGHT_SHIFT_OBSERVER_MODEL (default opus); any "inherit" uses the startup model.
 Runs use
@@ -657,17 +663,30 @@ model_flag() {
   esac
 }
 
+# True when the spec declares a ## Design Contract (the marker that also activates the
+# Design Fidelity Reviewer + visual_review). Drives the build-from-Figma procedure and
+# the opus implement bump. Independent of VISUAL_CAPTURE (the build is design-directed
+# even when capture tooling is absent). Empty/missing path -> false.
+spec_has_design_contract() {
+  [ -n "${1:-}" ] && grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
+}
+
 # Pure: the model the primary should run on in a given session scope. Planning is
 # low-token, high-leverage judgment (a bad plan poisons the whole implement loop),
 # so it gets PLAN_MODEL; everything after the plan — the implement grind, the
 # observe-request turn, and completion — is constrained execution on the cheaper
-# IMPLEMENT_MODEL. The strong independent judgment in the observe scope is the
-# separate observer (OBSERVER_MODEL), not this primary turn. Unknown scope ->
+# IMPLEMENT_MODEL, EXCEPT the implement scope of a ## Design Contract spec, which is
+# judgment-heavy design-fidelity work and bumps to DESIGN_IMPLEMENT_MODEL (opus). The
+# strong independent judgment in the observe scope is the separate observer
+# (OBSERVER_MODEL), not this primary turn. Unknown scope ->
 # "inherit" (force no model; safe default).
 stage_model() {
   case "$1" in
     plan) printf '%s' "$PLAN_MODEL" ;;
-    implement|visual|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
+    implement)
+      if spec_has_design_contract "${SPEC:-}"; then printf '%s' "$DESIGN_IMPLEMENT_MODEL"
+      else printf '%s' "$IMPLEMENT_MODEL"; fi ;;
+    visual|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
     *) printf 'inherit' ;;
   esac
 }
@@ -675,7 +694,7 @@ stage_model() {
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set model_line reround_note
-  local session primary_turns handoff_note spec_base expected
+  local session primary_turns handoff_note design_build_note spec_base expected
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
@@ -724,13 +743,38 @@ approved work or redo findings already resolved. Read what you need:
     commit $BASE_COMMIT to see exactly what has been done so far.
 "
   fi
+  design_build_note=""
+  case "$stage" in
+    implementation|implementation_review)
+      if spec_has_design_contract "$SPEC"; then
+        design_build_note="
+Design-fidelity build (this spec has a \`## Design Contract\`). You are building this
+screen to match its Figma design. Before/while implementing:
+1. Pull the design via the Figma MCP (never a token): mcp__figma__get_figma_data for the
+   node's structure (layout, text, sizes, colors, typography, tokens) AND its Dev Mode
+   annotations / notes / comments, and mcp__figma__download_figma_images for the frame
+   image — open and VIEW it. Treat the annotations and comments as requirements (states,
+   spacing rationale, behavior), not just the pixels.
+2. Decompose the design into a component breakdown.
+3. Reuse what exists: Grep/Glob src/ui/components and src/features/* for components that
+   already satisfy each piece and REUSE them; build only what is genuinely missing.
+4. Build the missing components to the design (the project's tokens/sizes/spacing from
+   src/ui), following the layer boundaries.
+5. Assemble them on the screen, wired to real app state (per this spec) — do NOT hardcode
+   the Figma's sample values.
+6. Keep tsc/eslint/tests green. The engine's visual_review then pixel-diffs your screen
+   against the Figma image and auto-repairs the residual — get the structure + tokens
+   right here; it tightens the pixels.
+"
+      fi ;;
+  esac
   cat >"$prompt" <<EOF
 You are the fixed $PRIMARY primary for night-shift run $RUN_ID.
 Project: $PROJECT
 Task spec: $SPEC
 Current stage: $stage
 Base commit: $BASE_COMMIT
-
+$design_build_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
 You own planning, implementation, reviewer coordination, finding resolution,

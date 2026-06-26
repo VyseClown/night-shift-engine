@@ -225,10 +225,12 @@ session to fix the findings. Only validated structured review artifacts count.
 
 The primary itself is tiered: it **plans** on `NIGHT_SHIFT_PLAN_MODEL` (default
 `opus`, the high-leverage step) and does the implement grind, observe-request, and
-completion on the cheaper `NIGHT_SHIFT_IMPLEMENT_MODEL` (default `sonnet`). The
-model changes only at stage-scope boundaries (which already start a fresh
-session), so it is constant within a scope and resumes never re-pass it. Set any
-model knob to `inherit` to use the CLI's startup model.
+completion on the cheaper `NIGHT_SHIFT_IMPLEMENT_MODEL` (default `sonnet`) — except
+the implement grind of a spec with a `## Design Contract`, which is judgment-heavy
+design-fidelity work (Flow B) and bumps to `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL`
+(default `opus`). The model changes only at stage-scope boundaries (which already
+start a fresh session), so it is constant within a scope and resumes never re-pass
+it. Set any model knob to `inherit` to use the CLI's startup model.
 
 **Optional reviewers** (cross-track, off by default): Product Reviewer, Design
 Fidelity Reviewer, Security Reviewer, API Contract Reviewer. A spec opts in via an
