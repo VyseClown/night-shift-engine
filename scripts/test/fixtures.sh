@@ -193,6 +193,8 @@ run_dry_fixtures() {
   fixture_assert "run_visual: VISUAL_REPAIR constant + lib sourced + repair branch gated" fixture_run_visual_repair_gate "$root"
   fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
   fixture_assert "repair agent runs on the opus knob + reads the cached Figma data (no live get_figma_data)" fixture_repair_agent_cached "$root"
+  fixture_assert "repair_metro_start reuses an existing :8081 Metro; stop kills only an engine-started one" fixture_repair_metro "$root"
+  fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2826,6 +2828,68 @@ fixture_repair_agent_cached() {
   printf '%s' "$body" | grep -q '\-figma\.md' || return 1
   # the pre-fetch CALL (not just the definition) is wired into the orchestration
   grep -qF 'visual_stage_figma_data "$REPAIR_FILEKEY"' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
+  return 0
+}
+
+fixture_repair_metro() {
+  local root="$1" d="$root/rmetro"
+  mkdir -p "$d/bin" "$d/proj"
+  local PROJECT="$d/proj" NO_BUILD=1 _REPAIR_METRO_PID="" _REPAIR_METRO_STARTED=0
+  cat >"$d/bin/npx" <<STUB
+#!/usr/bin/env bash
+echo called >>"$d/npx.log"
+exit 0
+STUB
+  chmod +x "$d/bin/npx"
+  # (a) reuse: curl always succeeds (Metro up) -> repair_metro_start must NOT run npx.
+  cat >"$d/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+  chmod +x "$d/bin/curl"
+  : >"$d/npx.log"
+  (
+    export PATH="$d/bin:$PATH"
+    repair_metro_start somedev || exit 1
+    [ "$_REPAIR_METRO_STARTED" = "0" ] || exit 1
+    [ -s "$d/npx.log" ] && exit 1   # npx (expo start) must NOT have been called
+    exit 0
+  ) || return 1
+  # (b) start: curl fails once (down) then succeeds -> repair_metro_start runs npx.
+  cat >"$d/bin/curl" <<STUB
+#!/usr/bin/env bash
+n=\$(cat "$d/curln" 2>/dev/null || echo 0); n=\$((n+1)); echo \$n >"$d/curln"
+[ "\$n" -eq 1 ] && exit 1   # reuse check: down
+exit 0                       # wait loop: up
+STUB
+  chmod +x "$d/bin/curl"
+  : >"$d/npx.log"; rm -f "$d/curln"
+  (
+    export PATH="$d/bin:$PATH"
+    repair_metro_start somedev || exit 1
+    [ "$_REPAIR_METRO_STARTED" = "1" ] || exit 1
+    i=0; until [ -s "$d/npx.log" ]; do i=$((i+1)); [ "$i" -ge 10 ] && exit 1; sleep 0.2; done
+    exit 0
+  ) || return 1
+  # (c) stop kills ONLY an engine-started Metro.
+  (
+    sleep 30 & sp=$!
+    _REPAIR_METRO_STARTED=0; _REPAIR_METRO_PID=$sp
+    repair_metro_stop
+    kill -0 "$sp" 2>/dev/null || exit 1    # NOT engine-started -> still alive
+    _REPAIR_METRO_STARTED=1; _REPAIR_METRO_PID=$sp
+    repair_metro_stop
+    kill -0 "$sp" 2>/dev/null && { kill "$sp" 2>/dev/null; exit 1; }  # engine-started -> killed
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_repair_metro_call_order() {
+  local f="$WORKSPACE_ROOT/scripts/visual-review.sh" sline cline
+  sline="$(grep -n 'repair_metro_start "' "$f" | head -1 | cut -d: -f1)"
+  cline="$(grep -n 'for s in "${SPECS\[@\]}"; do review_spec' "$f" | head -1 | cut -d: -f1)"
+  [ -n "$sline" ] && [ -n "$cline" ] && [ "$sline" -lt "$cline" ] || return 1
   return 0
 }
 

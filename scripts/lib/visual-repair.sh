@@ -206,6 +206,13 @@ visual_stage_refs_for_spec() {
 
 # ---- Metro fast-reload harness (for repair) ---------------------------------
 _REPAIR_METRO_PID=""
+_REPAIR_METRO_STARTED=0
+
+# True when a Metro bundler already answers on the dev port.
+metro_is_up() {
+  curl -s -o /dev/null "http://localhost:${NIGHT_SHIFT_METRO_PORT:-8081}/status" 2>/dev/null
+}
+
 # shellcheck disable=SC2153  # PROJECT/NO_BUILD are caller-set globals (documented interface)
 repair_metro_start() {
   local device="$1"
@@ -214,18 +221,23 @@ repair_metro_start() {
     ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo run:ios --device "$device" >/dev/null 2>&1 ) \
       || { log "repair: dev build failed (build manually + re-run with --no-build)"; return 1; }
   fi
+  _REPAIR_METRO_STARTED=0
+  if metro_is_up; then
+    log "repair: reusing the Metro already on :${NIGHT_SHIFT_METRO_PORT:-8081}"
+    return 0
+  fi
   log "repair: starting Metro (EXPO_PUBLIC_PREVIEW=1)…"
   ( cd "$PROJECT" && EXPO_PUBLIC_PREVIEW=1 npx expo start >/tmp/visual-repair-metro.log 2>&1 ) &
   _REPAIR_METRO_PID=$!
-  # wait for the bundler port
-  local i=0; until curl -s http://localhost:8081/status >/dev/null 2>&1; do
+  _REPAIR_METRO_STARTED=1
+  local i=0; until metro_is_up; do
     i=$((i+1)); [ "$i" -ge 30 ] && { log "WARN: Metro did not come up after 60s"; break; }; sleep 2; done
 }
 repair_metro_stop() {
-  [ -n "$_REPAIR_METRO_PID" ] || return 0
-  kill "$_REPAIR_METRO_PID" 2>/dev/null || true
-  pkill -f "expo start" 2>/dev/null || true
-  _REPAIR_METRO_PID=""
+  [ "${_REPAIR_METRO_STARTED:-0}" = "1" ] || return 0
+  [ -n "${_REPAIR_METRO_PID:-}" ] && kill "$_REPAIR_METRO_PID" 2>/dev/null || true
+  [ -n "${_REPAIR_METRO_PID:-}" ] && wait "$_REPAIR_METRO_PID" 2>/dev/null || true
+  _REPAIR_METRO_PID=""; _REPAIR_METRO_STARTED=0
 }
 
 # ---- repair agent + validate ------------------------------------------------
