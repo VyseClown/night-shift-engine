@@ -139,7 +139,9 @@ on disk to keep cost down; set NIGHT_SHIFT_SESSION_SCOPE=run for one pinned
 session), the spec's review personas (selected by its Track + Review Profile)
 review, and a fresh independent Claude session observes each candidate. Models are
 tiered by role: plan on NIGHT_SHIFT_PLAN_MODEL (default opus), implement/observe-
-request/completion on NIGHT_SHIFT_IMPLEMENT_MODEL (default sonnet), personas on
+request/completion on NIGHT_SHIFT_IMPLEMENT_MODEL (default sonnet) — but the implement
+scope of a ## Design Contract spec bumps to NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL (default
+opus) for design-fidelity work — personas on
 NIGHT_SHIFT_PERSONA_MODEL (default sonnet), and the observer on
 NIGHT_SHIFT_OBSERVER_MODEL (default opus); any "inherit" uses the startup model.
 Runs use
@@ -673,8 +675,10 @@ spec_has_design_contract() {
 # low-token, high-leverage judgment (a bad plan poisons the whole implement loop),
 # so it gets PLAN_MODEL; everything after the plan — the implement grind, the
 # observe-request turn, and completion — is constrained execution on the cheaper
-# IMPLEMENT_MODEL. The strong independent judgment in the observe scope is the
-# separate observer (OBSERVER_MODEL), not this primary turn. Unknown scope ->
+# IMPLEMENT_MODEL, EXCEPT the implement scope of a ## Design Contract spec, which is
+# judgment-heavy design-fidelity work and bumps to DESIGN_IMPLEMENT_MODEL (opus). The
+# strong independent judgment in the observe scope is the separate observer
+# (OBSERVER_MODEL), not this primary turn. Unknown scope ->
 # "inherit" (force no model; safe default).
 stage_model() {
   case "$1" in
