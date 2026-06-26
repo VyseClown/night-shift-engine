@@ -189,6 +189,7 @@ run_dry_fixtures() {
   fixture_assert "visual-repair helpers (devices/node/key/label) in shared lib" fixture_visual_repair_helpers "$root"
   fixture_assert "visual_repair_for_spec builds TSV + parameterizes paths by candidate_label" fixture_visual_repair_for_spec "$root"
   fixture_assert "run_visual: VISUAL_REPAIR constant + lib sourced + repair branch gated" fixture_run_visual_repair_gate "$root"
+  fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2702,6 +2703,18 @@ fixture_run_visual_repair_gate() {
   awk '/^run_visual_inloop_repair\(\)/{f=1} f&&/return 0/{print NR; exit}' "$WORKSPACE_ROOT/scripts/night-shift.sh" | head -1 | grep -q '[0-9]' || return 1
   # and the very first guard line references VISUAL_REPAIR
   awk '/^run_visual_inloop_repair\(\)/{f=1} f&&/VISUAL_REPAIR/{print "ok"; exit}' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q ok || return 1
+  return 0
+}
+
+fixture_run_visual_stages_refs() {
+  local body
+  body="$(sed -n '/^run_visual()/,/^}/p' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+  printf '%s' "$body" | grep -q 'visual_stage_refs_for_spec "$SPEC" "$RUN_ROOT/validated"' || return 1
+  # staging must come BEFORE the capture call.
+  local sline cline
+  sline="$(printf '%s\n' "$body" | grep -n 'visual_stage_refs_for_spec' | head -1 | cut -d: -f1)"
+  cline="$(printf '%s\n' "$body" | grep -n 'run_visual_capture "$SPEC"' | head -1 | cut -d: -f1)"
+  [ -n "$sline" ] && [ -n "$cline" ] && [ "$sline" -lt "$cline" ] || return 1
   return 0
 }
 
