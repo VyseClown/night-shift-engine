@@ -236,7 +236,7 @@ repair_metro_start() {
 repair_metro_stop() {
   [ "${_REPAIR_METRO_STARTED:-0}" = "1" ] || return 0
   [ -n "${_REPAIR_METRO_PID:-}" ] && kill "$_REPAIR_METRO_PID" 2>/dev/null || true
-  wait "${_REPAIR_METRO_PID:-0}" 2>/dev/null || true
+  [ -n "${_REPAIR_METRO_PID:-}" ] && wait "$_REPAIR_METRO_PID" 2>/dev/null || true
   _REPAIR_METRO_PID=""; _REPAIR_METRO_STARTED=0
 }
 
