@@ -196,6 +196,7 @@ run_dry_fixtures() {
   fixture_assert "repair_metro_start reuses an existing :8081 Metro; stop kills only an engine-started one" fixture_repair_metro "$root"
   fixture_assert "bundle freshness: polls, resets only on timeout, reset is port-scoped + no-rebuild, clean-degrades without Metro" fixture_bundle_freshness "$root"
   fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
+  fixture_assert "repair_recapture_screen: freshness-then-capture order; first-pass never invokes freshness" fixture_recapture_wrapper "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2960,6 +2961,42 @@ fixture_repair_metro_call_order() {
   sline="$(grep -n 'repair_metro_start "' "$f" | head -1 | cut -d: -f1)"
   cline="$(grep -n 'for s in "${SPECS\[@\]}"; do review_spec' "$f" | head -1 | cut -d: -f1)"
   [ -n "$sline" ] && [ -n "$cline" ] && [ "$sline" -lt "$cline" ] || return 1
+  return 0
+}
+
+fixture_recapture_wrapper() {
+  local root="$1" d="$root/rcw"
+  mkdir -p "$d"
+
+  # (a) repair_recapture_screen: freshness runs FIRST then capture, in order.
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
+    log() { :; }
+    __visual_force_fresh_bundle() { printf 'fresh\n' >>"$d/order.log"; return 0; }
+    visual_recapture_screen() { printf 'capture\n' >>"$d/order.log"; }
+    repair_recapture_screen Home default iphone-15 "$d/out.png"
+    [ "$(cat "$d/order.log")" = "$(printf 'fresh\ncapture')" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # (b) freshness failure is swallowed: capture still runs.
+  : >"$d/cap2.log"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
+    log() { :; }
+    __visual_force_fresh_bundle() { return 1; }
+    visual_recapture_screen() { printf 'capture\n' >>"$d/cap2.log"; }
+    repair_recapture_screen Home default iphone-15 "$d/out2.png"
+    [ "$(cat "$d/cap2.log")" = "capture" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # (c) first-pass capture (__visual_capture_screenshot via run_visual_capture) never
+  #     invokes __visual_force_fresh_bundle — grep the capture lib for the absence.
+  grep -q '__visual_force_fresh_bundle' "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh" && return 1
+
   return 0
 }
 

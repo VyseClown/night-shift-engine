@@ -291,6 +291,15 @@ __visual_force_fresh_bundle() {
   return 0
 }
 
+# Injected capture_fn for the repair loop: forces a fresh Metro bundle before
+# every re-capture. Swallows freshness failures (|| true) so the repair loop
+# always gets a screenshot even when Metro is unreachable.
+# shellcheck disable=SC2329  # invoked indirectly as the capture_fn argument
+repair_recapture_screen() {
+  __visual_force_fresh_bundle || true
+  visual_recapture_screen "$@"
+}
+
 # ---- repair agent + validate ------------------------------------------------
 # shellcheck disable=SC2329  # invoked indirectly as an injected function name
 repair_validate() {
@@ -335,12 +344,16 @@ visual_repair_for_spec() {
   _repair_one() {
     local sc="$1" st="$2" dv="$3"
     eval "REPAIR_NODE_$sc=\"$(node_id_for "$spec" "$sc")\""
+    export NIGHT_SHIFT_VISUAL_PREVHASH_FILE="$out_dir/_rsnap/$sc-prevhash"
+    export REPAIR_TOUCH_GLOB="$project/${allow_csv%%,*}"
+    REPAIR_RESET_DEVICE="$(device_label_to_name "$dv")"
+    export REPAIR_RESET_DEVICE
     visual_stage_figma_data "$REPAIR_FILEKEY" "$(node_id_for "$spec" "$sc")" \
       "$out_dir/design/$sc-figma.md" || true
     visual_repair_screen "$project" "$out_dir/_rsnap" "$out_dir" "$sc" "$st" "$dv" \
       "$out_dir/design/$sc-$st-$dv.png" "$out_dir/screenshots/$candidate_label/$sc-$st-$dv.png" \
       "$out_dir/diffs/$candidate_label/$sc-$st-$dv.png" "$(visual_capture_tolerance "$spec")" \
-      "$max" repair_agent visual_recapture_screen repair_validate "$allow_csv" >/dev/null
+      "$max" repair_agent repair_recapture_screen repair_validate "$allow_csv" >/dev/null
     printf '%s\n' "$max"
   }
   visual_repair_run "$fail" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" _repair_one
