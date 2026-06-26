@@ -160,6 +160,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual_stage_ref exports a Figma node via the MCP (claude -p), caches, degrades" fixture_visual_stage_ref "$root"
   fixture_assert "visual_stage_figma_data caches the node's Figma design data via the MCP" fixture_visual_stage_figma_data "$root"
+  fixture_assert "spec_design_sections prints the Design Contract + Design source sections" fixture_spec_design_sections "$root"
   fixture_assert "visual_stage_refs_for_spec stages the Design-Contract matrix via the MCP" fixture_visual_stage_refs_for_spec "$root"
   fixture_assert "visual-review.sh exports refs via the MCP, no FIGMA_TOKEN/REST" fixture_visual_review_no_token "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
@@ -2261,6 +2262,28 @@ STUB
   fbody="$(sed -n '/^visual_stage_figma_data()/,/^}/p' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh")"
   printf '%s' "$fbody" | grep -qiE 'VERBATIM|COMPLETE' || return 1
   printf '%s' "$fbody" | grep -q 'as JSON' || return 1
+  return 0
+}
+
+fixture_spec_design_sections() {
+  local root="$1" d="$root/sds"
+  mkdir -p "$d"
+  cat >"$d/spec.md" <<'SPEC'
+## Test Plan
+- TESTLINE should not appear
+## Design Contract
+- Figma file: X, fileKey `ABC`
+- DCLINE design-contract marker
+## Design source
+- DSLINE two crossing wave layers
+## Edge Cases
+- EDGELINE should not appear
+SPEC
+  local out; out="$(spec_design_sections "$d/spec.md")"
+  printf '%s' "$out" | grep -q 'DCLINE' || return 1
+  printf '%s' "$out" | grep -q 'DSLINE' || return 1
+  printf '%s' "$out" | grep -q 'TESTLINE' && return 1
+  printf '%s' "$out" | grep -q 'EDGELINE' && return 1
   return 0
 }
 

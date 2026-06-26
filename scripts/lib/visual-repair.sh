@@ -173,6 +173,12 @@ node_id_for() {
 
 figma_key_for() { sed -nE 's/.*fileKey `([A-Za-z0-9]+)`.*/\1/p' "$1" | head -n1; }
 
+# Print the spec's design-intent sections (## Design Contract + ## Design source)
+# verbatim — the human-editable source the repair agent honors.
+spec_design_sections() {
+  awk '/^## /{ p = ($0 ~ /^## (Design Contract|Design source)/) ? 1 : 0 } p' "$1"
+}
+
 # Fetch node $node's Figma design data (Dev Mode specs + annotations) via the MCP and
 # write concise design notes to $cache, ONCE — the repair agent then Reads $cache each
 # attempt instead of calling get_figma_data live (cuts Figma API volume; avoids 429).
