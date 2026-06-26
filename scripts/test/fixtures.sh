@@ -2191,7 +2191,7 @@ fixture_visual_stage_ref() {
   mkdir -p "$d/bin"
   cat >"$d/bin/claude" <<STUB
 #!/usr/bin/env bash
-printf 'called\n' >>"$d/claude.log"
+printf '%s\n' "\$*" >>"$d/argv.log"
 p="\$(cat)"   # prompt via stdin
 out="\$(printf '%s' "\$p" | grep -oE '/[^ ]+\.png' | head -1)"
 [ -n "\$out" ] && printf x >"\$out"
@@ -2203,14 +2203,14 @@ STUB
     export PATH="$d/bin:$PATH"
     visual_stage_ref ABC123 1:1548 "$d/design/Home-default-iphone-15.png" || exit 1
     [ -s "$d/design/Home-default-iphone-15.png" ] || exit 1
-    grep -q called "$d/claude.log" || exit 1
+    grep -q -- '--permission-mode bypassPermissions' "$d/argv.log" || exit 1
   ) || return 1
   # (b) caches: out already exists -> returns 0 WITHOUT calling claude.
-  : >"$d/claude.log"
+  : >"$d/argv.log"
   (
     export PATH="$d/bin:$PATH"
     visual_stage_ref ABC123 1:1548 "$d/design/Home-default-iphone-15.png" || exit 1
-    [ -s "$d/claude.log" ] && exit 1   # claude must NOT have been called
+    [ -s "$d/argv.log" ] && exit 1   # claude must NOT have been called
     exit 0
   ) || return 1
   # (c) degrades: no claude on PATH -> non-zero, no file.
