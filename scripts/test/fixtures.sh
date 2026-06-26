@@ -192,6 +192,7 @@ run_dry_fixtures() {
   fixture_assert "visual_repair_for_spec builds TSV + parameterizes paths by candidate_label" fixture_visual_repair_for_spec "$root"
   fixture_assert "run_visual: VISUAL_REPAIR constant + lib sourced + repair branch gated" fixture_run_visual_repair_gate "$root"
   fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
+  fixture_assert "repair agent runs on the opus knob + reads the cached Figma data (no live get_figma_data)" fixture_repair_agent_cached "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2811,6 +2812,20 @@ fixture_visual_repair_audit() {
     [ "$(printf '%s' "$obj" | jq -r '.attempts[2].screenshot')" = "$out/shot.attempt-3.png" ] || exit 1
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_repair_agent_cached() {
+  local body
+  body="$(sed -n '/^repair_agent()/,/^}/p' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh")"
+  # opus model knob present
+  printf '%s' "$body" | grep -q 'NIGHT_SHIFT_VISUAL_REPAIR_MODEL' || return 1
+  # MCP get_figma_data dropped from the agent's allowlist
+  printf '%s' "$body" | grep -q 'mcp__figma__get_figma_data' && return 1
+  # the agent reads the per-screen Figma cache
+  printf '%s' "$body" | grep -q '\-figma\.md' || return 1
+  # the pre-fetch CALL (not just the definition) is wired into the orchestration
+  grep -qF 'visual_stage_figma_data "$REPAIR_FILEKEY"' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
   return 0
 }
 

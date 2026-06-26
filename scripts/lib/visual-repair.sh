@@ -237,12 +237,13 @@ repair_validate() {
 # shellcheck disable=SC2329  # invoked indirectly as an injected function name
 repair_agent() {
   local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
-  local key node allow prompt result
+  local key node allow prompt result cache
   key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
   allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
+  cache="$out_dir/design/$screen-figma.md"
   prompt="You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
 FIRST use the Read tool to OPEN AND VIEW the images so you can see the pixels: reference=$ref  current screenshot=$shot  diff overlay (red = differences)=$diff_img.  current diff=$pct, target tolerance=$tol.
-Pull the Figma design for node $node in file $key via mcp__figma__get_figma_data — its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments the MCP exposes — and treat them as requirements. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
+Read the cached Figma design notes at $cache (the node's Dev Mode specs — sizes, spacing, colors, typography, tokens — and annotations/comments) and treat them as requirements. If that file is absent, work from the images. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
 Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
 When done, print ONLY a JSON object: {\"changed\":\"<one concise line describing the visual change you made>\", \"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}."
   # The prompt MUST go via stdin: the variadic --allowed-tools otherwise swallows a
@@ -250,7 +251,8 @@ When done, print ONLY a JSON object: {\"changed\":\"<one concise line describing
   # Tools are comma-separated — a single space-joined string is parsed as ONE
   # (invalid) tool name, leaving the agent with no tools. (Proven by the smoke.)
   result="$(cd "$PROJECT" && printf '%s' "$prompt" | claude -p --output-format json \
-    --allowed-tools "Read,Edit,Write,Bash(npx tsc*),Bash(npx eslint*),mcp__figma__get_figma_data" 2>/dev/null)"
+    --model "${NIGHT_SHIFT_VISUAL_REPAIR_MODEL:-claude-opus-4-8}" \
+    --allowed-tools "Read,Edit,Write,Bash(npx tsc*),Bash(npx eslint*)" 2>/dev/null)"
   printf '%s' "$result" | jq -r '.result // "{}"' 2>/dev/null | grep -o '{.*}' | tail -n1
   [ -n "$result" ]
 }
@@ -270,6 +272,8 @@ visual_repair_for_spec() {
   _repair_one() {
     local sc="$1" st="$2" dv="$3"
     eval "REPAIR_NODE_$sc=\"$(node_id_for "$spec" "$sc")\""
+    visual_stage_figma_data "$REPAIR_FILEKEY" "$(node_id_for "$spec" "$sc")" \
+      "$out_dir/design/$sc-figma.md" || true
     visual_repair_screen "$project" "$out_dir/_rsnap" "$out_dir" "$sc" "$st" "$dv" \
       "$out_dir/design/$sc-$st-$dv.png" "$out_dir/screenshots/$candidate_label/$sc-$st-$dv.png" \
       "$out_dir/diffs/$candidate_label/$sc-$st-$dv.png" "$(visual_capture_tolerance "$spec")" \
