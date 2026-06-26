@@ -119,6 +119,7 @@ run_dry_fixtures() {
   fixture_assert "visual_review prompt signals engine-invoked RUN_VISUAL (no agent capture)" fixture_visual_review_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
+  fixture_assert "primary_prompt carries the build-from-Figma procedure iff a Design Contract" fixture_design_build_note "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
   fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
   fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
@@ -1121,6 +1122,28 @@ fixture_stage_model() {
   PLAN_MODEL=inherit IMPLEMENT_MODEL=inherit DESIGN_IMPLEMENT_MODEL=inherit SPEC="$d/plain.md"
   [ "$(stage_model plan)" = "inherit" ] || return 1
   [ "$(stage_model implement)" = "inherit" ] || return 1
+  return 0
+}
+
+fixture_design_build_note() {
+  local root="$1" dir="$root/dbn"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
+  # Design Contract at the implementation stage -> the procedure is present.
+  fixture_write_min_spec "$SPEC" "$(printf '## Design Contract\n- Figma file: X, fileKey `ABC`\n- Frames: Home')"
+  primary_prompt "$dir/p-design.txt"
+  grep -q "Pull the design via the Figma MCP" "$dir/p-design.txt" || return 1
+  grep -q "mcp__figma__get_figma_data" "$dir/p-design.txt" || return 1
+  grep -q "annotations" "$dir/p-design.txt" || return 1
+  grep -q "Reuse what exists" "$dir/p-design.txt" || return 1
+  grep -q "real app state" "$dir/p-design.txt" || return 1
+  grep -q "FIGMA_TOKEN" "$dir/p-design.txt" && return 1
+  # No Design Contract -> the procedure is absent.
+  fixture_write_min_spec "$SPEC"
+  primary_prompt "$dir/p-plain.txt"
+  grep -q "Pull the design via the Figma MCP" "$dir/p-plain.txt" && return 1
   return 0
 }
 

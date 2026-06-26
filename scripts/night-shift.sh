@@ -690,7 +690,7 @@ stage_model() {
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set model_line reround_note
-  local session primary_turns handoff_note spec_base expected
+  local session primary_turns handoff_note design_build_note spec_base expected
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
@@ -739,13 +739,38 @@ approved work or redo findings already resolved. Read what you need:
     commit $BASE_COMMIT to see exactly what has been done so far.
 "
   fi
+  design_build_note=""
+  case "$stage" in
+    implementation|implementation_review)
+      if spec_has_design_contract "$SPEC"; then
+        design_build_note="
+Design-fidelity build (this spec has a \`## Design Contract\`). You are building this
+screen to match its Figma design. Before/while implementing:
+1. Pull the design via the Figma MCP (never a token): mcp__figma__get_figma_data for the
+   node's structure (layout, text, sizes, colors, typography, tokens) AND its Dev Mode
+   annotations / notes / comments, and mcp__figma__download_figma_images for the frame
+   image — open and VIEW it. Treat the annotations and comments as requirements (states,
+   spacing rationale, behavior), not just the pixels.
+2. Decompose the design into a component breakdown.
+3. Reuse what exists: Grep/Glob src/ui/components and src/features/* for components that
+   already satisfy each piece and REUSE them; build only what is genuinely missing.
+4. Build the missing components to the design (the project's tokens/sizes/spacing from
+   src/ui), following the layer boundaries.
+5. Assemble them on the screen, wired to real app state (per this spec) — do NOT hardcode
+   the Figma's sample values.
+6. Keep tsc/eslint/tests green. The engine's visual_review then pixel-diffs your screen
+   against the Figma image and auto-repairs the residual — get the structure + tokens
+   right here; it tightens the pixels.
+"
+      fi ;;
+  esac
   cat >"$prompt" <<EOF
 You are the fixed $PRIMARY primary for night-shift run $RUN_ID.
 Project: $PROJECT
 Task spec: $SPEC
 Current stage: $stage
 Base commit: $BASE_COMMIT
-
+$design_build_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
 You own planning, implementation, reviewer coordination, finding resolution,
