@@ -1136,6 +1136,7 @@ fixture_design_build_note() {
   primary_prompt "$dir/p-design.txt"
   grep -q "Pull the design via the Figma MCP" "$dir/p-design.txt" || return 1
   grep -q "mcp__figma__get_figma_data" "$dir/p-design.txt" || return 1
+  grep -q "mcp__figma__download_figma_images" "$dir/p-design.txt" || return 1
   grep -q "annotations" "$dir/p-design.txt" || return 1
   grep -q "Reuse what exists" "$dir/p-design.txt" || return 1
   grep -q "real app state" "$dir/p-design.txt" || return 1
