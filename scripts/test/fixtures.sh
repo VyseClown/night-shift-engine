@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2318,SC2329,SC2317,SC2034,SC2030,SC2031,SC2333,SC2181
+# shellcheck disable=SC2318,SC2329,SC2317,SC2034,SC2030,SC2031,SC2333
 # ^ Test-scaffolding-wide suppressions (THIS file only — kept ON for production):
 #   fixtures are dispatched indirectly via fixture_assert "$fn" (SC2329/SC2317
 #   "never invoked"/"unreachable", incl. deliberately stubbed mock functions like
@@ -2178,12 +2178,12 @@ STUB
   # (c) degrades: no claude on PATH -> non-zero, no file.
   (
     export PATH="/usr/bin:/bin"
-    visual_stage_ref ABC123 1:1548 "$d/n.png"; [ "$?" -ne 0 ] || exit 1
+    ! visual_stage_ref ABC123 1:1548 "$d/n.png" || exit 1
     [ -e "$d/n.png" ] && exit 1
     exit 0
   ) || return 1
   # (d) empty key/node -> non-zero.
-  ( export PATH="$d/bin:$PATH"; visual_stage_ref "" 1:1548 "$d/e.png"; [ "$?" -ne 0 ] || exit 1 ) || return 1
+  ( export PATH="$d/bin:$PATH"; ! visual_stage_ref "" 1:1548 "$d/e.png" || exit 1 ) || return 1
   return 0
 }
 

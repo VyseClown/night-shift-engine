@@ -1369,8 +1369,9 @@ visual_stage_enabled() {
   grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
 }
 
-# The visual_review stage handler. Engine-invoked: the engine itself runs the
-# design-fidelity capture (Figma reference -> iOS-simulator screenshot -> pixel
+# The visual_review stage handler. Engine-invoked: the engine itself stages the Figma
+# references via the MCP (scripts/lib/visual-repair.sh visual_stage_refs_for_spec) then
+# runs the design-fidelity capture (Figma reference -> iOS-simulator screenshot -> pixel
 # diff) via scripts/lib/visual-capture.sh, producing validated/visual-diff-<spec>.json,
 # then advances to the observer (which reviews the candidate + the report; per-screen
 # pass/fail is the observer's concern, a failing report still flows as evidence).
