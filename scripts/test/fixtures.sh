@@ -174,6 +174,9 @@ run_dry_fixtures() {
   fixture_assert "visual-repair scope-check allows in-scope, rejects out-of-scope" fixture_visual_repair_scope "$root"
   fixture_assert "visual_repair_snapshot/restore round-trips in-scope trees" fixture_visual_repair_snapshot "$root"
   fixture_assert "visual repair loop: converge on pass" fixture_visual_repair_loop "$root"
+  fixture_assert "visual repair: keeps the best attempt (not the last)" fixture_visual_repair_keepbest "$root"
+  fixture_assert "visual repair: never worse than the pre-repair baseline" fixture_visual_repair_neverworse "$root"
+  fixture_assert "visual repair: patience stop on diminishing returns" fixture_visual_repair_patience "$root"
   fixture_assert "visual repair loop: retries a re-capture whose diff failed" fixture_visual_repair_recapture_retry "$root"
   fixture_assert "visual_repair_run: worst-first ordering + global cap" fixture_visual_repair_run "$root"
   fixture_assert "visual_recapture_screen resolves udid + captures to out_png" fixture_visual_recapture "$root"
@@ -2378,7 +2381,7 @@ fixture_visual_repair_loop() {
     # capture: stub diff sequence via a global counter -> first 0.3 (fail), then 0.05 (pass)
     _N=0
     _capture() { :; }
-    _diffseq() { _N=$((_N+1)); [ "$_N" -ge 2 ] && printf '0.05' || printf '0.30'; }
+    _diffseq() { _N=$((_N+1)); [ "$_N" -ge 3 ] && printf '0.05' || printf '0.30'; }
     # Override the diff used by the loop by exporting a pluggable hook:
     NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
     obj="$(visual_repair_screen "$proj" "$root/lt" "$out" Home default iphone-15 \
@@ -2390,6 +2393,7 @@ fixture_visual_repair_loop() {
   ) || return 1
   (
     . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    export NIGHT_SHIFT_VISUAL_REPAIR_PATIENCE=99
     _agent(){ printf 'x' >>"$proj/src/features/home/HomeScreen.tsx"; printf '{}'; }
     _cap(){ :; }; _ok(){ return 0; }; _bad(){ return 1; }
     _hi(){ printf '0.30'; }; NIGHT_SHIFT_VISUAL_DIFF_FN=_hi
@@ -2400,6 +2404,82 @@ fixture_visual_repair_loop() {
     git -C "$proj" checkout -q -- src/features/home/HomeScreen.tsx
     visual_repair_screen "$proj" "$root/lt3" "$out" Home default iphone-15 "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.10 3 _agent _cap _bad "src/features/" >/dev/null
     [ -z "$(git -C "$proj" status --porcelain)" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_visual_repair_keepbest() {
+  local root="$1" proj="$root/kbp" out="$root/kbout"
+  mkdir -p "$proj/src/features/home" "$out/design"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; git -C "$proj" add -A; git -C "$proj" commit -qm base
+  : >"$out/design/Home-default-iphone-15.png"; : >"$out/shot.png"; : >"$out/diff.png"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    # Use a file-based counter since _agent is called inside $() (a subshell).
+    _cnt="$root/_kbcnt"; printf '0' >"$_cnt"
+    _agent(){ _n=$(( $(cat "$_cnt") + 1 )); printf '%s' "$_n" >"$_cnt"
+               printf '%s' "$_n" >"$proj/src/features/home/HomeScreen.tsx"; printf '{}'; }
+    _cap(){ :; }; _ok(){ return 0; }
+    # call1=baseline 0.40, a1=0.30, a2=0.09 (best), a3=0.12
+    _seq=(0.40 0.30 0.09 0.12); _i=0
+    _diffseq(){ printf '%s' "${_seq[$_i]}"; _i=$((_i+1)); return 0; }
+    export NIGHT_SHIFT_VISUAL_REPAIR_PATIENCE=9
+    NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
+    obj="$(visual_repair_screen "$proj" "$root/kt" "$out" Home default iphone-15 \
+        "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.01 3 _agent _cap _ok "src/features/")"
+    # best is attempt 2 (0.09): report shows 0.09 and the code is restored to attempt-2's marker.
+    printf '%s' "$obj" | jq -e '.diff_pct==0.09 and (.attempts|length)==3' >/dev/null || exit 1
+    [ "$(cat "$proj/src/features/home/HomeScreen.tsx")" = "2" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_visual_repair_neverworse() {
+  local root="$1" proj="$root/nwp" out="$root/nwout"
+  mkdir -p "$proj/src/features/home" "$out/design"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; git -C "$proj" add -A; git -C "$proj" commit -qm base
+  : >"$out/design/Home-default-iphone-15.png"; : >"$out/shot.png"; : >"$out/diff.png"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    _agent(){ printf 'WORSE' >"$proj/src/features/home/HomeScreen.tsx"; printf '{}'; }
+    _cap(){ :; }; _ok(){ return 0; }
+    # baseline 0.10; every attempt is worse (0.30).
+    _seq=(0.10 0.30 0.30 0.30); _i=0
+    _diffseq(){ printf '%s' "${_seq[$_i]}"; _i=$((_i+1)); return 0; }
+    export NIGHT_SHIFT_VISUAL_REPAIR_PATIENCE=2
+    NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
+    obj="$(visual_repair_screen "$proj" "$root/nt" "$out" Home default iphone-15 \
+        "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.05 6 _agent _cap _ok "src/features/")"
+    # best is the baseline 0.10; the worse edits were discarded (file back to empty baseline).
+    printf '%s' "$obj" | jq -e '.diff_pct==0.10' >/dev/null || exit 1
+    [ ! -s "$proj/src/features/home/HomeScreen.tsx" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_visual_repair_patience() {
+  local root="$1" proj="$root/ptp" out="$root/ptout"
+  mkdir -p "$proj/src/features/home" "$out/design"
+  git -C "$proj" init -q && git -C "$proj" config user.email t@t && git -C "$proj" config user.name t
+  : >"$proj/src/features/home/HomeScreen.tsx"; git -C "$proj" add -A; git -C "$proj" commit -qm base
+  : >"$out/design/Home-default-iphone-15.png"; : >"$out/shot.png"; : >"$out/diff.png"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"; . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"; log(){ :; }
+    _an=0; _agent(){ _an=$((_an+1)); printf '%s' "$_an" >"$proj/src/features/home/HomeScreen.tsx"; printf '{}'; }
+    _cap(){ :; }; _ok(){ return 0; }
+    # baseline 0.40; a1 0.30, a2 0.20 (best); a3 0.205, a4 0.207 -> 2 non-improving -> stop at 4 (< max 6).
+    _seq=(0.40 0.30 0.20 0.205 0.207 0.20 0.20); _i=0
+    _diffseq(){ printf '%s' "${_seq[$_i]}"; _i=$((_i+1)); return 0; }
+    export NIGHT_SHIFT_VISUAL_REPAIR_EPSILON=0.005 NIGHT_SHIFT_VISUAL_REPAIR_PATIENCE=2
+    NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
+    obj="$(visual_repair_screen "$proj" "$root/pt" "$out" Home default iphone-15 \
+        "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.01 6 _agent _cap _ok "src/features/")"
+    printf '%s' "$obj" | jq -e '.diff_pct==0.20 and (.attempts|length)==4' >/dev/null || exit 1
     exit 0
   ) || return 1
   return 0

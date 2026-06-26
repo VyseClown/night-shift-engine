@@ -69,13 +69,20 @@ visual_repair_screen() {
   local IFS_OLD="$IFS"; IFS=','; read -r -a allow <<<"$allow_csv"; IFS="$IFS_OLD"
   local attempts="[]" unmet="[]" cur="" n=0 snap="$tmpbase/snap" passed=0 agent_out
   local _pct_file="$tmpbase/_pct"
+  local best_pct="" best_snap="$tmpbase/best" best_shot="$tmpbase/best.shot" best_diff="$tmpbase/best.diff" stall=0
+  local epsilon="${NIGHT_SHIFT_VISUAL_REPAIR_EPSILON:-0.005}" patience="${NIGHT_SHIFT_VISUAL_REPAIR_PATIENCE:-2}"
   mkdir -p "$tmpbase"
+  # Seed "best" with the pre-repair baseline: if no attempt beats it, end on no change.
+  if visual_repair_diff "$ref" "$shot" "$diff_img" >"$_pct_file" 2>/dev/null; then
+    best_pct="$(cat "$_pct_file")"
+    visual_repair_snapshot "$project" "$best_snap" "${allow[@]}"
+    cp "$shot" "$best_shot" 2>/dev/null || true; cp "$diff_img" "$best_diff" 2>/dev/null || true
+  fi
   while [ "$n" -lt "$max" ]; do
     n=$((n+1))
     visual_repair_snapshot "$project" "$snap" "${allow[@]}"
     agent_out="$("$agent_fn" "$screen" "$state" "$ref" "$shot" "$diff_img" "$cur" "$tol" "$out_dir" 2>/dev/null || printf '{}')"
     unmet="$(printf '%s' "$agent_out" | jq -c '.unmet_brief // []' 2>/dev/null || printf '[]')"
-    # scope + validation gate; revert this attempt on failure and stop.
     if ! visual_repair_scope_check "$project" "${allow[@]}" || ! "$validate_fn" "$project"; then
       log "visual-repair: $screen attempt $n failed scope/validation; reverting"
       visual_repair_restore "$project" "$snap" "${allow[@]}"
@@ -83,9 +90,6 @@ visual_repair_screen() {
         '. + [{attempt:$a, diff_pct:0, pass:false, analysis:"reverted: scope/validation failed", screenshot:$s, diff_image:$d}]')"
       break
     fi
-    # Capture + diff, with one retry if the diff COMPUTATION fails (a bad/blank
-    # screenshot — e.g. captured while Metro was still rebuilding). A diff that
-    # succeeds (even high) is a real signal and is not retried.
     local _try=0 _dok=0
     while [ "$_try" -lt 2 ]; do
       _try=$((_try+1))
@@ -99,10 +103,25 @@ visual_repair_screen() {
     attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --argjson p "$cur" --argjson ps "$pass" \
       --arg s "$shot" --arg d "$diff_img" \
       '. + [{attempt:$a, diff_pct:$p, pass:$ps, analysis:"", screenshot:$s, diff_image:$d}]')"
-    if [ "$pass" = "true" ]; then passed=1; break; fi
+    local improved; improved="$(LC_ALL=C awk -v c="$cur" -v b="$best_pct" -v e="$epsilon" 'BEGIN{ if (b=="") print "yes"; else print (c <= b - e)?"yes":"no" }')"
+    if [ "$improved" = "yes" ]; then
+      best_pct="$cur"; visual_repair_snapshot "$project" "$best_snap" "${allow[@]}"
+      cp "$shot" "$best_shot" 2>/dev/null || true; cp "$diff_img" "$best_diff" 2>/dev/null || true
+      stall=0
+    else
+      stall=$((stall+1))
+    fi
+    if [ "$pass" = "true" ]; then break; fi
+    [ "$stall" -ge "$patience" ] && { log "visual-repair: $screen improvement stalled; stopping"; break; }
   done
-  # If cur is still empty (e.g. early break before any diff ran), default to 1.
+  # End on the best: restore the best code + images.
+  if [ -d "$best_snap" ]; then
+    visual_repair_restore "$project" "$best_snap" "${allow[@]}"
+    cp "$best_shot" "$shot" 2>/dev/null || true; cp "$best_diff" "$diff_img" 2>/dev/null || true
+    cur="$best_pct"
+  fi
   [ -n "$cur" ] || cur="1"
+  passed="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?1:0}')"
   visual_assemble_screen "$screen" "$state" "$device" "$ref" "$shot" "$cur" "$tol" "$diff_img" "" "$attempts" "$unmet"
   [ "$passed" = "1" ]
 }
