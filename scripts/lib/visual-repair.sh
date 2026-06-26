@@ -179,9 +179,10 @@ spec_design_sections() {
   awk '/^## /{ p = ($0 ~ /^## (Design Contract|Design source)/) ? 1 : 0 } p' "$1"
 }
 
-# Fetch node $node's Figma design data (Dev Mode specs + annotations) via the MCP and
-# write concise design notes to $cache, ONCE — the repair agent then Reads $cache each
-# attempt instead of calling get_figma_data live (cuts Figma API volume; avoids 429).
+# Fetch node $node's Figma design data via the MCP and write the COMPLETE raw
+# get_figma_data result to $cache as JSON, verbatim (no summary), ONCE — the repair
+# agent then Reads $cache each attempt instead of calling get_figma_data live (cuts
+# Figma API volume; avoids 429; preserves per-element fills/gradients/layers).
 # Caches (skips if $cache exists). Degrades cleanly (non-zero) if claude/MCP unavailable.
 visual_stage_figma_data() {
   local key="$1" node="$2" cache="$3" prompt
