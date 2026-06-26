@@ -157,6 +157,9 @@ run_dry_fixtures() {
   fixture_assert "visual report status: absent/malformed/valid classification" fixture_visual_report_status "$root"
   fixture_assert "visual capture uses explicit udid, else resolves internally" fixture_visual_capture_udid_arg "$root"
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
+  fixture_assert "visual_stage_ref exports a Figma node via the MCP (claude -p), caches, degrades" fixture_visual_stage_ref "$root"
+  fixture_assert "visual_stage_refs_for_spec stages the Design-Contract matrix via the MCP" fixture_visual_stage_refs_for_spec "$root"
+  fixture_assert "visual-review.sh exports refs via the MCP, no FIGMA_TOKEN/REST" fixture_visual_review_no_token "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
   fixture_assert "visual capture maestro-drive times out a hung flow (no infinite hang)" fixture_visual_capture_maestro_timeout "$root"
   fixture_assert "visual capture pins status bar with a simctl-valid HH:MM time" fixture_visual_capture_statusbar_time "$root"
@@ -186,6 +189,7 @@ run_dry_fixtures() {
   fixture_assert "visual-repair helpers (devices/node/key/label) in shared lib" fixture_visual_repair_helpers "$root"
   fixture_assert "visual_repair_for_spec builds TSV + parameterizes paths by candidate_label" fixture_visual_repair_for_spec "$root"
   fixture_assert "run_visual: VISUAL_REPAIR constant + lib sourced + repair branch gated" fixture_run_visual_repair_gate "$root"
+  fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -2144,6 +2148,73 @@ STUB
   )
 }
 
+fixture_visual_stage_ref() {
+  local root="$1" d="$root/vsr"
+  mkdir -p "$d/bin"
+  cat >"$d/bin/claude" <<STUB
+#!/usr/bin/env bash
+printf 'called\n' >>"$d/claude.log"
+p="\$(cat)"   # prompt via stdin
+out="\$(printf '%s' "\$p" | grep -oE '/[^ ]+\.png' | head -1)"
+[ -n "\$out" ] && printf x >"\$out"
+exit 0
+STUB
+  chmod +x "$d/bin/claude"
+  # (a) stages via MCP: out doesn't exist -> claude stub writes it.
+  (
+    export PATH="$d/bin:$PATH"
+    visual_stage_ref ABC123 1:1548 "$d/design/Home-default-iphone-15.png" || exit 1
+    [ -s "$d/design/Home-default-iphone-15.png" ] || exit 1
+    grep -q called "$d/claude.log" || exit 1
+  ) || return 1
+  # (b) caches: out already exists -> returns 0 WITHOUT calling claude.
+  : >"$d/claude.log"
+  (
+    export PATH="$d/bin:$PATH"
+    visual_stage_ref ABC123 1:1548 "$d/design/Home-default-iphone-15.png" || exit 1
+    [ -s "$d/claude.log" ] && exit 1   # claude must NOT have been called
+    exit 0
+  ) || return 1
+  # (c) degrades: no claude on PATH -> non-zero, no file.
+  (
+    export PATH="/usr/bin:/bin"
+    ! visual_stage_ref ABC123 1:1548 "$d/n.png" || exit 1
+    [ -e "$d/n.png" ] && exit 1
+    exit 0
+  ) || return 1
+  # (d) empty key/node -> non-zero.
+  ( export PATH="$d/bin:$PATH"; ! visual_stage_ref "" 1:1548 "$d/e.png" || exit 1 ) || return 1
+  return 0
+}
+
+fixture_visual_stage_refs_for_spec() {
+  local root="$1" d="$root/vsrs"
+  mkdir -p "$d/bin" "$d/out"
+  cat >"$d/bin/claude" <<STUB
+#!/usr/bin/env bash
+out="\$(cat | grep -oE '/[^ ]+\.png' | head -1)"; [ -n "\$out" ] && printf x >"\$out"; exit 0
+STUB
+  chmod +x "$d/bin/claude"
+  cat >"$d/spec.md" <<'SPEC'
+## Design Contract
+- Figma file: Demo, fileKey `ABC123`
+- Frames: Home
+- Figma node IDs: Home = `1:1548`
+- Devices: iphone-15
+- Required states: default
+- Tolerance: 0.12
+SPEC
+  (
+    export PATH="$d/bin:$PATH"
+    visual_stage_refs_for_spec "$d/spec.md" "$d/out"
+    [ -s "$d/out/design/Home-default-iphone-15.png" ] || exit 1
+  ) || return 1
+  # no fileKey -> returns 0, stages nothing.
+  printf '## Design Contract\n- Frames: Home\n- Devices: iphone-15\n- Required states: default\n' >"$d/nokey.md"
+  ( export PATH="$d/bin:$PATH"; visual_stage_refs_for_spec "$d/nokey.md" "$d/out2" || exit 1; [ -d "$d/out2/design" ] && [ -n "$(ls -A "$d/out2/design" 2>/dev/null)" ] && exit 1; exit 0 ) || return 1
+  return 0
+}
+
 fixture_visual_capture_maestro() {
   local root="$1" d="$root/vmae"
   mkdir -p "$d/bin" "$d/flows"
@@ -2611,6 +2682,14 @@ JSON
   return 0
 }
 
+fixture_visual_review_no_token() {
+  local f="$WORKSPACE_ROOT/scripts/visual-review.sh"
+  grep -q "FIGMA_TOKEN" "$f" && return 1
+  grep -q "api.figma.com" "$f" && return 1
+  grep -q "visual_stage_refs_for_spec" "$f" || return 1
+  return 0
+}
+
 fixture_run_visual_repair_gate() {
   # lib is sourced
   grep -q '\. "\$NIGHT_SHIFT_LIB/visual-repair.sh"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
@@ -2624,6 +2703,18 @@ fixture_run_visual_repair_gate() {
   awk '/^run_visual_inloop_repair\(\)/{f=1} f&&/return 0/{print NR; exit}' "$WORKSPACE_ROOT/scripts/night-shift.sh" | head -1 | grep -q '[0-9]' || return 1
   # and the very first guard line references VISUAL_REPAIR
   awk '/^run_visual_inloop_repair\(\)/{f=1} f&&/VISUAL_REPAIR/{print "ok"; exit}' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q ok || return 1
+  return 0
+}
+
+fixture_run_visual_stages_refs() {
+  local body
+  body="$(sed -n '/^run_visual()/,/^}/p' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+  printf '%s' "$body" | grep -q 'visual_stage_refs_for_spec "$SPEC" "$RUN_ROOT/validated"' || return 1
+  # staging must come BEFORE the capture call.
+  local sline cline
+  sline="$(printf '%s\n' "$body" | grep -n 'visual_stage_refs_for_spec' | head -1 | cut -d: -f1)"
+  cline="$(printf '%s\n' "$body" | grep -n 'run_visual_capture "$SPEC"' | head -1 | cut -d: -f1)"
+  [ -n "$sline" ] && [ -n "$cline" ] && [ "$sline" -lt "$cline" ] || return 1
   return 0
 }
 

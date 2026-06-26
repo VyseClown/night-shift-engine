@@ -47,8 +47,9 @@
 #       <scheme>://preview?screen=<Screen>&state=<state>
 #     rendering each screen deterministically (seeded fixtures). Build this via the
 #     `visual-review-validation` night-shift spec; without it, capture SKIPs.
-#   - For reference export (unless --no-refs): FIGMA_TOKEN (a Figma personal access
-#     token). Without it, pre-stage references yourself under <out>/design/.
+#   - For reference export (unless --no-refs): the Figma MCP (the `claude` CLI with
+#     `mcp__figma__download_figma_images`). Without it, pre-stage references under
+#     <out>/design/.
 #
 # Exit status: 0 if every captured screen passed its tolerance (or all SKIPped
 # cleanly), 1 if any screen exceeded tolerance, 2 on a setup error.
@@ -178,34 +179,8 @@ build_and_install() {
 }
 
 # ---- stage 2: stage Figma reference images ----------------------------------
-# Export one Figma node to a PNG via the Figma REST API, with 429 backoff.
-stage_ref() {
-  local key="$1" node="$2" out="$3" attempt=0 wait=4 url
-  [ -s "$out" ] && return 0          # already staged
-  [ -n "${FIGMA_TOKEN:-}" ] || { log "  no FIGMA_TOKEN — cannot export $node (pre-stage $out yourself)"; return 1; }
-  while [ "$attempt" -lt 5 ]; do
-    url="$(curl -s -H "X-Figma-Token: $FIGMA_TOKEN" \
-      "https://api.figma.com/v1/images/${key}?ids=${node}&format=png&scale=2" \
-      | jq -r --arg n "$node" '.images[$n] // empty')"
-    if [ -n "$url" ] && [ "$url" != "null" ]; then
-      curl -s "$url" -o "$out" && [ -s "$out" ] && return 0
-    fi
-    attempt=$((attempt + 1)); log "  figma export retry $attempt for $node (waiting ${wait}s)"; sleep "$wait"; wait=$((wait * 2))
-  done
-  log "  WARN: could not export Figma node $node after retries"; return 1
-}
-
-stage_refs_for_spec() {
-  local spec="$1" out_dir="$2" key screen state device ref
-  key="$(figma_key_for "$spec")"
-  [ -n "$key" ] || { log "  no fileKey in $spec Design Contract; skipping refs"; return 0; }
-  while IFS='|' read -r screen state device; do
-    [ -n "$screen" ] || continue
-    ref="$out_dir/design/${screen}-${state}-${device}.png"
-    [ -s "$ref" ] && continue
-    stage_ref "$key" "$(node_id_for "$spec" "$screen")" "$ref" || true
-  done < <(visual_capture_screens "$spec")
-}
+# Reference staging now uses the shared visual_stage_refs_for_spec (visual-repair.sh),
+# which leverages the Figma MCP (claude -p download_figma_images).
 
 # ---- stage 3+4: capture, diff, report ---------------------------------------
 review_spec() {
@@ -214,7 +189,7 @@ review_spec() {
   out_dir="$OUT/$base"; mkdir -p "$out_dir/design"
   # Share the staged design refs across specs via the common design/ pool.
   cp -n "$OUT"/design/*.png "$out_dir/design/" 2>/dev/null || true
-  [ "$NO_REFS" -eq 1 ] || stage_refs_for_spec "$spec" "$out_dir"
+  [ "$NO_REFS" -eq 1 ] || visual_stage_refs_for_spec "$spec" "$out_dir"
   log "stage 3/4: capture + diff — $base"
   run_visual_capture "$spec" "review" "$out_dir" || true
   report="$out_dir/visual-diff-$base.json"

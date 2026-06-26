@@ -1369,8 +1369,9 @@ visual_stage_enabled() {
   grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
 }
 
-# The visual_review stage handler. Engine-invoked: the engine itself runs the
-# design-fidelity capture (Figma reference -> iOS-simulator screenshot -> pixel
+# The visual_review stage handler. Engine-invoked: the engine itself stages the Figma
+# references via the MCP (scripts/lib/visual-repair.sh visual_stage_refs_for_spec) then
+# runs the design-fidelity capture (Figma reference -> iOS-simulator screenshot -> pixel
 # diff) via scripts/lib/visual-capture.sh, producing validated/visual-diff-<spec>.json,
 # then advances to the observer (which reviews the candidate + the report; per-screen
 # pass/fail is the observer's concern, a failing report still flows as evidence).
@@ -1384,6 +1385,7 @@ run_visual() {
   [ "${NIGHT_SHIFT_DEVICE_REGISTRY:-0}" = "1" ] && device_registry_prune
   candidate="$(jq -r '.candidate // .candidate_commits[-1] // empty' "$STATE")"
   [ -n "$candidate" ] || block_run "visual_review reached without a candidate commit"
+  visual_stage_refs_for_spec "$SPEC" "$RUN_ROOT/validated"
   run_visual_capture "$SPEC" "$candidate" "$RUN_ROOT/validated" || true
   report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
   case "$(visual_report_status "$report")" in
