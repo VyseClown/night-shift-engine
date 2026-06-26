@@ -2850,12 +2850,17 @@ fixture_repair_agent_cached() {
   body="$(sed -n '/^repair_agent()/,/^}/p' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh")"
   # opus model knob present
   printf '%s' "$body" | grep -q 'NIGHT_SHIFT_VISUAL_REPAIR_MODEL' || return 1
-  # MCP get_figma_data dropped from the agent's allowlist
+  # MCP get_figma_data NOT in the agent's allowlist (it reads the cache)
   printf '%s' "$body" | grep -q 'mcp__figma__get_figma_data' && return 1
-  # the agent reads the per-screen Figma cache
-  printf '%s' "$body" | grep -q '\-figma\.md' || return 1
-  # the pre-fetch CALL (not just the definition) is wired into the orchestration
+  # the agent reads the RAW json cache (not the old .md prose)
+  printf '%s' "$body" | grep -q '\-figma\.json' || return 1
+  printf '%s' "$body" | grep -q '\-figma\.md' && return 1
+  # the agent interpolates the spec's design sections
+  printf '%s' "$body" | grep -q 'spec_design_sections' || return 1
+  # the orchestration sets REPAIR_SPEC and pre-fetches the .json cache
+  grep -q 'REPAIR_SPEC=' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
   grep -qF 'visual_stage_figma_data "$REPAIR_FILEKEY"' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
+  grep -q '\-figma\.json"' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
   return 0
 }
 
