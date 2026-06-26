@@ -78,17 +78,19 @@ visual_repair_screen() {
     visual_repair_snapshot "$project" "$best_snap" "${allow[@]}"
     cp "$shot" "$best_shot" 2>/dev/null || true; cp "$diff_img" "$best_diff" 2>/dev/null || true
   fi
-  # Baseline ("before") audit entry + image copies (attempt 0).
+  # Baseline ("before") audit entry + image copies. Numbered attempt 1 (the schema
+  # requires attempt>=1); agent repairs are numbered from 2 below.
   if [ -n "$best_pct" ]; then
-    cp "$shot" "${shot%.png}.attempt-0.png" 2>/dev/null || true
-    cp "$diff_img" "${diff_img%.png}.attempt-0.png" 2>/dev/null || true
+    cp "$shot" "${shot%.png}.attempt-1.png" 2>/dev/null || true
+    cp "$diff_img" "${diff_img%.png}.attempt-1.png" 2>/dev/null || true
     local _bpass; _bpass="$(LC_ALL=C awk -v p="$best_pct" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
     attempts="$(printf '%s' "$attempts" | jq -c --argjson p "$best_pct" --argjson ps "$_bpass" \
-      --arg s "${shot%.png}.attempt-0.png" --arg d "${diff_img%.png}.attempt-0.png" \
-      '. + [{attempt:0, diff_pct:$p, pass:$ps, analysis:"baseline (before repair)", screenshot:$s, diff_image:$d}]')"
+      --arg s "${shot%.png}.attempt-1.png" --arg d "${diff_img%.png}.attempt-1.png" \
+      '. + [{attempt:1, diff_pct:$p, pass:$ps, analysis:"baseline (before repair)", screenshot:$s, diff_image:$d}]')"
   fi
   while [ "$n" -lt "$max" ]; do
     n=$((n+1))
+    local dn=$((n+1))   # displayed/recorded attempt number (baseline is 1; repairs from 2)
     visual_repair_snapshot "$project" "$snap" "${allow[@]}"
     agent_out="$("$agent_fn" "$screen" "$state" "$ref" "$shot" "$diff_img" "$cur" "$tol" "$out_dir" 2>/dev/null || printf '{}')"
     unmet="$(printf '%s' "$agent_out" | jq -c '.unmet_brief // []' 2>/dev/null || printf '[]')"
@@ -96,7 +98,7 @@ visual_repair_screen() {
     if ! visual_repair_scope_check "$project" "${allow[@]}" || ! "$validate_fn" "$project"; then
       log "visual-repair: $screen attempt $n failed scope/validation; reverting"
       visual_repair_restore "$project" "$snap" "${allow[@]}"
-      attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --arg s "$shot" --arg d "$diff_img" \
+      attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$dn" --arg s "$shot" --arg d "$diff_img" \
         '. + [{attempt:$a, diff_pct:0, pass:false, analysis:"reverted: scope/validation failed", screenshot:$s, diff_image:$d}]')"
       break
     fi
@@ -109,11 +111,11 @@ visual_repair_screen() {
     done
     [ "$_dok" = "1" ] || printf '1' >"$_pct_file"
     cur="$(cat "$_pct_file")"
-    cp "$shot" "${shot%.png}.attempt-$n.png" 2>/dev/null || true
-    cp "$diff_img" "${diff_img%.png}.attempt-$n.png" 2>/dev/null || true
+    cp "$shot" "${shot%.png}.attempt-$dn.png" 2>/dev/null || true
+    cp "$diff_img" "${diff_img%.png}.attempt-$dn.png" 2>/dev/null || true
     local pass; pass="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
-    attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$n" --argjson p "$cur" --argjson ps "$pass" \
-      --arg an "$changed" --arg s "${shot%.png}.attempt-$n.png" --arg d "${diff_img%.png}.attempt-$n.png" \
+    attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$dn" --argjson p "$cur" --argjson ps "$pass" \
+      --arg an "$changed" --arg s "${shot%.png}.attempt-$dn.png" --arg d "${diff_img%.png}.attempt-$dn.png" \
       '. + [{attempt:$a, diff_pct:$p, pass:$ps, analysis:$an, screenshot:$s, diff_image:$d}]')"
     local improved; improved="$(LC_ALL=C awk -v c="$cur" -v b="$best_pct" -v e="$epsilon" 'BEGIN{ if (b=="") print "yes"; else print (c <= b - e)?"yes":"no" }')"
     if [ "$improved" = "yes" ]; then

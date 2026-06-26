@@ -2644,10 +2644,11 @@ fixture_visual_repair_audit() {
     NIGHT_SHIFT_VISUAL_DIFF_FN=_diffseq
     obj="$(visual_repair_screen "$proj" "$root/at" "$out" Home default iphone-15 \
         "$out/design/Home-default-iphone-15.png" "$out/shot.png" "$out/diff.png" 0.01 3 _agent _cap _ok "src/features/")"
-    # baseline attempt-0 + 3 attempts, each a distinct screenshot path that exists; analysis carried.
-    printf '%s' "$obj" | jq -e '(.attempts|length)==4 and (.attempts[0].attempt==0) and (.attempts[0].analysis|test("baseline")) and (.attempts[2].analysis=="grew ring") and .analysis=="grew ring"' >/dev/null || exit 1
-    [ -s "$out/shot.attempt-0.png" ] && [ -s "$out/shot.attempt-1.png" ] && [ -s "$out/shot.attempt-2.png" ] || exit 1
-    [ "$(printf '%s' "$obj" | jq -r '.attempts[2].screenshot')" = "$out/shot.attempt-2.png" ] || exit 1
+    # baseline (attempt 1) + 3 repair attempts (2,3,4); distinct screenshots that exist;
+    # analysis carried. EVERY attempt number must be >= 1 (the schema/viewer enforce it).
+    printf '%s' "$obj" | jq -e '(.attempts|length)==4 and (.attempts|all(.attempt>=1)) and (.attempts[0].attempt==1) and (.attempts[0].analysis|test("baseline")) and (.attempts[2].analysis=="grew ring") and .analysis=="grew ring"' >/dev/null || exit 1
+    [ -s "$out/shot.attempt-1.png" ] && [ -s "$out/shot.attempt-2.png" ] && [ -s "$out/shot.attempt-3.png" ] || exit 1
+    [ "$(printf '%s' "$obj" | jq -r '.attempts[2].screenshot')" = "$out/shot.attempt-3.png" ] || exit 1
     exit 0
   ) || return 1
   return 0

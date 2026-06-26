@@ -74,10 +74,11 @@ screen, overwritten every attempt — so every `attempts[]` row points at the sa
 and the progression is lost. This increment preserves them:
 
 - **Baseline ("before").** Before the loop, copy the incoming pre-repair `shot` and
-  `diff_img` to `<base>.attempt-0.png` (screenshots and diffs dirs respectively), and
-  prepend an `attempt: 0` entry to `attempts[]` with `analysis: "baseline (before
-  repair)"`, its `diff_pct` = the baseline diff, `pass` = (baseline ≤ tol), and
-  `screenshot`/`diff_image` = those `.attempt-0` paths.
+  `diff_img` to `<base>.attempt-1.png` (screenshots and diffs dirs respectively), and
+  prepend a baseline entry to `attempts[]` numbered **`attempt: 1`** (the `visual-diff`
+  schema requires `attempt >= 1`, enforced by the viewer; agent repairs are numbered
+  from 2) with `analysis: "baseline (before repair)"`, its `diff_pct` = the baseline
+  diff, `pass` = (baseline ≤ tol), and `screenshot`/`diff_image` = those `.attempt-1` paths.
 - **Per attempt N (1..).** After the attempt's capture+diff, copy the just-captured
   `shot`/`diff_img` to `<base>.attempt-N.png` and record **those** paths in the
   attempt's `screenshot`/`diff_image` (not the shared canonical path). For a
@@ -150,7 +151,7 @@ file) so "ended on the best attempt's code" is checkable.
   passes (a passing attempt still ends the loop and returns success).
 - **audit trail (images + analysis):** with a capture stub that writes a *distinct*
   byte per attempt to the canonical `shot`, and an agent returning
-  `{"changed":"grew ring","unmet_brief":[]}`, assert the report has an `attempt: 0`
+  `{"changed":"grew ring","unmet_brief":[]}`, assert the report has an `attempt: 1`
   baseline entry plus one entry per attempt, each with a **distinct** `screenshot`
   path ending `.attempt-<N>.png` that **exists on disk**, and `attempts[k].analysis
   == "grew ring"`; and the screen-level `analysis == "grew ring"` (best attempt's).
