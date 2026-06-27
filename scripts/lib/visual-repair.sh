@@ -270,6 +270,15 @@ repair_metro_reset() {
 # (wall-clock deadline NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT). Fallback: repair_metro_reset.
 # Returns non-zero when Metro is unreachable (caller degrades to a plain re-capture).
 __visual_force_fresh_bundle() {
+  # Known deferred caveats (both bounded; neither requires a logic change here):
+  # 1. FIRST-ATTEMPT cold start: prevhash is absent (prev=""), so the poll accepts the
+  #    first non-empty hash immediately without waiting for a change. In practice the
+  #    preceding tsc/eslint validate gate gives Metro time to recompile; confirm on
+  #    real hardware (Task 3).
+  # 2. POST-RESET unconditional write: after repair_metro_reset the new hash is always
+  #    written back (a --reset-cache restart is a fresh bundle by definition). A genuine
+  #    no-op edit may trigger a re-reset on the next attempt, but this is bounded by
+  #    the repair loop's max-attempts cap.
   local hf="${NIGHT_SHIFT_VISUAL_PREVHASH_FILE:-}" prev="" \
         timeout="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT:-25}" \
         interval="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL:-2}" \

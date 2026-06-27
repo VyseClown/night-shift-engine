@@ -2912,13 +2912,19 @@ STUB
   ) || { wait; return 1; }
   wait
 
-  # (b) fallback: bytes never change within the deadline -> reset fires exactly once.
+  # (b) fallback: bytes never change within the deadline -> reset fires exactly once,
+  #     AND the stub models a real reset by mutating the served bundle so prevhash is
+  #     written with the POST-RESET hash (a regression where the old hash is written
+  #     back would pass the grep-count assertion but fail the hash assertion below).
   printf 'same' >"$d/served"; printf '%s' "$(printf 'same' | shasum | awk '{print $1}')" >"$d/prevhash"; : >"$d/reset.log"
   (
     export PATH="$d/bin:$PATH"
-    repair_metro_reset() { echo reset >>"$d/reset.log"; }
+    repair_metro_reset() { echo reset >>"$d/reset.log"; printf 'afterreset' >"$d/served"; }
     __visual_force_fresh_bundle >/dev/null 2>&1 || true
     [ "$(grep -c reset "$d/reset.log" 2>/dev/null || echo 0)" = "1" ] || exit 1
+    expected="$(printf 'afterreset' | shasum | awk '{print $1}')"
+    got="$(cat "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || echo '')"
+    [ "$got" = "$expected" ] || exit 1
     exit 0
   ) || return 1
 
