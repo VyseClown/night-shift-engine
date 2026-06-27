@@ -210,7 +210,7 @@ _REPAIR_METRO_STARTED=0
 
 # True when a Metro bundler already answers on the dev port.
 metro_is_up() {
-  curl -s -o /dev/null "http://localhost:${NIGHT_SHIFT_METRO_PORT:-8081}/status" 2>/dev/null
+  curl -s -m 5 -o /dev/null "http://localhost:${NIGHT_SHIFT_METRO_PORT:-8081}/status" 2>/dev/null
 }
 
 # shellcheck disable=SC2153  # PROJECT/NO_BUILD are caller-set globals (documented interface)
@@ -263,9 +263,12 @@ __visual_entry_bundle_url() {
 }
 
 # Hash Metro's currently-served iOS bundle (empty + non-zero when Metro is unreachable).
+# Bounded: Metro's /…bundle request blocks until the bundle is compiled, so a stalled
+# --reset-cache rebuild would otherwise hang this curl (and the freshness poll) forever.
+# --connect-timeout fails fast on a dead Metro; -m caps a legitimate (slow) compile.
 __visual_bundle_hash() {
   local url="${NIGHT_SHIFT_PREVIEW_BUNDLE_URL:-http://localhost:${NIGHT_SHIFT_METRO_PORT:-8081}/index.bundle?platform=ios&dev=true}" body
-  body="$(curl -s "$url" 2>/dev/null)" || return 1
+  body="$(curl -s --connect-timeout 5 -m "${NIGHT_SHIFT_VISUAL_BUNDLE_CURL_TIMEOUT:-90}" "$url" 2>/dev/null)" || return 1
   [ -n "$body" ] || return 1
   printf '%s' "$body" | shasum 2>/dev/null | awk '{print $1}'
 }
@@ -301,7 +304,7 @@ __visual_force_fresh_bundle() {
         interval="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL:-2}" \
         port="${NIGHT_SHIFT_METRO_PORT:-8081}" deadline h
   [ -n "$hf" ] && [ -f "$hf" ] && prev="$(cat "$hf")"
-  curl -s -o /dev/null "http://localhost:${port}/reload" 2>/dev/null || true
+  curl -s -m 10 -o /dev/null "http://localhost:${port}/reload" 2>/dev/null || true
   [ -n "${REPAIR_TOUCH_GLOB:-}" ] && find "${REPAIR_TOUCH_GLOB}" -type f -exec touch {} + 2>/dev/null || true
   deadline=$(( $(date +%s) + timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -402,7 +405,10 @@ visual_repair_run() {
   while IFS=$'\t' read -r _ screen state device; do
     [ -n "$screen" ] || continue
     [ "$used" -lt "$cap" ] || { log "visual-repair: global cap $cap reached; stopping"; break; }
-    out="$("$repair_one_fn" "$screen" "$state" "$device" 2>/dev/null | tail -n1)"
+    # Do NOT discard stderr here: the per-screen repair's diagnostics (agent, scope/
+    # validate, freshness poll, resets, stalls) all log to stderr — swallowing them
+    # made the whole loop unobservable. Only stdout's last line is the attempt count.
+    out="$("$repair_one_fn" "$screen" "$state" "$device" | tail -n1)"
     case "$out" in (''|*[!0-9]*) out=1 ;; esac
     used=$((used + out))
   done < <(sort -t"$(printf '\t')" -k1,1 -rn "$tsv")
