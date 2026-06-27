@@ -95,6 +95,7 @@ visual_repair_screen() {
     agent_out="$("$agent_fn" "$screen" "$state" "$ref" "$shot" "$diff_img" "$cur" "$tol" "$out_dir" 2>/dev/null || printf '{}')"
     unmet="$(printf '%s' "$agent_out" | jq -c '.unmet_brief // []' 2>/dev/null || printf '[]')"
     local changed; changed="$(printf '%s' "$agent_out" | jq -r '.changed // ""' 2>/dev/null || printf '')"
+    log "visual-repair: $screen attempt $dn — agent reported: ${changed:-<none>}; working-tree: $(git -C "$project" diff --stat 2>/dev/null | tail -1 | sed 's/^ *//')"
     if ! visual_repair_scope_check "$project" "${allow[@]}" || ! "$validate_fn" "$project"; then
       log "visual-repair: $screen attempt $n failed scope/validation; reverting"
       visual_repair_restore "$project" "$snap" "${allow[@]}"
@@ -114,6 +115,7 @@ visual_repair_screen() {
     cp "$shot" "${shot%.png}.attempt-$dn.png" 2>/dev/null || true
     cp "$diff_img" "${diff_img%.png}.attempt-$dn.png" 2>/dev/null || true
     local pass; pass="$(LC_ALL=C awk -v p="$cur" -v t="$tol" 'BEGIN{print (p<=t)?"true":"false"}')"
+    log "visual-repair: $screen attempt $dn — diff_pct=$cur tol=$tol pass=$pass"
     attempts="$(printf '%s' "$attempts" | jq -c --argjson a "$dn" --argjson p "$cur" --argjson ps "$pass" \
       --arg an "$changed" --arg s "${shot%.png}.attempt-$dn.png" --arg d "${diff_img%.png}.attempt-$dn.png" \
       '. + [{attempt:$a, diff_pct:$p, pass:$ps, analysis:$an, screenshot:$s, diff_image:$d}]')"
@@ -309,7 +311,7 @@ __visual_force_fresh_bundle() {
   deadline=$(( $(date +%s) + timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     h="$(__visual_bundle_hash)" || return 1
-    if [ -n "$h" ] && [ -n "$prev" ] && [ "$h" != "$prev" ]; then [ -n "$hf" ] && printf '%s' "$h" >"$hf"; return 0; fi
+    if [ -n "$h" ] && [ -n "$prev" ] && [ "$h" != "$prev" ]; then log "visual-repair: fresh bundle served (hash changed from pre-edit)"; [ -n "$hf" ] && printf '%s' "$h" >"$hf"; return 0; fi
     sleep "$interval"
   done
   log "visual-repair: bundle unchanged after ${timeout}s; resetting Metro"
@@ -351,9 +353,16 @@ When done, print ONLY a JSON object: {\"changed\":\"<one concise line describing
   # positional prompt ("Input must be provided…") and the agent silently no-ops.
   # Tools are comma-separated — a single space-joined string is parsed as ONE
   # (invalid) tool name, leaving the agent with no tools. (Proven by the smoke.)
+  local _err; _err="$(mktemp)"
   result="$(cd "$PROJECT" && printf '%s' "$prompt" | claude -p --output-format json \
     --model "${NIGHT_SHIFT_VISUAL_REPAIR_MODEL:-claude-opus-4-8}" \
-    --allowed-tools "Read,Edit,Write,Bash(npx tsc*),Bash(npx eslint*)" 2>/dev/null)"
+    --allowed-tools "Read,Edit,Write,Bash(npx tsc*),Bash(npx eslint*)" 2>"$_err")"
+  local _rc=$?
+  # Surface agent failures instead of silently degrading to {} (a no-op repair).
+  if [ "$_rc" -ne 0 ] || [ -z "$result" ] || printf '%s' "$result" | jq -e '.is_error == true' >/dev/null 2>&1; then
+    log "visual-repair: $screen repair agent issue (claude rc=$_rc, result_len=${#result}): $(head -c 200 "$_err" 2>/dev/null | tr '\n' ' ')"
+  fi
+  rm -f "$_err"
   printf '%s' "$result" | jq -r '.result // "{}"' 2>/dev/null | grep -o '{.*}' | tail -n1
   [ -n "$result" ]
 }
