@@ -194,7 +194,7 @@ run_dry_fixtures() {
   fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
   fixture_assert "repair agent runs on the opus knob + reads the cached Figma data (no live get_figma_data)" fixture_repair_agent_cached "$root"
   fixture_assert "repair_metro_start reuses an existing :8081 Metro; stop kills only an engine-started one" fixture_repair_metro "$root"
-  fixture_assert "bundle freshness: polls, resets only on timeout, reset is port-scoped + no-rebuild, clean-degrades without Metro" fixture_bundle_freshness "$root"
+  fixture_assert "bundle freshness: seeded-prev race (accepts after change, no reset), empty-prev falls through to reset, resets only on timeout, port-scoped + no-rebuild, clean-degrades without Metro" fixture_bundle_freshness "$root"
   fixture_assert "entry bundle URL derived from package.json main (expo-router, plain index, relative file)" fixture_entry_bundle_url "$root"
   fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
   fixture_assert "repair_recapture_screen: freshness-then-capture order; first-pass never invokes freshness" fixture_recapture_wrapper "$root"
@@ -2901,7 +2901,10 @@ STUB
   export NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT=2 NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL=1
   export NIGHT_SHIFT_VISUAL_PREVHASH_FILE="$d/prevhash"
 
-  # (a) fast path: a background mutation flips the served bytes within the deadline -> NO reset.
+  # (a) fast path: seeded prev + background mutation within deadline -> accepts, NO reset.
+  #     Models the watcher race: Metro serves the pre-edit bundle first (same as prev), then
+  #     flips to new bytes mid-deadline. The poll must NOT accept the stale bytes, then MUST
+  #     accept the new bytes, and must NOT call repair_metro_reset.
   printf 'v1' >"$d/served"; printf '%s' "$(printf 'v1' | shasum | awk '{print $1}')" >"$d/prevhash"; : >"$d/reset.log"
   ( sleep 1; printf 'v2' >"$d/served" ) &
   (
@@ -2909,6 +2912,9 @@ STUB
     repair_metro_reset() { echo reset >>"$d/reset.log"; }
     __visual_force_fresh_bundle || exit 1
     [ -s "$d/reset.log" ] && exit 1   # reset must NOT have fired
+    expected="$(printf 'v2' | shasum | awk '{print $1}')"
+    got="$(cat "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || echo '')"
+    [ "$got" = "$expected" ] || exit 1   # prevhash written with the NEW hash
     exit 0
   ) || { wait; return 1; }
   wait
@@ -2960,6 +2966,24 @@ STUB
     if __visual_force_fresh_bundle >/dev/null 2>&1; then exit 1; fi   # returns non-zero
     exit 0
   ) || return 1
+
+  # (e) empty prev (prevhash file absent): fast-accept must never fire even when Metro
+  #     serves bytes immediately; reset MUST fire (the only path to a guaranteed-fresh
+  #     bundle). This is the defensive guard against the old accept-first bug: with
+  #     prev="" the condition [ -n "$prev" ] is false, so the fast path is skipped
+  #     entirely and we fall through to repair_metro_reset.
+  rm -f "$d/prevhash"; printf 'somebytes' >"$d/served"; : >"$d/reset.log"
+  (
+    export PATH="$d/bin:$PATH"
+    repair_metro_reset() { echo reset >>"$d/reset.log"; printf 'freshbytes' >"$d/served"; }
+    __visual_force_fresh_bundle >/dev/null 2>&1 || true
+    [ "$(grep -c reset "$d/reset.log" 2>/dev/null || echo 0)" = "1" ] || exit 1  # reset fired once
+    expected="$(printf 'freshbytes' | shasum | awk '{print $1}')"
+    got="$(cat "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || echo '')"
+    [ "$got" = "$expected" ] || exit 1   # prevhash written with post-reset hash
+    exit 0
+  ) || return 1
+
   return 0
 }
 

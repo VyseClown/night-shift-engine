@@ -291,15 +291,11 @@ repair_metro_reset() {
 # (wall-clock deadline NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT). Fallback: repair_metro_reset.
 # Returns non-zero when Metro is unreachable (caller degrades to a plain re-capture).
 __visual_force_fresh_bundle() {
-  # Known deferred caveats (both bounded; neither requires a logic change here):
-  # 1. FIRST-ATTEMPT cold start: prevhash is absent (prev=""), so the poll accepts the
-  #    first non-empty hash immediately without waiting for a change. In practice the
-  #    preceding tsc/eslint validate gate gives Metro time to recompile; confirm on
-  #    real hardware (Task 3).
-  # 2. POST-RESET unconditional write: after repair_metro_reset the new hash is always
-  #    written back (a --reset-cache restart is a fresh bundle by definition). A genuine
-  #    no-op edit may trigger a re-reset on the next attempt, but this is bounded by
-  #    the repair loop's max-attempts cap.
+  # prev MUST be non-empty for the fast-accept to fire. _repair_one seeds the prevhash
+  # file with the actual pre-edit bundle hash before any agent edit runs, so prev is
+  # always set on a real repair attempt. When prev is empty (defensive: file absent or
+  # blank) the fast path never fires and we fall through to repair_metro_reset, which
+  # guarantees a fresh --reset-cache bundle.
   local hf="${NIGHT_SHIFT_VISUAL_PREVHASH_FILE:-}" prev="" \
         timeout="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT:-25}" \
         interval="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL:-2}" \
@@ -310,7 +306,7 @@ __visual_force_fresh_bundle() {
   deadline=$(( $(date +%s) + timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     h="$(__visual_bundle_hash)" || return 1
-    if [ -n "$h" ] && [ "$h" != "$prev" ]; then [ -n "$hf" ] && printf '%s' "$h" >"$hf"; return 0; fi
+    if [ -n "$h" ] && [ -n "$prev" ] && [ "$h" != "$prev" ]; then [ -n "$hf" ] && printf '%s' "$h" >"$hf"; return 0; fi
     sleep "$interval"
   done
   log "visual-repair: bundle unchanged after ${timeout}s; resetting Metro"
@@ -377,6 +373,12 @@ visual_repair_for_spec() {
     local sc="$1" st="$2" dv="$3"
     eval "REPAIR_NODE_$sc=\"$(node_id_for "$spec" "$sc")\""
     export NIGHT_SHIFT_VISUAL_PREVHASH_FILE="$out_dir/_rsnap/$sc-prevhash"
+    # Seed the prevhash file with the PRE-EDIT bundle hash so the first repair
+    # attempt's poll waits for a REAL change rather than accepting the first
+    # served hash (which may be the stale pre-edit bundle due to Metro's async
+    # file watcher). Metro is already up and serving at this point.
+    mkdir -p "$(dirname "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE")"
+    __visual_bundle_hash >"$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || true
     export REPAIR_TOUCH_GLOB="$project/${allow_csv%%,*}"
     REPAIR_RESET_DEVICE="$(device_label_to_name "$dv")"
     export REPAIR_RESET_DEVICE
