@@ -195,6 +195,7 @@ run_dry_fixtures() {
   fixture_assert "repair agent runs on the opus knob + reads the cached Figma data (no live get_figma_data)" fixture_repair_agent_cached "$root"
   fixture_assert "repair_metro_start reuses an existing :8081 Metro; stop kills only an engine-started one" fixture_repair_metro "$root"
   fixture_assert "bundle freshness: polls, resets only on timeout, reset is port-scoped + no-rebuild, clean-degrades without Metro" fixture_bundle_freshness "$root"
+  fixture_assert "entry bundle URL derived from package.json main (expo-router, plain index, relative file)" fixture_entry_bundle_url "$root"
   fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
   fixture_assert "repair_recapture_screen: freshness-then-capture order; first-pass never invokes freshness" fixture_recapture_wrapper "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
@@ -2959,6 +2960,37 @@ STUB
     if __visual_force_fresh_bundle >/dev/null 2>&1; then exit 1; fi   # returns non-zero
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_entry_bundle_url() {
+  local root="$1" d="$root/ebu" url
+  mkdir -p "$d"
+  # (a) expo-router bare subpath: no matching file → node_modules/ prefix.
+  printf '{"main":"expo-router/entry"}\n' >"$d/package.json"
+  url="$(__visual_entry_bundle_url "$d" 8081)"
+  case "$url" in *"/node_modules/expo-router/entry.bundle?platform=ios&dev=true") ;; *)
+    printf 'FAIL (a): got %s\n' "$url" >&2; return 1 ;; esac
+  # (b) plain "index" (default / no main field): stays as /index.bundle.
+  printf '{"name":"app"}\n' >"$d/package.json"
+  url="$(__visual_entry_bundle_url "$d" 8081)"
+  case "$url" in *"/index.bundle?platform=ios&dev=true") ;; *)
+    printf 'FAIL (b): got %s\n' "$url" >&2; return 1 ;; esac
+  # (c) explicit "index" value.
+  printf '{"main":"index"}\n' >"$d/package.json"
+  url="$(__visual_entry_bundle_url "$d" 8081)"
+  case "$url" in *"/index.bundle?platform=ios&dev=true") ;; *)
+    printf 'FAIL (c): got %s\n' "$url" >&2; return 1 ;; esac
+  # (d) relative path "./index.js" strips the ./ and extension.
+  printf '{"main":"./index.js"}\n' >"$d/package.json"
+  url="$(__visual_entry_bundle_url "$d" 8081)"
+  case "$url" in *"/index.bundle?platform=ios&dev=true") ;; *)
+    printf 'FAIL (d): got %s\n' "$url" >&2; return 1 ;; esac
+  # (e) honours NIGHT_SHIFT_METRO_PORT via the port argument.
+  printf '{"main":"expo-router/entry"}\n' >"$d/package.json"
+  url="$(__visual_entry_bundle_url "$d" 9090)"
+  case "$url" in "http://localhost:9090/"*) ;; *)
+    printf 'FAIL (e) port: got %s\n' "$url" >&2; return 1 ;; esac
   return 0
 }
 

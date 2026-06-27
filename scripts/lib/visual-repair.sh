@@ -241,10 +241,31 @@ repair_metro_stop() {
   _REPAIR_METRO_PID=""; _REPAIR_METRO_STARTED=0
 }
 
+# Derive Metro's dev-bundle URL for a project from its package.json "main" entry.
+# Bare package subpaths (e.g. "expo-router/entry") resolve under node_modules/;
+# relative files ("./index", "src/main.tsx") resolve as-is. Defaults to index.
+__visual_entry_bundle_url() {
+  local proj="$1" port="${2:-${NIGHT_SHIFT_METRO_PORT:-8081}}" main entry
+  main="$(jq -r '.main // "index"' "$proj/package.json" 2>/dev/null)"
+  [ -n "$main" ] && [ "$main" != "null" ] || main="index"
+  case "$main" in
+    ./*) entry="${main#./}" ;;
+    /*)  entry="${main#/}" ;;
+    */*) if [ -e "$proj/$main" ] || [ -e "$proj/$main.js" ] || [ -e "$proj/$main.ts" ] || [ -e "$proj/$main.tsx" ]; then
+           entry="$main"                # a relative file path inside the project
+         else
+           entry="node_modules/$main"   # a bare package subpath (e.g. expo-router/entry)
+         fi ;;
+    *)   entry="$main" ;;
+  esac
+  entry="${entry%.js}"; entry="${entry%.ts}"; entry="${entry%.tsx}"; entry="${entry%.jsx}"
+  printf 'http://localhost:%s/%s.bundle?platform=ios&dev=true' "$port" "$entry"
+}
+
 # Hash Metro's currently-served iOS bundle (empty + non-zero when Metro is unreachable).
 __visual_bundle_hash() {
-  local port="${NIGHT_SHIFT_METRO_PORT:-8081}" body
-  body="$(curl -s "http://localhost:${port}/index.bundle?platform=ios&dev=true" 2>/dev/null)" || return 1
+  local url="${NIGHT_SHIFT_PREVIEW_BUNDLE_URL:-http://localhost:${NIGHT_SHIFT_METRO_PORT:-8081}/index.bundle?platform=ios&dev=true}" body
+  body="$(curl -s "$url" 2>/dev/null)" || return 1
   [ -n "$body" ] || return 1
   printf '%s' "$body" | shasum 2>/dev/null | awk '{print $1}'
 }
@@ -344,6 +365,8 @@ When done, print ONLY a JSON object: {\"changed\":\"<one concise line describing
 visual_repair_for_spec() {
   local spec="$1" project="$2" out_dir="$3" candidate_label="$4" report="$5" \
         max="$6" allow_csv="$7"
+  NIGHT_SHIFT_PREVIEW_BUNDLE_URL="$(__visual_entry_bundle_url "$project")"
+  export NIGHT_SHIFT_PREVIEW_BUNDLE_URL
   REPAIR_FILEKEY="$(figma_key_for "$spec")"
   REPAIR_FALLBACK_NODE="$(node_id_for "$spec" "")"
   case "$allow_csv" in *src/ui*) REPAIR_SHARED=1 ;; *) REPAIR_SHARED=0 ;; esac
