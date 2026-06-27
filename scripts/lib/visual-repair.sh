@@ -173,9 +173,16 @@ node_id_for() {
 
 figma_key_for() { sed -nE 's/.*fileKey `([A-Za-z0-9]+)`.*/\1/p' "$1" | head -n1; }
 
-# Fetch node $node's Figma design data (Dev Mode specs + annotations) via the MCP and
-# write concise design notes to $cache, ONCE — the repair agent then Reads $cache each
-# attempt instead of calling get_figma_data live (cuts Figma API volume; avoids 429).
+# Print the spec's design-intent sections (## Design Contract + ## Design source)
+# verbatim — the human-editable source the repair agent honors.
+spec_design_sections() {
+  awk '/^## /{ p = ($0 ~ /^## (Design Contract|Design source)/) ? 1 : 0 } p' "$1"
+}
+
+# Fetch node $node's Figma design data via the MCP and write the COMPLETE raw
+# get_figma_data result to $cache as JSON, verbatim (no summary), ONCE — the repair
+# agent then Reads $cache each attempt instead of calling get_figma_data live (cuts
+# Figma API volume; avoids 429; preserves per-element fills/gradients/layers).
 # Caches (skips if $cache exists). Degrades cleanly (non-zero) if claude/MCP unavailable.
 visual_stage_figma_data() {
   local key="$1" node="$2" cache="$3" prompt
@@ -183,7 +190,7 @@ visual_stage_figma_data() {
   [ -n "$key" ] && [ -n "$node" ] || return 1
   command -v claude >/dev/null 2>&1 || return 1
   mkdir -p "$(dirname "$cache")" || return 1
-  prompt="Call mcp__figma__get_figma_data for node ${node} in file ${key}. Then use the Write tool to write its Dev Mode specs (sizes, spacing, colors, typography, tokens) AND any annotations/comments to the file ${cache} as concise design notes. Figma is accessed ONLY through the MCP; never a token or REST. Reply 'done' once the file exists."
+  prompt="Call mcp__figma__get_figma_data for node ${node} in file ${key}. Then use the Write tool to write its COMPLETE result to the file ${cache} as JSON, VERBATIM — every node, its type, all fills and gradient stops, bounds, text styles, and child/stacking order. Do NOT summarize, omit, or paraphrase (layered/overlapping shapes are SEPARATE child nodes — keep them all). Figma is accessed ONLY through the MCP; never a token or REST. Reply 'done' once the file exists."
   ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
       --permission-mode bypassPermissions \
       --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" >/dev/null 2>&1 ) || true
@@ -249,13 +256,18 @@ repair_validate() {
 # shellcheck disable=SC2329  # invoked indirectly as an injected function name
 repair_agent() {
   local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
-  local key node allow prompt result cache
+  local key node allow prompt result cache spec_notes
   key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
   allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
-  cache="$out_dir/design/$screen-figma.md"
+  cache="$out_dir/design/$screen-figma.json"
+  spec_notes="$(spec_design_sections "${REPAIR_SPEC:-}" 2>/dev/null)"
   prompt="You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
 FIRST use the Read tool to OPEN AND VIEW the images so you can see the pixels: reference=$ref  current screenshot=$shot  diff overlay (red = differences)=$diff_img.  current diff=$pct, target tolerance=$tol.
-Read the cached Figma design notes at $cache (the node's Dev Mode specs — sizes, spacing, colors, typography, tokens — and annotations/comments) and treat them as requirements. If that file is absent, work from the images. Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
+Read the raw Figma node tree (JSON) at $cache — it is your source of truth for EXACT per-element styles: every node's fills, gradient stops, bounds, text styles, and child/stacking order. Layered or overlapping shapes are SEPARATE child nodes — match each. If that file is absent, work from the images. ALSO treat the following design intent from the spec as requirements:
+---
+$spec_notes
+---
+Figma is accessed ONLY through the MCP; never use a Figma token or REST API.
 Edit ONLY files under $allow to bring the screen to the design. Do NOT touch tests, src/data, src/domain, app/, or native config. Keep 'npx tsc --noEmit' and 'npx eslint . --max-warnings 0' clean. Do NOT run git, commit, push, or build native.
 When done, print ONLY a JSON object: {\"changed\":\"<one concise line describing the visual change you made>\", \"unmet_brief\":[\"<specs/comments you could not satisfy>\"]}."
   # The prompt MUST go via stdin: the variadic --allowed-tools otherwise swallows a
@@ -277,6 +289,7 @@ visual_repair_for_spec() {
         max="$6" allow_csv="$7"
   REPAIR_FILEKEY="$(figma_key_for "$spec")"
   REPAIR_FALLBACK_NODE="$(node_id_for "$spec" "")"
+  REPAIR_SPEC="$spec"
   case "$allow_csv" in *src/ui*) REPAIR_SHARED=1 ;; *) REPAIR_SHARED=0 ;; esac
   local fail="$out_dir/_fail.tsv"
   jq -r '.screens[]|select(.pass|not)|[.diff_pct,.screen,.state,.device]|@tsv' "$report" >"$fail"
@@ -285,7 +298,7 @@ visual_repair_for_spec() {
     local sc="$1" st="$2" dv="$3"
     eval "REPAIR_NODE_$sc=\"$(node_id_for "$spec" "$sc")\""
     visual_stage_figma_data "$REPAIR_FILEKEY" "$(node_id_for "$spec" "$sc")" \
-      "$out_dir/design/$sc-figma.md" || true
+      "$out_dir/design/$sc-figma.json" || true
     visual_repair_screen "$project" "$out_dir/_rsnap" "$out_dir" "$sc" "$st" "$dv" \
       "$out_dir/design/$sc-$st-$dv.png" "$out_dir/screenshots/$candidate_label/$sc-$st-$dv.png" \
       "$out_dir/diffs/$candidate_label/$sc-$st-$dv.png" "$(visual_capture_tolerance "$spec")" \

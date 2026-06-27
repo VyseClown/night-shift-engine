@@ -87,7 +87,10 @@ engine/workflow git here at the root.
   `claude -p` calls (Figma reference export + the per-run `get_figma_data` fetch) run
   with `--permission-mode bypassPermissions` — MCP tools are otherwise deferred in
   headless — and the repair flow fetches `get_figma_data` once per run (cached under
-  `design/<screen>-figma.md`) to bound Figma API volume.
+  `design/<screen>-figma.json`, reused across runs) rather than a prose summary, and the
+  repair agent honors the spec's `## Design Contract` + `## Design source` sections — so
+  design details a flat image misses (e.g. a ring built from two layered wave nodes) are
+  stated in the spec you edit and backed by the complete node tree.
 
 > For **parallel** visual_review across worktrees, set `NIGHT_SHIFT_DEVICE_REGISTRY=1`
 > (the `scripts/parallel-worktrees.sh` wrapper sets it automatically for `--jobs>1`). Each

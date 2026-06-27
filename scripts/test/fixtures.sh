@@ -160,6 +160,7 @@ run_dry_fixtures() {
   fixture_assert "visual capture file-drive writes target + cold-launches prompt-free" fixture_visual_capture_file_drive "$root"
   fixture_assert "visual_stage_ref exports a Figma node via the MCP (claude -p), caches, degrades" fixture_visual_stage_ref "$root"
   fixture_assert "visual_stage_figma_data caches the node's Figma design data via the MCP" fixture_visual_stage_figma_data "$root"
+  fixture_assert "spec_design_sections prints the Design Contract + Design source sections" fixture_spec_design_sections "$root"
   fixture_assert "visual_stage_refs_for_spec stages the Design-Contract matrix via the MCP" fixture_visual_stage_refs_for_spec "$root"
   fixture_assert "visual-review.sh exports refs via the MCP, no FIGMA_TOKEN/REST" fixture_visual_review_no_token "$root"
   fixture_assert "visual capture maestro-drive runs the screen-state flow + screenshots" fixture_visual_capture_maestro "$root"
@@ -2236,7 +2237,7 @@ fixture_visual_stage_figma_data() {
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$d/argv.log"
 p="\$(cat)"
-out="\$(printf '%s' "\$p" | grep -oE '/[^ ]+\.md' | head -1)"
+out="\$(printf '%s' "\$p" | grep -oE '/[^ ]+\.json' | head -1)"
 [ -n "\$out" ] && printf 'specs\n' >"\$out"
 exit 0
 STUB
@@ -2244,18 +2245,45 @@ STUB
   # (a) fetches + caches the node data, with the flag + get_figma_data tool.
   (
     export PATH="$d/bin:$PATH"
-    visual_stage_figma_data ABC123 1:1548 "$d/design/Home-figma.md" || exit 1
-    [ -s "$d/design/Home-figma.md" ] || exit 1
+    visual_stage_figma_data ABC123 1:1548 "$d/design/Home-figma.json" || exit 1
+    [ -s "$d/design/Home-figma.json" ] || exit 1
     grep -q -- '--permission-mode bypassPermissions' "$d/argv.log" || exit 1
     grep -q 'mcp__figma__get_figma_data' "$d/argv.log" || exit 1
   ) || return 1
   # (b) caches: file exists -> returns 0 WITHOUT calling claude.
   : >"$d/argv.log"
-  ( export PATH="$d/bin:$PATH"; visual_stage_figma_data ABC123 1:1548 "$d/design/Home-figma.md" || exit 1; [ -s "$d/argv.log" ] && exit 1; exit 0 ) || return 1
+  ( export PATH="$d/bin:$PATH"; visual_stage_figma_data ABC123 1:1548 "$d/design/Home-figma.json" || exit 1; [ -s "$d/argv.log" ] && exit 1; exit 0 ) || return 1
   # (c) degrades: no claude -> non-zero, no file.
-  ( export PATH="/usr/bin:/bin"; ! visual_stage_figma_data ABC123 1:1548 "$d/n.md" || exit 1; [ -e "$d/n.md" ] && exit 1; exit 0 ) || return 1
+  ( export PATH="/usr/bin:/bin"; ! visual_stage_figma_data ABC123 1:1548 "$d/n.json" || exit 1; [ -e "$d/n.json" ] && exit 1; exit 0 ) || return 1
   # (d) empty key/node -> non-zero.
-  ( export PATH="$d/bin:$PATH"; ! visual_stage_figma_data "" 1:1548 "$d/e.md" || exit 1 ) || return 1
+  ( export PATH="$d/bin:$PATH"; ! visual_stage_figma_data "" 1:1548 "$d/e.json" || exit 1 ) || return 1
+  # the prompt requests the COMPLETE raw data VERBATIM as JSON (not a summary)
+  local fbody
+  fbody="$(sed -n '/^visual_stage_figma_data()/,/^}/p' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh")"
+  printf '%s' "$fbody" | grep -qiE 'VERBATIM|COMPLETE' || return 1
+  printf '%s' "$fbody" | grep -q 'as JSON' || return 1
+  return 0
+}
+
+fixture_spec_design_sections() {
+  local root="$1" d="$root/sds"
+  mkdir -p "$d"
+  cat >"$d/spec.md" <<'SPEC'
+## Test Plan
+- TESTLINE should not appear
+## Design Contract
+- Figma file: X, fileKey `ABC`
+- DCLINE design-contract marker
+## Design source
+- DSLINE two crossing wave layers
+## Edge Cases
+- EDGELINE should not appear
+SPEC
+  local out; out="$(spec_design_sections "$d/spec.md")"
+  printf '%s' "$out" | grep -q 'DCLINE' || return 1
+  printf '%s' "$out" | grep -q 'DSLINE' || return 1
+  printf '%s' "$out" | grep -q 'TESTLINE' && return 1
+  printf '%s' "$out" | grep -q 'EDGELINE' && return 1
   return 0
 }
 
@@ -2822,12 +2850,17 @@ fixture_repair_agent_cached() {
   body="$(sed -n '/^repair_agent()/,/^}/p' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh")"
   # opus model knob present
   printf '%s' "$body" | grep -q 'NIGHT_SHIFT_VISUAL_REPAIR_MODEL' || return 1
-  # MCP get_figma_data dropped from the agent's allowlist
+  # MCP get_figma_data NOT in the agent's allowlist (it reads the cache)
   printf '%s' "$body" | grep -q 'mcp__figma__get_figma_data' && return 1
-  # the agent reads the per-screen Figma cache
-  printf '%s' "$body" | grep -q '\-figma\.md' || return 1
-  # the pre-fetch CALL (not just the definition) is wired into the orchestration
+  # the agent reads the RAW json cache (not the old .md prose)
+  printf '%s' "$body" | grep -q '\-figma\.json' || return 1
+  printf '%s' "$body" | grep -q '\-figma\.md' && return 1
+  # the agent interpolates the spec's design sections
+  printf '%s' "$body" | grep -q 'spec_design_sections' || return 1
+  # the orchestration sets REPAIR_SPEC and pre-fetches the .json cache
+  grep -q 'REPAIR_SPEC=' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
   grep -qF 'visual_stage_figma_data "$REPAIR_FILEKEY"' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
+  grep -q '\-figma\.json"' "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" || return 1
   return 0
 }
 
