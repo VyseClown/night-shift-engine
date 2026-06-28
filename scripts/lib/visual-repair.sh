@@ -193,9 +193,18 @@ visual_stage_figma_data() {
   command -v claude >/dev/null 2>&1 || return 1
   mkdir -p "$(dirname "$cache")" || return 1
   prompt="Call mcp__figma__get_figma_data for node ${node} in file ${key}. Then use the Write tool to write its COMPLETE result to the file ${cache} as JSON, VERBATIM — every node, its type, all fills and gradient stops, bounds, text styles, and child/stacking order. Do NOT summarize, omit, or paraphrase (layered/overlapping shapes are SEPARATE child nodes — keep them all). Figma is accessed ONLY through the MCP; never a token or REST. Reply 'done' once the file exists."
+  # Bound the MCP fetch: an unresponsive Figma MCP otherwise hangs this claude -p (and the
+  # whole repair run) indefinitely — observed wedging a run 8+ min. Background it with a
+  # watchdog that kills it after NIGHT_SHIFT_VISUAL_REF_TIMEOUT; the caller degrades cleanly
+  # (the agent works from the images when the cache is absent).
   ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
       --permission-mode bypassPermissions \
-      --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" >/dev/null 2>&1 ) || true
+      --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" >/dev/null 2>&1 ) &
+  local _sp=$!
+  ( sleep "${NIGHT_SHIFT_VISUAL_REF_TIMEOUT:-180}"; kill "$_sp" 2>/dev/null ) &
+  local _wd=$!
+  wait "$_sp" 2>/dev/null || true
+  kill "$_wd" 2>/dev/null || true; wait "$_wd" 2>/dev/null || true
   [ -s "$cache" ]
 }
 
@@ -282,6 +291,31 @@ __visual_bundle_hash() {
   printf '%s' "$body" | shasum 2>/dev/null | awk '{print $1}'
 }
 
+# Block until Metro is serving a REAL (compiled) entry bundle. The /…bundle GET blocks
+# until the (re)build completes, so this deterministically waits out a fresh compile.
+# A real bundle is megabytes; an error/"bundling" page is tiny → size gates readiness.
+__visual_wait_bundle_ready() {
+  local url="${NIGHT_SHIFT_PREVIEW_BUNDLE_URL:-http://localhost:${NIGHT_SHIFT_METRO_PORT:-8081}/index.bundle?platform=ios&dev=true}" sz
+  sz="$(curl -s --connect-timeout 5 -m "${NIGHT_SHIFT_VISUAL_BUNDLE_CURL_TIMEOUT:-120}" -o /dev/null -w '%{size_download}' "$url" 2>/dev/null)" || return 1
+  [ "${sz:-0}" -gt 100000 ]
+}
+
+# Plain Metro restart (NO --reset-cache): a fresh process reads the edited sources from
+# disk on its next bundle request (the content-keyed transform cache recompiles only the
+# changed modules), so it is disk-truthful AND much faster / less hang-prone than a full
+# cache wipe. Port-scoped + NO_BUILD-forced (never runs expo run:ios).
+repair_metro_restart() {
+  local device="$1" port="${NIGHT_SHIFT_METRO_PORT:-8081}" pids i=0 _nb
+  repair_metro_stop
+  pids="$(lsof -ti "tcp:${port}" 2>/dev/null)"
+  # shellcheck disable=SC2086  # word-splitting intentional: space-separated PID list
+  [ -n "$pids" ] && kill $pids 2>/dev/null || true
+  while metro_is_up && [ "$i" -lt 15 ]; do i=$((i+1)); sleep 1; done
+  _nb="${NO_BUILD:-0}"; NO_BUILD=1
+  repair_metro_start "$device"
+  NO_BUILD="$_nb"
+}
+
 # Force a fresh, cache-cleared Metro on THIS run's port. Port-scoped (safe under
 # NIGHT_SHIFT_DEVICE_REGISTRY: distinct ports) — never the blanket pkill PR #36 removed.
 # Forces NO_BUILD=1 so it never runs `expo run:ios`; clears the port first so the
@@ -329,13 +363,25 @@ __visual_force_fresh_bundle() {
   return 0
 }
 
-# Injected capture_fn for the repair loop: forces a fresh Metro bundle before
-# every re-capture. Swallows freshness failures (|| true) so the repair loop
-# always gets a screenshot even when Metro is unreachable.
+# Injected capture_fn for the repair loop. On-device validation showed Metro's in-process
+# hot-reload watcher does NOT reliably pick up the agent's edit, and that capturing right
+# after a restart races the rebuild. So: (1) restart Metro once from a clean process
+# (disk truth, no watcher dependency); (2) block until the new bundle is actually compiled
+# + served; (3) capture, retrying the screenshot ONLY (never another Metro restart, which
+# compounds into flakiness/hangs) until a non-empty shot lands. Reliable over fast.
 # shellcheck disable=SC2329  # invoked indirectly as the capture_fn argument
 repair_recapture_screen() {
-  __visual_force_fresh_bundle || true
-  visual_recapture_screen "$@"
+  local screen="$1" state="$2" device="$3" out="$4" _t=0
+  repair_metro_restart "${REPAIR_RESET_DEVICE:-}"
+  __visual_wait_bundle_ready || log "visual-repair: fresh bundle not confirmed after restart; capturing anyway"
+  while [ "$_t" -lt "${NIGHT_SHIFT_VISUAL_RECAPTURE_TRIES:-3}" ]; do
+    _t=$((_t+1))
+    NIGHT_SHIFT_VISUAL_SETTLE_SECONDS="${NIGHT_SHIFT_VISUAL_REPAIR_SETTLE:-25}" \
+      visual_recapture_screen "$screen" "$state" "$device" "$out" && [ -s "$out" ] && return 0
+    log "visual-repair: $screen capture try $_t produced no shot; retrying (no restart)"
+    sleep 5
+  done
+  return 1
 }
 
 # ---- repair agent + validate ------------------------------------------------
