@@ -24,12 +24,13 @@ Opus access).
 
 ## Workspace Map
 
-`~/work` is the **night-shift engine repo** (the orchestrator `scripts/`, the
-`schemas/` contracts, `docs/`, `specs/`, and these workflow docs). It also
-*contains* independent app project repos (`rn-sandbox/`, `web-app/`,
-`night-shift-viewer/`, …) which are **git-ignored here** — each has its own repo.
-Run a project's own git and validation commands inside that project directory; run
-engine/workflow git here at the root.
+The **night-shift engine repo** (`night-shift-engine/` — the orchestrator
+`scripts/`, the `schemas/` contracts, `docs/`, `specs/`, and these workflow docs)
+lives in its own directory inside a workspace container. The independent app
+project repos (`rn-sandbox/`, `web-app/`, `water-tracker-app/`, `night-shift-viewer/`,
+…) are **siblings alongside it**, each its own repo; the container itself is not a
+git repo. Run a project's own git and validation commands inside that project
+directory; run engine/workflow git inside the engine directory.
 
 | Project | Stack | Validation / commands |
 |---|---|---|
@@ -40,7 +41,7 @@ engine/workflow git here at the root.
 
 ## Engine + viewer (two repos)
 
-- **Engine** = this repo (`~/work`, GitHub `VyseClown/night-shift-engine`):
+- **Engine** = this repo (`night-shift-engine/`, GitHub `VyseClown/night-shift-engine`):
   `scripts/night-shift.sh` + sourced libs `scripts/lib/personas.sh` (persona/profile
   resolution) and `scripts/lib/visual-capture.sh` (Phase-2 design-fidelity scaffold,
   inert without a simulator), plus `schemas/`, `specs/`, `docs/`.
@@ -51,12 +52,12 @@ engine/workflow git here at the root.
 
 ## Running a night-shift
 
-- **CLI** (from `~/work`): `NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project ~/work/<proj> --spec specs/<name>.md`.
+- **CLI** (run from the `night-shift-engine/` directory): `NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <project-path> --spec specs/<name>.md`.
   Free pre-flight: append `--fixture-test --dry-run` (deterministic fixtures).
 - **Viewer**: server `cd night-shift-viewer/server && NSV_ALLOW_EDIT=1 NSV_ALLOW_LAUNCH=1 NSV_ALLOW_REAL=1 npm run dev:real`;
   web `cd ../web && npm run dev`; open http://127.0.0.1:5173. `NSV_ALLOW_REAL` = real
   paid runs, `NSV_ALLOW_EDIT` = spec editor. The viewer **auto-discovers**
-  target repos under `~/work`: any sibling that is its own git repo and has opted
+  target repos in the workspace container: any sibling that is its own git repo and has opted
   in by gitignoring `.night-shift/` (or already has a `.night-shift/` run dir).
   Override with `NSV_PROJECT_DIRS=/abs/a:/abs/b`. A repo that does not gitignore
   `.night-shift/` is intentionally skipped (a run there would commit artifacts).

@@ -20,31 +20,34 @@ review persona set and the validation checklist below. See the per-project
 
 ## Directory Layout
 
-`~/work` is itself the **engine git repo** (`VyseClown/night-shift-engine`); the
-project directories below are independent repos, git-ignored here.
+The **engine repo** (`VyseClown/night-shift-engine`) lives in its own
+`night-shift-engine/` directory inside a workspace container; the app project
+directories are independent repos, **siblings alongside it**. The container itself
+is not a git repo.
 
 ```
-~/work/                ← engine repo (VyseClown/night-shift-engine)
-  AGENTS.md          ← you are here
-  AGENT_LOOP.md      ← instructions for autonomous overnight runs
-  NIGHT_SHIFT_HOWTO.md ← human guide: what to write first + how a run works
-  TODO.md            ← ordered work queue; bugs are selected before features
-  CHANGELOG.md       ← completed user-visible and workflow changes
-  NIGHT_SHIFT_REVIEW.md ← validated observer review ledger
-  scripts/night-shift.sh ← fixed-primary overnight orchestrator (sources lib/)
-  scripts/lib/personas.sh      ← persona/track/profile + optional + `- Personas:` resolution
-  scripts/lib/visual-capture.sh ← Phase-2 design-fidelity scaffold (inert without a simulator)
-  schemas/           ← machine-readable coordination/review contracts (incl. visual-diff)
-  specs/             ← one markdown file per feature, before implementation starts
-    _template.md     ← copy this for a React Native (rn-track) spec
-    _template-web.md ← copy this for a web-track spec
-  docs/
-    review-personas.md     ← rn-track + the 4 optional cross-track personas
-    review-personas-web.md ← web-track review personas and their checklists
-    dev-environment.md / codex-cli-setup.md / terminal-setup.md ← env setup
-  rn-sandbox/ web-app/ nightshift-demo/ ← project repos (rn/web/demo), git-ignored here
+<workspace>/                     ← workspace container (not a git repo)
+  night-shift-engine/            ← engine repo (VyseClown/night-shift-engine)
+    AGENTS.md          ← you are here
+    AGENT_LOOP.md      ← instructions for autonomous overnight runs
+    NIGHT_SHIFT_HOWTO.md ← human guide: what to write first + how a run works
+    TODO.md            ← ordered work queue; bugs are selected before features
+    CHANGELOG.md       ← completed user-visible and workflow changes
+    NIGHT_SHIFT_REVIEW.md ← validated observer review ledger
+    scripts/night-shift.sh ← fixed-primary overnight orchestrator (sources lib/)
+    scripts/lib/personas.sh      ← persona/track/profile + optional + `- Personas:` resolution
+    scripts/lib/visual-capture.sh ← Phase-2 design-fidelity scaffold (inert without a simulator)
+    schemas/           ← machine-readable coordination/review contracts (incl. visual-diff)
+    specs/             ← one markdown file per feature, before implementation starts
+      _template.md     ← copy this for a React Native (rn-track) spec
+      _template-web.md ← copy this for a web-track spec
+    docs/
+      review-personas.md     ← rn-track + the 4 optional cross-track personas
+      review-personas-web.md ← web-track review personas and their checklists
+      dev-environment.md / codex-cli-setup.md / terminal-setup.md ← env setup
+  rn-sandbox/ web-app/ water-tracker-app/ nightshift-demo/ ← project repos, siblings (own repos)
   night-shift-viewer/ ← read dashboard + gated launcher + gated spec editor (own repo;
-                        spawns this same scripts/night-shift.sh — see its WORKFLOW.md)
+                        spawns the engine's scripts/night-shift.sh — see its WORKFLOW.md)
 ```
 
 ---
