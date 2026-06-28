@@ -28,6 +28,10 @@ runs do not infer a repository from the workspace root.
 
 ## Review
 
+- Track: rn
+<!-- `rn` is the default and may be omitted, but stating it is clearer. Valid
+     tracks: rn | web | node. Use `specs/_template-web.md` for a web spec. -->
+
 - Review Profile: full | frontend | logic | native
 
 The profile selects which review personas run, so review depth matches the work

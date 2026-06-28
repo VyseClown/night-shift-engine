@@ -107,8 +107,10 @@ Add one line pointing at the spec. Bugs are selected before features:
    Open http://127.0.0.1:5173 → **Specs** tab to read/edit specs, **Launch** tab →
    *Real run* → pick the project + spec → watch it stream. The project must be on
    the spec's feature branch and gitignore `.night-shift/` first (the script
-   refuses otherwise). The viewer scans `rn-sandbox`, `web-app`,
-   `nightshift-demo` only.
+   refuses otherwise). The viewer **auto-discovers** target repos under `~/work`:
+   any sibling that is its own git repo and has opted in by gitignoring
+   `.night-shift/` (or already has a `.night-shift/` run dir). Override the set
+   with `NSV_PROJECT_DIRS=/abs/a:/abs/b`.
 
 > `NIGHT_SHIFT_ACCEPT_COSTS=YES` is a safety gate so live model calls aren't made
 > by accident — not a billing switch. On a Claude Pro/Max login it consumes plan
