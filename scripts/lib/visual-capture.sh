@@ -265,9 +265,14 @@ __visual_pixel_diff() {
   local outp pct rc
   outp="$("${NIGHT_SHIFT_VISUAL_DIFF_TOOL:-odiff}" --parsable-stdout "$ref_use" "$screenshot" "$diff_out" 2>/dev/null)"
   rc=$?
-  # Identical images: real `odiff --parsable-stdout` prints NOTHING and exits 0.
-  # That is a perfect match → diff_pct 0 (a pass), NOT an unparseable SKIP.
-  if [ "$rc" -eq 0 ] && [ -z "$outp" ]; then
+  # A match → diff_pct 0 (a pass), NOT an unparseable SKIP. `odiff --parsable-stdout`
+  # exits 0 IFF the images match (within threshold); depending on the odiff version it
+  # then prints either NOTHING or a bare "0". The old check required rc==0 AND empty
+  # output, so a perfectly-converged capture (odiff prints "0") fell through to the
+  # ";"-format parser, produced no match, and returned 2 (unparseable failure) — which
+  # the repair loop read as a FAILED attempt and reverted, making convergence impossible
+  # to ever recognize. rc==0 alone is the correct "0% diff" signal.
+  if [ "$rc" -eq 0 ]; then
     printf '0'
     return 0
   fi

@@ -195,10 +195,10 @@ run_dry_fixtures() {
   fixture_assert "in-loop run_visual stages refs via the MCP before capture" fixture_run_visual_stages_refs "$root"
   fixture_assert "repair agent runs on the opus knob + reads the cached Figma data (no live get_figma_data)" fixture_repair_agent_cached "$root"
   fixture_assert "repair_metro_start reuses an existing :8081 Metro; stop kills only an engine-started one" fixture_repair_metro "$root"
-  fixture_assert "bundle freshness: seeded-prev race (accepts after change, no reset), empty-prev falls through to reset, resets only on timeout, port-scoped + no-rebuild, clean-degrades without Metro" fixture_bundle_freshness "$root"
   fixture_assert "entry bundle URL derived from package.json main (expo-router, plain index, relative file)" fixture_entry_bundle_url "$root"
   fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
-  fixture_assert "repair_recapture_screen: freshness-then-capture order; first-pass never invokes freshness" fixture_recapture_wrapper "$root"
+  fixture_assert "repair_recapture_screen: restart-then-wait-then-capture order; first-pass never invokes repair-only fns" fixture_recapture_wrapper "$root"
+  fixture_assert "__visual_wait_bundle_ready: large bundle ready, tiny error page not ready" fixture_wait_bundle_ready "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -586,6 +586,17 @@ SH
   cat >"$tool" <<'SH'
 #!/usr/bin/env bash
 exit 0
+SH
+  chmod +x "$tool"
+  pct="$(NIGHT_SHIFT_VISUAL_DIFF_TOOL="$tool" __visual_pixel_diff "$ref" "$shot" "$out")" || return 1
+  awk -v p="$pct" 'BEGIN{ exit !(p == 0) }' || return 1
+  # Regression: some odiff versions exit 0 AND print a bare "0" for a perfect match
+  # (not empty). __visual_pixel_diff must still return 0, not mis-parse the "0" as an
+  # unparseable failure (return 2) — which made the repair loop read a CONVERGED capture
+  # as a failed attempt and revert, so it could never recognize success.
+  cat >"$tool" <<'SH'
+#!/usr/bin/env bash
+printf '0\n'; exit 0
 SH
   chmod +x "$tool"
   pct="$(NIGHT_SHIFT_VISUAL_DIFF_TOOL="$tool" __visual_pixel_diff "$ref" "$shot" "$out")" || return 1
@@ -2241,7 +2252,9 @@ fixture_visual_stage_figma_data() {
 printf '%s\n' "\$*" >>"$d/argv.log"
 p="\$(cat)"
 out="\$(printf '%s' "\$p" | grep -oE '/[^ ]+\.json' | head -1)"
-[ -n "\$out" ] && printf 'specs\n' >"\$out"
+# Write valid JSON (the real agent writes the node tree) — visual_stage_figma_data now
+# requires the cache to be jq-parseable so a watchdog-truncated write is treated as absent.
+[ -n "\$out" ] && printf '{"id":"1:1548","type":"FRAME"}\n' >"\$out"
 exit 0
 STUB
   chmod +x "$d/bin/claude"
@@ -2921,104 +2934,6 @@ STUB
   return 0
 }
 
-fixture_bundle_freshness() {
-  local root="$1" d="$root/bfresh"
-  mkdir -p "$d/bin"
-  # curl serves the contents of $d/served (the "served bundle"); reload/status URLs are no-ops.
-  cat >"$d/bin/curl" <<STUB
-#!/usr/bin/env bash
-for a in "\$@"; do case "\$a" in *index.bundle*) cat "$d/served" 2>/dev/null; exit 0;; esac; done
-exit 0
-STUB
-  chmod +x "$d/bin/curl"
-  export NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT=2 NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL=1
-  export NIGHT_SHIFT_VISUAL_PREVHASH_FILE="$d/prevhash"
-
-  # (a) fast path: seeded prev + background mutation within deadline -> accepts, NO reset.
-  #     Models the watcher race: Metro serves the pre-edit bundle first (same as prev), then
-  #     flips to new bytes mid-deadline. The poll must NOT accept the stale bytes, then MUST
-  #     accept the new bytes, and must NOT call repair_metro_reset.
-  printf 'v1' >"$d/served"; printf '%s' "$(printf 'v1' | shasum | awk '{print $1}')" >"$d/prevhash"; : >"$d/reset.log"
-  ( sleep 1; printf 'v2' >"$d/served" ) &
-  (
-    export PATH="$d/bin:$PATH"
-    repair_metro_reset() { echo reset >>"$d/reset.log"; }
-    __visual_force_fresh_bundle || exit 1
-    [ -s "$d/reset.log" ] && exit 1   # reset must NOT have fired
-    expected="$(printf 'v2' | shasum | awk '{print $1}')"
-    got="$(cat "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || echo '')"
-    [ "$got" = "$expected" ] || exit 1   # prevhash written with the NEW hash
-    exit 0
-  ) || { wait; return 1; }
-  wait
-
-  # (b) fallback: bytes never change within the deadline -> reset fires exactly once,
-  #     AND the stub models a real reset by mutating the served bundle so prevhash is
-  #     written with the POST-RESET hash (a regression where the old hash is written
-  #     back would pass the grep-count assertion but fail the hash assertion below).
-  printf 'same' >"$d/served"; printf '%s' "$(printf 'same' | shasum | awk '{print $1}')" >"$d/prevhash"; : >"$d/reset.log"
-  (
-    export PATH="$d/bin:$PATH"
-    repair_metro_reset() { echo reset >>"$d/reset.log"; printf 'afterreset' >"$d/served"; }
-    __visual_force_fresh_bundle >/dev/null 2>&1 || true
-    [ "$(grep -c reset "$d/reset.log" 2>/dev/null || echo 0)" = "1" ] || exit 1
-    expected="$(printf 'afterreset' | shasum | awk '{print $1}')"
-    got="$(cat "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || echo '')"
-    [ "$got" = "$expected" ] || exit 1
-    exit 0
-  ) || return 1
-
-  # (c) reset is port-scoped + forces NO_BUILD=1 (no expo run:ios) + sets --reset-cache.
-  : >"$d/lsof.log"; : >"$d/start.log"
-  cat >"$d/bin/lsof" <<STUB
-#!/usr/bin/env bash
-echo lsof "\$@" >>"$d/lsof.log"; echo 4242   # a fake pid holding the port
-STUB
-  chmod +x "$d/bin/lsof"
-  cat >"$d/bin/kill" <<STUB
-#!/usr/bin/env bash
-exit 0
-STUB
-  chmod +x "$d/bin/kill"
-  (
-    export PATH="$d/bin:$PATH" NO_BUILD=0
-    metro_is_up() { return 1; }   # port clears immediately so the wait loop ends
-    repair_metro_start() { echo "start nb=$NO_BUILD rc=${NIGHT_SHIFT_METRO_RESET_CACHE:-0} dev=$1" >>"$d/start.log"; }
-    repair_metro_stop() { :; }
-    repair_metro_reset "iPhone 16" || exit 1
-    grep -q 'tcp:' "$d/lsof.log" || exit 1                         # port-scoped kill
-    grep -q 'start nb=1 rc=1 dev=iPhone 16' "$d/start.log" || exit 1 # NO_BUILD forced 1 + --reset-cache flag
-    exit 0
-  ) || return 1
-
-  # (d) clean degrade: no Metro (curl serves nothing) -> empty hash, non-zero, no crash.
-  rm -f "$d/served" "$d/prevhash";
-  (
-    export PATH="$d/bin:$PATH"
-    repair_metro_reset() { :; }
-    if __visual_force_fresh_bundle >/dev/null 2>&1; then exit 1; fi   # returns non-zero
-    exit 0
-  ) || return 1
-
-  # (e) empty prev (prevhash file absent): fast-accept must never fire even when Metro
-  #     serves bytes immediately; reset MUST fire (the only path to a guaranteed-fresh
-  #     bundle). This is the defensive guard against the old accept-first bug: with
-  #     prev="" the condition [ -n "$prev" ] is false, so the fast path is skipped
-  #     entirely and we fall through to repair_metro_reset.
-  rm -f "$d/prevhash"; printf 'somebytes' >"$d/served"; : >"$d/reset.log"
-  (
-    export PATH="$d/bin:$PATH"
-    repair_metro_reset() { echo reset >>"$d/reset.log"; printf 'freshbytes' >"$d/served"; }
-    __visual_force_fresh_bundle >/dev/null 2>&1 || true
-    [ "$(grep -c reset "$d/reset.log" 2>/dev/null || echo 0)" = "1" ] || exit 1  # reset fired once
-    expected="$(printf 'freshbytes' | shasum | awk '{print $1}')"
-    got="$(cat "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || echo '')"
-    [ "$got" = "$expected" ] || exit 1   # prevhash written with post-reset hash
-    exit 0
-  ) || return 1
-
-  return 0
-}
 
 fixture_entry_bundle_url() {
   local root="$1" d="$root/ebu" url
@@ -3063,35 +2978,61 @@ fixture_recapture_wrapper() {
   local root="$1" d="$root/rcw"
   mkdir -p "$d"
 
-  # (a) repair_recapture_screen: freshness runs FIRST then capture, in order.
+  # (a) repair_recapture_screen: restart Metro -> wait for the new bundle -> capture,
+  #     in that order (disk truth via a fresh Metro process, no watcher dependency).
   (
     . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
     . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
     log() { :; }
-    __visual_force_fresh_bundle() { printf 'fresh\n' >>"$d/order.log"; return 0; }
-    visual_recapture_screen() { printf 'capture\n' >>"$d/order.log"; }
+    repair_metro_restart() { printf 'restart\n' >>"$d/order.log"; }
+    __visual_wait_bundle_ready() { printf 'wait\n' >>"$d/order.log"; return 0; }
+    visual_recapture_screen() { printf 'capture\n' >>"$d/order.log"; : >"$2.touch" 2>/dev/null; printf x >"$4"; }
     repair_recapture_screen Home default iphone-15 "$d/out.png"
-    [ "$(cat "$d/order.log")" = "$(printf 'fresh\ncapture')" ] || exit 1
+    [ "$(cat "$d/order.log")" = "$(printf 'restart\nwait\ncapture')" ] || exit 1
     exit 0
   ) || return 1
 
-  # (b) freshness failure is swallowed: capture still runs.
+  # (b) a not-ready bundle is non-fatal: the capture still runs.
   : >"$d/cap2.log"
   (
     . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
     . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
     log() { :; }
-    __visual_force_fresh_bundle() { return 1; }
-    visual_recapture_screen() { printf 'capture\n' >>"$d/cap2.log"; }
+    repair_metro_restart() { :; }
+    __visual_wait_bundle_ready() { return 1; }
+    visual_recapture_screen() { printf 'capture\n' >>"$d/cap2.log"; printf x >"$4"; }
     repair_recapture_screen Home default iphone-15 "$d/out2.png"
     [ "$(cat "$d/cap2.log")" = "capture" ] || exit 1
     exit 0
   ) || return 1
 
-  # (c) first-pass capture (__visual_capture_screenshot via run_visual_capture) never
-  #     invokes __visual_force_fresh_bundle — grep the capture lib for the absence.
-  grep -q '__visual_force_fresh_bundle' "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh" && return 1
+  # (c) the first-pass capture lib (visual-capture.sh) never invokes the repair-only
+  #     restart/readiness functions — grep for their absence there.
+  grep -qE 'repair_metro_restart|__visual_wait_bundle_ready|repair_recapture_screen' \
+    "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh" && return 1
 
+  return 0
+}
+
+# __visual_wait_bundle_ready: a real (large) served bundle => ready (0); a tiny error
+# page (or unreachable Metro) => not ready (non-zero). Stubbed curl echoes BR_SIZE as
+# the -w '%{size_download}' value the function reads.
+fixture_wait_bundle_ready() {
+  local root="$1" d="$root/wbr"; mkdir -p "$d/bin"
+  cat >"$d/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${BR_SIZE:-0}"
+exit 0
+STUB
+  chmod +x "$d/bin/curl"
+  (
+    . "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    . "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh"
+    export PATH="$d/bin:$PATH"
+    export BR_SIZE=5000000; __visual_wait_bundle_ready || exit 1   # large bundle -> ready
+    export BR_SIZE=512;     __visual_wait_bundle_ready && exit 1   # tiny error page -> not ready
+    exit 0
+  ) || return 1
   return 0
 }
 
