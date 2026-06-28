@@ -106,9 +106,14 @@ visual_repair_screen() {
     local _try=0 _dok=0
     while [ "$_try" -lt 2 ]; do
       _try=$((_try+1))
-      "$capture_fn" "$screen" "$state" "$device" "$shot"
-      if visual_repair_diff "$ref" "$shot" "$diff_img" >"$_pct_file" 2>/dev/null; then _dok=1; break; fi
-      [ "$_try" -lt 2 ] && { log "visual-repair: $screen re-capture diff failed; retrying after settle"; sleep "${NIGHT_SHIFT_VISUAL_RECAPTURE_SETTLE:-5}"; }
+      # Gate the diff on a SUCCESSFUL capture: if capture_fn fails (no fresh shot), do
+      # NOT diff the stale prior shot as if it were this attempt's result — short-circuit
+      # so it counts as a failed attempt. (capture_fn, e.g. repair_recapture_screen, does
+      # its own restart + bounded screenshot retries, so a second outer pass is a genuine
+      # last resort, not the common path.)
+      if "$capture_fn" "$screen" "$state" "$device" "$shot" \
+         && visual_repair_diff "$ref" "$shot" "$diff_img" >"$_pct_file" 2>/dev/null; then _dok=1; break; fi
+      [ "$_try" -lt 2 ] && { log "visual-repair: $screen capture/diff failed; retrying after settle"; sleep "${NIGHT_SHIFT_VISUAL_RECAPTURE_SETTLE:-5}"; }
     done
     [ "$_dok" = "1" ] || printf '1' >"$_pct_file"
     cur="$(cat "$_pct_file")"
@@ -194,18 +199,23 @@ visual_stage_figma_data() {
   mkdir -p "$(dirname "$cache")" || return 1
   prompt="Call mcp__figma__get_figma_data for node ${node} in file ${key}. Then use the Write tool to write its COMPLETE result to the file ${cache} as JSON, VERBATIM — every node, its type, all fills and gradient stops, bounds, text styles, and child/stacking order. Do NOT summarize, omit, or paraphrase (layered/overlapping shapes are SEPARATE child nodes — keep them all). Figma is accessed ONLY through the MCP; never a token or REST. Reply 'done' once the file exists."
   # Bound the MCP fetch: an unresponsive Figma MCP otherwise hangs this claude -p (and the
-  # whole repair run) indefinitely — observed wedging a run 8+ min. Background it with a
-  # watchdog that kills it after NIGHT_SHIFT_VISUAL_REF_TIMEOUT; the caller degrades cleanly
+  # whole repair run) indefinitely — observed wedging a run 8+ min. Background `claude`
+  # DIRECTLY (prompt via herestring, not `printf | claude` in a subshell — so $! is the
+  # claude process itself, not a wrapper subshell whose kill would orphan claude), then a
+  # watchdog kills it after NIGHT_SHIFT_VISUAL_REF_TIMEOUT. The caller degrades cleanly
   # (the agent works from the images when the cache is absent).
-  ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
-      --permission-mode bypassPermissions \
-      --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" >/dev/null 2>&1 ) &
+  claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
+    --permission-mode bypassPermissions \
+    --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" \
+    <<<"$prompt" >/dev/null 2>&1 &
   local _sp=$!
   ( sleep "${NIGHT_SHIFT_VISUAL_REF_TIMEOUT:-180}"; kill "$_sp" 2>/dev/null ) &
   local _wd=$!
   wait "$_sp" 2>/dev/null || true
   kill "$_wd" 2>/dev/null || true; wait "$_wd" 2>/dev/null || true
-  [ -s "$cache" ]
+  # A watchdog kill can leave a half-written cache; require the JSON to at least parse,
+  # else treat as absent (the agent falls back to the images) rather than feed it garbage.
+  [ -s "$cache" ] && jq -e . "$cache" >/dev/null 2>&1
 }
 
 # Stage every Design-Contract screen's Figma reference into $out_dir/design/ via the
@@ -280,17 +290,6 @@ __visual_entry_bundle_url() {
   printf 'http://localhost:%s/%s.bundle?platform=ios&dev=true' "$port" "$entry"
 }
 
-# Hash Metro's currently-served iOS bundle (empty + non-zero when Metro is unreachable).
-# Bounded: Metro's /…bundle request blocks until the bundle is compiled, so a stalled
-# --reset-cache rebuild would otherwise hang this curl (and the freshness poll) forever.
-# --connect-timeout fails fast on a dead Metro; -m caps a legitimate (slow) compile.
-__visual_bundle_hash() {
-  local url="${NIGHT_SHIFT_PREVIEW_BUNDLE_URL:-http://localhost:${NIGHT_SHIFT_METRO_PORT:-8081}/index.bundle?platform=ios&dev=true}" body
-  body="$(curl -s --connect-timeout 5 -m "${NIGHT_SHIFT_VISUAL_BUNDLE_CURL_TIMEOUT:-90}" "$url" 2>/dev/null)" || return 1
-  [ -n "$body" ] || return 1
-  printf '%s' "$body" | shasum 2>/dev/null | awk '{print $1}'
-}
-
 # Block until Metro is serving a REAL (compiled) entry bundle. The /…bundle GET blocks
 # until the (re)build completes, so this deterministically waits out a fresh compile.
 # A real bundle is megabytes; an error/"bundling" page is tiny → size gates readiness.
@@ -314,53 +313,6 @@ repair_metro_restart() {
   _nb="${NO_BUILD:-0}"; NO_BUILD=1
   repair_metro_start "$device"
   NO_BUILD="$_nb"
-}
-
-# Force a fresh, cache-cleared Metro on THIS run's port. Port-scoped (safe under
-# NIGHT_SHIFT_DEVICE_REGISTRY: distinct ports) — never the blanket pkill PR #36 removed.
-# Forces NO_BUILD=1 so it never runs `expo run:ios`; clears the port first so the
-# repair_metro_start reuse-guard falls through to a fresh `--reset-cache` start.
-repair_metro_reset() {
-  local device="$1" port="${NIGHT_SHIFT_METRO_PORT:-8081}" pids i=0 _nb
-  repair_metro_stop
-  pids="$(lsof -ti "tcp:${port}" 2>/dev/null)"
-  # shellcheck disable=SC2086  # word-splitting intentional: $pids is a space-separated PID list
-  [ -n "$pids" ] && kill $pids 2>/dev/null || true
-  while metro_is_up && [ "$i" -lt 15 ]; do i=$((i+1)); sleep 1; done
-  _nb="${NO_BUILD:-0}"; NO_BUILD=1
-  NIGHT_SHIFT_METRO_RESET_CACHE=1 repair_metro_start "$device"
-  NO_BUILD="$_nb"
-}
-
-# Make Metro serve a bundle reflecting on-disk sources, then record its hash. Fast path:
-# touch + reload, poll the served-bundle hash until it differs from the previous attempt
-# (wall-clock deadline NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT). Fallback: repair_metro_reset.
-# Returns non-zero when Metro is unreachable (caller degrades to a plain re-capture).
-__visual_force_fresh_bundle() {
-  # prev MUST be non-empty for the fast-accept to fire. _repair_one seeds the prevhash
-  # file with the actual pre-edit bundle hash before any agent edit runs, so prev is
-  # always set on a real repair attempt. When prev is empty (defensive: file absent or
-  # blank) the fast path never fires and we fall through to repair_metro_reset, which
-  # guarantees a fresh --reset-cache bundle.
-  local hf="${NIGHT_SHIFT_VISUAL_PREVHASH_FILE:-}" prev="" \
-        timeout="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_TIMEOUT:-25}" \
-        interval="${NIGHT_SHIFT_VISUAL_BUNDLE_POLL_INTERVAL:-2}" \
-        port="${NIGHT_SHIFT_METRO_PORT:-8081}" deadline h
-  [ -n "$hf" ] && [ -f "$hf" ] && prev="$(cat "$hf")"
-  curl -s -m 10 -o /dev/null "http://localhost:${port}/reload" 2>/dev/null || true
-  [ -n "${REPAIR_TOUCH_GLOB:-}" ] && find "${REPAIR_TOUCH_GLOB}" -type f -exec touch {} + 2>/dev/null || true
-  deadline=$(( $(date +%s) + timeout ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    h="$(__visual_bundle_hash)" || return 1
-    if [ -n "$h" ] && [ -n "$prev" ] && [ "$h" != "$prev" ]; then log "visual-repair: fresh bundle served (hash changed from pre-edit)"; [ -n "$hf" ] && printf '%s' "$h" >"$hf"; return 0; fi
-    sleep "$interval"
-  done
-  log "visual-repair: bundle unchanged after ${timeout}s; resetting Metro"
-  repair_metro_reset "${REPAIR_RESET_DEVICE:-}"
-  h="$(__visual_bundle_hash)" || return 1
-  [ -n "$h" ] || return 1
-  [ -n "$hf" ] && printf '%s' "$h" >"$hf"
-  return 0
 }
 
 # Injected capture_fn for the repair loop. On-device validation showed Metro's in-process
@@ -443,14 +395,7 @@ visual_repair_for_spec() {
   _repair_one() {
     local sc="$1" st="$2" dv="$3"
     eval "REPAIR_NODE_$sc=\"$(node_id_for "$spec" "$sc")\""
-    export NIGHT_SHIFT_VISUAL_PREVHASH_FILE="$out_dir/_rsnap/$sc-prevhash"
-    # Seed the prevhash file with the PRE-EDIT bundle hash so the first repair
-    # attempt's poll waits for a REAL change rather than accepting the first
-    # served hash (which may be the stale pre-edit bundle due to Metro's async
-    # file watcher). Metro is already up and serving at this point.
-    mkdir -p "$(dirname "$NIGHT_SHIFT_VISUAL_PREVHASH_FILE")"
-    __visual_bundle_hash >"$NIGHT_SHIFT_VISUAL_PREVHASH_FILE" 2>/dev/null || true
-    export REPAIR_TOUCH_GLOB="$project/${allow_csv%%,*}"
+    # repair_recapture_screen restarts Metro on this device before each capture.
     REPAIR_RESET_DEVICE="$(device_label_to_name "$dv")"
     export REPAIR_RESET_DEVICE
     visual_stage_figma_data "$REPAIR_FILEKEY" "$(node_id_for "$spec" "$sc")" \
