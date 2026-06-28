@@ -36,6 +36,7 @@ directory; run engine/workflow git inside the engine directory.
 |---|---|---|
 | `web-app/` | Next.js 16 + React 19 + Prisma + Postgres (web) | see `web-app/CLAUDE.md` |
 | `rn-sandbox/` | React Native 0.85 (bare, New Arch) | see `rn-sandbox/CLAUDE.md` |
+| `water-tracker-app/` | React Native (Expo 56 + expo-router + Skia) | see `water-tracker-app/CLAUDE.md` |
 | `nightshift-demo/` | plain Node (vitest) — scratch/demo target | `node --test` |
 | `night-shift-viewer/` | Hono + Vite/React dashboard, launcher, spec editor | its own repo + `WORKFLOW.md` |
 
@@ -54,7 +55,7 @@ directory; run engine/workflow git inside the engine directory.
 
 - **CLI** (run from the `night-shift-engine/` directory): `NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <project-path> --spec specs/<name>.md`.
   Free pre-flight: append `--fixture-test --dry-run` (deterministic fixtures).
-- **Viewer**: server `cd night-shift-viewer/server && NSV_ALLOW_EDIT=1 NSV_ALLOW_LAUNCH=1 NSV_ALLOW_REAL=1 npm run dev:real`;
+- **Viewer** (run from the workspace container, where the engine and viewer are siblings): server `cd night-shift-viewer/server && NSV_ALLOW_EDIT=1 NSV_ALLOW_LAUNCH=1 NSV_ALLOW_REAL=1 npm run dev:real`;
   web `cd ../web && npm run dev`; open http://127.0.0.1:5173. `NSV_ALLOW_REAL` = real
   paid runs, `NSV_ALLOW_EDIT` = spec editor. The viewer **auto-discovers**
   target repos in the workspace container: any sibling that is its own git repo and has opted
