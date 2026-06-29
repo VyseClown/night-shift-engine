@@ -229,6 +229,11 @@ List the non-happy-path scenarios the implementation must handle:
 ## Test Plan
 
 - First failing test or executable check: `npm test [target-test]`
+<!-- Must be RED before the change. Net-new: name the not-yet-existing test (absent →
+     red). MODIFYING an already-tested module (named test exists and passes at
+     baseline): the engine auto-detects "modify-mode" — it does not block on the green
+     baseline and instead proves red by overlaying the candidate's updated test files
+     onto BASE production after implementation. Naming an existing test is fine. -->
 - Unit tests for: [list functions/utilities to test]
 - Component / integration tests for: [list components or flows]
 - E2E test (if applicable): [describe the Playwright flow]
