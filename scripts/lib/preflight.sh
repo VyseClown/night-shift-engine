@@ -222,20 +222,23 @@ run_test_command() {
 # files are left at BASE so the proof isolates the test change.
 verify_red_against_base() {
   local project="$1" base="$2" candidate="$3" command="$4" target="$5"
-  local wt log f rc=0
+  local wt log f rc=0 overlaid=0
   wt="$(tmp_base)/ns-redbase-$candidate-$$"
   rm -rf "$wt" 2>/dev/null
   git -C "$project" worktree add --detach "$wt" "$base" >/dev/null 2>&1 || return 2
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
+    # Match conventional test files anywhere, INCLUDING a top-level __tests__/ dir
+    # (the leading * also matches an empty leading path component).
     case "$f" in
-      *.test.*|*.spec.*|*/__tests__/*)
+      *.test.*|*.spec.*|*__tests__/*)
         if git -C "$project" cat-file -e "$candidate:$f" 2>/dev/null; then
           mkdir -p "$wt/$(dirname "$f")"
           git -C "$project" show "$candidate:$f" >"$wt/$f"
         else
           rm -f "$wt/$f"
-        fi ;;
+        fi
+        overlaid=1 ;;
     esac
   done < <(git -C "$project" diff -z --name-only "$base..$candidate")
   link_worktree_dependencies "$wt" 2>/dev/null || true
@@ -243,9 +246,16 @@ verify_red_against_base() {
   (cd "$wt" && bash -lc "$command") >"$log" 2>&1 </dev/null || rc=$?
   jq -n --arg command "$command" --argjson exit_status "$rc" \
     --arg output "$(tail -c 20000 "$log")" \
-    '{command:$command,exit_status:$exit_status,output:$output}' >"$target"
+    '{command:$command,exit_status:$exit_status,output:$output}' >"$target" || rc=-1
   git -C "$project" worktree remove --force "$wt" >/dev/null 2>&1 || true
   rm -rf "$wt" 2>/dev/null || true
+  # Signal a setup failure (caller blocks with a clear message) when: no test file was
+  # overlaid (the diff named none → the proof would be vacuous), the test runner was
+  # not found (127), or the result JSON could not be written (-1). A genuine run
+  # returns 0 and the caller judges red/green from the JSON exit_status.
+  [ "$overlaid" -eq 1 ] || return 3
+  [ "$rc" -ne 127 ] || return 4
+  [ "$rc" -ne -1 ] || return 5
   return 0
 }
 

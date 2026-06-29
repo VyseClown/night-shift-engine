@@ -1704,6 +1704,7 @@ EOF
     .baseline_status=$baseline_status | .finding_ids=[] | .candidate_commits=[] |
     .plan_approved=false | .implementation_approved=false |
     .candidate_verified=false | .baseline_complete=false |
+    .test_first_baseline_green=false |
     .stage_counters={planning:0} | .stage_started={planning:$epoch} |
     .updated_at=$now
   ' --arg task "$SPEC" --argjson epoch "$epoch" --arg base "$BASE_COMMIT" \
@@ -1719,10 +1720,18 @@ EOF
   assert_tools_available "$RUN_ROOT/validated/baseline.json" "next task baseline"
   test_command="$(sed -nE 's/^- First failing test or executable check: `([^`]+)`.*/\1/p' "$SPEC" | head -n 1)"
   run_test_command failing "$test_command" "$RUN_ROOT/validated/test-first-failing.json"
-  [ "$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-failing.json")" -ne 127 ] ||
+  test_first_exit="$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-failing.json")"
+  [ "$test_first_exit" -ne 127 ] ||
     block_run "next task test-first command was not found (exit 127); fix the toolchain"
-  [ "$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-failing.json")" -ne 0 ] ||
-    block_run "next task test-first command did not fail before implementation"
+  if [ "$test_first_exit" -eq 0 ]; then
+    # Same modify-mode handling as the initial baseline gate: a spec that modifies an
+    # already-tested module cannot be red at baseline; the red proof is verified
+    # against base after implementation (see verify_candidate).
+    state_set '.test_first_baseline_green=true'
+    log "next task test-first passes at baseline; modify-mode — red verified against base after implementation"
+  else
+    state_set '.test_first_baseline_green=false'
+  fi
   state_set '.baseline_complete=true'
 }
 

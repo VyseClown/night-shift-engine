@@ -428,16 +428,20 @@ fixture_red_against_base_blind() {
   git -C "$repo" config user.email fixture@example.invalid
   git -C "$repo" config user.name Fixture
   printf 'module.exports = { f: () => 1 };\n' >"$repo/src/m.js"
-  printf 'const m=require("./m");process.exit(typeof m.f==="function"?0:1);\n' >"$repo/src/m.test.js"
+  printf '// v1\nconst m=require("./m");process.exit(typeof m.f==="function"?0:1);\n' >"$repo/src/m.test.js"
   git -C "$repo" add .
   git -C "$repo" commit -qm base
   local base; base="$(git -C "$repo" rev-parse HEAD)"
+  # Candidate changes production AND edits the test (so it IS in the diff and gets
+  # overlaid) — but the test is change-blind: it asserts only that f exists, which is
+  # true on both old and new code. The overlay must therefore stay GREEN on base.
   printf 'module.exports = { f: () => 2 };\n' >"$repo/src/m.js"
+  printf '// v2\nconst m=require("./m");process.exit(typeof m.f==="function"?0:1);\n' >"$repo/src/m.test.js"
   git -C "$repo" add .
   git -C "$repo" commit -qm candidate
   local cand; cand="$(git -C "$repo" rev-parse HEAD)"
   verify_red_against_base "$repo" "$base" "$cand" "node src/m.test.js" "$target" || return 1
-  # change-blind test stays GREEN on base => exit_status 0 (caller blocks; no red proof)
+  # change-blind test (overlaid onto base) stays GREEN => exit_status 0 (caller blocks; no red proof)
   [ "$(jq -r '.exit_status' "$target")" -eq 0 ]
 }
 
