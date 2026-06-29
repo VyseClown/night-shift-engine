@@ -65,7 +65,7 @@ Launch unattended from a terminal (not a Claude session):
 scripts/night-shift.sh --fixture-test --dry-run
 
 # A real run on a spec:
-NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project ~/work/<proj> --spec specs/<name>.md
+NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <workspace>/<proj> --spec specs/<name>.md
 ```
 
 | Command | What it does |

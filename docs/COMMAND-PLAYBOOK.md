@@ -2,7 +2,9 @@
 
 A task → command index for the visual-fidelity / Figma / night-shift capabilities in
 this repo. Written for both humans and a fresh Claude instance: **match the task to a
-row, run the command.** All paths are relative to the engine repo root (`~/work`).
+row, run the command.** Script paths (`scripts/…`) are relative to the engine repo
+root (the `night-shift-engine/` directory); `--project` takes an app repo in the
+workspace container (`<workspace>/<app>`).
 
 > **Figma rule (always):** use the **Figma MCP** (`get_figma_data`,
 > `download_figma_images`) for every Figma read/export. **Never** use `FIGMA_TOKEN` or
@@ -32,14 +34,14 @@ Find the `fileKey` and `nodeId` from the Figma URL
   call the MCP tool `get_figma_data` with `{ fileKey, nodeId }`.
 - **Reference image** (for pixel-diff or to view the design): call
   `download_figma_images` with `{ fileKey, nodes:[{nodeId, fileName:"Frame.png"}], localPath, pngScale:2 }`.
-  `localPath` must be **inside the MCP image directory** (`~/work`); pass it relative
+  `localPath` must be **inside the MCP image directory** (the workspace container); pass it relative
   (e.g. `water-tracker-app/.night-shift/refs`). Stage exports under a **gitignored**
   dir (`.night-shift/`) so they don't pollute `git status`.
 
 ## §2 — Review an RN screen's fidelity vs Figma (capture + diff %)
 
 ```bash
-scripts/visual-review.sh --project ~/work/<rn-app> --drive <mode> [--spec specs/<name>.md] [--no-refs] [--no-build]
+scripts/visual-review.sh --project <workspace>/<rn-app> --drive <mode> [--spec specs/<name>.md] [--no-refs] [--no-build]
 ```
 Builds/installs the app on the Design-Contract device matrix, stages the Figma
 references, captures each screen, pixel-diffs with `odiff`, and writes
@@ -61,7 +63,7 @@ tolerance, 1 = something over, 2 = setup error.
 ## §3 — Auto-fix an RN screen toward Figma (standalone)
 
 ```bash
-scripts/visual-review.sh --project ~/work/<rn-app> --repair[=N] [--repair-shared] --drive file
+scripts/visual-review.sh --project <workspace>/<rn-app> --repair[=N] [--repair-shared] --drive file
 ```
 After the report, an agent edits each over-tolerance screen toward the Figma design,
 re-captures (Metro fast-reload), and repeats up to `N` attempts/screen (default 3;
@@ -80,7 +82,7 @@ is not wired — drive a closeable-gap loop manually if you need maestro re-capt
 
 ```bash
 NIGHT_SHIFT_VISUAL_CAPTURE=1 NIGHT_SHIFT_VISUAL_REPAIR=1 NIGHT_SHIFT_ACCEPT_COSTS=YES \
-  scripts/night-shift.sh --project ~/work/<rn-app> --spec specs/<name>.md
+  scripts/night-shift.sh --project <workspace>/<rn-app> --spec specs/<name>.md
 ```
 The engine's `visual_review` stage auto-repairs over-tolerance screens *during* the
 build: capture → repair → commit `fix(visual): auto-repair …` on the feature branch →
@@ -106,7 +108,7 @@ scenario, then the pipeline screenshots it.
    pipeline shoots). Sample: `docs/examples/maestro/Home-default.yaml`.
 3. Run review with `--drive maestro`:
    ```bash
-   scripts/visual-review.sh --project ~/work/<rn-app> --drive maestro --maestro-dir <flows-dir>
+   scripts/visual-review.sh --project <workspace>/<rn-app> --drive maestro --maestro-dir <flows-dir>
    ```
 
 **Auto-generate a flow from a Figma frame:** dispatch an agent with (a) the Figma
@@ -118,9 +120,9 @@ navigation files; have it infer which screen/state the frame depicts and write t
 
 ```bash
 # free deterministic pre-flight (no cost):
-scripts/night-shift.sh --project ~/work/<app> --spec specs/<name>.md --fixture-test --dry-run
+scripts/night-shift.sh --project <workspace>/<app> --spec specs/<name>.md --fixture-test --dry-run
 # real (paid) run:
-NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project ~/work/<app> --spec specs/<name>.md
+NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <workspace>/<app> --spec specs/<name>.md
 ```
 The spec's `- Track:` (`rn` | `web` | `node`, default `rn`) selects the review persona
 set, template, and validation checklist. Model tiering: `NIGHT_SHIFT_PLAN_MODEL`
