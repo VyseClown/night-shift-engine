@@ -212,6 +212,43 @@ run_test_command() {
     '{command:$command,exit_status:$exit_status,output:$output}' >"$target"
 }
 
+# Red-against-base proof for a spec that MODIFIES an already-tested module (the
+# first-failing-test passes at baseline). Overlays the candidate's added/modified/
+# deleted TEST files onto a worktree at BASE production code and runs the test there,
+# writing {command,exit_status,output} to $target. A genuine red→green change leaves
+# the updated tests FAILING (exit != 0) against the old code; a change-blind test stays
+# green (exit 0), which the caller treats as "no real red proof" and blocks. Test files
+# are matched by the conventional *.test.* / *.spec.* / __tests__ patterns; production
+# files are left at BASE so the proof isolates the test change.
+verify_red_against_base() {
+  local project="$1" base="$2" candidate="$3" command="$4" target="$5"
+  local wt log f rc=0
+  wt="$(tmp_base)/ns-redbase-$candidate-$$"
+  rm -rf "$wt" 2>/dev/null
+  git -C "$project" worktree add --detach "$wt" "$base" >/dev/null 2>&1 || return 2
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      *.test.*|*.spec.*|*/__tests__/*)
+        if git -C "$project" cat-file -e "$candidate:$f" 2>/dev/null; then
+          mkdir -p "$wt/$(dirname "$f")"
+          git -C "$project" show "$candidate:$f" >"$wt/$f"
+        else
+          rm -f "$wt/$f"
+        fi ;;
+    esac
+  done < <(git -C "$project" diff -z --name-only "$base..$candidate")
+  link_worktree_dependencies "$wt" 2>/dev/null || true
+  log="$target.log"
+  (cd "$wt" && bash -lc "$command") >"$log" 2>&1 </dev/null || rc=$?
+  jq -n --arg command "$command" --argjson exit_status "$rc" \
+    --arg output "$(tail -c 20000 "$log")" \
+    '{command:$command,exit_status:$exit_status,output:$output}' >"$target"
+  git -C "$project" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  rm -rf "$wt" 2>/dev/null || true
+  return 0
+}
+
 run_validation_commands() {
   local kind="$1" target="$2" commands="$3" run_dir="${4:-$PROJECT}" command output rc first=1 tmp
   tmp="$target.tmp.$$"

@@ -94,6 +94,8 @@ run_dry_fixtures() {
   fixture_assert "validation worktree gets linked dependencies" fixture_worktree_dependencies "$root"
   fixture_assert "validation worktree links nested (web-layout) dependencies" fixture_worktree_dependencies_nested "$root"
   fixture_assert "tmp base is canonical (worktree path matches cleanup prefix)" fixture_tmp_base_canonical "$root"
+  fixture_assert "test-first red-against-base: updated tests fail on base production" fixture_red_against_base "$root"
+  fixture_assert "test-first red-against-base: change-blind tests stay green on base (caught)" fixture_red_against_base_blind "$root"
   fixture_assert "review fields are read only from the ## Review section" fixture_review_fields_scoped "$root"
   fixture_assert "visual-diff schema enforces shape + pass-consistency" fixture_visual_diff_schema "$root"
   fixture_assert "visual capture parses Design Contract frames x states" fixture_visual_capture_screens "$root"
@@ -389,6 +391,54 @@ fixture_candidate_isolation() {
   printf 'dirty\n' >"$repo/dirty.txt"
   git -C "$repo" worktree add --detach "$worktree" HEAD >/dev/null 2>&1
   [ -f "$worktree/tracked.txt" ] && [ ! -e "$worktree/dirty.txt" ]
+}
+
+# Builds a repo whose candidate genuinely changes behavior AND updates the test to
+# assert it. `verify_red_against_base` overlays the candidate's test file onto BASE
+# production and must observe RED (the updated test fails against the old code) — the
+# wrapper-owned red proof for a spec that modifies an already-tested module.
+fixture_red_against_base() {
+  local root="$1" repo="$root/rab-repo" target="$root/rab.json"
+  mkdir -p "$repo/src"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email fixture@example.invalid
+  git -C "$repo" config user.name Fixture
+  printf 'module.exports = { f: () => 1 };\n' >"$repo/src/m.js"
+  printf 'const {f}=require("./m");process.exit(f()===1?0:1);\n' >"$repo/src/m.test.js"
+  git -C "$repo" add .
+  git -C "$repo" commit -qm base
+  local base; base="$(git -C "$repo" rev-parse HEAD)"
+  printf 'module.exports = { f: () => 2 };\n' >"$repo/src/m.js"
+  printf 'const {f}=require("./m");process.exit(f()===2?0:1);\n' >"$repo/src/m.test.js"
+  git -C "$repo" add .
+  git -C "$repo" commit -qm candidate
+  local cand; cand="$(git -C "$repo" rev-parse HEAD)"
+  verify_red_against_base "$repo" "$base" "$cand" "node src/m.test.js" "$target" || return 1
+  # candidate test (asserts f()===2) on base production (f()===1) => RED (exit != 0)
+  [ "$(jq -r '.exit_status' "$target")" -ne 0 ]
+}
+
+# Negative: the candidate changes production but the test is change-blind (asserts
+# something true on both old and new code). The overlay stays GREEN on base, so the
+# wrapper has NO genuine red proof — the caller must treat exit_status 0 as a block.
+fixture_red_against_base_blind() {
+  local root="$1" repo="$root/rab2-repo" target="$root/rab2.json"
+  mkdir -p "$repo/src"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email fixture@example.invalid
+  git -C "$repo" config user.name Fixture
+  printf 'module.exports = { f: () => 1 };\n' >"$repo/src/m.js"
+  printf 'const m=require("./m");process.exit(typeof m.f==="function"?0:1);\n' >"$repo/src/m.test.js"
+  git -C "$repo" add .
+  git -C "$repo" commit -qm base
+  local base; base="$(git -C "$repo" rev-parse HEAD)"
+  printf 'module.exports = { f: () => 2 };\n' >"$repo/src/m.js"
+  git -C "$repo" add .
+  git -C "$repo" commit -qm candidate
+  local cand; cand="$(git -C "$repo" rev-parse HEAD)"
+  verify_red_against_base "$repo" "$base" "$cand" "node src/m.test.js" "$target" || return 1
+  # change-blind test stays GREEN on base => exit_status 0 (caller blocks; no red proof)
+  [ "$(jq -r '.exit_status' "$target")" -eq 0 ]
 }
 
 # Exercises path_in_baseline directly with paths that contain spaces.
