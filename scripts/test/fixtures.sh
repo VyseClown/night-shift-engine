@@ -112,6 +112,7 @@ run_dry_fixtures() {
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
   fixture_assert "observer temp dir cleanup is scoped, removing, and idempotent" fixture_observer_tmp_cleanup "$root"
   fixture_assert "observer cost is recorded from the retry's .attempt raw" fixture_observer_cost_capture "$root"
+  fixture_assert "observer gets engine-computed diff + engine-run validation (independent evidence)" fixture_observer_wrapper_evidence "$root"
   fixture_assert "persona result normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
   fixture_assert "persona_lens extracts a persona's doc section (cross-doc fallback)" fixture_persona_lens "$root"
   fixture_assert "engine spawns personas itself + stamps identity (provenance)" fixture_persona_spawn "$root"
@@ -906,6 +907,31 @@ fixture_cost_ledger() {
     "$ledger" >/dev/null || return 1
   # The raw files themselves are still compacted away.
   [ ! -d "$dir/raw" ] || return 1
+  return 0
+}
+
+fixture_observer_wrapper_evidence() {
+  # The observer's evidence is wrapper-controlled, not primary-curated: the engine
+  # computes the base..candidate diff and surfaces its own validation output.
+  local root="$1" dir="$root/obsev"
+  mkdir -p "$dir"
+  ( PROJECT="$dir/proj"; RUN_ROOT="$dir/run"
+    mkdir -p "$PROJECT" "$RUN_ROOT/validated"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'line-a\n' >"$PROJECT/f.txt"
+    git -C "$PROJECT" add f.txt; git -C "$PROJECT" commit -qm base
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf 'line-a\nline-b-CANDIDATE\n' >"$PROJECT/f.txt"
+    git -C "$PROJECT" add f.txt; git -C "$PROJECT" commit -qm cand
+    cand="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '[{"command":"echo","exit_status":0,"output":"FINAL-OK"}]' >"$RUN_ROOT/validated/final.json"
+    out="$(observer_wrapper_evidence "$cand")"
+    printf '%s' "$out" | grep -q 'ENGINE-COMPUTED CANDIDATE DIFF' || exit 1
+    printf '%s' "$out" | grep -q 'line-b-CANDIDATE' || exit 1     # the real diff, engine-computed
+    printf '%s' "$out" | grep -q 'FINAL-OK' || exit 1            # engine-run validation surfaced
+    printf '%s' "$out" | grep -q "base=$BASE_COMMIT" || exit 1
+  ) || return 1
   return 0
 }
 

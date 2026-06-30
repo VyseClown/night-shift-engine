@@ -8,9 +8,19 @@
 ## Status
 
 - [x] Draft
-- [ ] Ready for implementation
-- [ ] In progress
-- [ ] Done — branch: `feat/engine-observer-evidence-anchor`
+- [x] Ready for implementation
+- [x] In progress
+- [x] Done — branch: `claude/recent-changes-open-prs-6yzp7h` (140 fixtures pass, shellcheck clean)
+
+Implemented via `observer_wrapper_evidence`: `run_observer` now appends an
+engine-computed `base..candidate` diff plus the wrapper-run validation
+(`validated/final.json` and `test-first-passing.json` from `verify_candidate`,
+produced in the isolated worktree) to the observer context, marked "authoritative".
+The observer prompt tells the observer to weight those over primary-supplied
+artifacts. Observer isolation (neutral cwd, non-bypass, fresh session) is
+unchanged; it still has no live repo access — the wrapper hands it the ground
+truth. New fixture `fixture_observer_wrapper_evidence` builds a real base→candidate
+repo and asserts the engine-computed diff and engine-run validation are surfaced.
 
 ---
 

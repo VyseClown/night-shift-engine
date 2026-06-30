@@ -1512,6 +1512,10 @@ observer_prompt() {
   cat <<EOF
 You are an independent Claude observer reviewing another Claude session's work.
 You share no context with the implementer; judge only the supplied evidence.
+The sections marked "authoritative" (the engine-computed base..candidate diff and
+the engine-run validation) are ground truth produced by the wrapper, not the
+implementer — weight them over any primary-supplied artifact, which is
+supplementary and may be incomplete.
 
 Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:
@@ -1637,6 +1641,27 @@ run_visual_inloop_repair() {
   log "visual_review: auto-repaired ($screens); committed $newsha; refreshed report for observer"
 }
 
+# Engine-controlled evidence the observer can trust regardless of what the primary
+# attaches: the base..candidate diff the WRAPPER computes, and the validation the
+# WRAPPER ran at the candidate commit in the isolated worktree (final.json /
+# test-first-passing.json from verify_candidate). This makes the observer's
+# evidence independent, not just its judgment — a primary that omits or shades its
+# artifacts cannot hide the real diff or the real validation verdict.
+observer_wrapper_evidence() {
+  local candidate="$1"
+  printf '%s\n' '--- ENGINE-COMPUTED CANDIDATE DIFF (base..candidate; authoritative) ---'
+  printf 'base=%s candidate=%s\n\n' "$BASE_COMMIT" "$candidate"
+  git -C "$PROJECT" diff "$BASE_COMMIT..$candidate" 2>/dev/null
+  if [ -s "$RUN_ROOT/validated/final.json" ]; then
+    printf '\n%s\n' '--- ENGINE-RUN FINAL VALIDATION (at candidate, isolated worktree; authoritative) ---'
+    cat "$RUN_ROOT/validated/final.json"
+  fi
+  if [ -s "$RUN_ROOT/validated/test-first-passing.json" ]; then
+    printf '\n%s\n' '--- ENGINE-RUN TEST-FIRST (passing at candidate; authoritative) ---'
+    cat "$RUN_ROOT/validated/test-first-passing.json"
+  fi
+}
+
 run_observer() {
   local signal="$1" candidate context="$RUN_ROOT/prompts/observer-context.txt"
   local out raw attempt=0 artifact
@@ -1653,6 +1678,7 @@ run_observer() {
       find "$review_dir" -type f -name '*.json' -exec jq -c \
         '{persona,stage,commit,status,findings,documentation_changes}' {} \;
     done
+    observer_wrapper_evidence "$candidate"
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30
