@@ -31,13 +31,19 @@ a handful of low-probability durability edges, and a real visual-repair bug.
 
 ## Proposals (this directory)
 
-| Priority | Proposal | File |
-|---|---|---|
-| HIGHEST | Enforce persona-review provenance (close the self-report hole) | `engine-persona-provenance.md` |
-| HIGH | Give the observer a wrapper-controlled evidence anchor | `engine-observer-evidence-anchor.md` |
-| HIGH | Fix visual-repair hyphen hazard, global-cap over-count, default drift | `engine-visual-repair-fixes.md` |
-| MEDIUM | Harden durability/concurrency edges | `engine-durability-hardening.md` |
-| MEDIUM | Reduce hand-synced duplication + add a config inventory | `engine-reduce-hand-sync.md` |
+All five were implemented, fixture-tested, and pushed on branch
+`claude/recent-changes-open-prs-6yzp7h` (143 deterministic fixtures pass,
+shellcheck clean). Live LLM behavior of the wrapper-spawned personas / observer
+needs a real run; the deterministic seams are stubbed exactly like the existing
+observer/repair paths.
+
+| Priority | Proposal | File | Status |
+|---|---|---|---|
+| HIGHEST | Enforce persona-review provenance (close the self-report hole) | `engine-persona-provenance.md` | ✅ done (wrapper-spawns personas) |
+| HIGH | Give the observer a wrapper-controlled evidence anchor | `engine-observer-evidence-anchor.md` | ✅ done (engine diff + validation) |
+| HIGH | Fix visual-repair hyphen hazard, global-cap over-count, default drift | `engine-visual-repair-fixes.md` | ✅ done (+ node/key wired in) |
+| MEDIUM | Harden durability/concurrency edges | `engine-durability-hardening.md` | ✅ done 3/4 (fsync deferred) |
+| MEDIUM | Reduce hand-synced duplication + add a config inventory | `engine-reduce-hand-sync.md` | ✅ done (all 4 parts) |
 
 Lower-priority items not yet written up as proposals: per-stage in-session
 compaction for long implement stages; an aspect-ratio sanity check before the
