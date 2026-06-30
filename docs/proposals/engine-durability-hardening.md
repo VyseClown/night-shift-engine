@@ -9,9 +9,35 @@
 ## Status
 
 - [x] Draft
-- [ ] Ready for implementation
-- [ ] In progress
-- [ ] Done — branch: `feat/engine-durability-hardening`
+- [x] Ready for implementation
+- [x] In progress
+- [x] Done (3 of 4) — branch: `claude/recent-changes-open-prs-6yzp7h` (142 fixtures pass, shellcheck clean)
+
+Implemented:
+1. **Trap gap** — `initialize_run` now arms the `HUP/INT/TERM → block_run` trap
+   immediately after `state.json` is written, before the minutes-long baseline
+   validation, so an early signal records a resumable block instead of leaving
+   `status=running` for the supervisor to escalate. `main_run` re-arms it for the
+   recovery path (harmless).
+2. **PID reuse** — `lock_is_stale` (`locking.sh`) now compares the holder's
+   recorded process start time (`proc_start_time`: `/proc/<pid>/stat` field 22 on
+   Linux, `ps -o lstart=` on BSD) against the live PID's; a mismatch ⇒ reused PID ⇒
+   reclaimable. Falls back to liveness-only when start time is unrecorded/unreadable
+   (backward compatible — the device-registry "reclaim stale" fixture still passes).
+3. **Worktree orphan** — `verify_candidate` records the intended worktree path
+   *before* creating it, and `prepare_validation_worktree` prunes a pre-existing
+   orphan at that exact (RUN_ID+candidate-unique) path on re-entry instead of
+   blocking.
+
+Deferred:
+4. **fsync** — not implemented. Portable per-file fsync from bash is awkward
+   (`sync` is global/heavy), `tmp+mv` already gives crash-atomicity (old-or-new,
+   never torn), and power-loss during an overnight workstation run is low-impact.
+   Left as a knob-gated follow-up if power-loss durability is ever required.
+
+Tests: `fixture_lock_pid_reuse` (alive+match=live, alive+mismatch=stale,
+no-start=fallback-live, dead=stale) and `fixture_worktree_reentry` (orphan pruned
+and recreated, no wedge).
 
 ---
 

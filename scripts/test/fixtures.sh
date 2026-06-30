@@ -94,6 +94,7 @@ run_dry_fixtures() {
   fixture_assert "validation worktree gets linked dependencies" fixture_worktree_dependencies "$root"
   fixture_assert "validation worktree links nested (web-layout) dependencies" fixture_worktree_dependencies_nested "$root"
   fixture_assert "tmp base is canonical (worktree path matches cleanup prefix)" fixture_tmp_base_canonical "$root"
+  fixture_assert "prepare_validation_worktree prunes a re-entry orphan (no wedge)" fixture_worktree_reentry "$root"
   fixture_assert "test-first red-against-base: updated tests fail on base production" fixture_red_against_base "$root"
   fixture_assert "test-first red-against-base: change-blind tests stay green on base (caught)" fixture_red_against_base_blind "$root"
   fixture_assert "review fields are read only from the ## Review section" fixture_review_fields_scoped "$root"
@@ -173,6 +174,7 @@ run_dry_fixtures() {
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
+  fixture_assert "lock_is_stale detects PID reuse via start-time mismatch" fixture_lock_pid_reuse "$root"
   fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
   fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
   fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
@@ -484,6 +486,42 @@ fixture_dirty_path_space() {
   path_in_baseline "$baseline" "clean.txt" && return 1
   # (d) A spaced committed path that is clean is not blocked.
   path_in_baseline "$baseline" "other clean.txt" && return 1
+  return 0
+}
+
+fixture_worktree_reentry() {
+  # A prior attempt's orphan worktree at the exact path must be pruned and recreated
+  # on re-entry, not block the run (the crash-between-add-and-record window).
+  local root="$1" repo="$root/wtre" wt="$root/wtre-vw"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+  printf 'a\n' >"$repo/f.txt"; git -C "$repo" add f.txt; git -C "$repo" commit -qm base
+  local commit; commit="$(git -C "$repo" rev-parse HEAD)"
+  prepare_validation_worktree "$repo" "$wt" "$commit" || return 1
+  [ -e "$wt/f.txt" ] || return 1
+  # Re-entry: the worktree already exists (simulated orphan). Must succeed, not wedge.
+  prepare_validation_worktree "$repo" "$wt" "$commit" || return 1
+  [ -e "$wt/f.txt" ] || return 1
+  return 0
+}
+
+fixture_lock_pid_reuse() {
+  local root="$1" dir="$root/lockpid"
+  mkdir -p "$dir"
+  proc_start_time "$$" >/dev/null || return 1                      # start time is readable here
+  # Alive PID + matching recorded start => live (not stale).
+  printf '%s\n' "$$" >"$dir/pid"; proc_start_time "$$" >"$dir/start"
+  lock_is_stale "$dir" && return 1
+  # Alive PID + MISMATCHED recorded start (PID reuse) => stale/reclaimable.
+  printf 'not-the-real-start\n' >"$dir/start"
+  lock_is_stale "$dir" || return 1
+  # Alive PID + NO recorded start => fall back to liveness-only (live).
+  rm -f "$dir/start"
+  lock_is_stale "$dir" && return 1
+  # Dead PID => stale (unchanged behavior).
+  printf '2147483646\n' >"$dir/pid"; rm -f "$dir/start"
+  lock_is_stale "$dir" || return 1
   return 0
 }
 

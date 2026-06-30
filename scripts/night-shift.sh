@@ -540,6 +540,12 @@ initialize_run() {
     --arg base "$BASE_COMMIT" --arg branch "$BASE_BRANCH" \
     --arg baseline_status "$BASE_STATUS" ||
     die "could not initialize run state"
+  # Arm the interrupt trap now that state.json exists but BEFORE the minutes-long
+  # baseline validation below. Otherwise a signal during baseline validation frees
+  # the lock (EXIT trap) yet leaves status="running" with no block_reason, which the
+  # supervisor treats as a hard error and escalates instead of resuming. main_run
+  # re-arms the same trap after init for the recovery path; re-setting is harmless.
+  trap 'block_run "run interrupted by signal"' HUP INT TERM
   baseline_commands="$(extract_validation_commands "$SPEC" "Baseline validation commands")"
   run_validation_commands baseline "$RUN_ROOT/validated/baseline.json" "$baseline_commands" ||
     block_run "baseline validation commands are missing or could not run"
@@ -1404,6 +1410,20 @@ path_in_baseline() {
   return 1
 }
 
+# Create the isolated candidate-validation worktree at <path>, first pruning a
+# pre-existing orphan there — left by a crash between `worktree add` and recording
+# the path on a prior attempt of THIS run. The path embeds RUN_ID+candidate, so a
+# pre-existing match is always our own orphan, never a concurrent run's. Returns
+# non-zero iff the worktree could not be created.
+prepare_validation_worktree() {
+  local project="$1" path="$2" commit="$3"
+  if [ -e "$path" ]; then
+    git -C "$project" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+    git -C "$project" worktree prune 2>/dev/null || true
+  fi
+  git -C "$project" worktree add --detach "$path" "$commit" >/dev/null 2>&1
+}
+
 verify_candidate() {
   local candidate committed_path previous evidence artifact validation_worktree
   [ "$(jq -r '.baseline_complete and .plan_approved and .implementation_approved' "$STATE")" = "true" ] ||
@@ -1429,11 +1449,13 @@ verify_candidate() {
   [ "$candidate" != "$previous" ] ||
     block_run "CREATE_CANDIDATE did not produce a new candidate commit"
   validation_worktree="$(tmp_base)/night-shift-$RUN_ID-$candidate"
-  [ ! -e "$validation_worktree" ] ||
-    block_run "candidate validation worktree already exists: $validation_worktree"
-  git -C "$PROJECT" worktree add --detach "$validation_worktree" "$candidate" >/dev/null ||
-    block_run "could not create isolated candidate validation worktree"
+  # Record the intended worktree path BEFORE creating it, so a crash between the
+  # `worktree add` and the state write leaves a discoverable orphan rather than a
+  # silent wedge. prepare_validation_worktree prunes a pre-existing orphan at this
+  # exact (RUN_ID+candidate-unique) path on --resume instead of blocking on it.
   state_set '.validation_worktree=$path' --arg path "$validation_worktree"
+  prepare_validation_worktree "$PROJECT" "$validation_worktree" "$candidate" ||
+    block_run "could not create isolated candidate validation worktree"
   link_worktree_dependencies "$validation_worktree"
 
   evidence=""
