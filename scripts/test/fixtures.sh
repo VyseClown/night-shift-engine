@@ -3151,7 +3151,7 @@ fixture_recapture_wrapper() {
     log() { :; }
     repair_metro_restart() { printf 'restart\n' >>"$d/order.log"; }
     __visual_wait_bundle_ready() { printf 'wait\n' >>"$d/order.log"; return 0; }
-    visual_recapture_screen() { printf 'capture\n' >>"$d/order.log"; : >"$2.touch" 2>/dev/null; printf x >"$4"; }
+    visual_recapture_screen() { printf 'capture\n' >>"$d/order.log"; printf x >"$4"; }
     repair_recapture_screen Home default iphone-15 "$d/out.png"
     [ "$(cat "$d/order.log")" = "$(printf 'restart\nwait\ncapture')" ] || exit 1
     exit 0
