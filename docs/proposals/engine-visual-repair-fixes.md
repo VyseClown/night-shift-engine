@@ -8,9 +8,9 @@
 ## Status
 
 - [x] Draft
-- [ ] Ready for implementation
-- [ ] In progress
-- [ ] Done — branch: `feat/engine-visual-repair-fixes`
+- [x] Ready for implementation
+- [x] In progress
+- [x] Done — branch: `claude/recent-changes-open-prs-6yzp7h` (fixtures green; shellcheck clean at warning severity)
 
 ---
 
@@ -145,13 +145,15 @@ the published contract and is the cheaper default.)
 
 ## Acceptance criteria
 
-- [ ] AC1: A spec with a hyphenated/spaced frame name resolves the **correct**
+- [x] AC1: A spec with a hyphenated/spaced frame name resolves the **correct**
   per-screen node id in `repair_agent` (no fallback, no eval error on stderr).
-- [ ] AC2: No `eval` remains in the node-id pass-through; `shellcheck` clean.
-- [ ] AC3: The global repair cap is charged the **actual** attempts each screen
+- [x] AC2: No `eval` remains in the node-id pass-through; `shellcheck` clean at
+  warning severity (only pre-existing SC2317-info on the indirectly-invoked
+  `_repair_one`, same class as the original).
+- [x] AC3: The global repair cap is charged the **actual** attempts each screen
   consumed; a screen that passes on attempt 1 bills 1 (or 0 if no repair ran), not
   `$max`.
-- [ ] AC4: `NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS` unset yields **3** attempts in both
+- [x] AC4: `NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS` unset yields **3** attempts in both
   entry points, matching `CLAUDE.md` / `COMMAND-PLAYBOOK.md`.
 
 ## Validation

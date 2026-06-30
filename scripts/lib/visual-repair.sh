@@ -346,7 +346,11 @@ repair_validate() {
 repair_agent() {
   local screen="$1" state="$2" ref="$3" shot="$4" diff_img="$5" pct="$6" tol="$7" out_dir="$8"
   local key node allow prompt result cache spec_notes
-  key="$REPAIR_FILEKEY"; node="$REPAIR_NODE_${screen}"; node="${!node:-$REPAIR_FALLBACK_NODE}"
+  # Per-screen node id is set by _repair_one as a single fixed-name var. The old
+  # REPAIR_NODE_${screen} dynamic name + ${!node} indirection built an INVALID shell
+  # identifier for any screen name with a hyphen/space (the common Figma frame case),
+  # failing under set -u and silently degrading to the fallback node.
+  key="$REPAIR_FILEKEY"; node="${REPAIR_NODE_CURRENT:-$REPAIR_FALLBACK_NODE}"
   allow="src/features/"; [ "$REPAIR_SHARED" -eq 1 ] && allow="src/features/ and src/ui/"
   cache="$out_dir/design/$screen-figma.json"
   spec_notes="$(spec_design_sections "${REPAIR_SPEC:-}" 2>/dev/null)"
@@ -394,17 +398,26 @@ visual_repair_for_spec() {
   # shellcheck disable=SC2329  # invoked indirectly via visual_repair_run
   _repair_one() {
     local sc="$1" st="$2" dv="$3"
-    eval "REPAIR_NODE_$sc=\"$(node_id_for "$spec" "$sc")\""
+    # No eval / dynamic var name: works for any screen name and removes the
+    # eval-injection surface. repair_agent reads REPAIR_NODE_CURRENT.
+    REPAIR_NODE_CURRENT="$(node_id_for "$spec" "$sc")"
     # repair_recapture_screen restarts Metro on this device before each capture.
     REPAIR_RESET_DEVICE="$(device_label_to_name "$dv")"
     export REPAIR_RESET_DEVICE
     visual_stage_figma_data "$REPAIR_FILEKEY" "$(node_id_for "$spec" "$sc")" \
       "$out_dir/design/$sc-figma.json" || true
-    visual_repair_screen "$project" "$out_dir/_rsnap" "$out_dir" "$sc" "$st" "$dv" \
+    # Capture the assembled screen object so we report attempts ACTUALLY consumed
+    # (repairs are numbered from attempt 2), not the per-screen max — otherwise the
+    # global cap is charged $max per screen and trips early. On parse failure fall
+    # back to $max (conservative over-count, never an under-count).
+    local _screen_json _consumed
+    _screen_json="$(visual_repair_screen "$project" "$out_dir/_rsnap" "$out_dir" "$sc" "$st" "$dv" \
       "$out_dir/design/$sc-$st-$dv.png" "$out_dir/screenshots/$candidate_label/$sc-$st-$dv.png" \
       "$out_dir/diffs/$candidate_label/$sc-$st-$dv.png" "$(visual_capture_tolerance "$spec")" \
-      "$max" repair_agent repair_recapture_screen repair_validate "$allow_csv" >/dev/null
-    printf '%s\n' "$max"
+      "$max" repair_agent repair_recapture_screen repair_validate "$allow_csv")"
+    _consumed="$(printf '%s' "$_screen_json" | jq -r '[.attempts[]?|select(.attempt>1)]|length' 2>/dev/null)"
+    case "$_consumed" in (''|*[!0-9]*) _consumed="$max" ;; esac
+    printf '%s\n' "$_consumed"
   }
   visual_repair_run "$fail" "${NIGHT_SHIFT_VISUAL_REPAIR_GLOBAL_CAP:-30}" _repair_one
   unset -f _repair_one

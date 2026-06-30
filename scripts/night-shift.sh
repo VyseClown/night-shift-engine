@@ -1481,7 +1481,7 @@ run_visual_inloop_repair() {
   NO_BUILD="${NIGHT_SHIFT_VISUAL_REPAIR_NO_BUILD:-0}"
   repair_metro_start "$(device_label_to_name "$iter_dev")" || { log "visual_review: repair harness unavailable; proceeding unrepaired"; return 0; }
   visual_repair_for_spec "$SPEC" "$PROJECT" "$RUN_ROOT/validated" "$candidate" "$report" \
-    "${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-6}" \
+    "${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" \
     "$([ "${NIGHT_SHIFT_VISUAL_REPAIR_SHARED:-0}" = "1" ] && echo 'src/features/,src/ui/' || echo 'src/features/')" \
     "$iter_dev"
   repair_metro_stop

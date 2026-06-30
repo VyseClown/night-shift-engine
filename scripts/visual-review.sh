@@ -71,7 +71,7 @@ die() { log "ERROR: $*"; exit 2; }
 
 # ---- args -------------------------------------------------------------------
 PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="openurl" PREVIEW_FILE="" MAESTRO_DIR=""
-REPAIR=0 MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-6}" REPAIR_SHARED=0
+REPAIR=0 MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" REPAIR_SHARED=0
 SPECS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
