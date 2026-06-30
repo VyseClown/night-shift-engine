@@ -703,7 +703,7 @@ stage_model() {
 
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
-  local review_stage_name pending pending_stage review_set model_line reround_note
+  local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
@@ -720,8 +720,6 @@ primary_prompt() {
   review_set="$(review_round_set "$active" "$pending" "$pending_stage" "$review_stage_name")"
   persona_list="$(printf '%s' "$review_set" | tr '|' '\n' | sed 's/^/  - /')"
   persona_count="$(printf '%s' "$review_set" | tr '|' '\n' | grep -c .)"
-  model_line=""
-  [ "$PERSONA_MODEL" = "inherit" ] || model_line=" launched with model \"$PERSONA_MODEL\","
   reround_note=""
   if [ "$review_set" != "$active" ]; then
     reround_note="
@@ -787,15 +785,17 @@ Base commit: $BASE_COMMIT
 $design_build_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
-You own planning, implementation, reviewer coordination, finding resolution,
-validation, candidate commits, documentation, and task completion.
+You own planning, implementation, resolving review findings, validation,
+candidate commits, documentation, and task completion. The ENGINE runs the
+review personas itself; you do not coordinate or run reviewers.
 
 Maintain the authoritative plan at .night-shift/control/plan.md: write it during
 planning (acceptance criteria, approach, file-level steps) and keep it current as
 work proceeds. It is the handoff record across stage sessions and the "current
 plan" section of the RUN_PERSONAS review bundle.
 $handoff_note
-The review personas to run on the next RUN_PERSONAS action ($persona_count required results) are:
+On the next RUN_PERSONAS action the ENGINE runs these $persona_count independent
+review personas itself (you do NOT run them or write their results):
 $persona_list
 $reround_note
 Stage gate — you are at stage "$stage". The wrapper advances stages ONE step at a
@@ -813,18 +813,14 @@ It must validate against $SCHEMA_DIR/next-action.json. "task" must equal
 $SPEC. "artifacts" lists only project-relative files (no absolute paths, no
 "..") the wrapper must consume for the chosen action:
 
-- RUN_PERSONAS: first assemble ONE review bundle at
-  .night-shift/control/review-bundle.md containing the spec, the current plan,
-  the full diff against the base commit, and the latest test output. Then run
-  each persona listed above as a separate sub-agent,${model_line} each scoped to
-  its own domain and judging from the bundle — personas must not re-explore the
-  repo themselves. Write exactly $persona_count result files, one per listed
-  persona, each validating against $SCHEMA_DIR/persona-review.json, with the
-  persona's exact name and "stage" set to "plan" during plan_review or
-  "implementation" during implementation_review. In "artifacts" list ONLY those
-  persona result files — do NOT list the review bundle or the plan doc (they are
-  written to disk but are not persona results). Do not run personas outside the
-  listed set. Every finding is a blocker; APPROVE carries no findings.
+- RUN_PERSONAS: ensure the authoritative plan at .night-shift/control/plan.md is
+  current (it is the plan the reviewers judge), then signal RUN_PERSONAS with an
+  EMPTY "artifacts" array. The ENGINE assembles the review bundle (spec, plan, the
+  diff against the base commit, validation output) and runs each of the
+  $persona_count active personas as an independent, context-isolated sub-agent
+  itself — you do NOT run personas, write persona result files, or list them. On a
+  re-review round, resolve every finding the engine reported last round before you
+  signal RUN_PERSONAS again.
 - CREATE_CANDIDATE: create ONE local commit on the feature branch containing
   only files this run changed (never baseline dirty paths). Then write an
   execution-evidence file validating against $SCHEMA_DIR/execution-evidence.json
@@ -1122,35 +1118,172 @@ normalize_persona_result() {
   ' "$1"
 }
 
-# Copies the persona-review artifacts listed in a RUN_PERSONAS signal into the
-# round result dir. Each artifact is resolved for safety first (an unsafe or
-# missing path is fatal — path-traversal guard). Each is normalized (verdict→status
-# etc.) then validated; artifacts that still do not validate as persona-review
-# records are SKIPPED, not fatal: the primary also lists non-persona deliverables it
-# produced (the review bundle, the plan doc), and the exact-set + count + stage gate
-# in run_personas is the real enforcement. The normalized result is written into the
-# round dir, overwriting any malformed copy the primary placed there directly (which
-# previously lingered and made the gate miscount). Returns non-zero only on an
-# unsafe/missing path or a write failure.
-collect_persona_results() {
-  local signal="$1" result_dir="$2" artifact out dst tmp
-  while IFS= read -r artifact; do
-    [ -n "$artifact" ] || continue
-    out="$(resolve_artifact "$artifact")" || return 1
-    tmp="$result_dir/.collect-$$.json"
-    if normalize_persona_result "$out" >"$tmp" 2>/dev/null && json_schema_basic persona-review "$tmp"; then
-      dst="$result_dir/$(basename "$out")"
-      mv "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
-    else
-      rm -f "$tmp"
+# --- engine-spawned persona review (provenance: the WRAPPER runs each persona) --
+# Personas are run by the engine itself, not the primary, so a primary cannot
+# fabricate review approvals: it only signals RUN_PERSONAS (empty artifacts) and
+# the wrapper assembles the bundle, spawns each persona as an independent,
+# context-isolated sub-agent (mirroring the observer), stamps the result's
+# identity, validates it, and writes it into the round dir.
+
+persona_doc() {
+  case "$1" in
+    web) printf '%s' "$WORKSPACE_ROOT/docs/review-personas-web.md" ;;
+    *)   printf '%s' "$WORKSPACE_ROOT/docs/review-personas.md" ;;
+  esac
+}
+
+# Slug a persona name to a filesystem-safe, collision-free token. "TypeScript &
+# Code Quality Expert" -> "typescript-code-quality-expert".
+persona_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' |
+    sed -E 's/-+/-/g; s/^-//; s/-$//'
+}
+
+# Extract a persona's review-lens prose from the track's persona doc (falling back
+# to the other doc, since the node track reuses backend personas documented under
+# web). Matches a markdown heading whose text — after stripping #s and an optional
+# "N. " ordinal — equals the persona name, and prints the section body up to the
+# next heading. Empty output is acceptable: persona_prompt falls back to a generic
+# instruction so a missing doc never blocks a run.
+persona_lens() {
+  local persona="$1" track="$2" doc body
+  for doc in "$(persona_doc "$track")" \
+             "$WORKSPACE_ROOT/docs/review-personas.md" \
+             "$WORKSPACE_ROOT/docs/review-personas-web.md"; do
+    [ -f "$doc" ] || continue
+    body="$(awk -v name="$persona" '
+      /^#{1,6}[ \t]/ {
+        h=$0; sub(/^#{1,6}[ \t]+/, "", h); sub(/^[0-9]+\.[ \t]+/, "", h);
+        sub(/[ \t]+$/, "", h);
+        if (insec) exit;
+        if (h == name) { insec=1; next }
+        next
+      }
+      insec { print }
+    ' "$doc")"
+    if [ -n "$body" ]; then printf '%s' "$body"; return 0; fi
+  done
+  return 0
+}
+
+# Assemble the review bundle the engine hands every persona: the spec, the
+# approved plan, and (for implementation) the diff against the base commit plus
+# the latest validation output. Wrapper-computed, so the evidence the reviewers
+# judge is independent of anything the primary chooses to surface.
+assemble_review_bundle() {
+  local stage="$1" out="$2"
+  {
+    printf '# Review bundle (engine-assembled) — stage: %s\n\n' "$stage"
+    printf '## Task spec\n\n'
+    cat "$SPEC"
+    if [ -s "$RUN_ROOT/control/plan.md" ]; then
+      printf '\n\n## Approved plan\n\n'
+      cat "$RUN_ROOT/control/plan.md"
     fi
-  done <<EOF
-$(jq -r '.artifacts[]' "$signal")
+    if [ "$stage" = "implementation" ]; then
+      printf '\n\n## Implementation diff against base commit %s\n\n```diff\n' "$BASE_COMMIT"
+      git -C "$PROJECT" diff "$BASE_COMMIT" -- . 2>/dev/null
+      printf '```\n'
+      if [ -s "$RUN_ROOT/validated/baseline.json" ]; then
+        printf '\n## Baseline validation output\n\n```json\n'
+        cat "$RUN_ROOT/validated/baseline.json"
+        printf '\n```\n'
+      fi
+    fi
+  } >"$out"
+}
+
+# The prompt for one engine-spawned persona. Mirrors observer_prompt: judge only
+# the supplied bundle, end with a single fenced json verdict block.
+persona_prompt() {
+  local persona="$1" stage="$2" bundle="$3" lens="$4"
+  [ -n "$lens" ] || lens="Review strictly within the concerns of \"$persona\"; raise only issues a \"$persona\" would own."
+  cat <<EOF
+You are the "$persona" review persona for night-shift run $RUN_ID, independently
+reviewing another Claude session's $stage work. You share no context with the
+implementer and cannot see the repository — judge ONLY the review bundle below,
+strictly through your persona's lens. This is unattended; never ask questions.
+
+Your review lens:
+$lens
+
+Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
+block tagged json containing your verdict and NOTHING after it:
+
+\`\`\`json
+{"persona":"$persona","stage":"$stage","commit":null,"status":"APPROVE","findings":[],"documentation_changes":[]}
+\`\`\`
+
+Rules for that JSON object:
+- Use ONLY these six keys. "status" is EXACTLY "APPROVE" or "BLOCK" — APPROVE with
+  an empty "findings" array, or BLOCK with one or more findings. Every concern you
+  have is a blocker; an APPROVE carries no findings.
+- Each finding has a stable "id" matching ^[A-Z][A-Z0-9_-]*-[0-9]{3,}$ (e.g.
+  UX-001), concrete "evidence", and a binary "required_change".
+  "documentation_changes" is an array of strings.
+
+REVIEW BUNDLE:
+$(cat "$bundle")
 EOF
 }
 
+# One persona sub-agent, context-isolated like the observer: a fresh Claude
+# session launched from a neutral empty dir (no repo access), its JSON verdict
+# extracted from stdout. A discrete seam the fixtures override to test the spawn
+# loop deterministically without a live model.
+invoke_persona_once() {
+  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" neutral lens
+  neutral="${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID"
+  mkdir -p "$neutral"
+  lens="$(persona_lens "$persona" "$(spec_track "$SPEC")")"
+  # model_flag word-splits into `--model X` (or nothing). No --allowedTools: it is
+  # variadic and would swallow the prompt argument (see invoke_observer_once).
+  # shellcheck disable=SC2046
+  (cd "$neutral" && claude -p $(model_flag "$PERSONA_MODEL") --output-format json \
+    "$(persona_prompt "$persona" "$stage" "$bundle" "$lens")") >"$raw" 2>"${raw}.err" || return 1
+  extract_claude_structured "$raw" "$out"
+}
+
+# Spawn every persona in $expected_set, writing one validated result per persona
+# into $result_dir. The wrapper STAMPS .persona/.stage authoritatively (identity =
+# who the engine asked, not a spoofable field) then normalizes + schema-validates;
+# a persona that cannot return a valid review after a retry blocks the run.
+spawn_personas() {
+  local result_dir="$1" persona_stage="$2" expected_set="$3"
+  local bundle persona slug out raw tmp idd norm tries old_ifs
+  bundle="$RUN_ROOT/control/review-bundle.md"
+  assemble_review_bundle "$persona_stage" "$bundle"
+  old_ifs="$IFS"; IFS='|'
+  for persona in $expected_set; do
+    IFS="$old_ifs"
+    slug="$(persona_slug "$persona")"
+    out="$result_dir/$slug.json"
+    raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.json"
+    tmp="$result_dir/.spawn-$slug.$$"; idd="$tmp.id"; norm="$tmp.norm"
+    tries=0
+    while :; do
+      tries=$((tries + 1))
+      if invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" &&
+        jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
+        normalize_persona_result "$idd" >"$norm" 2>/dev/null &&
+        json_schema_basic persona-review "$norm"; then
+        mv "$norm" "$out"
+        rm -f "$tmp" "$idd"
+        record_cost "$raw" "$(basename "$raw")"
+        log "persona ($persona_stage): $persona → $(jq -r '.status' "$out")"
+        break
+      fi
+      rm -f "$tmp" "$idd" "$norm"
+      [ "$tries" -lt 2 ] ||
+        block_run "engine-spawned persona '$persona' did not return a valid $persona_stage review after $tries attempts"
+    done
+    IFS='|'
+  done
+  IFS="$old_ifs"
+}
+
 run_personas() {
-  local signal="$1" review_stage persona_stage result_dir out artifact
+  local review_stage persona_stage result_dir
   review_stage="$(jq -r '.stage' "$STATE")"
   case "$review_stage" in
     planning|plan_review) persona_stage="plan"; set_stage plan_review ;;
@@ -1160,12 +1293,6 @@ run_personas() {
   result_dir="$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/$persona_stage/round-$(( $(jq -r '.review_round' "$STATE") + 1 ))"
   mkdir -p "$result_dir"
   state_set '.review_round += 1'
-
-  # Claude primary runs the active personas as native sub-agents and lists their
-  # result files as artifacts. Collect the persona-review files into the round dir;
-  # the exact-set/count gate below does the real enforcement.
-  collect_persona_results "$signal" "$result_dir" ||
-    block_run "persona result artifacts are missing, unsafe, or malformed"
 
   local full_set expected_set expected_count pending pending_stage
   full_set="$(resolve_active_personas "$SPEC")" ||
@@ -1177,6 +1304,15 @@ run_personas() {
   pending_stage="$(jq -r '.pending_stage // empty' "$STATE")"
   expected_set="$(review_round_set "$full_set" "$pending" "$pending_stage" "$persona_stage")"
   expected_count="$(printf '%s' "$expected_set" | tr '|' '\n' | grep -c .)"
+
+  # The ENGINE — not the primary — spawns each active persona as an independent,
+  # context-isolated sub-agent and writes the validated result into the round dir.
+  # This is the provenance guarantee that closes the self-report hole: the gate
+  # below judges results the wrapper produced (the primary only signals
+  # RUN_PERSONAS with no artifacts), so a cost-cutting primary cannot fabricate
+  # persona approvals. Mirrors the independent-observer spawn.
+  spawn_personas "$result_dir" "$persona_stage" "$expected_set"
+
   [ "$(find "$result_dir" -type f -name '*.json' | wc -l | tr -d ' ')" -eq "$expected_count" ] ||
     block_run "persona gate requires exactly $expected_count validated results for this spec's active personas"
   jq -s -e --arg stage "$persona_stage" --arg personas "$expected_set" '
@@ -1742,7 +1878,7 @@ handle_signal() {
   transition_allowed "$(jq -r '.stage' "$STATE")" "$action" ||
     block_run "action $action is invalid from stage $(jq -r '.stage' "$STATE")"
   case "$action" in
-    RUN_PERSONAS) run_personas "$signal" ;;
+    RUN_PERSONAS) run_personas ;;
     CREATE_CANDIDATE) verify_candidate ;;
     REQUEST_OBSERVER) run_observer "$signal" ;;
     RUN_VISUAL) run_visual ;;

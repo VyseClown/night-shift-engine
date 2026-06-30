@@ -112,8 +112,9 @@ run_dry_fixtures() {
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
   fixture_assert "observer temp dir cleanup is scoped, removing, and idempotent" fixture_observer_tmp_cleanup "$root"
   fixture_assert "observer cost is recorded from the retry's .attempt raw" fixture_observer_cost_capture "$root"
-  fixture_assert "persona collection skips non-persona artifacts" fixture_persona_collect "$root"
-  fixture_assert "persona collection normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
+  fixture_assert "persona result normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
+  fixture_assert "persona_lens extracts a persona's doc section (cross-doc fallback)" fixture_persona_lens "$root"
+  fixture_assert "engine spawns personas itself + stamps identity (provenance)" fixture_persona_spawn "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "set_stage resets review_round at scope boundaries (GH #18)" fixture_stage_round_reset "$root"
@@ -924,52 +925,78 @@ fixture_observer_tmp_cleanup() {
   return 0
 }
 
-fixture_persona_collect() {
-  local root="$1" result_dir signal
-  local PROJECT="$root/collect"
-  result_dir="$PROJECT/.night-shift/out"
-  signal="$PROJECT/signal.json"
-  mkdir -p "$PROJECT" "$result_dir"
-  printf '{"persona":"Web Architect","stage":"plan","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/a.json"
-  printf '{"persona":"Human Advocate","stage":"plan","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/b.json"
-  # A non-persona deliverable the primary also lists (the review bundle).
-  printf '# review bundle\nnot persona-review json\n' >"$PROJECT/bundle.md"
-  printf '{"artifacts":["bundle.md","a.json","b.json"]}\n' >"$signal"
-  collect_persona_results "$signal" "$result_dir" || return 1
-  # Exactly the two persona files were collected; the bundle was skipped.
-  [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || return 1
-  [ -f "$result_dir/a.json" ] && [ -f "$result_dir/b.json" ] || return 1
-  [ ! -f "$result_dir/bundle.md" ] || return 1
-  # An unsafe/absolute path anywhere in the list is still fatal (traversal guard).
-  printf '{"artifacts":["/etc/hosts","a.json"]}\n' >"$signal"
-  collect_persona_results "$signal" "$result_dir" && return 1
+# GH #20: an agent result written with `verdict` instead of the schema's `status`
+# (and omitting the always-empty commit/documentation_changes on a clean APPROVE)
+# is normalized to the canonical shape by normalize_persona_result, which
+# spawn_personas applies to every engine-spawned persona result before validation.
+fixture_persona_normalize() {
+  local root="$1" dir="$root/normalize"
+  mkdir -p "$dir"
+  # The agent slip: `verdict` not `status`, and omitted empty fields.
+  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"APPROVE","findings":[]}\n' >"$dir/ha.json"
+  normalize_persona_result "$dir/ha.json" >"$dir/ha.norm" || return 1
+  [ "$(jq -r '.status' "$dir/ha.norm")" = "APPROVE" ] || return 1
+  [ "$(jq -r 'has("verdict")' "$dir/ha.norm")" = "false" ] || return 1
+  json_schema_basic persona-review "$dir/ha.norm" || return 1
+  # A canonical result stays schema-valid.
+  printf '{"persona":"React Native Architect","stage":"implementation","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$dir/rn.json"
+  json_schema_basic persona-review "$dir/rn.json" || return 1
+  # Faithful, not masking: a verdict BLOCK maps to status BLOCK.
+  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"BLOCK","findings":[{"id":"HA-001","evidence":"x","required_change":"y"}]}\n' >"$dir/blk.json"
+  [ "$(normalize_persona_result "$dir/blk.json" | jq -r '.status')" = "BLOCK" ] || return 1
   return 0
 }
 
-# GH #20: a primary result written with `verdict` instead of the schema's `status`
-# (and omitting the always-empty commit/documentation_changes on a clean APPROVE)
-# is normalized to the canonical shape on collection, so the round gate accepts it.
-fixture_persona_normalize() {
-  local root="$1" result_dir signal
-  local PROJECT="$root/normalize"
-  result_dir="$PROJECT/.night-shift/out"
-  signal="$PROJECT/signal.json"
-  mkdir -p "$PROJECT" "$result_dir"
-  # The primary slip: `verdict` not `status`, and omitted empty fields.
-  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"APPROVE","findings":[]}\n' >"$PROJECT/ha.json"
-  # A canonical result is left untouched.
-  printf '{"persona":"React Native Architect","stage":"implementation","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/rn.json"
-  printf '{"artifacts":["ha.json","rn.json"]}\n' >"$signal"
-  collect_persona_results "$signal" "$result_dir" || return 1
-  # Both collected; the verdict one now carries a canonical, schema-valid status.
-  [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || return 1
-  [ "$(jq -r '.status' "$result_dir/ha.json")" = "APPROVE" ] || return 1
-  [ "$(jq -r 'has("verdict")' "$result_dir/ha.json")" = "false" ] || return 1
-  json_schema_basic persona-review "$result_dir/ha.json" || return 1
-  [ "$(jq -r '.status' "$result_dir/rn.json")" = "APPROVE" ] || return 1
-  # Faithful, not masking: a verdict BLOCK maps to status BLOCK.
-  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"BLOCK","findings":[{"id":"HA-001","evidence":"x","required_change":"y"}]}\n' >"$PROJECT/blk.json"
-  [ "$(normalize_persona_result "$PROJECT/blk.json" | jq -r '.status')" = "BLOCK" ] || return 1
+fixture_persona_lens() {
+  # Extracts a persona's documented review lens from the track doc, with a
+  # cross-doc fallback (node reuses a persona documented under web), and yields
+  # empty (not an error) for an unknown persona.
+  [ -n "$(persona_lens "React Native Architect" rn)" ] || return 1
+  [ -n "$(persona_lens "Backend & Data Expert" node)" ] || return 1
+  [ -z "$(persona_lens "No Such Persona" rn)" ] || return 1
+  return 0
+}
+
+fixture_persona_spawn() {
+  # The ENGINE spawns each persona itself and writes the result — there is no
+  # signal/artifact input, so a primary cannot supply (or fabricate) reviews.
+  # Stub the live model call (invoke_persona_once) to return a status-only verdict;
+  # assert the wrapper STAMPS the persona/stage identity, validates, and that the
+  # exact-set gate passes against the engine-written files.
+  local root="$1" dir="$root/pspawn"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="pspawn"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    cat >"$SPEC" <<'SPEC'
+## Review
+- Track: node
+- Review Profile: logic
+SPEC
+    printf '# the plan\n' >"$RUN_ROOT/control/plan.md"
+    # Stub the only live seam: write a status-only APPROVE to $out (the wrapper
+    # stamps persona+stage), and a cost-less raw to $raw.
+    invoke_persona_once() {
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{"result":"ok"}' >"$5"
+    }
+    set="$(profile_personas logic node)" || exit 1
+    n="$(printf '%s' "$set" | tr '|' '\n' | grep -c .)"
+    result_dir="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$result_dir"
+    spawn_personas "$result_dir" "plan" "$set"
+    # the engine assembled the bundle from its own inputs (spec + plan)
+    grep -q 'Task spec' "$RUN_ROOT/control/review-bundle.md" || exit 1
+    grep -q 'Approved plan' "$RUN_ROOT/control/review-bundle.md" || exit 1
+    # exactly one validated result per active persona, written by the wrapper
+    [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq "$n" ] || exit 1
+    # identity is wrapper-stamped: the exact active set + stage gate passes
+    jq -s -e --arg personas "$set" \
+      '($personas|split("|")|sort) as $e | (map(.persona)|sort)==$e and all(.[]; .stage=="plan")' \
+      "$result_dir"/*.json >/dev/null || exit 1
+    # every written result is schema-valid
+    for f in "$result_dir"/*.json; do json_schema_basic persona-review "$f" || exit 1; done
+  ) || return 1
   return 0
 }
 

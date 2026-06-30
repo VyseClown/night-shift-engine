@@ -9,9 +9,19 @@
 ## Status
 
 - [x] Draft
-- [ ] Ready for implementation
-- [ ] In progress
-- [ ] Done — branch: `feat/engine-persona-provenance`
+- [x] Ready for implementation
+- [x] In progress
+- [x] Done — branch: `claude/recent-changes-open-prs-6yzp7h` (option A: wrapper-spawns personas; 139 fixtures pass, shellcheck clean)
+
+Implemented as **option A**: the engine now assembles the review bundle and spawns
+each active persona itself (`spawn_personas` / `invoke_persona_once`, mirroring the
+independent observer), stamps the result's identity, normalizes + schema-validates,
+and writes it into the round dir. The primary only signals `RUN_PERSONAS` with no
+artifacts — it can no longer supply or fabricate reviews. The now-dead
+`collect_persona_results` (which trusted primary-listed artifacts) was removed.
+The provenance nonce (option B / AC4) is unnecessary and was not added: provenance
+is structural — the wrapper writes the files, so there is nothing for the primary
+to forge.
 
 ---
 
