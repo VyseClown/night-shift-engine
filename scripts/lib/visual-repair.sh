@@ -356,7 +356,7 @@ repair_agent() {
   spec_notes="$(spec_design_sections "${REPAIR_SPEC:-}" 2>/dev/null)"
   prompt="You are repairing the '$screen' screen ($state) of this Expo RN app to match its Figma frame.
 FIRST use the Read tool to OPEN AND VIEW the images so you can see the pixels: reference=$ref  current screenshot=$shot  diff overlay (red = differences)=$diff_img.  current diff=$pct, target tolerance=$tol.
-Read the raw Figma node tree (JSON) at $cache — it is your source of truth for EXACT per-element styles: every node's fills, gradient stops, bounds, text styles, and child/stacking order. Layered or overlapping shapes are SEPARATE child nodes — match each. If that file is absent, work from the images. ALSO treat the following design intent from the spec as requirements:
+This screen maps to Figma node $node in file $key; its complete raw node tree (JSON) is cached at $cache — READ that file: it is your source of truth for EXACT per-element styles: every node's fills, gradient stops, bounds, text styles, and child/stacking order. Layered or overlapping shapes are SEPARATE child nodes — match each. If that file is absent, work from the images. ALSO treat the following design intent from the spec as requirements:
 ---
 $spec_notes
 ---
@@ -399,12 +399,13 @@ visual_repair_for_spec() {
   _repair_one() {
     local sc="$1" st="$2" dv="$3"
     # No eval / dynamic var name: works for any screen name and removes the
-    # eval-injection surface. repair_agent reads REPAIR_NODE_CURRENT.
+    # eval-injection surface. repair_agent reads REPAIR_NODE_CURRENT, and we reuse
+    # the same resolved id for the Figma fetch below (one node_id_for parse).
     REPAIR_NODE_CURRENT="$(node_id_for "$spec" "$sc")"
     # repair_recapture_screen restarts Metro on this device before each capture.
     REPAIR_RESET_DEVICE="$(device_label_to_name "$dv")"
     export REPAIR_RESET_DEVICE
-    visual_stage_figma_data "$REPAIR_FILEKEY" "$(node_id_for "$spec" "$sc")" \
+    visual_stage_figma_data "$REPAIR_FILEKEY" "$REPAIR_NODE_CURRENT" \
       "$out_dir/design/$sc-figma.json" || true
     # Capture the assembled screen object so we report attempts ACTUALLY consumed
     # (repairs are numbered from attempt 2), not the per-screen max — otherwise the
