@@ -9,9 +9,26 @@
 ## Status
 
 - [x] Draft
-- [ ] Ready for implementation
-- [ ] In progress
-- [ ] Done — branch: `feat/engine-reduce-hand-sync`
+- [x] Ready for implementation
+- [x] In progress
+- [x] Done — branch: `claude/recent-changes-open-prs-6yzp7h` (143 fixtures pass, shellcheck clean)
+
+All four parts implemented:
+1. **Single-source transitions** — `transition_allowed` and `expected_action` now
+   both derive from one `stage_forward_actions` table (the forward action(s) per
+   stage), so the gate and the prompt can't drift. The existing `fixture_expected_action`
+   (which cross-checks both, incl. `completion` → "NEXT_TASK or COMPLETE") passes.
+2. **Redundant gating removed** — `handle_signal` no longer re-checks
+   `stage == completion` for NEXT_TASK/COMPLETE; the `transition_allowed` gate at
+   the top already enforces it.
+3. **Schema drift** — added `fixture_schema_inline_sync`, which asserts the
+   `next-action.json` action enum equals the action set derivable from the state
+   machine and the `persona-review.json` persona enum equals the `$PERSONAS` union.
+   (A full runtime JSON-Schema validator would need a new dependency; this
+   consistency test catches the high-value enum drift cheaply.)
+4. **Config inventory** — new `--list-config` flag prints every `NIGHT_SHIFT_*`
+   knob and its default, derived from the engine source (`${VAR:-default}` patterns)
+   so the inventory cannot drift from the real defaults. Listed in `usage()`.
 
 ---
 

@@ -12,6 +12,7 @@ FIXTURE_TEST=0
 DRY_RUN=0
 FULL_PERSONA_LIVE_TEST=0
 LIST_OPTIONAL_PERSONAS=0
+LIST_CONFIG=0
 PREFLIGHT=0
 RESUME=0
 MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
@@ -130,6 +131,7 @@ Usage:
   scripts/night-shift.sh --fixture-test --dry-run
   scripts/night-shift.sh --fixture-test [--full-persona-live-test]
   scripts/night-shift.sh --list-optional-personas   # JSON manifest, no run
+  scripts/night-shift.sh --list-config              # NIGHT_SHIFT_* knobs + defaults, no run
   scripts/night-shift.sh --preflight --project PATH --spec PATH  # JSON readiness, no run
   scripts/night-shift.sh --project PATH [--spec PATH] --resume    # resume a preserved blocked run
 
@@ -166,6 +168,7 @@ while [ "$#" -gt 0 ]; do
     --dry-run) DRY_RUN=1; shift ;;
     --full-persona-live-test) FULL_PERSONA_LIVE_TEST=1; shift ;;
     --list-optional-personas) LIST_OPTIONAL_PERSONAS=1; shift ;;
+    --list-config) LIST_CONFIG=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
     --resume) RESUME=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -200,6 +203,30 @@ emit_optional_personas_manifest() {
   printf '\n  ]\n}\n'
 }
 
+# Single discoverable inventory of the NIGHT_SHIFT_* knobs, derived from the engine
+# source so it cannot drift from the actual `${VAR:-default}` defaults. Names + the
+# defaults the code applies; see CLAUDE.md / docs/COMMAND-PLAYBOOK.md for meanings.
+list_config() {
+  printf 'night-shift configuration knobs (NIGHT_SHIFT_*) and their engine defaults.\n'
+  printf 'Derived from source; see CLAUDE.md and docs/COMMAND-PLAYBOOK.md for meanings.\n\n'
+  grep -hoE 'NIGHT_SHIFT_[A-Z_]+:-[^}"]*' \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh" \
+    "$WORKSPACE_ROOT/scripts/visual-review.sh" \
+    "$WORKSPACE_ROOT/scripts/parallel-worktrees.sh" \
+    "$NIGHT_SHIFT_LIB"/*.sh 2>/dev/null \
+    | sort -u \
+    | while IFS= read -r entry; do
+        local name def
+        name="${entry%%:-*}"; def="${entry#*:-}"
+        [ -n "$def" ] || def="(empty)"
+        printf '  %-46s default: %s\n' "$name" "$def"
+      done
+}
+
+if [ "$LIST_CONFIG" -eq 1 ]; then
+  list_config
+  exit 0
+fi
 if [ "$LIST_OPTIONAL_PERSONAS" -eq 1 ]; then
   require_command jq
   emit_optional_personas_manifest
@@ -1016,27 +1043,39 @@ set_stage() {
     --arg stage "$1" --argjson epoch "$(now_epoch)" --arg now "$(now_iso)"
 }
 
-transition_allowed() {
-  case "$1:$2" in
-    planning:RUN_PERSONAS|plan_review:RUN_PERSONAS|implementation:RUN_PERSONAS|implementation_review:RUN_PERSONAS|implementation_ready:CREATE_CANDIDATE|visual_review:RUN_VISUAL|observer_review:REQUEST_OBSERVER|completion:NEXT_TASK|completion:COMPLETE|*:BLOCKED) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Pure: the single forward action a stage may emit (BLOCKED is always also valid).
-# Mirrors transition_allowed so the prompt can tell the primary exactly which
-# signal to write — the wrapper advances stages one step at a time, so a primary
-# that skips ahead (e.g. REQUEST_OBSERVER straight from implementation) is blocked.
-# Keep in sync with transition_allowed above.
-expected_action() {
+# SINGLE SOURCE OF TRUTH for the stage state machine: the forward action(s) a
+# stage may legally emit (space-separated; most stages have one, `completion` has
+# two). transition_allowed (the gate) and expected_action (the prompt) both derive
+# from this, so the gate and the prompt can never drift apart. BLOCKED is always
+# also valid and is handled directly in transition_allowed. An unknown stage
+# returns non-zero so callers reject it.
+stage_forward_actions() {
   case "$1" in
     planning|plan_review|implementation|implementation_review) printf 'RUN_PERSONAS' ;;
     implementation_ready) printf 'CREATE_CANDIDATE' ;;
     visual_review) printf 'RUN_VISUAL' ;;
     observer_review) printf 'REQUEST_OBSERVER' ;;
-    completion) printf 'NEXT_TASK or COMPLETE' ;;
-    *) printf 'BLOCKED' ;;
+    completion) printf 'NEXT_TASK COMPLETE' ;;
+    *) return 1 ;;
   esac
+}
+
+transition_allowed() {
+  local actions
+  [ "$2" = "BLOCKED" ] && return 0
+  actions="$(stage_forward_actions "$1")" || return 1
+  case " $actions " in *" $2 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# Pure: the forward action(s) a stage may emit, in display form ("A or B" when a
+# stage permits more than one). Derived from stage_forward_actions so the prompt
+# always matches the gate; an unknown stage shows BLOCKED. The wrapper advances
+# stages one step at a time, so a primary that skips ahead (e.g. REQUEST_OBSERVER
+# straight from implementation) is blocked.
+expected_action() {
+  local actions
+  actions="$(stage_forward_actions "$1")" || { printf 'BLOCKED'; return 0; }
+  printf '%s' "$actions" | sed 's/ / or /g'
 }
 
 block_run() {
@@ -1931,8 +1970,8 @@ handle_signal() {
     REQUEST_OBSERVER) run_observer "$signal" ;;
     RUN_VISUAL) run_visual ;;
     NEXT_TASK)
-      [ "$(jq -r '.stage' "$STATE")" = "completion" ] ||
-        block_run "NEXT_TASK requires observer approval"
+      # NEXT_TASK is legal only from the completion stage — already enforced by the
+      # transition_allowed gate above (no redundant re-check here).
       # An explicit `--spec` run is a single task — the caller (e.g. a wrapper that
       # owns cross-spec sequencing + per-spec branch routing) advances to the next
       # spec itself. Treat NEXT_TASK as COMPLETE so the run exits 0 cleanly instead
@@ -1946,8 +1985,8 @@ handle_signal() {
       ;;
     BLOCKED) block_run "primary reported: $(jq -r '.reason' "$signal")" ;;
     COMPLETE)
-      [ "$(jq -r '.stage' "$STATE")" = "completion" ] ||
-        block_run "COMPLETE requires observer approval"
+      # COMPLETE is legal only from the completion stage — enforced by the
+      # transition_allowed gate above.
       complete_run
       ;;
     *) block_run "unsupported action $action" ;;

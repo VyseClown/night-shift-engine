@@ -126,6 +126,7 @@ run_dry_fixtures() {
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "primary_prompt carries the build-from-Figma procedure iff a Design Contract" fixture_design_build_note "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
+  fixture_assert "schema enums stay in sync with the engine's state machine + personas" fixture_schema_inline_sync "$root"
   fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
   fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
   fixture_assert "visual capture grid includes device axis" fixture_visual_grid "$root"
@@ -1125,6 +1126,25 @@ fixture_stage_round_reset() {
   printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"review_round":2}\n' >"$STATE"
   set_stage implementation >/dev/null 2>&1
   [ "$(jq -r '.review_round' "$STATE")" = "0" ] || return 1
+  return 0
+}
+
+fixture_schema_inline_sync() {
+  # Anti-drift: the schemas/*.json enums must match the engine's canonical sources
+  # — the state machine (stage_forward_actions) and the $PERSONAS union — so a
+  # divergence between the JSON Schemas and the inline jq validators is caught here
+  # rather than at runtime.
+  local stages s acts engine_actions schema_actions schema_personas
+  stages="planning plan_review implementation implementation_review implementation_ready visual_review observer_review completion"
+  acts=""
+  for s in $stages; do acts="$acts $(stage_forward_actions "$s")"; done
+  acts="$acts BLOCKED"
+  # shellcheck disable=SC2086  # word-split $acts into one action per line on purpose
+  engine_actions="$(printf '%s\n' $acts | sort -u | paste -sd'|' -)"
+  schema_actions="$(jq -r '.properties.action.enum | sort | join("|")' "$WORKSPACE_ROOT/schemas/next-action.json")"
+  [ "$engine_actions" = "$schema_actions" ] || return 1
+  schema_personas="$(jq -r '.properties.persona.enum | sort | join("|")' "$WORKSPACE_ROOT/schemas/persona-review.json")"
+  [ "$schema_personas" = "$(printf '%s' "$PERSONAS" | tr '|' '\n' | sort | paste -sd'|' -)" ] || return 1
   return 0
 }
 
