@@ -2391,7 +2391,7 @@ fixture_device_release() {
     device_try_claim UDID-AAA run-A false || exit 1     # real device
     device_release UDID-AAA
     [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1          # lock removed
-    grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1   # NOT deleted (real)
+    grep -q "delete UDID-AAA" "$stub/calls.log" 2>/dev/null && exit 1   # NOT deleted (real)
     device_try_claim UDID-CLONE-x run-B true || exit 1  # a clone
     device_release UDID-CLONE-x
     grep -q "delete UDID-CLONE-x" "$stub/calls.log" || exit 1  # clone deleted
