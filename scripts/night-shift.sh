@@ -1181,7 +1181,12 @@ normalize_persona_result() {
       commit: (if (.commit == null or (.commit | type == "string" and length > 0)) then .commit else null end),
       status: ((.status // .verdict) | norm_status),
       findings: ((.findings // []) | to_entries | map(
-        (.key + 1) as $k | .value as $f |
+        (.key + 1) as $k |
+        # Coerce a non-object findings element (a live model sometimes emits a bare
+        # string, or a mixed array) into an object so the $f.id/$f.evidence lookups
+        # below never index a string and abort jq — which would empty the output,
+        # force the retry, and spuriously block the run this normalizer exists to save.
+        (.value | if type == "object" then . else {evidence: (if type == "string" then . else tostring end)} end) as $f |
         (($f.id // "") | tostring) as $idstr |
         (if ($idstr | test("^[A-Z][A-Z0-9_-]*-[0-9]{3,}$")) then $idstr
          else ("REV-" + ((if ($idstr | test("[0-9]")) then ($idstr | capture("(?<n>[0-9]+)").n) else ($k | tostring) end)
@@ -1271,7 +1276,10 @@ bounded_diff() {
   body="$(git -C "$PROJECT" diff "$@" 2>/dev/null | head -c "$((budget + 1))")"
   n="$(printf '%s' "$body" | wc -c | tr -d ' ')"
   if [ "$n" -gt "$budget" ]; then
-    printf '%s' "$body" | head -c "$budget"
+    # head -c is byte-based and can cut mid-UTF-8; drop an incomplete trailing
+    # sequence so the emitted prompt is always valid UTF-8 (best-effort: pass
+    # through unchanged if iconv is unavailable).
+    printf '%s' "$body" | head -c "$budget" | { iconv -f UTF-8 -t UTF-8//IGNORE 2>/dev/null || cat; }
     printf '\n[... diff truncated at %s bytes; full file list in the --stat above ...]\n' "$budget"
   else
     printf '%s\n' "$body"
@@ -1882,7 +1890,12 @@ normalize_observer_output() {
         | if (. == "APPROVE" or . == "APPROVED" or . == "PASS" or . == "OK" or . == "LGTM")
           then "APPROVE" else "BLOCK" end),
       findings: ((.findings // []) | to_entries | map(
-        (.key + 1) as $k | .value as $f |
+        (.key + 1) as $k |
+        # Coerce a non-object findings element (a live model sometimes emits a bare
+        # string, or a mixed array) into an object so the $f.id/$f.evidence lookups
+        # below never index a string and abort jq — which would empty the output,
+        # force the retry, and spuriously block the run this normalizer exists to save.
+        (.value | if type == "object" then . else {evidence: (if type == "string" then . else tostring end)} end) as $f |
         (($f.id // "") | tostring) as $idstr |
         (if ($idstr | test("[0-9]")) then ($idstr | capture("(?<n>[0-9]+)").n) else ($k | tostring) end) as $num |
         {

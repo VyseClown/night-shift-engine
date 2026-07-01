@@ -1049,6 +1049,13 @@ fixture_persona_coerce_findings() {
   json_schema_basic persona-review "$d/out4.json" || return 1
   [ "$(jq -r '.findings[0].required_change' "$d/out4.json")" != "true" ] || return 1
   jq -e '.findings[0].required_change|test("real evidence")' "$d/out4.json" >/dev/null || return 1
+  # A non-object findings element (bare string, or a mixed array) must NOT throw jq
+  # (which would empty the output and spuriously block); coerce it to a finding.
+  printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":["stray prose",{"id":"UX-001","evidence":"real bug","required_change":"fix it"}]}' >"$d/in5.json"
+  normalize_persona_result "$d/in5.json" >"$d/out5.json" || return 1
+  json_schema_basic persona-review "$d/out5.json" || return 1
+  [ "$(jq -r '.findings|length' "$d/out5.json")" -eq 2 ] || return 1
+  jq -e '.findings[1].evidence|test("real bug")' "$d/out5.json" >/dev/null || return 1
   return 0
 }
 
@@ -2105,6 +2112,12 @@ fixture_observer_normalization() {
   json_schema_basic observer-review "$in" &&
     [ "$(jq -r '.findings[0].required_change' "$in")" != "true" ] &&
     { jq -e '.findings[0].required_change|test("real evidence")' "$in" >/dev/null; } || ok=0
+  # A non-object findings element must not throw jq (which would leave the raw verdict
+  # and force a spurious block); it is coerced to a finding.
+  printf '%s\n' '{"status":"BLOCK","findings":["stray",{"id":"OBS-3","evidence":"e","required_change":"r"}]}' >"$in"
+  normalize_observer_output "$in" "specs/x.md" "abcdef1234567"
+  json_schema_basic observer-review "$in" &&
+    [ "$(jq -r '.findings|length' "$in")" -eq 2 ] || ok=0
   [ "$ok" -eq 1 ]
 }
 
