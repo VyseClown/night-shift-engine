@@ -19,15 +19,21 @@ Implemented:
    validation, so an early signal records a resumable block instead of leaving
    `status=running` for the supervisor to escalate. `main_run` re-arms it for the
    recovery path (harmless).
-2. **PID reuse** — `lock_is_stale` (`locking.sh`) now compares the holder's
-   recorded process start time (`proc_start_time`: `/proc/<pid>/stat` field 22 on
-   Linux, `ps -o lstart=` on BSD) against the live PID's; a mismatch ⇒ reused PID ⇒
-   reclaimable. Falls back to liveness-only when start time is unrecorded/unreadable
-   (backward compatible — the device-registry "reclaim stale" fixture still passes).
+2. **Lock reclaim TOCTOU** (replaces the originally-proposed PID-reuse guard) —
+   a follow-up adversarial review found the *reclaim* branch of `atomic_lock_acquire`
+   was itself racy: two runs that both see a dead-PID lock as stale both `rm -f` and
+   recreate, and the second's `rm` clobbers the first winner's fresh pid → **both
+   win** → two runs against one `state.json`. Now serialized with an atomic `mkdir`
+   mutex so only one reclaimer performs the destructive rm+recreate.
+   The originally-proposed **process-start-time PID-reuse guard was reverted**: on a
+   hardened host where `/proc` becomes unreadable mid-run it could misjudge a *live*
+   holder as reused and steal its lock (worse than the astronomically-rare PID reuse
+   it defended). Plain `kill -0` liveness is the safe, proven check.
 3. **Worktree orphan** — `verify_candidate` records the intended worktree path
-   *before* creating it, and `prepare_validation_worktree` prunes a pre-existing
-   orphan at that exact (RUN_ID+candidate-unique) path on re-entry instead of
-   blocking.
+   *before* creating it, and `prepare_validation_worktree` prunes **unconditionally**
+   before `worktree add` (a stale `.git/worktrees/<name>` admin entry can linger even
+   when the directory has vanished — crash mid-remove or a /tmp cleaner — and would
+   otherwise fail `add` with exit 128 on `--resume`).
 
 Deferred:
 4. **fsync** — not implemented. Portable per-file fsync from bash is awkward
@@ -35,9 +41,9 @@ Deferred:
    never torn), and power-loss during an overnight workstation run is low-impact.
    Left as a knob-gated follow-up if power-loss durability is ever required.
 
-Tests: `fixture_lock_pid_reuse` (alive+match=live, alive+mismatch=stale,
-no-start=fallback-live, dead=stale) and `fixture_worktree_reentry` (orphan pruned
-and recreated, no wedge).
+Tests: `fixture_lock_reclaim_mutex` (single reclaim winner; a held mutex blocks a
+second reclaimer without clobbering the pid) and `fixture_worktree_reentry` (orphan
+worktree AND vanished-dir + stale admin entry both pruned and recreated, no wedge).
 
 ---
 

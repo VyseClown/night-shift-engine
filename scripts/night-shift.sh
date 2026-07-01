@@ -1080,6 +1080,10 @@ expected_action() {
 
 block_run() {
   local reason="$1"
+  # Disarm the interrupt trap first: block_run's cleanup below is slow, and a second
+  # signal arriving mid-cleanup would re-enter block_run (double cleanup, garbled
+  # reason). The EXIT trap still runs release_lock. (HUP/INT/TERM only; not EXIT.)
+  trap '' HUP INT TERM
   cleanup_validation_worktree >/dev/null 2>&1 || reason="$reason; validation worktree cleanup also failed"
   cleanup_observer_tmp
   # Record the blocked status best-effort: if state.json is corrupt, state_set
@@ -1114,6 +1118,8 @@ cleanup_validation_worktree() {
 cleanup_observer_tmp() {
   [ -n "${RUN_ID:-}" ] || return 0
   rm -rf "${TMPDIR:-/tmp}/night-shift-observer-$RUN_ID" 2>/dev/null || true
+  # The engine-spawned personas use a sibling neutral dir; clean it up too.
+  rm -rf "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID" 2>/dev/null || true
 }
 
 validate_signal() {
@@ -1172,8 +1178,10 @@ normalize_persona_result() {
 
 persona_doc() {
   case "$1" in
-    web) printf '%s' "$WORKSPACE_ROOT/docs/review-personas-web.md" ;;
-    *)   printf '%s' "$WORKSPACE_ROOT/docs/review-personas.md" ;;
+    # node reuses the backend personas (Backend & Data Expert, TypeScript, …) that
+    # are documented in the web doc, so it prefers that doc for its lenses.
+    web|node) printf '%s' "$WORKSPACE_ROOT/docs/review-personas-web.md" ;;
+    *)        printf '%s' "$WORKSPACE_ROOT/docs/review-personas.md" ;;
   esac
 }
 
@@ -1215,6 +1223,26 @@ persona_lens() {
 # approved plan, and (for implementation) the diff against the base commit plus
 # the latest validation output. Wrapper-computed, so the evidence the reviewers
 # judge is independent of anything the primary chooses to surface.
+# Emit a size-bounded diff for a review bundle/observer context: a --stat summary
+# (always) then the full diff capped at NIGHT_SHIFT_DIFF_BUDGET bytes with an
+# explicit truncation marker. A large-but-legitimate diff (lockfile regen, vendored
+# or generated files, snapshot updates) otherwise overflows the model context and
+# garbles the verdict. $@ are git-diff args: a range (BASE..CAND) or a single
+# BASE for a working-tree diff.
+bounded_diff() {
+  local budget="${NIGHT_SHIFT_DIFF_BUDGET:-400000}" body n
+  git -C "$PROJECT" diff --stat "$@" 2>/dev/null
+  printf '\n'
+  body="$(git -C "$PROJECT" diff "$@" 2>/dev/null | head -c "$((budget + 1))")"
+  n="$(printf '%s' "$body" | wc -c | tr -d ' ')"
+  if [ "$n" -gt "$budget" ]; then
+    printf '%s' "$body" | head -c "$budget"
+    printf '\n[... diff truncated at %s bytes; full file list in the --stat above ...]\n' "$budget"
+  else
+    printf '%s\n' "$body"
+  fi
+}
+
 assemble_review_bundle() {
   local stage="$1" out="$2"
   {
@@ -1226,8 +1254,10 @@ assemble_review_bundle() {
       cat "$RUN_ROOT/control/plan.md"
     fi
     if [ "$stage" = "implementation" ]; then
-      printf '\n\n## Implementation diff against base commit %s\n\n```diff\n' "$BASE_COMMIT"
-      git -C "$PROJECT" diff "$BASE_COMMIT" -- . 2>/dev/null
+      # Working-tree diff (there is no candidate commit yet at persona-review time);
+      # size-bounded so a large change cannot overflow the reviewer's context.
+      printf '\n\n## Implementation diff against base commit %s (working tree)\n\n```diff\n' "$BASE_COMMIT"
+      bounded_diff "$BASE_COMMIT" -- .
       printf '```\n'
       if [ -s "$RUN_ROOT/validated/baseline.json" ]; then
         printf '\n## Baseline validation output\n\n```json\n'
@@ -1281,11 +1311,12 @@ invoke_persona_once() {
   neutral="${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID"
   mkdir -p "$neutral"
   lens="$(persona_lens "$persona" "$(spec_track "$SPEC")")"
-  # model_flag word-splits into `--model X` (or nothing). No --allowedTools: it is
-  # variadic and would swallow the prompt argument (see invoke_observer_once).
+  # Prompt via STDIN (not argv): the bundle inlines a diff that can be large, and a
+  # positional arg risks the ARG_MAX/E2BIG exec limit (repair_agent pipes for the
+  # same reason). model_flag word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
-  (cd "$neutral" && claude -p $(model_flag "$PERSONA_MODEL") --output-format json \
-    "$(persona_prompt "$persona" "$stage" "$bundle" "$lens")") >"$raw" 2>"${raw}.err" || return 1
+  (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" |
+    claude -p $(model_flag "$PERSONA_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }
 
@@ -1295,26 +1326,33 @@ invoke_persona_once() {
 # a persona that cannot return a valid review after a retry blocks the run.
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
-  local bundle persona slug out raw tmp idd norm tries old_ifs
+  local bundle persona slug out raw tmp idd norm tries iv old_ifs
   bundle="$RUN_ROOT/control/review-bundle.md"
   assemble_review_bundle "$persona_stage" "$bundle"
   old_ifs="$IFS"; IFS='|'
   for persona in $expected_set; do
     IFS="$old_ifs"
+    # These are direct engine-spawned model sessions, outside invoke_primary's turn
+    # loop — enforce the wall-clock budget here so an over-time run halts before
+    # spawning yet another paid session (restores the cost/time ceiling).
+    enforce_elapsed_limits
     slug="$(persona_slug "$persona")"
     out="$result_dir/$slug.json"
-    raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.json"
     tmp="$result_dir/.spawn-$slug.$$"; idd="$tmp.id"; norm="$tmp.norm"
     tries=0
     while :; do
       tries=$((tries + 1))
-      if invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" &&
+      # Per-attempt raw path so a failed first attempt's cost is not overwritten by
+      # the retry before it is recorded.
+      raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$tries.json"
+      invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw"; iv=$?
+      record_cost "$raw" "$(basename "$raw")"   # record every paid attempt, valid or not
+      if [ "$iv" -eq 0 ] &&
         jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
         normalize_persona_result "$idd" >"$norm" 2>/dev/null &&
         json_schema_basic persona-review "$norm"; then
         mv "$norm" "$out"
         rm -f "$tmp" "$idd"
-        record_cost "$raw" "$(basename "$raw")"
         log "persona ($persona_stage): $persona → $(jq -r '.status' "$out")"
         break
       fi
@@ -1456,10 +1494,12 @@ path_in_baseline() {
 # non-zero iff the worktree could not be created.
 prepare_validation_worktree() {
   local project="$1" path="$2" commit="$3"
-  if [ -e "$path" ]; then
-    git -C "$project" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
-    git -C "$project" worktree prune 2>/dev/null || true
-  fi
+  [ ! -e "$path" ] || git -C "$project" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+  # Prune UNCONDITIONALLY: a stale `.git/worktrees/<name>` admin entry can linger
+  # even when the directory is gone (crash mid-remove, or a /tmp cleaner deleting
+  # the dir over a long run), and `worktree add` then fails with exit 128. Pruning
+  # first makes the path reusable whether or not the dir still exists.
+  git -C "$project" worktree prune 2>/dev/null || true
   git -C "$project" worktree add --detach "$path" "$commit" >/dev/null 2>&1
 }
 
@@ -1621,10 +1661,12 @@ invoke_observer_once() {
   # and hangs, producing nothing. Instead the prompt asks the observer to end its
   # reply with a fenced ```json verdict block, which extract_claude_structured
   # pulls out; json_schema_basic then enforces the strict contract.
+  # Prompt via STDIN (not argv): the context inlines a size-bounded diff that can
+  # still be sizeable, and a positional arg risks the ARG_MAX/E2BIG exec limit.
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
-  (cd "$neutral" && claude -p $(model_flag "$OBSERVER_MODEL") --output-format json \
-    "$(observer_prompt "$context" "$candidate")") >"$raw" 2>"${raw}.err" || return 1
+  (cd "$neutral" && observer_prompt "$context" "$candidate" |
+    claude -p $(model_flag "$OBSERVER_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }
 
@@ -1712,7 +1754,7 @@ observer_wrapper_evidence() {
   local candidate="$1"
   printf '%s\n' '--- ENGINE-COMPUTED CANDIDATE DIFF (base..candidate; authoritative) ---'
   printf 'base=%s candidate=%s\n\n' "$BASE_COMMIT" "$candidate"
-  git -C "$PROJECT" diff "$BASE_COMMIT..$candidate" 2>/dev/null
+  bounded_diff "$BASE_COMMIT..$candidate"
   if [ -s "$RUN_ROOT/validated/final.json" ]; then
     printf '\n%s\n' '--- ENGINE-RUN FINAL VALIDATION (at candidate, isolated worktree; authoritative) ---'
     cat "$RUN_ROOT/validated/final.json"
@@ -1725,9 +1767,16 @@ observer_wrapper_evidence() {
 
 run_observer() {
   local signal="$1" candidate context="$RUN_ROOT/prompts/observer-context.txt"
-  local out raw attempt=0 artifact
+  local out raw attempt=0 artifact plan_results implementation_results review_dir resolved
   candidate="$(jq -r '.candidate // .candidate_commits[-1] // empty' "$STATE")"
   [ -n "$candidate" ] || block_run "observer requested without a candidate commit"
+  # Fail closed: the observer prompt treats the engine diff as authoritative ground
+  # truth, so an unresolvable range must NOT hand it an empty diff (which would invite
+  # a spurious APPROVE of a candidate it never saw). Verify both ends resolve first.
+  git -C "$PROJECT" rev-parse --verify -q "$candidate^{commit}" >/dev/null ||
+    block_run "observer: candidate commit $candidate does not resolve in the project"
+  git -C "$PROJECT" rev-parse --verify -q "$BASE_COMMIT^{commit}" >/dev/null ||
+    block_run "observer: base commit $BASE_COMMIT does not resolve in the project"
   plan_results="$(find "$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/plan" -maxdepth 1 -type d -name 'round-*' 2>/dev/null | sort -V | tail -n 1)"
   implementation_results="$(find "$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/implementation" -maxdepth 1 -type d -name 'round-*' 2>/dev/null | sort -V | tail -n 1)"
   {

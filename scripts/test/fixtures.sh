@@ -117,6 +117,8 @@ run_dry_fixtures() {
   fixture_assert "persona result normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
   fixture_assert "persona_lens extracts a persona's doc section (cross-doc fallback)" fixture_persona_lens "$root"
   fixture_assert "engine spawns personas itself + stamps identity (provenance)" fixture_persona_spawn "$root"
+  fixture_assert "spawn_personas enforces the elapsed budget + records per-attempt cost" fixture_persona_spawn_guards "$root"
+  fixture_assert "bounded_diff caps a large diff with --stat + truncation marker" fixture_bounded_diff "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "set_stage resets review_round at scope boundaries (GH #18)" fixture_stage_round_reset "$root"
@@ -175,7 +177,7 @@ run_dry_fixtures() {
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
-  fixture_assert "lock_is_stale detects PID reuse via start-time mismatch" fixture_lock_pid_reuse "$root"
+  fixture_assert "stale-lock reclaim is serialized (single winner, no pid clobber)" fixture_lock_reclaim_mutex "$root"
   fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
   fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
   fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
@@ -504,25 +506,32 @@ fixture_worktree_reentry() {
   # Re-entry: the worktree already exists (simulated orphan). Must succeed, not wedge.
   prepare_validation_worktree "$repo" "$wt" "$commit" || return 1
   [ -e "$wt/f.txt" ] || return 1
+  # Vanished dir but a stale .git/worktrees/<name> admin entry remains (crash
+  # mid-remove / tmp cleaner): unconditional prune must still let `add` succeed
+  # (exit 0), not fail with git exit 128.
+  rm -rf "$wt"
+  prepare_validation_worktree "$repo" "$wt" "$commit" || return 1
+  [ -e "$wt/f.txt" ] || return 1
   return 0
 }
 
-fixture_lock_pid_reuse() {
-  local root="$1" dir="$root/lockpid"
+fixture_lock_reclaim_mutex() {
+  # The stale-lock reclaim must be serialized so two racing reclaimers can't both
+  # win (the second's `rm -f` clobbering the first's fresh pid -> two runs). We can
+  # test the gate deterministically: a reclaim already in progress (the .reclaiming
+  # mutex held) must make a second reclaimer LOSE without touching the pid.
+  local root="$1" dir="$root/lockmx/run.lock"
   mkdir -p "$dir"
-  proc_start_time "$$" >/dev/null || return 1                      # start time is readable here
-  # Alive PID + matching recorded start => live (not stale).
-  printf '%s\n' "$$" >"$dir/pid"; proc_start_time "$$" >"$dir/start"
-  lock_is_stale "$dir" && return 1
-  # Alive PID + MISMATCHED recorded start (PID reuse) => stale/reclaimable.
-  printf 'not-the-real-start\n' >"$dir/start"
-  lock_is_stale "$dir" || return 1
-  # Alive PID + NO recorded start => fall back to liveness-only (live).
-  rm -f "$dir/start"
-  lock_is_stale "$dir" && return 1
-  # Dead PID => stale (unchanged behavior).
-  printf '2147483646\n' >"$dir/pid"; rm -f "$dir/start"
-  lock_is_stale "$dir" || return 1
+  # (a) stale lock, no reclaim in progress -> we reclaim it (return 0, pid becomes us).
+  printf '2147483646\n' >"$dir/pid"                # a dead PID -> stale
+  atomic_lock_acquire "$dir" || return 1
+  [ "$(cat "$dir/pid")" = "$$" ] || return 1
+  # (b) stale lock, reclaim mutex already held by a concurrent reclaimer -> we lose,
+  #     and must NOT clobber the stale pid the winner is about to replace.
+  rm -rf "$dir"; mkdir -p "$dir"; printf '2147483646\n' >"$dir/pid"
+  mkdir "$dir/.reclaiming"                          # simulate the other reclaimer holding it
+  ! atomic_lock_acquire "$dir" || return 1          # must fail to reclaim
+  [ "$(cat "$dir/pid")" = "2147483646" ] || return 1  # stale pid left intact (not clobbered)
   return 0
 }
 
@@ -1040,6 +1049,8 @@ fixture_persona_spawn() {
 - Review Profile: logic
 SPEC
     printf '# the plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _now="$(now_epoch)"   # spawn_personas enforces the elapsed budget
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_now" "$_now" >"$STATE"
     # Stub the only live seam: write a status-only APPROVE to $out (the wrapper
     # stamps persona+stage), and a cost-less raw to $raw.
     invoke_persona_once() {
@@ -1062,6 +1073,67 @@ SPEC
     # every written result is schema-valid
     for f in "$result_dir"/*.json; do json_schema_basic persona-review "$f" || exit 1; done
   ) || return 1
+  return 0
+}
+
+fixture_bounded_diff() {
+  # bounded_diff caps the diff at NIGHT_SHIFT_DIFF_BUDGET with a --stat summary and a
+  # truncation marker, so a huge diff can't overflow the reviewer/observer context.
+  local root="$1" repo="$root/bd"
+  mkdir -p "$repo"
+  ( PROJECT="$repo"
+    git -C "$repo" init -q; git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+    printf 'base\n' >"$repo/f.txt"; git -C "$repo" add f.txt; git -C "$repo" commit -qm base
+    base="$(git -C "$repo" rev-parse HEAD)"
+    yes 'a-long-line-of-content-to-inflate-the-diff-well-past-the-budget' | head -n 800 >"$repo/f.txt"
+    NIGHT_SHIFT_DIFF_BUDGET=2000
+    out="$(bounded_diff "$base" -- .)"
+    printf '%s' "$out" | grep -q 'diff truncated at 2000 bytes' || exit 1   # marker present
+    printf '%s' "$out" | grep -q 'f.txt' || exit 1                          # --stat names the file
+    [ "$(printf '%s' "$out" | wc -c)" -lt 6000 ] || exit 1                  # actually bounded
+    # A small change under budget is emitted in full, no truncation.
+    printf 'base\nsmall-change\n' >"$repo/f.txt"
+    out2="$(bounded_diff "$base" -- .)"
+    printf '%s' "$out2" | grep -q 'diff truncated' && exit 1
+    printf '%s' "$out2" | grep -q 'small-change' || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_persona_spawn_guards() {
+  # spawn_personas must (a) halt an over-budget run before spawning another paid
+  # session, and (b) record cost for EVERY paid attempt, not just the successful one.
+  local root="$1" dir="$root/pguard"
+  mkdir -p "$dir"
+  # (a) task started in 1970 -> elapsed exceeds the budget -> block before any spawn.
+  ( log() { :; }
+    RUN_ROOT="$dir/a"; SPEC="$dir/a.md"; PROJECT="$dir/ap"; RUN_ID="pga"; PERSONA_MODEL="inherit"; BASE_COMMIT="HEAD"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage_started_at":1,"task_started_at":1}' >"$STATE"
+    invoke_persona_once() { printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"; printf '{}' >"$5"; }
+    block_run() { exit 7; }
+    rd="$RUN_ROOT/validated/personas/a/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate"
+    exit 0 )
+  [ "$?" -eq 7 ] || return 1
+  # (b) attempt 1 returns invalid, attempt 2 valid; both raws carry cost -> 2 ledger lines.
+  ( log() { :; }
+    RUN_ROOT="$dir/b"; SPEC="$dir/b.md"; PROJECT="$dir/bp"; RUN_ID="pgb"; PERSONA_MODEL="inherit"; BASE_COMMIT="HEAD"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"; printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    _try=0
+    invoke_persona_once() { _try=$((_try+1))
+      if [ "$_try" -eq 1 ]; then printf 'not json' >"$4"; else printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"; fi
+      printf '{"total_cost_usd":0.01,"num_turns":1}' >"$5"; }
+    rd="$RUN_ROOT/validated/personas/b/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    [ "$(grep -c . "$RUN_ROOT/cost-ledger.jsonl")" -eq 2 ] || exit 1
+    exit 0 ) || return 1
   return 0
 }
 
