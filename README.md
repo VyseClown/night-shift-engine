@@ -52,9 +52,12 @@ A spec declares `- Track: rn | web | node` (default `rn`), which selects the
 review persona set, the spec template, and the validation checklist:
 
 - **`rn`** — React Native (`rn-sandbox`). Personas in `docs/review-personas.md`.
-- **`web`** — Next.js / React (`web-app`). Personas in `docs/review-personas-web.md`.
+- **`web`** — Next.js / React with its data/API layer (`web-app`, e.g. Prisma +
+  Postgres). Personas in `docs/review-personas-web.md`, including a dedicated
+  **Backend & Data Expert**; the `data` profile targets that backend/data work.
 - **`node`** — plain Node / CLI / backend, no UI surface. Reuses the backend
-  personas; `full` and `logic` profiles only (no UX persona).
+  personas (the **Backend & Data Expert** stands in for the architecture role);
+  `full` and `logic` profiles only (no UX persona).
 
 ## Running it
 
@@ -100,6 +103,7 @@ The engine spends the strong model only where judgment matters. All knobs accept
 |---|---|---|
 | `NIGHT_SHIFT_PLAN_MODEL` | `opus` | Planning (high-leverage) |
 | `NIGHT_SHIFT_IMPLEMENT_MODEL` | `sonnet` | Implement grind, observe-request, completion |
+| `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL` | `opus` | Implement grind for a spec with a `## Design Contract` (judgment-heavy design fidelity) |
 | `NIGHT_SHIFT_PERSONA_MODEL` | `sonnet` | Review persona sub-agents |
 | `NIGHT_SHIFT_OBSERVER_MODEL` | `opus` | Independent final gate (the backstop that makes a cheaper primary safe) |
 | `NIGHT_SHIFT_SESSION_SCOPE` | `stage` | Fresh session per stage scope; `run` for one pinned session |
