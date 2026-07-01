@@ -1546,10 +1546,11 @@ verify_candidate() {
   [ "$candidate" != "$BASE_COMMIT" ] || block_run "CREATE_CANDIDATE did not create a commit"
   git -C "$PROJECT" merge-base --is-ancestor "$BASE_COMMIT" "$candidate" ||
     block_run "candidate is not descended from the recorded base commit"
-  # Use -z so both sides are NUL-delimited and paths are literal/unquoted —
-  # git diff --name-only (without -z) quotes paths with spaces just like status
-  # (without -z) does, making the match unreliable.
-  [ -n "$(git -C "$PROJECT" diff -z --name-only "$BASE_COMMIT..$candidate")" ] ||
+  # Emptiness check via --quiet (exit 1 = has changes): command-substituting the
+  # -z --name-only output just to test non-emptiness triggers bash's "ignored null
+  # byte in input" warning on every candidate. --quiet avoids capturing the NUL
+  # stream entirely. (The path loop below still reads -z output the NUL-safe way.)
+  git -C "$PROJECT" diff --quiet "$BASE_COMMIT..$candidate" &&
     block_run "candidate commit is empty"
   # For each path committed by the run, check whether it was pre-existing dirt.
   # Both sides are now unquoted bytes so spaces and unicode compare correctly.
