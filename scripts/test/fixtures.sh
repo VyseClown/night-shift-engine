@@ -115,6 +115,7 @@ run_dry_fixtures() {
   fixture_assert "observer cost is recorded from the retry's .attempt raw" fixture_observer_cost_capture "$root"
   fixture_assert "observer gets engine-computed diff + engine-run validation (independent evidence)" fixture_observer_wrapper_evidence "$root"
   fixture_assert "persona result normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
+  fixture_assert "persona findings coerced to schema (live models mis-shape them)" fixture_persona_coerce_findings "$root"
   fixture_assert "persona_lens extracts a persona's doc section (cross-doc fallback)" fixture_persona_lens "$root"
   fixture_assert "engine spawns personas itself + stamps identity (provenance)" fixture_persona_spawn "$root"
   fixture_assert "spawn_personas enforces the elapsed budget + records per-attempt cost" fixture_persona_spawn_guards "$root"
@@ -1018,6 +1019,29 @@ fixture_persona_normalize() {
   # Faithful, not masking: a verdict BLOCK maps to status BLOCK.
   printf '{"persona":"Human Advocate","stage":"implementation","verdict":"BLOCK","findings":[{"id":"HA-001","evidence":"x","required_change":"y"}]}\n' >"$dir/blk.json"
   [ "$(normalize_persona_result "$dir/blk.json" | jq -r '.status')" = "BLOCK" ] || return 1
+  return 0
+}
+
+fixture_persona_coerce_findings() {
+  # Regression for a LIVE-discovered failure: a real model returns the right STATUS
+  # but mis-shapes findings (file/line/summary/details instead of
+  # id/evidence/required_change). Coercion must yield a schema-valid, still-BLOCKing
+  # result rather than failing the gate and blocking the run on a format nit.
+  local root="$1" d="$root/pcoerce"
+  mkdir -p "$d"
+  printf '%s' '{"persona":"TypeScript & Code Quality Expert","stage":"implementation","verdict":"REQUEST_CHANGES","findings":[{"file":"x.ts","line":1,"summary":"missing types","details":"annotate params"}]}' >"$d/in.json"
+  normalize_persona_result "$d/in.json" >"$d/out.json" || return 1
+  json_schema_basic persona-review "$d/out.json" || return 1                    # now valid
+  [ "$(jq -r '.status' "$d/out.json")" = "BLOCK" ] || return 1                  # fail-closed: still BLOCK
+  [ "$(jq -r '.findings[0].id' "$d/out.json")" = "REV-001" ] || return 1        # synthesized id
+  jq -e '.findings[0].evidence|test("missing types")' "$d/out.json" >/dev/null || return 1  # evidence from summary
+  # A well-formed id is preserved, not rewritten.
+  printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":[{"id":"HA-007","evidence":"e","required_change":"r"}]}' >"$d/in2.json"
+  [ "$(normalize_persona_result "$d/in2.json" | jq -r '.findings[0].id')" = "HA-007" ] || return 1
+  # A BLOCK with no usable finding still halts (placeholder), never coerced to APPROVE.
+  local out3; out3="$(normalize_persona_result <(printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":[]}'))"
+  [ "$(printf '%s' "$out3" | jq -r '.status')" = "BLOCK" ] || return 1
+  [ "$(printf '%s' "$out3" | jq -r '.findings|length')" -ge 1 ] || return 1
   return 0
 }
 

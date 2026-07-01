@@ -1154,18 +1154,48 @@ extract_claude_structured() {
   return 1
 }
 
-# Normalize a near-miss persona-review record to the canonical schema shape so the
-# round gate (which reads .status) accepts a genuine APPROVE/BLOCK result instead
-# of rejecting it with a confusing downstream message ("BLOCK by <empty>"). The
-# primary occasionally writes `verdict` for the schema's `status`, and omits the
-# always-empty `commit`/`documentation_changes` on a clean APPROVE. Pure: reads $1,
-# prints normalized JSON; a non-record (review bundle, plan doc) passes through and
-# then fails json_schema_basic, exactly as before. (GH #20)
+# Coerce a substantively-valid but sloppily-shaped persona-review verdict into the
+# strict persona-review schema — the SAME robustness the observer already gets from
+# normalize_observer_output. A live model (esp. a cheaper persona tier) reliably
+# returns the right STATUS but often the wrong FINDING keys (e.g. file/line/summary/
+# details instead of id/evidence/required_change), which would fail json_schema_basic
+# and, after the retry, block the whole run on a format nit. So: map status synonyms
+# (verdict/APPROVED/PASS/… → APPROVE/BLOCK), keep a schema-valid finding id but
+# synthesize REV-NNN for a missing/malformed one, pull evidence/required_change from
+# common synonyms, drop unknown keys, and keep APPROVE↔findings consistent.
+#
+# Bias (deliberate, mirrors the observer): fail-closed on BLOCK — a blocking verdict
+# with no usable finding still HALTS the run via a placeholder, and an APPROVE is
+# never fabricated. Pure: reads $1, prints normalized JSON; the wrapper stamps
+# .persona/.stage before calling this, so those pass through untouched. A non-record
+# (review bundle, plan doc) yields junk that still fails json_schema_basic, as before.
 normalize_persona_result() {
   jq '
-    (if (has("verdict") and (has("status") | not)) then (.status = .verdict | del(.verdict)) else . end)
-    | (if has("commit") then . else .commit = null end)
-    | (if has("documentation_changes") then . else .documentation_changes = [] end)
+    def norm_status: (. // "BLOCK") | tostring | ascii_upcase
+      | if (. == "APPROVE" or . == "APPROVED" or . == "PASS" or . == "OK" or . == "LGTM")
+        then "APPROVE" else "BLOCK" end;
+    {
+      persona: .persona,
+      stage: .stage,
+      commit: (if (.commit == null or (.commit | type == "string" and length > 0)) then .commit else null end),
+      status: ((.status // .verdict) | norm_status),
+      findings: ((.findings // []) | to_entries | map(
+        (.key + 1) as $k | .value as $f |
+        (($f.id // "") | tostring) as $idstr |
+        (if ($idstr | test("^[A-Z][A-Z0-9_-]*-[0-9]{3,}$")) then $idstr
+         else ("REV-" + ((if ($idstr | test("[0-9]")) then ($idstr | capture("(?<n>[0-9]+)").n) else ($k | tostring) end)
+           | if (length < 3) then (("000" + .)[-3:]) else . end)) end) as $id |
+        {
+          id: $id,
+          evidence: (($f.evidence // $f.summary // $f.details // $f.message // $f.location // "see persona notes") | tostring),
+          required_change: (($f.required_change // $f.recommendation // $f.fix // $f.summary // "address the persona finding") | tostring)
+        })),
+      documentation_changes: ((.documentation_changes // []) | map(select(type == "string" and length > 0)))
+    }
+    | if .status == "APPROVE" then .findings = []
+      elif (.findings | length) == 0 then
+        .findings = [{id: "REV-001", evidence: "persona requested changes without a structured finding", required_change: "address the persona feedback"}]
+      else . end
   ' "$1"
 }
 
