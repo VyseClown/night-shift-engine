@@ -1867,6 +1867,11 @@ run_observer() {
 normalize_observer_output() {
   local file="$1" task="$2" candidate="$3" tmp="$1.norm.$$"
   jq --arg task "$task" --arg candidate "$candidate" '
+    # Prefer the first NON-EMPTY STRING among candidates: a live model (observer
+    # included — verified) often sets required_change to a BOOLEAN true, and a plain
+    # `//` keeps it -> "true". nonempty() skips non-strings so we fall through to real
+    # text (required_change falls back to the finding evidence when no change text).
+    def nonempty($v): ($v | if (type == "string" and length > 0) then . else empty end);
     {
       observer: "claude",
       primary: "claude",
@@ -1881,8 +1886,8 @@ normalize_observer_output() {
         (if ($idstr | test("[0-9]")) then ($idstr | capture("(?<n>[0-9]+)").n) else ($k | tostring) end) as $num |
         {
           id: ("OBS-" + (if ($num | length) < 3 then (("000" + $num)[-3:]) else $num end)),
-          evidence: (($f.evidence // $f.location // $f.summary // "see observer notes") | tostring),
-          required_change: (($f.required_change // $f.summary // $f.recommendation // "address the observer finding") | tostring)
+          evidence: ([nonempty($f.evidence), nonempty($f.location), nonempty($f.summary), nonempty($f.details), nonempty($f.message)] | (.[0] // "see observer notes")),
+          required_change: ([nonempty($f.required_change), nonempty($f.summary), nonempty($f.recommendation), nonempty($f.fix), nonempty($f.evidence)] | (.[0] // "address the observer finding"))
         }
       )),
       documentation_changes: ((.documentation_changes // []) | map(select(type == "string" and length > 0)))

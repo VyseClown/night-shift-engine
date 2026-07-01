@@ -2098,6 +2098,13 @@ fixture_observer_normalization() {
   json_schema_basic observer-review "$in" &&
     [ "$(jq -r '.status' "$in")" = "APPROVE" ] &&
     [ "$(jq -r '.findings|length' "$in")" = "0" ] || ok=0
+  # required_change as a BOOLEAN (a live observer treated it as a flag) must fall
+  # through to real text, not become the useless string "true" (found via a live call).
+  printf '%s\n' '{"status":"BLOCK","findings":[{"id":"OBS-9","evidence":"real evidence here","required_change":true}]}' >"$in"
+  normalize_observer_output "$in" "specs/x.md" "abcdef1234567"
+  json_schema_basic observer-review "$in" &&
+    [ "$(jq -r '.findings[0].required_change' "$in")" != "true" ] &&
+    { jq -e '.findings[0].required_change|test("real evidence")' "$in" >/dev/null; } || ok=0
   [ "$ok" -eq 1 ]
 }
 
