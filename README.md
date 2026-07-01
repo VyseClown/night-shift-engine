@@ -52,9 +52,12 @@ A spec declares `- Track: rn | web | node` (default `rn`), which selects the
 review persona set, the spec template, and the validation checklist:
 
 - **`rn`** — React Native (`rn-sandbox`). Personas in `docs/review-personas.md`.
-- **`web`** — Next.js / React (`web-app`). Personas in `docs/review-personas-web.md`.
+- **`web`** — Next.js / React with its data/API layer (`web-app`, e.g. Prisma +
+  Postgres). Personas in `docs/review-personas-web.md`, including a dedicated
+  **Backend & Data Expert**; the `data` profile targets that backend/data work.
 - **`node`** — plain Node / CLI / backend, no UI surface. Reuses the backend
-  personas; `full` and `logic` profiles only (no UX persona).
+  personas (the **Backend & Data Expert** stands in for the architecture role);
+  `full` and `logic` profiles only (no UX persona).
 
 ## Running it
 
