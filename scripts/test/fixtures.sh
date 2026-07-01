@@ -1042,6 +1042,13 @@ fixture_persona_coerce_findings() {
   local out3; out3="$(normalize_persona_result <(printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":[]}'))"
   [ "$(printf '%s' "$out3" | jq -r '.status')" = "BLOCK" ] || return 1
   [ "$(printf '%s' "$out3" | jq -r '.findings|length')" -ge 1 ] || return 1
+  # required_change as a BOOLEAN (a live model treated it as a flag) must fall through
+  # to real text, not become the useless string "true" (found via a live model call).
+  printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":[{"id":"HA-002","evidence":"real evidence text","required_change":true}]}' >"$d/in4.json"
+  normalize_persona_result "$d/in4.json" >"$d/out4.json" || return 1
+  json_schema_basic persona-review "$d/out4.json" || return 1
+  [ "$(jq -r '.findings[0].required_change' "$d/out4.json")" != "true" ] || return 1
+  jq -e '.findings[0].required_change|test("real evidence")' "$d/out4.json" >/dev/null || return 1
   return 0
 }
 

@@ -1174,6 +1174,7 @@ normalize_persona_result() {
     def norm_status: (. // "BLOCK") | tostring | ascii_upcase
       | if (. == "APPROVE" or . == "APPROVED" or . == "PASS" or . == "OK" or . == "LGTM")
         then "APPROVE" else "BLOCK" end;
+    def nonempty($v): ($v | if (type == "string" and length > 0) then . else empty end);
     {
       persona: .persona,
       stage: .stage,
@@ -1187,8 +1188,12 @@ normalize_persona_result() {
            | if (length < 3) then (("000" + .)[-3:]) else . end)) end) as $id |
         {
           id: $id,
-          evidence: (($f.evidence // $f.summary // $f.details // $f.message // $f.location // "see persona notes") | tostring),
-          required_change: (($f.required_change // $f.recommendation // $f.fix // $f.summary // "address the persona finding") | tostring)
+          # Prefer the first NON-EMPTY STRING among the candidates. `//` alone is
+          # wrong here: a live model often sets required_change to a BOOLEAN true
+          # (treating it as a flag), and `true // x` keeps true -> "true", losing the
+          # real change. nonempty() skips non-strings so we fall through to real text.
+          evidence: ([nonempty($f.evidence), nonempty($f.summary), nonempty($f.details), nonempty($f.message), nonempty($f.location)] | (.[0] // "see persona notes")),
+          required_change: ([nonempty($f.required_change), nonempty($f.recommendation), nonempty($f.fix), nonempty($f.summary), nonempty($f.evidence)] | (.[0] // "address the persona finding"))
         })),
       documentation_changes: ((.documentation_changes // []) | map(select(type == "string" and length > 0)))
     }
