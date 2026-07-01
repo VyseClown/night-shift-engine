@@ -103,6 +103,7 @@ The engine spends the strong model only where judgment matters. All knobs accept
 |---|---|---|
 | `NIGHT_SHIFT_PLAN_MODEL` | `opus` | Planning (high-leverage) |
 | `NIGHT_SHIFT_IMPLEMENT_MODEL` | `sonnet` | Implement grind, observe-request, completion |
+| `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL` | `opus` | Implement grind for a spec with a `## Design Contract` (judgment-heavy design fidelity) |
 | `NIGHT_SHIFT_PERSONA_MODEL` | `sonnet` | Review persona sub-agents |
 | `NIGHT_SHIFT_OBSERVER_MODEL` | `opus` | Independent final gate (the backstop that makes a cheaper primary safe) |
 | `NIGHT_SHIFT_SESSION_SCOPE` | `stage` | Fresh session per stage scope; `run` for one pinned session |
