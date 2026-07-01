@@ -17,7 +17,16 @@ set -uo pipefail
 ENGINE_DIR="$(cd "$(dirname "$0")/../.." && pwd -P)"
 ENGINE="$ENGINE_DIR/scripts/night-shift.sh"
 WORK="$(mktemp -d)"
-cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
+# The engine appends each observer verdict to $WORKSPACE_ROOT/NIGHT_SHIFT_REVIEW.md
+# (the engine repo) — that is intended for real runs, but this test must not leave
+# throwaway entries in that tracked file, so back it up and restore it on exit.
+REVIEW="$ENGINE_DIR/NIGHT_SHIFT_REVIEW.md"
+REVIEW_BAK="$(mktemp)"; cp "$REVIEW" "$REVIEW_BAK" 2>/dev/null || REVIEW_BAK=""
+cleanup() {
+  [ -n "$REVIEW_BAK" ] && cp "$REVIEW_BAK" "$REVIEW" 2>/dev/null || true
+  rm -f "$REVIEW_BAK" 2>/dev/null || true
+  rm -rf "$WORK" 2>/dev/null || true
+}
 trap cleanup EXIT
 fail() { printf 'not ok - integration: %s\n' "$*" >&2; exit 1; }
 
