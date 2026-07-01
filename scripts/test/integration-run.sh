@@ -29,6 +29,12 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { printf 'not ok - integration: %s\n' "$*" >&2; exit 1; }
+# macOS has no GNU `timeout`; fall back to a perl alarm wrapper (stock perl).
+run_with_timeout() {
+  if command -v timeout >/dev/null 2>&1; then timeout "$@"
+  else perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$@"
+  fi
+}
 
 PROJECT="$WORK/project"; BIN="$WORK/bin"; SPEC="$WORK/spec.md"
 mkdir -p "$PROJECT" "$BIN"
@@ -123,7 +129,7 @@ chmod +x "$BIN/claude"
 
 # --- run the real engine end-to-end ------------------------------------------
 log="$WORK/run.log"
-if ! timeout "${NS_INTEGRATION_TIMEOUT:-240}" \
+if ! run_with_timeout "${NS_INTEGRATION_TIMEOUT:-240}" \
      env PATH="$BIN:$PATH" NIGHT_SHIFT_ACCEPT_COSTS=YES \
      "$ENGINE" --project "$PROJECT" --spec "$SPEC" >"$log" 2>&1; then
   sed -n '$p;' "$log" >&2 || true
