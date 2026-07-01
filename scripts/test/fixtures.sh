@@ -178,7 +178,7 @@ run_dry_fixtures() {
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
-  fixture_assert "stale-lock reclaim is serialized (single winner, no pid clobber)" fixture_lock_reclaim_mutex "$root"
+  fixture_assert "stale-lock reclaim is atomic + self-healing (no wedge, live untouched)" fixture_lock_reclaim "$root"
   fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
   fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
   fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
@@ -516,23 +516,26 @@ fixture_worktree_reentry() {
   return 0
 }
 
-fixture_lock_reclaim_mutex() {
-  # The stale-lock reclaim must be serialized so two racing reclaimers can't both
-  # win (the second's `rm -f` clobbering the first's fresh pid -> two runs). We can
-  # test the gate deterministically: a reclaim already in progress (the .reclaiming
-  # mutex held) must make a second reclaimer LOSE without touching the pid.
+fixture_lock_reclaim() {
+  # Stale-lock reclaim is atomic (rename-aside) and SELF-HEALING: a crashed reclaimer
+  # must not permanently wedge the lock, and a live holder must never be reclaimed.
   local root="$1" dir="$root/lockmx/run.lock"
   mkdir -p "$dir"
-  # (a) stale lock, no reclaim in progress -> we reclaim it (return 0, pid becomes us).
-  printf '2147483646\n' >"$dir/pid"                # a dead PID -> stale
+  # (a) stale lock (dead PID) -> reclaimed, pid becomes us, no leftover .stale/.reclaiming.
+  printf '2147483646\n' >"$dir/pid"
   atomic_lock_acquire "$dir" || return 1
   [ "$(cat "$dir/pid")" = "$$" ] || return 1
-  # (b) stale lock, reclaim mutex already held by a concurrent reclaimer -> we lose,
-  #     and must NOT clobber the stale pid the winner is about to replace.
-  rm -rf "$dir"; mkdir -p "$dir"; printf '2147483646\n' >"$dir/pid"
-  mkdir "$dir/.reclaiming"                          # simulate the other reclaimer holding it
-  ! atomic_lock_acquire "$dir" || return 1          # must fail to reclaim
-  [ "$(cat "$dir/pid")" = "2147483646" ] || return 1  # stale pid left intact (not clobbered)
+  [ -z "$(find "$root/lockmx" -maxdepth 1 -name 'run.lock.stale.*' 2>/dev/null)" ] || return 1
+  [ ! -e "$dir/.reclaiming" ] || return 1
+  # (b) a LIVE holder ($$ is alive) is NOT reclaimed and its pid is left intact.
+  printf '%s\n' "$$" >"$dir/pid"
+  ! atomic_lock_acquire "$dir" || return 1
+  [ "$(cat "$dir/pid")" = "$$" ] || return 1
+  # (c) NO permanent wedge: repeated stale reclaims keep succeeding (the mkdir-mutex
+  #     version could orphan .reclaiming and block all future reclaims; rename-aside
+  #     cannot).
+  printf '2147483646\n' >"$dir/pid"; atomic_lock_acquire "$dir" || return 1
+  printf '2147483646\n' >"$dir/pid"; atomic_lock_acquire "$dir" || return 1
   return 0
 }
 

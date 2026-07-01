@@ -35,27 +35,28 @@ lock_is_stale() {
 # the mkdir->write-pid window a plain `mkdir` gate leaves: a concurrent claimant
 # can no longer see a freshly-created, pid-less dir and wrongly judge it stale.
 #
-# A stale pid (dead owner) is reclaimed, but the reclaim is SERIALIZED by an atomic
-# `mkdir` mutex. The destructive `rm -f pid` + recreate must be exclusive: without
-# the mutex, two reclaimers both pass lock_is_stale, and the second's `rm -f` can
-# clobber the first winner's freshly-created pid AFTER it returned 0 — so BOTH win
-# and run concurrently against the shared state.json. Only the mkdir winner
-# reclaims; the loser returns 1. (A crash between the mkdir and its rmdir orphans
-# the mutex, which an operator clears exactly like any stale lock: remove the lock
-# dir.) The re-create is O_EXCL too, belt-and-suspenders.
+# A stale pid (dead owner) is reclaimed by atomically RENAMING the stale lock dir
+# aside, then recreating it fresh. rename is atomic, so of two racing reclaimers only
+# ONE moves the dir; the other's rename fails (source gone) and it returns 1 — there
+# is no `rm -f pid` window where a second reclaimer clobbers the first's freshly
+# written pid and both win. This is also SELF-HEALING: if we die after the rename but
+# before recreating, the lock dir is simply absent and the very next acquire creates
+# it fresh — unlike a held mutex, a crash cannot permanently wedge the lock. The
+# recreate's pid write is O_EXCL, so a fresh acquirer racing the recreate still yields
+# a single winner.
 atomic_lock_acquire() {
-  local lockdir="$1"
+  local lockdir="$1" aside
   mkdir -p "$lockdir" 2>/dev/null || return 1
   if ( set -C; printf '%s\n' "$$" >"$lockdir/pid" ) 2>/dev/null; then
     return 0
   fi
-  if lock_is_stale "$lockdir" && mkdir "$lockdir/.reclaiming" 2>/dev/null; then
-    rm -f "$lockdir/pid"
-    if ( set -C; printf '%s\n' "$$" >"$lockdir/pid" ) 2>/dev/null; then
-      rmdir "$lockdir/.reclaiming" 2>/dev/null || true
-      return 0
+  if lock_is_stale "$lockdir"; then
+    aside="$lockdir.stale.$$"
+    if mv "$lockdir" "$aside" 2>/dev/null; then
+      rm -rf "$aside" 2>/dev/null || true
+      mkdir -p "$lockdir" 2>/dev/null || return 1
+      ( set -C; printf '%s\n' "$$" >"$lockdir/pid" ) 2>/dev/null && return 0
     fi
-    rmdir "$lockdir/.reclaiming" 2>/dev/null || true
   fi
   return 1
 }
