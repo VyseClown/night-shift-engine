@@ -1069,6 +1069,25 @@ fixture_persona_lens() {
   [ -n "$(persona_lens "React Native Architect" rn)" ] || return 1
   [ -n "$(persona_lens "Backend & Data Expert" node)" ] || return 1
   [ -z "$(persona_lens "No Such Persona" rn)" ] || return 1
+  # A deeper sub-heading inside a persona section must NOT truncate the lens; only a
+  # same-or-shallower heading ends it.
+  local d="$1/plsub"; mkdir -p "$d/docs"
+  cat > "$d/docs/review-personas.md" <<'MD'
+## 1. Test Persona
+Focus: the focus line.
+#### Examples
+an example here.
+Checklist: the checklist line.
+## 2. Next Persona
+other persona body.
+MD
+  ( WORKSPACE_ROOT="$d"
+    b="$(persona_lens "Test Persona" rn)"
+    printf '%s' "$b" | grep -q 'checklist line' || exit 1   # sub-heading did not truncate
+    printf '%s' "$b" | grep -q 'an example here' || exit 1   # sub-heading body included
+    printf '%s' "$b" | grep -q 'Next Persona' && exit 1      # stopped at the next ## persona
+    exit 0
+  ) || return 1
   return 0
 }
 

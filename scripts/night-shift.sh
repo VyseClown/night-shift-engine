@@ -1246,10 +1246,13 @@ persona_lens() {
     [ -f "$doc" ] || continue
     body="$(awk -v name="$persona" '
       /^#{1,6}[ \t]/ {
+        lvl=0; while (substr($0, lvl+1, 1) == "#") lvl++;
         h=$0; sub(/^#{1,6}[ \t]+/, "", h); sub(/^[0-9]+\.[ \t]+/, "", h);
         sub(/[ \t]+$/, "", h);
-        if (insec) exit;
-        if (h == name) { insec=1; next }
+        # End the section only at a heading of the SAME-or-shallower level; a deeper
+        # sub-heading (e.g. #### Examples under a ## persona) is part of the body.
+        if (insec) { if (lvl <= seclvl) exit; else { print; next } }
+        if (h == name) { insec=1; seclvl=lvl; next }
         next
       }
       insec { print }
