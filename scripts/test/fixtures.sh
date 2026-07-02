@@ -126,6 +126,7 @@ run_dry_fixtures() {
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
   fixture_assert "persona/observer retry attempts carry the rejection note (first attempts do not)" fixture_retry_feedback_note "$root"
   fixture_assert "personas spawn concurrently (bounded by NIGHT_SHIFT_PERSONA_CONCURRENCY; 1 = serial)" fixture_persona_parallel_spawn "$root"
+  fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
   fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
@@ -1166,6 +1167,47 @@ fixture_bounded_diff() {
     printf '%s' "$out2" | grep -q 'small-change' || exit 1
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_wrapper_owned_integrity() {
+  # state.json and the validated/* evidence are wrapper-owned, but they live in
+  # $PROJECT/.night-shift where the primary runs unattended with
+  # bypassPermissions — an out-of-band edit (an in-distribution "helpful" fix,
+  # not necessarily malice) to approvals, stage, or the red/green record would
+  # be trusted by the engine on its next read. The engine keeps private copies
+  # outside the project, verifies at trust points, and degrades to
+  # seed-on-first-check when the private copy is missing (tmp cleared).
+  local root="$1" dir="$root/integrity"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="integ-fixture-$$"
+    mkdir -p "$RUN_ROOT/validated"
+    printf '{"stage":"planning","plan_approved":false}\n' >"$STATE"
+    integrity_put "$STATE"
+    integrity_check "$STATE" || exit 1                    # untouched -> ok
+    jq '.plan_approved=true' "$STATE" >"$STATE.t" && mv "$STATE.t" "$STATE"
+    integrity_check "$STATE" && exit 1                    # out-of-band edit detected
+    integrity_put "$STATE"                                # an engine write blesses it
+    integrity_check "$STATE" || exit 1
+    # Validated evidence follows the same contract.
+    printf '{"exit_status":1}\n' >"$RUN_ROOT/validated/test-first-failing.json"
+    integrity_put "$RUN_ROOT/validated/test-first-failing.json"
+    printf '{"exit_status":0}\n' >"$RUN_ROOT/validated/test-first-failing.json"
+    integrity_check "$RUN_ROOT/validated/test-first-failing.json" && exit 1
+    # Degraded mode: a missing private copy seeds instead of blocking, then re-arms.
+    rm -rf "$(integrity_dir)"
+    integrity_check "$STATE" || exit 1
+    jq '.stage="completion"' "$STATE" >"$STATE.t" && mv "$STATE.t" "$STATE"
+    integrity_check "$STATE" && exit 1
+    integrity_cleanup
+    [ ! -d "$(integrity_dir)" ] || exit 1
+    exit 0 ) || return 1
+  # Wiring: the trust points consult the check (primary-turn return, candidate
+  # gate, observer evidence) and state_set re-seeds after every engine write.
+  grep -q 'integrity_check "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
   return 0
 }
 

@@ -516,12 +516,69 @@ compact_success() {
 # release_lock now live in scripts/lib/locking.sh (sourced above), shared with
 # device-registry.sh which reuses the atomic-claim idiom.
 
+# ---------------------------------------------------------------------------
+# Wrapper-owned file integrity (engine-private anchor)
+# ---------------------------------------------------------------------------
+# state.json and the engine-run validated/* evidence are wrapper-owned, but they
+# live inside $PROJECT/.night-shift — where the primary runs unattended with
+# bypassPermissions. Nothing filesystem-level stops an in-distribution "helpful"
+# edit (rewriting approvals, the stage, or the red/green record) from being
+# trusted by the engine on its next read. The engine therefore keeps a private
+# byte-for-byte copy of each wrapper-owned file outside the project and compares
+# at the trust points (primary-turn return, the candidate gate, the observer's
+# evidence). This is the same principle that moved persona reviews from
+# self-reported to engine-spawned, applied to the engine's own ledgers.
+#
+# NOT cryptographic: a process running with the user's privileges could hunt
+# down and tamper the private copies too — the anchor raises the bar from
+# "accidental in-tree edit" (in-distribution for an LLM working in the repo) to
+# "deliberate out-of-tree hunt" (outside the stated threat model, like the
+# engine's trust in the OS generally). A missing private copy (a reboot cleared
+# tmp before a --resume) degrades to seed-on-first-check with a log line — never
+# a block. The anchor dir is kept on a blocked run so --resume retains
+# integrity continuity; it is removed only on successful completion.
+integrity_dir() { printf '%s/night-shift-auth-%s' "$(tmp_base)" "$RUN_ID"; }
+
+integrity_key() {
+  local file="$1"
+  case "$file" in
+    "$RUN_ROOT"/*) printf '%s' "${file#"$RUN_ROOT"/}" ;;
+    *) basename "$file" ;;
+  esac
+}
+
+integrity_put() {
+  [ -n "${RUN_ID:-}" ] && [ -n "${RUN_ROOT:-}" ] && [ -f "${1:-}" ] || return 0
+  local dst
+  dst="$(integrity_dir)/$(integrity_key "$1")"
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 0
+  cp "$1" "$dst" 2>/dev/null || true
+}
+
+integrity_check() {
+  [ -n "${RUN_ID:-}" ] && [ -n "${RUN_ROOT:-}" ] && [ -f "${1:-}" ] || return 0
+  local auth
+  auth="$(integrity_dir)/$(integrity_key "$1")"
+  if [ ! -f "$auth" ]; then
+    log "integrity: no private copy of $(integrity_key "$1") (fresh seed or cleared tmp); seeding"
+    integrity_put "$1"
+    return 0
+  fi
+  cmp -s "$auth" "$1"
+}
+
+integrity_cleanup() {
+  [ -n "${RUN_ID:-}" ] || return 0
+  rm -rf "$(integrity_dir)" 2>/dev/null || true
+}
+
 state_set() {
   local filter="$1"
   shift
   local tmp="$STATE.tmp.$$"
   jq "$@" "$filter" "$STATE" >"$tmp" && mv "$tmp" "$STATE" ||
     die "failed to update run state; preserved at ${RUN_ROOT:-unknown}"
+  integrity_put "$STATE"
 }
 
 # Pure predicate: return 0 if $1 is a non-negative integer string, 1 otherwise.
@@ -586,6 +643,7 @@ initialize_run() {
     --arg base "$BASE_COMMIT" --arg branch "$BASE_BRANCH" \
     --arg baseline_status "$BASE_STATUS" ||
     die "could not initialize run state"
+  integrity_put "$STATE"
   # Arm the interrupt trap now that state.json exists but BEFORE the minutes-long
   # baseline validation below. Otherwise a signal during baseline validation frees
   # the lock (EXIT trap) yet leaves status="running" with no block_reason, which the
@@ -997,6 +1055,11 @@ invoke_primary() {
   if [ -n "$session" ] && [ "$emitted" != "$session" ]; then
     block_run "primary session ID changed from $session to $emitted"
   fi
+  # The primary just had unattended write access to the whole project including
+  # .night-shift/. Verify the wrapper-owned state BEFORE the engine's own writes
+  # below would launder an out-of-band edit into the private copy.
+  integrity_check "$STATE" ||
+    block_run "wrapper-owned state.json was modified outside the engine during the primary turn"
   state_set '
     .session_id=$session |
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
@@ -1836,6 +1899,13 @@ EOF
   [ -n "$evidence" ] || block_run "candidate requires schema-valid execution evidence"
   [ "$(jq -r '.task' "$evidence")" = "$SPEC" ] ||
     block_run "execution evidence task does not match current spec"
+  # The red/green cross-checks below trust these as wrapper-run ground truth;
+  # verify the primary did not rewrite them in the project tree.
+  local owned
+  for owned in "$RUN_ROOT/validated/baseline.json" "$RUN_ROOT/validated/test-first-failing.json"; do
+    integrity_check "$owned" ||
+      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine"
+  done
   # Modify-mode (the first-failing-test passed at baseline): establish the genuine red
   # proof now by overlaying the candidate's updated test files onto BASE production and
   # requiring RED there. This overwrites test-first-failing.json with a real failing
@@ -1848,6 +1918,7 @@ EOF
       block_run "could not run the test-first red-against-base overlay"
     [ "$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-failing.json")" -ne 0 ] ||
       block_run "test-first: candidate tests still pass against base production code (no genuine red→green)"
+    integrity_put "$RUN_ROOT/validated/test-first-failing.json"
   fi
   # Run the passing check with the WRAPPER's own failing command (not the primary's
   # echoed string), so a primary-supplied command never drives control flow.
@@ -2062,9 +2133,15 @@ observer_wrapper_evidence() {
 
 run_observer() {
   local signal="$1" candidate context="$RUN_ROOT/prompts/observer-context.txt"
-  local out raw attempt=0 artifact plan_results implementation_results review_dir resolved
+  local out raw attempt=0 artifact plan_results implementation_results review_dir resolved owned
   candidate="$(jq -r '.candidate // .candidate_commits[-1] // empty' "$STATE")"
   [ -n "$candidate" ] || block_run "observer requested without a candidate commit"
+  # observer_wrapper_evidence presents these as authoritative ground truth;
+  # verify the primary did not rewrite them in the project tree.
+  for owned in "$RUN_ROOT/validated/final.json" "$RUN_ROOT/validated/test-first-passing.json"; do
+    [ ! -f "$owned" ] || integrity_check "$owned" ||
+      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine"
+  done
   # Fail closed: the observer prompt treats the engine diff as authoritative ground
   # truth, so an unresolvable range must NOT hand it an empty diff (which would invite
   # a spurious APPROVE of a candidate it never saw). Verify both ends resolve first.
@@ -2244,6 +2321,9 @@ complete_run() {
     primary_turns,review_round,finding_ids,started_at,completed_at}' "$STATE" >"$summary"
   compact_success "$RUN_ROOT" "$RUN_ID"
   cleanup_observer_tmp
+  # Only on SUCCESS: a blocked run keeps the anchor so --resume retains
+  # integrity continuity across the gap.
+  integrity_cleanup
   log "run $RUN_ID complete; compact archive: $RUN_ROOT/archive/$RUN_ID"
   exit 0
 }
@@ -2297,6 +2377,7 @@ EOF
   run_validation_commands baseline "$RUN_ROOT/validated/baseline-$(basename "$SPEC" .md).json" "$baseline_commands" ||
     block_run "next task baseline validation could not run"
   cp "$RUN_ROOT/validated/baseline-$(basename "$SPEC" .md).json" "$RUN_ROOT/validated/baseline.json"
+  integrity_put "$RUN_ROOT/validated/baseline.json"
   assert_tools_available "$RUN_ROOT/validated/baseline.json" "next task baseline"
   test_command="$(sed -nE 's/^- First failing test or executable check: `([^`]+)`.*/\1/p' "$SPEC" | head -n 1)"
   run_test_command failing "$test_command" "$RUN_ROOT/validated/test-first-failing.json"
