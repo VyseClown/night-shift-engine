@@ -124,6 +124,7 @@ run_dry_fixtures() {
   fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
   fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
+  fixture_assert "persona/observer retry attempts carry the rejection note (first attempts do not)" fixture_retry_feedback_note "$root"
   fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
   fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
@@ -1164,6 +1165,53 @@ fixture_bounded_diff() {
     printf '%s' "$out2" | grep -q 'small-change' || exit 1
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_retry_feedback_note() {
+  # Persona and observer retries used to blindly re-send the identical prompt —
+  # the model got no signal about WHY attempt 1 failed validation. The retry
+  # attempt must carry a rejection note (the same principle that fixed the
+  # primary's malformed-signal loops), and the first attempt must not.
+  local root="$1" dir="$root/retry-note" p
+  mkdir -p "$dir"
+  local RUN_ID=testrun SPEC="$dir/spec.md" PROJECT="$dir" BASE_COMMIT=deadbeef
+  fixture_write_min_spec "$SPEC"
+  printf 'bundle-body\n' >"$dir/bundle.md"
+  # (1) persona_prompt: note present iff supplied.
+  p="$(persona_prompt "Human Advocate" plan "$dir/bundle.md" "lens-text" "keys must be exactly six")"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' || return 1
+  printf '%s' "$p" | grep -q 'keys must be exactly six' || return 1
+  p="$(persona_prompt "Human Advocate" plan "$dir/bundle.md" "lens-text")"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' && return 1
+  # (2) observer_prompt: same contract.
+  printf 'ctx\n' >"$dir/ctx.txt"
+  p="$(observer_prompt "$dir/ctx.txt" deadbeef "verdict failed the observer-review schema")"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' || return 1
+  p="$(observer_prompt "$dir/ctx.txt" deadbeef)"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' && return 1
+  # (3) spawn_personas feeds a note to attempt 2 only.
+  ( log() { :; }
+    RUN_ROOT="$dir"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$dir/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      printf '%s' "${6:-}" >"$dir/note-args.$(basename "$5" | sed 's/.*\.\([0-9]*\)\.json/\1/')"
+      if [ -f "$dir/fail-once" ]; then
+        rm -f "$dir/fail-once"; printf 'junk' >"$4"; printf '{}' >"$5"; return 1
+      fi
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{}' >"$5"
+    }
+    block_run() { exit 7; }
+    : >"$dir/fail-once"
+    rd="$dir/validated/personas/spec/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    exit 0 ) || return 1
+  [ -s "$dir/note-args.1" ] && return 1   # attempt 1: no note
+  [ -s "$dir/note-args.2" ] || return 1   # attempt 2: rejection note present
   return 0
 }
 

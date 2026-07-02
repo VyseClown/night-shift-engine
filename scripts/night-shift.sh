@@ -1480,14 +1480,23 @@ assemble_review_bundle() {
 # The prompt for one engine-spawned persona. Mirrors observer_prompt: judge only
 # the supplied bundle, end with a single fenced json verdict block.
 persona_prompt() {
-  local persona="$1" stage="$2" bundle="$3" lens="$4"
+  local persona="$1" stage="$2" bundle="$3" lens="$4" retry_note="${5:-}"
   [ -n "$lens" ] || lens="Review strictly within the concerns of \"$persona\"; raise only issues a \"$persona\" would own."
+  # A retry after a rejected attempt says WHY it was rejected — a blind re-send
+  # is indistinguishable from the original and reliably repeats the mistake
+  # (the same principle as the primary's signal-rejection feedback).
+  [ -z "$retry_note" ] ||
+    retry_note="
+PREVIOUS ATTEMPT REJECTED: a previous attempt at this review was discarded
+because: $retry_note
+Avoid that mistake; follow the verdict rules below exactly.
+"
   cat <<EOF
 You are the "$persona" review persona for night-shift run $RUN_ID, independently
 reviewing another Claude session's $stage work. You share no context with the
 implementer and cannot see the repository — judge ONLY the review bundle below,
 strictly through your persona's lens. This is unattended; never ask questions.
-
+$retry_note
 Your review lens:
 $lens
 
@@ -1516,7 +1525,7 @@ EOF
 # extracted from stdout. A discrete seam the fixtures override to test the spawn
 # loop deterministically without a live model.
 invoke_persona_once() {
-  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" neutral lens
+  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" retry_note="${6:-}" neutral lens
   neutral="${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID"
   mkdir -p "$neutral"
   lens="$(persona_lens "$persona" "$(spec_track "$SPEC")")"
@@ -1524,7 +1533,7 @@ invoke_persona_once() {
   # positional arg risks the ARG_MAX/E2BIG exec limit (repair_agent pipes for the
   # same reason). model_flag word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
-  (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" |
+  (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
     claude -p $(model_flag "$PERSONA_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }
@@ -1535,7 +1544,7 @@ invoke_persona_once() {
 # a persona that cannot return a valid review after a retry blocks the run.
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
-  local bundle persona slug out raw tmp idd norm tries iv old_ifs
+  local bundle persona slug out raw tmp idd norm tries iv old_ifs retry_note
   bundle="$RUN_ROOT/control/review-bundle.md"
   assemble_review_bundle "$persona_stage" "$bundle"
   old_ifs="$IFS"; IFS='|'
@@ -1548,13 +1557,13 @@ spawn_personas() {
     slug="$(persona_slug "$persona")"
     out="$result_dir/$slug.json"
     tmp="$result_dir/.spawn-$slug.$$"; idd="$tmp.id"; norm="$tmp.norm"
-    tries=0
+    tries=0; retry_note=""
     while :; do
       tries=$((tries + 1))
       # Per-attempt raw path so a failed first attempt's cost is not overwritten by
       # the retry before it is recorded.
       raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$tries.json"
-      invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw"; iv=$?
+      invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" "$retry_note"; iv=$?
       record_cost "$raw" "$(basename "$raw")"   # record every paid attempt, valid or not
       if [ "$iv" -eq 0 ] &&
         jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
@@ -1564,6 +1573,13 @@ spawn_personas() {
         rm -f "$tmp" "$idd"
         log "persona ($persona_stage): $persona → $(jq -r '.status' "$out")"
         break
+      fi
+      # Say WHY on the retry: extraction failure vs a verdict the normalizer +
+      # schema still rejected. A blind identical re-send repeats the mistake.
+      if [ "$iv" -ne 0 ]; then
+        retry_note="no parseable JSON verdict could be extracted from the reply; end with EXACTLY one fenced json code block and nothing after it"
+      else
+        retry_note="the verdict failed the persona-review contract: exactly the six keys persona/stage/commit/status/findings/documentation_changes; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
       fi
       rm -f "$tmp" "$idd" "$norm"
       [ "$tries" -lt 2 ] ||
@@ -1819,10 +1835,19 @@ EOF
 }
 
 observer_prompt() {
-  local context="$1" candidate="$2"
+  local context="$1" candidate="$2" retry_note="${3:-}"
+  # Same retry-feedback principle as persona_prompt / the primary's
+  # signal-rejection block: a retry says why the previous attempt was rejected.
+  [ -z "$retry_note" ] ||
+    retry_note="
+PREVIOUS ATTEMPT REJECTED: a previous attempt at this review was discarded
+because: $retry_note
+Avoid that mistake; follow the verdict rules below exactly.
+"
   cat <<EOF
 You are an independent Claude observer reviewing another Claude session's work.
 You share no context with the implementer; judge only the supplied evidence.
+$retry_note
 The sections marked "authoritative" (the engine-computed base..candidate diff and
 the engine-run validation) are ground truth produced by the wrapper, not the
 implementer — weight them over any primary-supplied artifact, which is
@@ -1856,7 +1881,7 @@ EOF
 }
 
 invoke_observer_once() {
-  local context="$1" candidate="$2" out="$3" raw="$4" neutral
+  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral
   # Context-isolated observer: a fresh Claude session (no --resume) launched from
   # a neutral empty directory. It runs in the default (non-bypass) permission
   # mode, so tool use is not auto-approved and, combined with the neutral cwd, it
@@ -1875,7 +1900,7 @@ invoke_observer_once() {
   # still be sizeable, and a positional arg risks the ARG_MAX/E2BIG exec limit.
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
-  (cd "$neutral" && observer_prompt "$context" "$candidate" |
+  (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" |
     claude -p $(model_flag "$OBSERVER_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }
@@ -2080,10 +2105,10 @@ normalize_observer_output() {
 }
 
 validated_observer_retry() {
-  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0
+  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note=""
   while [ "$attempt" -lt 2 ]; do
     enforce_limits
-    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" || true
+    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note" || true
     # Record the cost of THIS attempt immediately after the call returns,
     # regardless of whether the verdict validates. This ensures the cost is
     # never lost when both attempts fail and we fall through to block_run. On
@@ -2100,6 +2125,7 @@ validated_observer_retry() {
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
       return 0
     fi
+    retry_note="the verdict failed the observer-review contract: exactly the seven keys observer/primary/task/candidate_commit/status/findings/documentation_changes with the exact task and candidate values shown; status APPROVE or BLOCK only; finding ids match OBS-NNN"
     attempt=$((attempt + 1))
   done
   return 1
