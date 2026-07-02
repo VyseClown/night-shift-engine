@@ -125,6 +125,7 @@ run_dry_fixtures() {
   fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
   fixture_assert "persona/observer retry attempts carry the rejection note (first attempts do not)" fixture_retry_feedback_note "$root"
+  fixture_assert "personas spawn concurrently (bounded by NIGHT_SHIFT_PERSONA_CONCURRENCY; 1 = serial)" fixture_persona_parallel_spawn "$root"
   fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
   fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
@@ -1165,6 +1166,58 @@ fixture_bounded_diff() {
     printf '%s' "$out2" | grep -q 'small-change' || exit 1
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_persona_parallel_spawn() {
+  # Personas are independent read-only reviewers of the same static bundle, so
+  # the engine fans them out concurrently (NIGHT_SHIFT_PERSONA_CONCURRENCY,
+  # default 4) — a serial spawn made every review round pay N sequential model
+  # latencies. Proof of concurrency is a rendezvous: each stubbed persona waits
+  # (bounded) for the OTHER to have started; only overlapping workers ever see
+  # two started-markers.
+  local root="$1" dir="$root/pparallel"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="ppar"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      : >"$dir/started-$(persona_slug "$1")"
+      local i=0
+      while [ "$(find "$dir" -maxdepth 1 -name 'started-*' | wc -l | tr -d ' ')" -lt 2 ] && [ "$i" -lt 50 ]; do
+        sleep 0.1; i=$((i + 1))
+      done
+      [ "$i" -lt 50 ] || : >"$dir/.no-overlap"
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{}' >"$5"
+    }
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    NIGHT_SHIFT_PERSONA_CONCURRENCY=2 spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate"
+    [ ! -f "$dir/.no-overlap" ] || exit 1                                # truly concurrent
+    [ "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || exit 1
+    exit 0 ) || return 1
+  # Serial mode (concurrency=1) still produces every result.
+  ( log() { :; }
+    RUN_ROOT="$dir/run1"; SPEC="$dir/s1.md"; PROJECT="$dir/proj1"
+    BASE_COMMIT="HEAD"; RUN_ID="pser"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{}' >"$5"
+    }
+    rd="$RUN_ROOT/validated/personas/s1/plan/round-1"; mkdir -p "$rd"
+    NIGHT_SHIFT_PERSONA_CONCURRENCY=1 spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate"
+    [ "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || exit 1
+    exit 0 ) || return 1
   return 0
 }
 

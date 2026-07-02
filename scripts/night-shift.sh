@@ -1538,56 +1538,116 @@ invoke_persona_once() {
   extract_claude_structured "$raw" "$out"
 }
 
+# One persona's full attempt loop, run as a (possibly backgrounded) worker.
+# NEVER calls block_run — a child's exit cannot stop its siblings, so failure is
+# reported through a .failed-<slug> marker the parent turns into block_run after
+# the batch joins. Writes .attempts-<slug> with the attempts actually made this
+# round so the parent records exactly those raws' costs (stale attempt-2 raws
+# from an earlier round must not be re-counted).
+spawn_persona_worker() {
+  local persona="$1" persona_stage="$2" bundle="$3" result_dir="$4"
+  local slug out raw tmp idd norm tries iv retry_note=""
+  slug="$(persona_slug "$persona")"
+  out="$result_dir/$slug.json"
+  tmp="$result_dir/.spawn-$slug.$$"; idd="$tmp.id"; norm="$tmp.norm"
+  tries=0
+  while :; do
+    tries=$((tries + 1))
+    printf '%s' "$tries" >"$result_dir/.attempts-$slug"
+    # Per-attempt raw path so a failed first attempt's cost is not overwritten by
+    # the retry before it is recorded.
+    raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$tries.json"
+    invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" "$retry_note"; iv=$?
+    if [ "$iv" -eq 0 ] &&
+      jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
+      normalize_persona_result "$idd" >"$norm" 2>/dev/null &&
+      json_schema_basic persona-review "$norm"; then
+      mv "$norm" "$out"
+      rm -f "$tmp" "$idd"
+      log "persona ($persona_stage): $persona → $(jq -r '.status' "$out")"
+      return 0
+    fi
+    # Say WHY on the retry: extraction failure vs a verdict the normalizer +
+    # schema still rejected. A blind identical re-send repeats the mistake.
+    if [ "$iv" -ne 0 ]; then
+      retry_note="no parseable JSON verdict could be extracted from the reply; end with EXACTLY one fenced json code block and nothing after it"
+    else
+      retry_note="the verdict failed the persona-review contract: exactly the six keys persona/stage/commit/status/findings/documentation_changes; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
+    fi
+    rm -f "$tmp" "$idd" "$norm"
+    if [ "$tries" -ge 2 ]; then
+      printf '%s' "$persona" >"$result_dir/.failed-$slug"
+      return 1
+    fi
+  done
+}
+
 # Spawn every persona in $expected_set, writing one validated result per persona
 # into $result_dir. The wrapper STAMPS .persona/.stage authoritatively (identity =
 # who the engine asked, not a spoofable field) then normalizes + schema-validates;
 # a persona that cannot return a valid review after a retry blocks the run.
+#
+# Personas are independent, read-only reviewers of the same static bundle, so
+# they fan out in parallel batches of NIGHT_SHIFT_PERSONA_CONCURRENCY (default 4;
+# 1 = serial). The parent is the single writer of shared state: it enforces the
+# wall-clock budget once per batch of paid spawns, records costs from the
+# per-attempt raws after each join (children never touch the shared ledger — a
+# signal mid-batch can lose at most that batch's cost rows), and raises
+# block_run for any worker's failure marker.
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
-  local bundle persona slug out raw tmp idd norm tries iv old_ifs retry_note
+  local bundle persona slug raw old_ifs concurrency i j k n a attempts
+  local -a queue pids names
   bundle="$RUN_ROOT/control/review-bundle.md"
   assemble_review_bundle "$persona_stage" "$bundle"
+  concurrency="${NIGHT_SHIFT_PERSONA_CONCURRENCY:-4}"
+  is_valid_int "$concurrency" && [ "$concurrency" -ge 1 ] || concurrency=1
+  queue=()
   old_ifs="$IFS"; IFS='|'
-  for persona in $expected_set; do
-    IFS="$old_ifs"
-    # These are direct engine-spawned model sessions, outside invoke_primary's turn
-    # loop — enforce the wall-clock budget here so an over-time run halts before
-    # spawning yet another paid session (restores the cost/time ceiling).
-    enforce_elapsed_limits
-    slug="$(persona_slug "$persona")"
-    out="$result_dir/$slug.json"
-    tmp="$result_dir/.spawn-$slug.$$"; idd="$tmp.id"; norm="$tmp.norm"
-    tries=0; retry_note=""
-    while :; do
-      tries=$((tries + 1))
-      # Per-attempt raw path so a failed first attempt's cost is not overwritten by
-      # the retry before it is recorded.
-      raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$tries.json"
-      invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" "$retry_note"; iv=$?
-      record_cost "$raw" "$(basename "$raw")"   # record every paid attempt, valid or not
-      if [ "$iv" -eq 0 ] &&
-        jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
-        normalize_persona_result "$idd" >"$norm" 2>/dev/null &&
-        json_schema_basic persona-review "$norm"; then
-        mv "$norm" "$out"
-        rm -f "$tmp" "$idd"
-        log "persona ($persona_stage): $persona → $(jq -r '.status' "$out")"
-        break
-      fi
-      # Say WHY on the retry: extraction failure vs a verdict the normalizer +
-      # schema still rejected. A blind identical re-send repeats the mistake.
-      if [ "$iv" -ne 0 ]; then
-        retry_note="no parseable JSON verdict could be extracted from the reply; end with EXACTLY one fenced json code block and nothing after it"
-      else
-        retry_note="the verdict failed the persona-review contract: exactly the six keys persona/stage/commit/status/findings/documentation_changes; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
-      fi
-      rm -f "$tmp" "$idd" "$norm"
-      [ "$tries" -lt 2 ] ||
-        block_run "engine-spawned persona '$persona' did not return a valid $persona_stage review after $tries attempts"
-    done
-    IFS='|'
-  done
+  for persona in $expected_set; do queue+=("$persona"); done
   IFS="$old_ifs"
+  i=0; n="${#queue[@]}"
+  while [ "$i" -lt "$n" ]; do
+    # These are direct engine-spawned model sessions, outside invoke_primary's turn
+    # loop — enforce the wall-clock budget per BATCH so an over-time run halts
+    # before spawning more paid sessions.
+    enforce_elapsed_limits
+    pids=(); names=()
+    j=0
+    while [ "$j" -lt "$concurrency" ] && [ "$i" -lt "$n" ]; do
+      persona="${queue[$i]}"
+      spawn_persona_worker "$persona" "$persona_stage" "$bundle" "$result_dir" &
+      pids+=("$!"); names+=("$persona")
+      i=$((i + 1)); j=$((j + 1))
+    done
+    k=0
+    while [ "$k" -lt "${#pids[@]}" ]; do
+      wait "${pids[$k]}" || true
+      k=$((k + 1))
+    done
+    # Costs: recorded by the parent from exactly the attempts each worker made
+    # this round (.attempts-<slug>), BEFORE any failure becomes block_run — so a
+    # blocked round still keeps every paid attempt's cost.
+    for persona in "${names[@]}"; do
+      slug="$(persona_slug "$persona")"
+      attempts="$(cat "$result_dir/.attempts-$slug" 2>/dev/null)" || attempts=0
+      is_valid_int "$attempts" || attempts=0
+      a=1
+      while [ "$a" -le "$attempts" ]; do
+        raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$a.json"
+        [ ! -f "$raw" ] || record_cost "$raw" "$(basename "$raw")"
+        a=$((a + 1))
+      done
+      rm -f "$result_dir/.attempts-$slug"
+    done
+    for persona in "${names[@]}"; do
+      slug="$(persona_slug "$persona")"
+      if [ -f "$result_dir/.failed-$slug" ]; then
+        rm -f "$result_dir/.failed-$slug"
+        block_run "engine-spawned persona '$persona' did not return a valid $persona_stage review after 2 attempts"
+      fi
+    done
+  done
 }
 
 run_personas() {
