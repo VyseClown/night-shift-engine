@@ -738,6 +738,7 @@ primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
+  local rejection_note malformed_prev
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
@@ -782,6 +783,21 @@ approved work or redo findings already resolved. Read what you need:
   - the latest observer verdict at .night-shift/validated/observer-*.json, if any;
   - the in-progress implementation IS the working tree — diff it against the base
     commit $BASE_COMMIT to see exactly what has been done so far.
+"
+  fi
+  # A correction turn (previous signal malformed/absent) must say WHAT was wrong:
+  # without this the re-prompt is byte-identical to the original and the model has
+  # no reason to change the file it believes it already wrote correctly.
+  rejection_note=""
+  malformed_prev="$(jq -r '.malformed_signal_consecutive // 0' "$STATE" 2>/dev/null)"
+  is_valid_int "$malformed_prev" || malformed_prev=0
+  if [ "$malformed_prev" -gt 0 ] && [ -s "$RUN_ROOT/control/signal-rejection.txt" ]; then
+    rejection_note="
+SIGNAL REJECTED — your previous turn's .night-shift/control/next-action.json was
+invalid and has been DISCARDED ($malformed_prev consecutive rejections; the run
+blocks at $MAX_MALFORMED_SIGNALS). The wrapper rejected it because:
+  $(cat "$RUN_ROOT/control/signal-rejection.txt")
+Fix exactly that and rewrite the WHOLE file this turn in the required shape below.
 "
   fi
   design_build_note=""
@@ -839,12 +855,15 @@ RUN_PERSONAS — the wrapper moves you to the candidate (CREATE_CANDIDATE) and t
 independent observer (REQUEST_OBSERVER) on later turns. Do not create the
 candidate commit or request the observer yourself from an earlier stage; any
 out-of-stage signal is rejected and wastes a turn.
-
+$rejection_note
 Before ending this turn, write a fresh JSON signal to:
   .night-shift/control/next-action.json
-It must validate against $SCHEMA_DIR/next-action.json. "task" must equal
-$SPEC. "artifacts" lists only project-relative files (no absolute paths, no
-"..") the wrapper must consume for the chosen action:
+It must validate against $SCHEMA_DIR/next-action.json: a single JSON object with
+EXACTLY these five top-level keys — no more, no fewer — shaped like:
+  {"action":"<$expected or BLOCKED>","artifacts":[],"reason":"<one sentence>","stage":"$stage","task":"$SPEC"}
+"task" must equal $SPEC exactly and "stage" must equal "$stage". "artifacts"
+lists only project-relative files (no absolute paths, no "..") the wrapper must
+consume for the chosen action:
 
 - RUN_PERSONAS: ensure the authoritative plan at .night-shift/control/plan.md is
   current (it is the plan the reviewers judge), then signal RUN_PERSONAS with an
@@ -1129,6 +1148,42 @@ validate_signal() {
   [ "$(jq -r '.task' "$signal")" = "$SPEC" ] || return 1
 }
 
+# Human-readable reason the last next-action signal was rejected, mirroring
+# validate_signal/json_schema_basic checks in order of likelihood. Fed back into
+# the correction turn (primary_prompt) so the model learns exactly what to fix —
+# without it the re-prompt is indistinguishable from the original and a weaker
+# model can loop the same mistake into the malformed cap.
+signal_rejection_reason() {
+  local signal="$1" rc="$2" keys
+  if [ "$rc" -eq 2 ] || [ ! -f "$signal" ]; then
+    printf 'no signal file was written to .night-shift/control/next-action.json before the turn ended'
+    return 0
+  fi
+  if ! jq -e . "$signal" >/dev/null 2>&1; then
+    printf 'the file is not valid JSON'
+    return 0
+  fi
+  keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$signal")"
+  if [ "$keys" != '["action","artifacts","reason","stage","task"]' ]; then
+    printf 'top-level keys must be EXACTLY ["action","artifacts","reason","stage","task"] (no more, no fewer); the file has %s' "$keys"
+    return 0
+  fi
+  if ! jq -e '.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","RUN_VISUAL","NEXT_TASK","BLOCKED","COMPLETE")' "$signal" >/dev/null 2>&1; then
+    printf '"action" %s is not one of RUN_PERSONAS|CREATE_CANDIDATE|REQUEST_OBSERVER|RUN_VISUAL|NEXT_TASK|BLOCKED|COMPLETE' \
+      "$(jq -c '.action' "$signal")"
+    return 0
+  fi
+  if [ "$(jq -r '.task' "$signal")" != "$SPEC" ]; then
+    printf '"task" must equal %s exactly; the file has %s' "$SPEC" "$(jq -c '.task' "$signal")"
+    return 0
+  fi
+  if ! jq -e '(.stage | type == "string" and length > 0) and (.reason | type == "string" and length > 0)' "$signal" >/dev/null 2>&1; then
+    printf '"stage" and "reason" must both be non-empty strings'
+    return 0
+  fi
+  printf '"artifacts" must be an array of unique, non-empty, project-relative paths (no absolute paths, no "..")'
+}
+
 # Extracts the observer's JSON verdict from a `claude -p --output-format json`
 # envelope, trying the most reliable shapes in order.
 extract_claude_structured() {
@@ -1272,11 +1327,30 @@ persona_lens() {
 # or generated files, snapshot updates) otherwise overflows the model context and
 # garbles the verdict. $@ are git-diff args: a range (BASE..CAND) or a single
 # BASE for a working-tree diff.
+# `git diff <commit>` omits untracked files entirely, so a brand-new file the
+# primary has not yet staged would be invisible to a working-tree diff. Emit a
+# synthetic new-file diff (or --stat line, per the args) for every untracked,
+# non-ignored file. Engine state under .night-shift/ is excluded explicitly so
+# it never leaks into a review bundle even when the project forgot to gitignore
+# it. `diff --no-index` exits 1 whenever the files differ; that is the expected
+# case, not an error.
+untracked_diff() {
+  git -C "$PROJECT" ls-files --others --exclude-standard -z -- ':(exclude).night-shift' 2>/dev/null |
+    while IFS= read -r -d '' f; do
+      git -C "$PROJECT" diff --no-index "$@" -- /dev/null "$f" 2>/dev/null || true
+    done
+}
+
 bounded_diff() {
+  local include_untracked=0
+  if [ "${1:-}" = "--include-untracked" ]; then include_untracked=1; shift; fi
   local budget="${NIGHT_SHIFT_DIFF_BUDGET:-400000}" body n
   git -C "$PROJECT" diff --stat "$@" 2>/dev/null
+  [ "$include_untracked" -eq 0 ] || untracked_diff --stat
   printf '\n'
-  body="$(git -C "$PROJECT" diff "$@" 2>/dev/null | head -c "$((budget + 1))")"
+  body="$( { git -C "$PROJECT" diff "$@" 2>/dev/null
+             [ "$include_untracked" -eq 0 ] || untracked_diff
+           } | head -c "$((budget + 1))")"
   n="$(printf '%s' "$body" | wc -c | tr -d ' ')"
   if [ "$n" -gt "$budget" ]; then
     # head -c is byte-based and can cut mid-UTF-8; drop an incomplete trailing
@@ -1303,7 +1377,7 @@ assemble_review_bundle() {
       # Working-tree diff (there is no candidate commit yet at persona-review time);
       # size-bounded so a large change cannot overflow the reviewer's context.
       printf '\n\n## Implementation diff against base commit %s (working tree)\n\n```diff\n' "$BASE_COMMIT"
-      bounded_diff "$BASE_COMMIT" -- .
+      bounded_diff --include-untracked "$BASE_COMMIT" -- .
       printf '```\n'
       if [ -s "$RUN_ROOT/validated/baseline.json" ]; then
         printf '\n## Baseline validation output\n\n```json\n'
@@ -2160,6 +2234,7 @@ main_run() {
       malformed_n="$(state_int '.malformed_signal_consecutive // 0')" || malformed_n=0
       [ "$malformed_n" -eq 0 ] ||
         state_set '.malformed_signal_consecutive=0 | .updated_at=$now' --arg now "$(now_iso)"
+      rm -f "$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null || true
       handle_signal
     else
       rc=$?
@@ -2170,6 +2245,9 @@ main_run() {
       malformed_n=$((malformed_n + 1))
       state_set '.malformed_signal_consecutive=$n | .updated_at=$now' \
         --argjson n "$malformed_n" --arg now "$(now_iso)"
+      # Record WHY for the correction turn's prompt (primary_prompt embeds it).
+      signal_rejection_reason "$RUN_ROOT/control/next-action.json" "$rc" \
+        >"$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null || true
       ! malformed_cap_reached "$malformed_n" ||
         block_run "primary produced $malformed_n consecutive malformed/absent signals (cap $MAX_MALFORMED_SIGNALS); aborting to avoid burning the turn budget"
       if [ "$rc" -eq 1 ]; then

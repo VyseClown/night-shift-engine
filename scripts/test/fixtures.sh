@@ -120,6 +120,8 @@ run_dry_fixtures() {
   fixture_assert "engine spawns personas itself + stamps identity (provenance)" fixture_persona_spawn "$root"
   fixture_assert "spawn_personas enforces the elapsed budget + records per-attempt cost" fixture_persona_spawn_guards "$root"
   fixture_assert "bounded_diff caps a large diff with --stat + truncation marker" fixture_bounded_diff "$root"
+  fixture_assert "review bundle shows untracked new files; gitignored + engine state excluded" fixture_bundle_untracked_diff "$root"
+  fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "set_stage resets review_round at scope boundaries (GH #18)" fixture_stage_round_reset "$root"
@@ -1161,6 +1163,46 @@ fixture_bounded_diff() {
   return 0
 }
 
+fixture_bundle_untracked_diff() {
+  # `git diff <base>` omits untracked files, so a brand-new file the primary had
+  # not yet staged was invisible to the engine-assembled review bundle — the
+  # personas then (correctly) BLOCKed on an empty diff and burned a fix round.
+  # The bundle must show untracked file content while still excluding gitignored
+  # files and .night-shift/ engine state (even when the project forgot to
+  # gitignore .night-shift/).
+  local root="$1" dir="$root/bundle-untracked"
+  mkdir -p "$dir/repo"
+  ( PROJECT="$dir/repo"; RUN_ROOT="$dir/rs"; SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    fixture_write_min_spec "$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'ignored.txt\n' >"$PROJECT/.gitignore"
+    printf 'base\n' >"$PROJECT/tracked.txt"
+    git -C "$PROJECT" add .gitignore tracked.txt
+    git -C "$PROJECT" commit -qm base
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf 'base\ntracked-change\n' >"$PROJECT/tracked.txt"
+    printf 'module.exports.answer = 42;\n' >"$PROJECT/newfile.js"
+    mkdir -p "$PROJECT/.night-shift"
+    printf 'engine-state\n' >"$PROJECT/.night-shift/state.json"
+    printf 'ignored-junk\n' >"$PROJECT/ignored.txt"
+    out="$dir/bundle.md"
+    assemble_review_bundle implementation "$out"
+    grep -q 'tracked-change' "$out" || exit 1  # tracked working-tree diff intact
+    grep -q 'newfile.js' "$out" || exit 1      # untracked file is named
+    grep -q 'answer = 42' "$out" || exit 1     # ...and its content is reviewable
+    grep -q 'ignored-junk' "$out" && exit 1    # .gitignore respected
+    grep -q 'engine-state' "$out" && exit 1    # .night-shift/ never leaks
+    # The observer's committed-range diff is untouched by the untracked handling.
+    range_out="$(bounded_diff "$BASE_COMMIT..$BASE_COMMIT")"
+    printf '%s' "$range_out" | grep -q 'newfile.js' && exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
 fixture_persona_spawn_guards() {
   # spawn_personas must (a) halt an over-budget run before spawning another paid
   # session, and (b) record cost for EVERY paid attempt, not just the successful one.
@@ -1484,6 +1526,55 @@ fixture_handoff_prompt() {
   printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
   primary_prompt "$prompt"
   grep -q "FRESH stage session" "$prompt" && return 1
+  return 0
+}
+
+fixture_signal_rejection_feedback() {
+  # A malformed/absent signal must feed the NEXT correction turn the exact
+  # rejection reason. The correction re-prompt used to be byte-identical to the
+  # original (only the turns-remaining counter changed), so the model was never
+  # told its signal was rejected or why — a weaker tier looped a missing "stage"
+  # key straight into the malformed cap AFTER observer approval.
+  local root="$1" dir="$root/sig-reject" prompt reason
+  mkdir -p "$dir/control"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  fixture_write_min_spec "$SPEC"
+  # (1) signal_rejection_reason is specific per failure mode.
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 2)"
+  printf '%s' "$reason" | grep -qi 'no signal file' || return 1
+  printf 'not-json' >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qi 'not valid JSON' || return 1
+  jq -cn --arg t "$SPEC" '{task:$t,action:"COMPLETE",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF '"action","artifacts","reason","stage","task"' || return 1
+  printf '%s' "$reason" | grep -q 'stage' || return 1
+  jq -cn --arg t "$SPEC" '{task:$t,stage:"completion",action:"FINISH",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -q 'FINISH' || return 1
+  jq -cn '{task:"/other.md",stage:"completion",action:"COMPLETE",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF "$SPEC" || return 1
+  # (2) A correction turn carries the recorded rejection verbatim.
+  prompt="$dir/prompt.txt"
+  printf '{"stage":"completion","stage_turns":1,"primary_turns":8,"session_id":"s1","malformed_signal_consecutive":2}\n' >"$STATE"
+  printf 'top-level keys must be EXACTLY [...]; missing: stage\n' >"$dir/control/signal-rejection.txt"
+  primary_prompt "$prompt"
+  grep -q 'SIGNAL REJECTED' "$prompt" || return 1
+  grep -q 'missing: stage' "$prompt" || return 1
+  # (3) No rejection -> no feedback block; the exact five-key example is ALWAYS
+  # present with the live stage and spec baked in.
+  printf '{"stage":"completion","stage_turns":0,"primary_turns":7,"session_id":null}\n' >"$STATE"
+  rm -f "$dir/control/signal-rejection.txt"
+  primary_prompt "$prompt"
+  grep -q 'SIGNAL REJECTED' "$prompt" && return 1
+  grep -qF '"stage":"completion"' "$prompt" || return 1
+  grep -qF '"artifacts":[]' "$prompt" || return 1
+  grep -qF "\"task\":\"$SPEC\"" "$prompt" || return 1
   return 0
 }
 
