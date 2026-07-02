@@ -127,6 +127,8 @@ run_dry_fixtures() {
   fixture_assert "persona/observer retry attempts carry the rejection note (first attempts do not)" fixture_retry_feedback_note "$root"
   fixture_assert "personas spawn concurrently (bounded by NIGHT_SHIFT_PERSONA_CONCURRENCY; 1 = serial)" fixture_persona_parallel_spawn "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
+  fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
+  fixture_assert "integrity mismatch quarantines forensics + restores engine truth" fixture_integrity_quarantine "$root"
   fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
   fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
@@ -1167,6 +1169,51 @@ fixture_bounded_diff() {
     printf '%s' "$out2" | grep -q 'small-change' || exit 1
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_record_findings_integrity() {
+  # record_findings is a state WRITER and must route through state_set so the
+  # integrity anchor is re-seeded. Live false-positive regression: its direct
+  # jq/tmp/mv write left the anchor stale, and the next primary-turn check
+  # blocked the run as "state.json was modified outside the engine" when the
+  # divergence was the engine's own unseeded finding_ids write.
+  local root="$1" dir="$root/rf-integ"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="rfinteg-$$"
+    mkdir -p "$RUN_ROOT/validated/rd"
+    printf '{"finding_ids":[]}\n' >"$STATE"
+    integrity_put "$STATE"
+    printf '{"persona":"P","stage":"plan","status":"BLOCK","commit":null,"documentation_changes":[],"findings":[{"id":"UA-001","evidence":"e","required_change":"r"}]}' \
+      >"$RUN_ROOT/validated/rd/p.json"
+    record_findings "$RUN_ROOT/validated/rd"
+    jq -e '.finding_ids == ["UA-001"]' "$STATE" >/dev/null || exit 1
+    integrity_check "$STATE" || exit 1   # the engine write re-seeded the anchor
+    integrity_cleanup
+    exit 0 ) || return 1
+  return 0
+}
+
+fixture_integrity_quarantine() {
+  # On an integrity mismatch the engine must (a) preserve the divergent project
+  # copy for forensics under raw/, and (b) restore the engine's last write from
+  # the anchor — otherwise block_run's own status write launders the edit into
+  # the anchor and a later --resume proceeds from the edited state.
+  local root="$1" dir="$root/quarantine"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="quar-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    printf '{"stage":"planning","plan_approved":false}\n' >"$STATE"
+    integrity_put "$STATE"
+    jq '.plan_approved=true' "$STATE" >"$STATE.t" && mv "$STATE.t" "$STATE"
+    integrity_check "$STATE" && exit 1
+    integrity_quarantine "$STATE" "state-test"
+    jq -e '.plan_approved == false' "$STATE" >/dev/null || exit 1   # restored to engine truth
+    find "$RUN_ROOT/raw" -name 'tampered-state-test*' | grep -q . || exit 1   # forensics kept
+    jq -e '.plan_approved == true' "$(find "$RUN_ROOT/raw" -name 'tampered-state-test*' | head -1)" >/dev/null || exit 1
+    integrity_check "$STATE" || exit 1
+    integrity_cleanup
+    exit 0 ) || return 1
   return 0
 }
 

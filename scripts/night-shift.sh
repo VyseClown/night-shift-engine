@@ -572,6 +572,16 @@ integrity_cleanup() {
   rm -rf "$(integrity_dir)" 2>/dev/null || true
 }
 
+# On an integrity mismatch: preserve the divergent project copy under raw/ for
+# forensics, then RESTORE the engine's last write from the anchor. Without the
+# restore, block_run's own status write would launder the out-of-band content
+# into the anchor and a later --resume would proceed from the edited state.
+integrity_quarantine() {
+  local file="$1" label="$2"
+  cp "$file" "$RUN_ROOT/raw/tampered-$label.$$.json" 2>/dev/null || true
+  cp "$(integrity_dir)/$(integrity_key "$file")" "$file" 2>/dev/null || true
+}
+
 state_set() {
   local filter="$1"
   shift
@@ -1058,8 +1068,10 @@ invoke_primary() {
   # The primary just had unattended write access to the whole project including
   # .night-shift/. Verify the wrapper-owned state BEFORE the engine's own writes
   # below would launder an out-of-band edit into the private copy.
-  integrity_check "$STATE" ||
-    block_run "wrapper-owned state.json was modified outside the engine during the primary turn"
+  if ! integrity_check "$STATE"; then
+    integrity_quarantine "$STATE" "state-turn-$turn"
+    block_run "wrapper-owned state.json was modified outside the engine during the primary turn (divergent copy kept under raw/)"
+  fi
   state_set '
     .session_id=$session |
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
@@ -1786,13 +1798,14 @@ run_personas() {
 }
 
 record_findings() {
-  local dir="$1" ids tmp
+  local dir="$1" ids
   # Only review files carry .findings; baseline/final/evidence JSON do not (some
   # are arrays). Guard the type so those produce nothing instead of jq errors.
   ids="$(find "$dir" -type f -name '*.json' -exec jq -r 'if (type=="object" and (.findings|type=="array")) then (.findings[].id // empty) else empty end' {} \; | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
-  tmp="$STATE.tmp.$$"
-  jq --argjson ids "$ids" '.finding_ids = ((.finding_ids + $ids) | unique)' "$STATE" >"$tmp" && mv "$tmp" "$STATE" ||
-    die "failed to record findings; state preserved at ${RUN_ROOT:-unknown}"
+  # Through state_set — the ONLY state writer — so the integrity anchor is
+  # re-seeded. A direct jq/tmp/mv here left the anchor stale and the next
+  # primary-turn check false-blocked the run as out-of-band tampering.
+  state_set '.finding_ids = ((.finding_ids + $ids) | unique)' --argjson ids "$ids"
 }
 
 # path_in_baseline FILE PATH
@@ -1903,8 +1916,10 @@ EOF
   # verify the primary did not rewrite them in the project tree.
   local owned
   for owned in "$RUN_ROOT/validated/baseline.json" "$RUN_ROOT/validated/test-first-failing.json"; do
-    integrity_check "$owned" ||
-      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine"
+    if ! integrity_check "$owned"; then
+      integrity_quarantine "$owned" "$(basename "$owned" .json)"
+      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine (divergent copy kept under raw/)"
+    fi
   done
   # Modify-mode (the first-failing-test passed at baseline): establish the genuine red
   # proof now by overlaying the candidate's updated test files onto BASE production and
@@ -2139,8 +2154,11 @@ run_observer() {
   # observer_wrapper_evidence presents these as authoritative ground truth;
   # verify the primary did not rewrite them in the project tree.
   for owned in "$RUN_ROOT/validated/final.json" "$RUN_ROOT/validated/test-first-passing.json"; do
-    [ ! -f "$owned" ] || integrity_check "$owned" ||
-      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine"
+    [ -f "$owned" ] || continue
+    if ! integrity_check "$owned"; then
+      integrity_quarantine "$owned" "$(basename "$owned" .json)"
+      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine (divergent copy kept under raw/)"
+    fi
   done
   # Fail closed: the observer prompt treats the engine diff as authoritative ground
   # truth, so an unresolvable range must NOT hand it an empty diff (which would invite
