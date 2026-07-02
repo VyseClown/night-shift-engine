@@ -401,12 +401,15 @@ tools_available() {
   jq -e 'all(.[]; .exit_status != 127)' "$1" >/dev/null 2>&1
 }
 
-# A fingerprint of the work under review (full diff vs base). When real code or
-# tests change, this changes and resets the stall counter, so legitimate
-# resolution attempts are not falsely blocked as "unchanged". Empty during the
-# plan stage, where no code exists yet.
+# A fingerprint of the work under review (full diff vs base, INCLUDING untracked
+# files via untracked_diff — a fix round that only adds a new file is a material
+# change and must reset the stall counter). When real code or tests change, this
+# changes, so legitimate resolution attempts are not falsely blocked as
+# "unchanged". Empty during the plan stage, where no code exists yet.
 material_token() {
-  git -C "$PROJECT" diff "$BASE_COMMIT" 2>/dev/null | cksum | awk '{print $1 ":" $2}'
+  { git -C "$PROJECT" diff "$BASE_COMMIT" 2>/dev/null
+    untracked_diff
+  } | cksum | awk '{print $1 ":" $2}'
 }
 
 # The isolated validation worktree has none of the ignored dependency dirs.
@@ -432,16 +435,20 @@ assert_tools_available() {
 # Tracks how many consecutive rounds a finding ID recurs with the same
 # fingerprint. Cosmetic-only rounds keep the same fingerprint and accumulate;
 # a materially changed fingerprint resets the count to 1. Echoes the max count.
+# Returns non-zero on a seed/jq/write failure — NEVER die(): callers invoke this
+# inside $(...), where die would kill only the subshell and leave the caller
+# comparing an empty string (same hazard state_int documents). The CALLER must
+# check the return code and block with the real reason.
 bump_finding_history() {
   local history="$1" findings="$2" tmp
-  [ -f "$history" ] || printf '{}\n' >"$history"
+  [ -f "$history" ] || printf '{}\n' >"$history" 2>/dev/null || return 1
   tmp="$history.tmp.$$"
   jq --argjson findings "$findings" '
     reduce $findings[] as $f (.;
       .[$f.id] = (if .[$f.id].fingerprint == $f.fp
         then {fingerprint:$f.fp, count:(.[$f.id].count + 1)}
         else {fingerprint:$f.fp, count:1} end))
-  ' "$history" >"$tmp" && mv "$tmp" "$history" || die "failed to update finding history"
+  ' "$history" >"$tmp" 2>/dev/null && mv "$tmp" "$history" || { rm -f "$tmp"; return 1; }
   jq -r '[to_entries[].value.count] | max // 0' "$history"
 }
 
@@ -461,17 +468,29 @@ record_cost() {
 }
 
 compact_success() {
-  local run_dir="$1" run_id="$2" archive ledger
+  local run_dir="$1" run_id="$2" archive ledger copy_ok=1
   archive="$run_dir/archive/$run_id"
-  mkdir -p "$archive"
-  [ -f "$run_dir/state.json" ] && cp "$run_dir/state.json" "$archive/state.json"
-  [ -d "$run_dir/validated" ] && cp -R "$run_dir/validated" "$archive/validated"
-  [ -f "$run_dir/summary.json" ] && cp "$run_dir/summary.json" "$archive/summary.json"
+  # Every copy is verified BEFORE the delete loop below: a failed copy (disk
+  # full, perms, a file squatting the archive path) must preserve the full run
+  # state rather than silently destroying a successful run's evidence. The run
+  # itself is still complete — we merely skip compaction and say so.
+  mkdir -p "$archive" 2>/dev/null || copy_ok=0
+  if [ "$copy_ok" -eq 1 ]; then
+    [ ! -f "$run_dir/state.json" ] || cp "$run_dir/state.json" "$archive/state.json" || copy_ok=0
+    [ ! -d "$run_dir/validated" ] || cp -R "$run_dir/validated" "$archive/validated" || copy_ok=0
+    [ ! -f "$run_dir/summary.json" ] || cp "$run_dir/summary.json" "$archive/summary.json" || copy_ok=0
+  fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
   # survives even when a raw is gone by archive time; copy it and add a TOTAL row.
   ledger="$archive/costs.jsonl"
-  [ -f "$run_dir/cost-ledger.jsonl" ] && cp "$run_dir/cost-ledger.jsonl" "$ledger"
+  if [ "$copy_ok" -eq 1 ] && [ -f "$run_dir/cost-ledger.jsonl" ]; then
+    cp "$run_dir/cost-ledger.jsonl" "$ledger" || copy_ok=0
+  fi
+  if [ "$copy_ok" -eq 0 ]; then
+    log "archive copy failed; preserving the FULL run state at $run_dir (no compaction)"
+    return 0
+  fi
   if [ -s "$ledger" ]; then
     # Compute the TOTAL row into a temp first, then append: reading and appending
     # the same file in one pipeline (jq ... "$ledger" >>"$ledger") has undefined
@@ -2113,7 +2132,8 @@ detect_stalled_findings() {
   findings="$(jq -c --arg e "$evidence_hash" --arg t "$token" \
     '[.findings[] | {id, fp:(.required_change + "|" + $e + "|" + $t)}]' "$out")"
   [ "$findings" = "[]" ] && return 0
-  maxc="$(bump_finding_history "$history" "$findings")"
+  maxc="$(bump_finding_history "$history" "$findings")" ||
+    block_run "failed to update the observer finding history at $history"
   [ "$maxc" -lt 3 ] ||
     block_run "an observer finding remained materially unchanged for three rounds"
 }
@@ -2125,7 +2145,8 @@ detect_stalled_personas() {
   findings="$(find "$result_dir" -type f -name '*.json' \
     -exec jq -c --arg t "$token" '.findings[] | {id, fp:(.required_change + "|" + $t)}' {} \; | jq -sc '.')"
   [ "$findings" = "[]" ] && return 0
-  maxc="$(bump_finding_history "$history" "$findings")"
+  maxc="$(bump_finding_history "$history" "$findings")" ||
+    block_run "failed to update the persona finding history at $history"
   [ "$maxc" -lt 3 ] ||
     block_run "a persona finding stayed materially unchanged for three $stage rounds"
 }

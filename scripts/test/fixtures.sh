@@ -121,6 +121,9 @@ run_dry_fixtures() {
   fixture_assert "spawn_personas enforces the elapsed budget + records per-attempt cost" fixture_persona_spawn_guards "$root"
   fixture_assert "bounded_diff caps a large diff with --stat + truncation marker" fixture_bounded_diff "$root"
   fixture_assert "review bundle shows untracked new files; gitignored + engine state excluded" fixture_bundle_untracked_diff "$root"
+  fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
+  fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
+  fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
   fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
   fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
@@ -1159,6 +1162,89 @@ fixture_bounded_diff() {
     out2="$(bounded_diff "$base" -- .)"
     printf '%s' "$out2" | grep -q 'diff truncated' && exit 1
     printf '%s' "$out2" | grep -q 'small-change' || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_compact_success_copy_guard() {
+  # compact_success deletes everything but archive/ AFTER copying state +
+  # validated evidence into it. The copies used to be unchecked, so a failed
+  # copy (disk full, perms, a file squatting the archive path) silently
+  # DESTROYED a successful run's evidence. On any copy failure the full run
+  # state must be preserved (no deletion).
+  local root="$1" dir="$root/compact-guard" run="rid"
+  mkdir -p "$dir/validated"
+  printf '{"ok":true}\n' >"$dir/state.json"
+  printf 'evidence\n' >"$dir/validated/final.json"
+  printf '{"s":1}\n' >"$dir/summary.json"
+  # A FILE squatting the archive run path makes mkdir -p fail.
+  mkdir -p "$dir/archive"
+  printf 'squatter\n' >"$dir/archive/$run"
+  ( log() { :; }; compact_success "$dir" "$run" ) || return 1
+  [ -f "$dir/state.json" ] || return 1          # nothing was deleted
+  [ -f "$dir/validated/final.json" ] || return 1
+  [ -f "$dir/summary.json" ] || return 1
+  # The happy path still compacts: fresh dir, no squatter.
+  local dir2="$root/compact-ok"
+  mkdir -p "$dir2/validated"
+  printf '{"ok":true}\n' >"$dir2/state.json"
+  printf 'evidence\n' >"$dir2/validated/final.json"
+  ( log() { :; }; compact_success "$dir2" "$run" ) || return 1
+  [ -f "$dir2/archive/$run/state.json" ] || return 1
+  [ -f "$dir2/archive/$run/validated/final.json" ] || return 1
+  [ ! -f "$dir2/state.json" ] || return 1       # compacted away
+  return 0
+}
+
+fixture_finding_history_failure_reason() {
+  # bump_finding_history used to die() inside the caller's $(...) — killing only
+  # the subshell — so on a jq/write failure the caller continued with an empty
+  # maxc and `[ "" -lt 3 ]` errored into the MISLEADING "stayed materially
+  # unchanged" block. The failure must surface as its own reason.
+  local root="$1" dir="$root/fhist"
+  mkdir -p "$dir/results" "$dir/proj"
+  ( log() { :; }
+    RUN_ROOT="$dir"; SPEC="$dir/spec.md"; PROJECT="$dir/proj"
+    printf '# s\n' >"$SPEC"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    git -C "$PROJECT" commit -q --allow-empty -m base
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '{"persona":"P","stage":"implementation","status":"BLOCK","findings":[{"id":"X-001","evidence":"e","required_change":"r"}],"documentation_changes":[],"commit":null}' \
+      >"$dir/results/p.json"
+    # A DIRECTORY at the history path makes both the seed write and jq fail.
+    mkdir -p "$dir/persona-history-spec-implementation.json"
+    block_run() { printf '%s' "$1" >"$dir/reason"; exit 7; }
+    detect_stalled_personas "$dir/results" implementation
+    exit 0 )
+  [ "$?" -eq 7 ] || return 1
+  grep -q 'finding history' "$dir/reason" || return 1
+  grep -q 'materially unchanged' "$dir/reason" && return 1
+  return 0
+}
+
+fixture_material_token_untracked() {
+  # material_token fingerprints the work under review so a genuine change resets
+  # the finding-stall counter. `git diff <base>` omits untracked files, so a fix
+  # round that only ADDS files (a test, a doc) kept the old fingerprint and three
+  # recurring rounds could false-block as "materially unchanged". Engine state
+  # under .night-shift/ must never affect the fingerprint.
+  local root="$1" repo="$root/mtok" t0 t1 t2
+  mkdir -p "$repo"
+  ( PROJECT="$repo"
+    git -C "$repo" init -q
+    git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+    printf 'base\n' >"$repo/f.txt"
+    git -C "$repo" add f.txt; git -C "$repo" commit -qm base
+    BASE_COMMIT="$(git -C "$repo" rev-parse HEAD)"
+    t0="$(material_token)"
+    printf 'added\n' >"$repo/added.js"
+    t1="$(material_token)"
+    [ "$t0" != "$t1" ] || exit 1   # a new untracked file IS material change
+    mkdir -p "$repo/.night-shift"; printf 'x\n' >"$repo/.night-shift/state.json"
+    t2="$(material_token)"
+    [ "$t1" = "$t2" ] || exit 1    # engine state never shifts the fingerprint
     exit 0
   ) || return 1
   return 0
