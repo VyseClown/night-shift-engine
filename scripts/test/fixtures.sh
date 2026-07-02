@@ -127,6 +127,8 @@ run_dry_fixtures() {
   fixture_assert "persona/observer retry attempts carry the rejection note (first attempts do not)" fixture_retry_feedback_note "$root"
   fixture_assert "personas spawn concurrently (bounded by NIGHT_SHIFT_PERSONA_CONCURRENCY; 1 = serial)" fixture_persona_parallel_spawn "$root"
   fixture_assert "signal path reaps live persona workers + salvages batch costs" fixture_worker_reap "$root"
+  fixture_assert "log writes to stderr (command-substituted JSON stays parseable)" fixture_log_stderr_and_repair_accounting "$root"
+  fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
   fixture_assert "integrity mismatch quarantines forensics + restores engine truth" fixture_integrity_quarantine "$root"
@@ -1256,6 +1258,53 @@ fixture_wrapper_owned_integrity() {
   grep -q 'integrity_check "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_log_stderr_and_repair_accounting() {
+  # log() must write to STDERR: visual_repair_screen's output is command-
+  # substituted into _screen_json, and stdout log lines interleaved with the
+  # JSON made the _consumed jq parse fail every time — the per-screen cap
+  # accounting silently degraded to charging $max (the pre-fix behavior),
+  # masked in fixtures by log(){ :; } stubs. Also aligns with every other
+  # script's log (visual-review.sh uses >&2).
+  local root="$1" dir="$root/logfd" out err
+  mkdir -p "$dir"
+  out="$(log 'stdout-must-stay-clean' 2>"$dir/err")"
+  [ -z "$out" ] || return 1
+  grep -q 'stdout-must-stay-clean' "$dir/err" || return 1
+  # End-to-end: a capture that mixes log output with JSON stays parseable.
+  emit_screen() { log 'progress line'; printf '{"attempts":[{"attempt":2}]}'; }
+  captured="$(emit_screen 2>/dev/null)"
+  [ "$(printf '%s' "$captured" | jq -r '[.attempts[]?|select(.attempt>1)]|length')" = "1" ] || return 1
+  return 0
+}
+
+fixture_require_nonempty_candidate_diff() {
+  # The empty-candidate guard must fail CLOSED: `git diff --quiet && block_run`
+  # skipped the block when git itself errored (exit 128 short-circuits &&) —
+  # a regression from the old command-substitution form, which blocked on any
+  # git failure. Review finding (CONFIRMED, low probability).
+  local root="$1" dir="$root/cand-empty"
+  mkdir -p "$dir/repo"
+  ( log() { :; }
+    PROJECT="$dir/repo"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'a\n' >"$PROJECT/f"; git -C "$PROJECT" add f; git -C "$PROJECT" commit -qm base
+    base="$(git -C "$PROJECT" rev-parse HEAD)"
+    git -C "$PROJECT" commit -q --allow-empty -m empty
+    empty="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf 'b\n' >>"$PROJECT/f"; git -C "$PROJECT" add f; git -C "$PROJECT" commit -qm change
+    real="$(git -C "$PROJECT" rev-parse HEAD)"
+    block_run() { printf '%s' "$1" >"$dir/reason"; exit 7; }
+    require_nonempty_candidate_diff "$base" "$real" || exit 1   # non-empty passes
+    ( require_nonempty_candidate_diff "$base" "$empty" ); [ "$?" -eq 7 ] || exit 1
+    grep -q 'empty' "$dir/reason" || exit 1
+    git() { return 128; }
+    ( require_nonempty_candidate_diff "$base" "$real" ); [ "$?" -eq 7 ] || exit 1
+    grep -q 'could not compute' "$dir/reason" || exit 1         # git error fails CLOSED
+    exit 0 ) || return 1
   return 0
 }
 

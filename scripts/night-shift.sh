@@ -154,7 +154,11 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES. (--primary is accepted only as claude.)
 EOF
 }
 
-log() { printf '[night-shift] %s\n' "$*"; }
+# STDERR, deliberately: helper output (visual_repair_screen, workers) is
+# command-substituted by callers, and stdout log lines interleaved with that
+# JSON silently broke jq parsing (the visual-repair cap accounting). Every
+# other script's log (visual-review.sh) already writes to stderr.
+log() { printf '[night-shift] %s\n' "$*" >&2; }
 die() { printf '[night-shift] BLOCKED: %s\n' "$*" >&2; exit 1; }
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 now_epoch() { date '+%s'; }
@@ -1929,12 +1933,7 @@ verify_candidate() {
   [ "$candidate" != "$BASE_COMMIT" ] || block_run "CREATE_CANDIDATE did not create a commit"
   git -C "$PROJECT" merge-base --is-ancestor "$BASE_COMMIT" "$candidate" ||
     block_run "candidate is not descended from the recorded base commit"
-  # Emptiness check via --quiet (exit 1 = has changes): command-substituting the
-  # -z --name-only output just to test non-emptiness triggers bash's "ignored null
-  # byte in input" warning on every candidate. --quiet avoids capturing the NUL
-  # stream entirely. (The path loop below still reads -z output the NUL-safe way.)
-  git -C "$PROJECT" diff --quiet "$BASE_COMMIT..$candidate" &&
-    block_run "candidate commit is empty"
+  require_nonempty_candidate_diff "$BASE_COMMIT" "$candidate"
   # For each path committed by the run, check whether it was pre-existing dirt.
   # Both sides are now unquoted bytes so spaces and unicode compare correctly.
   while IFS= read -r -d '' committed_path; do
@@ -2180,6 +2179,18 @@ run_visual_inloop_repair() {
   ' --arg c "$newsha" --arg now "$(now_iso)"
   run_visual_capture "$SPEC" "$newsha" "$RUN_ROOT/validated"
   log "visual_review: auto-repaired ($screens); committed $newsha; refreshed report for observer"
+}
+
+# Emptiness gate via --quiet (exit 1 = has changes): command-substituting the
+# -z --name-only output just to test non-emptiness triggers bash's "ignored null
+# byte in input" warning on every candidate. --quiet avoids capturing the NUL
+# stream entirely — but its error exits (>=2) must fail CLOSED, not be treated
+# as "has changes" (the old && form skipped the block on a git error).
+require_nonempty_candidate_diff() {
+  local base="$1" candidate="$2" rc=0
+  git -C "$PROJECT" diff --quiet "$base..$candidate" || rc=$?
+  [ "$rc" -ne 0 ] || block_run "candidate commit is empty"
+  [ "$rc" -eq 1 ] || block_run "could not compute the candidate diff (git exited $rc)"
 }
 
 # Engine-controlled evidence the observer can trust regardless of what the primary
