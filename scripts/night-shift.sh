@@ -876,7 +876,13 @@ consume for the chosen action:
 - CREATE_CANDIDATE: create ONE local commit on the feature branch containing
   only files this run changed (never baseline dirty paths). Then write an
   execution-evidence file validating against $SCHEMA_DIR/execution-evidence.json
-  whose baseline, test_first, and final_validation match the spec's commands.
+  whose baseline, test_first, and final_validation match the spec's commands,
+  shaped EXACTLY like (all four top-level keys; test_first carries BOTH the
+  failing and the passing evidence; integer exit statuses, key name exit_status):
+    {"task":"$SPEC",
+     "baseline":[{"command":"<cmd>","exit_status":0,"output":"<output>"}],
+     "test_first":{"command":"<cmd>","failing_exit_status":1,"failing_output":"<red>","passing_exit_status":0,"passing_output":"<green>"},
+     "final_validation":[{"command":"<cmd>","exit_status":0,"output":"<output>"}]}
   List that evidence file in artifacts.
 - REQUEST_OBSERVER: list the candidate evidence, relevant tests, and docs the
   fresh observer needs. The wrapper runs the observer; do not run it yourself.
@@ -1146,6 +1152,55 @@ validate_signal() {
   [ -f "$signal" ] || return 2
   json_schema_basic next-action "$signal" || return 1
   [ "$(jq -r '.task' "$signal")" = "$SPEC" ] || return 1
+  # A CREATE_CANDIDATE without schema-valid execution evidence is rejected HERE,
+  # where the malformed-signal correction machinery feeds the reason back to the
+  # primary — not deep in verify_candidate, whose evidence gate (kept as defense
+  # in depth) is a terminal block the primary never gets to fix. A live model
+  # reliably mis-shapes the evidence on the first try (exit_code for exit_status,
+  # missing task, a flat test_first); that must cost a correction turn, not the run.
+  [ "$(jq -r '.action' "$signal")" != "CREATE_CANDIDATE" ] ||
+    signal_has_valid_evidence "$signal" || return 1
+}
+
+# True when any artifact in the signal is a schema-valid execution-evidence file
+# whose task matches the current spec (the same two checks verify_candidate makes).
+signal_has_valid_evidence() {
+  local signal="$1" artifact resolved
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
+    resolved="$(resolve_artifact "$artifact")" || continue
+    if json_schema_basic execution-evidence "$resolved" &&
+      [ "$(jq -r '.task' "$resolved")" = "$SPEC" ]; then
+      return 0
+    fi
+  done <<EOF
+$(jq -r '.artifacts[]' "$signal" 2>/dev/null)
+EOF
+  return 1
+}
+
+# Specific reason an execution-evidence file fails the schema, in check order.
+evidence_rejection_reason() {
+  local f="$1" keys
+  if ! jq -e . "$f" >/dev/null 2>&1; then
+    printf 'the file is not valid JSON'
+    return 0
+  fi
+  keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$f")"
+  if [ "$keys" != '["baseline","final_validation","task","test_first"]' ]; then
+    printf 'top-level keys must be EXACTLY ["baseline","final_validation","task","test_first"]; the file has %s' "$keys"
+    return 0
+  fi
+  if [ "$(jq -r '.task' "$f")" != "$SPEC" ]; then
+    printf '"task" must equal %s exactly' "$SPEC"
+    return 0
+  fi
+  keys="$(jq -c '.test_first | if type == "object" then (keys | sort) else type end' "$f")"
+  if [ "$keys" != '["command","failing_exit_status","failing_output","passing_exit_status","passing_output"]' ]; then
+    printf '"test_first" keys must be EXACTLY ["command","failing_exit_status","failing_output","passing_exit_status","passing_output"] (failing AND passing evidence, not a single exit_code/output pair); the file has %s' "$keys"
+    return 0
+  fi
+  printf 'baseline/final_validation must be non-empty arrays of {"command","exit_status","output"} (integer exit_status >= 0), test_first needs failing_exit_status > 0 with non-empty failing_output and passing_exit_status == 0 with non-empty passing_output'
 }
 
 # Human-readable reason the last next-action signal was rejected, mirroring
@@ -1179,6 +1234,21 @@ signal_rejection_reason() {
   fi
   if ! jq -e '(.stage | type == "string" and length > 0) and (.reason | type == "string" and length > 0)' "$signal" >/dev/null 2>&1; then
     printf '"stage" and "reason" must both be non-empty strings'
+    return 0
+  fi
+  if [ "$(jq -r '.action' "$signal")" = "CREATE_CANDIDATE" ] && ! signal_has_valid_evidence "$signal"; then
+    local first resolved
+    first="$(jq -r '.artifacts[0] // empty' "$signal")"
+    if [ -z "$first" ]; then
+      printf 'CREATE_CANDIDATE must list the execution-evidence file in "artifacts"'
+      return 0
+    fi
+    if ! resolved="$(resolve_artifact "$first")"; then
+      printf 'the execution-evidence artifact %s is missing from the project (or unsafe: absolute/"..")' "$first"
+      return 0
+    fi
+    printf 'the execution-evidence artifact %s failed schema validation (%s/execution-evidence.json): %s' \
+      "$first" "$SCHEMA_DIR" "$(evidence_rejection_reason "$resolved")"
     return 0
   fi
   printf '"artifacts" must be an array of unique, non-empty, project-relative paths (no absolute paths, no "..")'

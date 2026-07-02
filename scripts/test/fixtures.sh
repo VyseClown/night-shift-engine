@@ -122,6 +122,7 @@ run_dry_fixtures() {
   fixture_assert "bounded_diff caps a large diff with --stat + truncation marker" fixture_bounded_diff "$root"
   fixture_assert "review bundle shows untracked new files; gitignored + engine state excluded" fixture_bundle_untracked_diff "$root"
   fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
+  fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "set_stage resets review_round at scope boundaries (GH #18)" fixture_stage_round_reset "$root"
@@ -1575,6 +1576,48 @@ fixture_signal_rejection_feedback() {
   grep -qF '"stage":"completion"' "$prompt" || return 1
   grep -qF '"artifacts":[]' "$prompt" || return 1
   grep -qF "\"task\":\"$SPEC\"" "$prompt" || return 1
+  return 0
+}
+
+fixture_candidate_evidence_feedback() {
+  # A CREATE_CANDIDATE whose execution evidence fails the schema must be a
+  # correctable rejection (exact reason fed to the next turn via the fix-B
+  # machinery), not a terminal block: a live haiku primary wrote test_first as
+  # {command, exit_code, output} (no failing/passing split, no task) and the run
+  # died at the gate AFTER 4/4 persona approval. verify_candidate keeps its own
+  # gate as defense in depth.
+  local root="$1" dir="$root/cand-ev" reason ev ev_rel
+  mkdir -p "$dir/proj/.night-shift/validated" "$dir/control"
+  local RUN_ROOT="$dir" PROJECT="$dir/proj" SPEC="$dir/spec.md" RUN_ID=testrun
+  local BASE_COMMIT=deadbeef STATE="$dir/state.json"
+  fixture_write_min_spec "$SPEC"
+  ev_rel=".night-shift/validated/execution-evidence.json"
+  ev="$PROJECT/$ev_rel"
+  jq -cn --arg t "$SPEC" --arg a "$ev_rel" \
+    '{action:"CREATE_CANDIDATE",artifacts:[$a],reason:"r",stage:"implementation_ready",task:$t}' \
+    >"$dir/control/next-action.json"
+  # (1) Mis-shaped evidence (the live-haiku shape) -> signal rejected, reason specific.
+  jq -cn '{baseline:[{command:"c",exit_code:0,output:"o"}],final_validation:[{command:"c",exit_code:0,output:"o"}],test_first:{command:"c",exit_code:1,output:"o"}}' >"$ev"
+  validate_signal && return 1
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -q 'execution-evidence' || return 1
+  printf '%s' "$reason" | grep -qF '"baseline","final_validation","task","test_first"' || return 1
+  # (2) Evidence artifact listed but the file is absent -> named as missing.
+  rm -f "$ev"
+  validate_signal && return 1
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qi 'missing' || return 1
+  # (3) Schema-valid evidence with the matching task -> the signal passes.
+  jq -cn --arg t "$SPEC" '{task:$t,
+    baseline:[{command:"c",exit_status:0,output:"o"}],
+    test_first:{command:"c",failing_exit_status:1,failing_output:"red",passing_exit_status:0,passing_output:"green"},
+    final_validation:[{command:"c",exit_status:0,output:"o"}]}' >"$ev"
+  validate_signal || return 1
+  # (4) The CREATE_CANDIDATE prompt bullet inlines the exact evidence shape.
+  printf '{"stage":"implementation_ready","stage_turns":0,"primary_turns":3,"session_id":"s"}\n' >"$STATE"
+  primary_prompt "$dir/prompt.txt"
+  grep -qF '"failing_exit_status"' "$dir/prompt.txt" || return 1
+  grep -qF '"exit_status"' "$dir/prompt.txt" || return 1
   return 0
 }
 
