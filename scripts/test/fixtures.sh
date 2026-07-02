@@ -126,6 +126,7 @@ run_dry_fixtures() {
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
   fixture_assert "persona/observer retry attempts carry the rejection note (first attempts do not)" fixture_retry_feedback_note "$root"
   fixture_assert "personas spawn concurrently (bounded by NIGHT_SHIFT_PERSONA_CONCURRENCY; 1 = serial)" fixture_persona_parallel_spawn "$root"
+  fixture_assert "signal path reaps live persona workers + salvages batch costs" fixture_worker_reap "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
   fixture_assert "integrity mismatch quarantines forensics + restores engine truth" fixture_integrity_quarantine "$root"
@@ -1255,6 +1256,48 @@ fixture_wrapper_owned_integrity() {
   grep -q 'integrity_check "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_worker_reap() {
+  # A directed HUP/INT/TERM to the ENGINE pid during a parallel persona batch
+  # must not orphan the backgrounded paid `claude -p` workers: block_run's
+  # signal path reaps them (kill the worker's process group, fall back to the
+  # pid) and salvages the interrupted batch's per-attempt costs from the
+  # .attempts markers BEFORE exiting. Review finding: pre-fix, the trap exited
+  # without kill/reap (orphans kept spending), skipped the cost loop, and
+  # cleanup_observer_tmp rm -rf'd the workers' live cwd.
+  local root="$1" dir="$root/reap" w1 w2 c1
+  mkdir -p "$dir/rd" "$dir/raw"
+  ( log() { :; }
+    RUN_ROOT="$dir"
+    # Two fake worker trees: subshell + long-lived child (emulates claude).
+    set -m
+    ( sleep 30 & wait ) >/dev/null 2>&1 &
+    w1=$!
+    ( sleep 30 & wait ) >/dev/null 2>&1 &
+    w2=$!
+    set +m
+    PERSONA_WORKER_PIDS="$w1 $w2"
+    PERSONA_BATCH_DIR="$dir/rd"; PERSONA_BATCH_STAGE="plan"
+    printf '2' >"$dir/rd/.attempts-human-advocate"
+    printf '{"total_cost_usd":0.01,"num_turns":1}' >"$dir/raw/persona-plan-human-advocate.1.json"
+    printf '{"total_cost_usd":0.02,"num_turns":1}' >"$dir/raw/persona-plan-human-advocate.2.json"
+    reap_persona_workers
+    sleep 0.3
+    kill -0 "$w1" 2>/dev/null && exit 1   # worker 1 dead
+    kill -0 "$w2" 2>/dev/null && exit 1   # worker 2 dead
+    [ ! -f "$dir/rd/.attempts-human-advocate" ] || exit 1   # marker consumed
+    [ "$(grep -c . "$dir/cost-ledger.jsonl")" -eq 2 ] || exit 1  # costs salvaged
+    [ -z "$PERSONA_WORKER_PIDS" ] || exit 1
+    reap_persona_workers   # idempotent with no active batch
+    exit 0 ) || return 1
+  # Wiring: block_run reaps BEFORE cleanup_observer_tmp (which removes the
+  # workers' neutral cwds), and each worker gets its own per-slug neutral cwd.
+  awk '/^block_run\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" |
+    grep -nE '^[[:space:]]*(reap_persona_workers|cleanup_observer_tmp)' |
+    head -2 | paste -sd '|' - | grep -q 'reap_persona_workers.*|.*cleanup_observer_tmp' || return 1
+  grep -q 'night-shift-persona-\$RUN_ID-' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   return 0
 }
 

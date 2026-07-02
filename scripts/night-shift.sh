@@ -1203,6 +1203,9 @@ block_run() {
   # signal arriving mid-cleanup would re-enter block_run (double cleanup, garbled
   # reason). The EXIT trap still runs release_lock. (HUP/INT/TERM only; not EXIT.)
   trap '' HUP INT TERM
+  # BEFORE cleanup_observer_tmp (which removes the workers' neutral cwds): stop
+  # any live paid persona sessions and salvage the interrupted batch's costs.
+  reap_persona_workers 2>/dev/null || true
   cleanup_validation_worktree >/dev/null 2>&1 || reason="$reason; validation worktree cleanup also failed"
   cleanup_observer_tmp
   # Record the blocked status best-effort: if state.json is corrupt, state_set
@@ -1238,7 +1241,7 @@ cleanup_observer_tmp() {
   [ -n "${RUN_ID:-}" ] || return 0
   rm -rf "${TMPDIR:-/tmp}/night-shift-observer-$RUN_ID" 2>/dev/null || true
   # The engine-spawned personas use a sibling neutral dir; clean it up too.
-  rm -rf "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID" 2>/dev/null || true
+  rm -rf "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID" "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID"-* 2>/dev/null || true
 }
 
 validate_signal() {
@@ -1601,7 +1604,10 @@ EOF
 # loop deterministically without a live model.
 invoke_persona_once() {
   local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" retry_note="${6:-}" neutral lens
-  neutral="${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID"
+  # Per-worker cwd (slug-suffixed): up to NIGHT_SHIFT_PERSONA_CONCURRENCY claude
+  # sessions run concurrently, and a shared cwd is an avoidable interference
+  # surface (the observer's shared-dir pattern was safe only because it is serial).
+  neutral="${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID-$(persona_slug "$persona")"
   mkdir -p "$neutral"
   lens="$(persona_lens "$persona" "$(spec_track "$SPEC")")"
   # Prompt via STDIN (not argv): the bundle inlines a diff that can be large, and a
@@ -1611,6 +1617,48 @@ invoke_persona_once() {
   (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
     claude -p $(model_flag "$PERSONA_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
+}
+
+# Live persona-worker bookkeeping for the signal path. A directed HUP/INT/TERM
+# to the ENGINE pid (a supervisor kill or timeout — Ctrl-C signals the whole
+# process group, a directed kill does not) fires block_run in the parent while
+# workers run backgrounded `claude -p` sessions. Without this, those paid
+# sessions orphan and keep spending, the batch's costs are never recorded, and
+# cleanup_observer_tmp removes their cwd from under them.
+PERSONA_WORKER_PIDS=""
+PERSONA_BATCH_DIR=""
+PERSONA_BATCH_STAGE=""
+
+# Kill + reap any live persona workers (whole process group per worker — they
+# are spawned under set -m so each leads its own group and the `claude` child
+# dies too; fall back to the bare pid when no group exists), then salvage the
+# interrupted batch's per-attempt costs from the .attempts markers. Idempotent;
+# a no-op when no batch is in flight.
+reap_persona_workers() {
+  local pid slug attempts a raw marker
+  [ -n "$PERSONA_WORKER_PIDS" ] || return 0
+  for pid in $PERSONA_WORKER_PIDS; do
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $PERSONA_WORKER_PIDS; do
+    wait "$pid" 2>/dev/null || true
+  done
+  PERSONA_WORKER_PIDS=""
+  [ -n "$PERSONA_BATCH_DIR" ] || return 0
+  for marker in "$PERSONA_BATCH_DIR"/.attempts-*; do
+    [ -f "$marker" ] || continue
+    slug="${marker##*/.attempts-}"
+    attempts="$(cat "$marker" 2>/dev/null)" || attempts=0
+    is_valid_int "$attempts" || attempts=0
+    a=1
+    while [ "$a" -le "$attempts" ]; do
+      raw="$RUN_ROOT/raw/persona-$PERSONA_BATCH_STAGE-$slug.$a.json"
+      [ ! -f "$raw" ] || record_cost "$raw" "$(basename "$raw")"
+      a=$((a + 1))
+    done
+    rm -f "$marker"
+  done
+  PERSONA_BATCH_DIR=""; PERSONA_BATCH_STAGE=""
 }
 
 # One persona's full attempt loop, run as a (possibly backgrounded) worker.
@@ -1688,11 +1736,18 @@ spawn_personas() {
     # before spawning more paid sessions.
     enforce_elapsed_limits
     pids=(); names=()
+    PERSONA_BATCH_DIR="$result_dir"; PERSONA_BATCH_STAGE="$persona_stage"
     j=0
     while [ "$j" -lt "$concurrency" ] && [ "$i" -lt "$n" ]; do
       persona="${queue[$i]}"
+      # set -m: each worker leads its own process group, so the signal path can
+      # kill the worker AND its `claude` child (a bare kill to the subshell pid
+      # would reparent the paid session, not stop it).
+      set -m
       spawn_persona_worker "$persona" "$persona_stage" "$bundle" "$result_dir" &
+      set +m
       pids+=("$!"); names+=("$persona")
+      PERSONA_WORKER_PIDS="$PERSONA_WORKER_PIDS $!"
       i=$((i + 1)); j=$((j + 1))
     done
     k=0
@@ -1700,6 +1755,7 @@ spawn_personas() {
       wait "${pids[$k]}" || true
       k=$((k + 1))
     done
+    PERSONA_WORKER_PIDS=""
     # Costs: recorded by the parent from exactly the attempts each worker made
     # this round (.attempts-<slug>), BEFORE any failure becomes block_run — so a
     # blocked round still keeps every paid attempt's cost.
@@ -1723,6 +1779,7 @@ spawn_personas() {
       fi
     done
   done
+  PERSONA_BATCH_DIR=""; PERSONA_BATCH_STAGE=""
 }
 
 run_personas() {
