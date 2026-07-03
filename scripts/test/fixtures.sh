@@ -133,6 +133,7 @@ run_dry_fixtures() {
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "mid-stage session refresh clears the session every N stage turns (0 = off)" fixture_session_refresh "$root"
+  fixture_assert "integrity + normalize families live in libs (monolith does not regrow)" fixture_lib_split "$root"
   fixture_assert "state writes are best-effort fsynced (durable_sync never fails the engine)" fixture_durable_state_write "$root"
   fixture_assert "429-contract canary warns (never blocks) on an unverified CLI version" fixture_rate_limit_contract_canary "$root"
   fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
@@ -1263,8 +1264,27 @@ fixture_wrapper_owned_integrity() {
   # Wiring: the trust points consult the guard (primary-turn return, candidate
   # gate, observer evidence) and state_set re-seeds after every engine write.
   grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
-  grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/lib/integrity.sh" || return 1
   grep -A 3 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_lib_split() {
+  # The orchestrator keeps only the run flow; self-contained families live in
+  # libs (the locking/recovery/preflight/personas/events pattern): the
+  # integrity anchor in lib/integrity.sh, the verdict extraction/normalization
+  # in lib/normalize.sh. Their behavior fixtures run unchanged — this pins the
+  # layout so the monolith does not silently regrow.
+  [ -f "$WORKSPACE_ROOT/scripts/lib/integrity.sh" ] || return 1
+  [ -f "$WORKSPACE_ROOT/scripts/lib/normalize.sh" ] || return 1
+  grep -q 'lib/integrity\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q 'lib/normalize\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q '^integrity_guard()' "$WORKSPACE_ROOT/scripts/lib/integrity.sh" || return 1
+  grep -q '^normalize_persona_result()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
+  grep -q '^normalize_observer_output()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
+  grep -q '^extract_claude_structured()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
+  grep -qE '^(integrity_guard|integrity_put|normalize_persona_result|extract_claude_structured)\(\)' \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh" && return 1
   return 0
 }
 
@@ -1365,7 +1385,7 @@ fixture_event_stream() {
   # Wiring: the decision points actually emit.
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry; do
-    grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+    grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
 }
@@ -1407,7 +1427,7 @@ fixture_verdict_prelude_and_preamble() {
   # divergence is intentional, not drift.
   local root="$1" dir="$root/prelude" p
   mkdir -p "$dir"
-  [ "$(grep -c 'JQ_VERDICT_PRELUDE' "$WORKSPACE_ROOT/scripts/night-shift.sh")" -ge 3 ] || return 1
+  [ "$(grep -c 'JQ_VERDICT_PRELUDE' "$WORKSPACE_ROOT/scripts/lib/normalize.sh")" -ge 3 ] || return 1
   # Shared synonym map still normalizes through both surfaces.
   printf '{"persona":"P","stage":"plan","verdict":"PASS","findings":[],"documentation_changes":[]}' >"$dir/p.json"
   [ "$(normalize_persona_result "$dir/p.json" | jq -r '.status')" = "APPROVE" ] || return 1
