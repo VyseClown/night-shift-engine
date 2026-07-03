@@ -9,7 +9,7 @@
 # by default; pass --prune to remove clean ones after a run.
 #
 # Usage:
-#   scripts/parallel-worktrees.sh --project ~/work/personal/web-app \
+#   scripts/parallel-worktrees.sh --project ~/work/web-app \
 #       specs/feature-a.md specs/feature-b.md specs/feature-c.md
 #
 # Flags:
