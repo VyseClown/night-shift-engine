@@ -1430,12 +1430,22 @@ extract_claude_structured() {
 # never fabricated. Pure: reads $1, prints normalized JSON; the wrapper stamps
 # .persona/.stage before calling this, so those pass through untouched. A non-record
 # (review bundle, plan doc) yields junk that still fails json_schema_basic, as before.
-normalize_persona_result() {
-  jq '
+# jq prelude shared by BOTH verdict normalizers. The status-synonym map and
+# nonempty's non-string skipping are contract-critical and must never diverge
+# between the persona and observer parsers — a synonym added to one side makes
+# the two review tiers read the same sloppy verdict differently. The findings
+# COERCION bodies below stay separate BY DESIGN: persona keeps schema-valid
+# finding ids while the observer forces OBS-, and the evidence/required_change
+# candidate orders were tuned per tier — that divergence is intentional.
+JQ_VERDICT_PRELUDE='
     def norm_status: (. // "BLOCK") | tostring | ascii_upcase
       | if (. == "APPROVE" or . == "APPROVED" or . == "PASS" or . == "OK" or . == "LGTM")
         then "APPROVE" else "BLOCK" end;
     def nonempty($v): ($v | if (type == "string" and length > 0) then . else empty end);
+'
+
+normalize_persona_result() {
+  jq "${JQ_VERDICT_PRELUDE}"'
     {
       persona: .persona,
       stage: .stage,
@@ -1596,18 +1606,19 @@ assemble_review_bundle() {
 
 # The prompt for one engine-spawned persona. Mirrors observer_prompt: judge only
 # the supplied bundle, end with a single fenced json verdict block.
+# Shared retry-rejection wording for BOTH reviewer prompts — one voice for the
+# persona and observer tiers (the same principle as the primary's signal-
+# rejection feedback: a blind re-send reliably repeats the mistake). Empty
+# note renders nothing.
+rejection_preamble() {
+  [ -n "${1:-}" ] || return 0
+  printf '\nPREVIOUS ATTEMPT REJECTED: a previous attempt at this review was discarded\nbecause: %s\nAvoid that mistake; follow the verdict rules below exactly.\n' "$1"
+}
+
 persona_prompt() {
   local persona="$1" stage="$2" bundle="$3" lens="$4" retry_note="${5:-}"
   [ -n "$lens" ] || lens="Review strictly within the concerns of \"$persona\"; raise only issues a \"$persona\" would own."
-  # A retry after a rejected attempt says WHY it was rejected — a blind re-send
-  # is indistinguishable from the original and reliably repeats the mistake
-  # (the same principle as the primary's signal-rejection feedback).
-  [ -z "$retry_note" ] ||
-    retry_note="
-PREVIOUS ATTEMPT REJECTED: a previous attempt at this review was discarded
-because: $retry_note
-Avoid that mistake; follow the verdict rules below exactly.
-"
+  retry_note="$(rejection_preamble "$retry_note")"
   cat <<EOF
 You are the "$persona" review persona for night-shift run $RUN_ID, independently
 reviewing another Claude session's $stage work. You share no context with the
@@ -2070,14 +2081,7 @@ EOF
 
 observer_prompt() {
   local context="$1" candidate="$2" retry_note="${3:-}"
-  # Same retry-feedback principle as persona_prompt / the primary's
-  # signal-rejection block: a retry says why the previous attempt was rejected.
-  [ -z "$retry_note" ] ||
-    retry_note="
-PREVIOUS ATTEMPT REJECTED: a previous attempt at this review was discarded
-because: $retry_note
-Avoid that mistake; follow the verdict rules below exactly.
-"
+  retry_note="$(rejection_preamble "$retry_note")"
   cat <<EOF
 You are an independent Claude observer reviewing another Claude session's work.
 You share no context with the implementer; judge only the supplied evidence.
@@ -2317,20 +2321,17 @@ run_observer() {
 # (see run_observer). Bias: fail-closed on BLOCK, never fabricate an APPROVE.
 normalize_observer_output() {
   local file="$1" task="$2" candidate="$3" tmp="$1.norm.$$"
-  jq --arg task "$task" --arg candidate "$candidate" '
+  jq --arg task "$task" --arg candidate "$candidate" "${JQ_VERDICT_PRELUDE}"'
     # Prefer the first NON-EMPTY STRING among candidates: a live model (observer
     # included — verified) often sets required_change to a BOOLEAN true, and a plain
     # `//` keeps it -> "true". nonempty() skips non-strings so we fall through to real
     # text (required_change falls back to the finding evidence when no change text).
-    def nonempty($v): ($v | if (type == "string" and length > 0) then . else empty end);
     {
       observer: "claude",
       primary: "claude",
       task: $task,
       candidate_commit: $candidate,
-      status: ((.status // "BLOCK") | tostring | ascii_upcase
-        | if (. == "APPROVE" or . == "APPROVED" or . == "PASS" or . == "OK" or . == "LGTM")
-          then "APPROVE" else "BLOCK" end),
+      status: (.status | norm_status),
       findings: ((.findings // []) | to_entries | map(
         (.key + 1) as $k |
         # Coerce a non-object findings element (a live model sometimes emits a bare

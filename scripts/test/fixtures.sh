@@ -129,6 +129,7 @@ run_dry_fixtures() {
   fixture_assert "signal path reaps live persona workers + salvages batch costs" fixture_worker_reap "$root"
   fixture_assert "log writes to stderr (command-substituted JSON stays parseable)" fixture_log_stderr_and_repair_accounting "$root"
   fixture_assert "wire contracts single-sourced (gate + rejection feedback + retry reminders) and integrity_guard owns check->quarantine->block" fixture_contract_single_source "$root"
+  fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
   fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
@@ -1259,6 +1260,33 @@ fixture_wrapper_owned_integrity() {
   grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_verdict_prelude_and_preamble() {
+  # The status-synonym map + nonempty helper live in ONE jq prelude used by
+  # BOTH verdict normalizers (a synonym added to one side would make the
+  # persona and observer tiers read the same sloppy verdict differently), and
+  # the PREVIOUS ATTEMPT REJECTED wording is one helper for both prompts. The
+  # findings-coercion bodies stay separate BY DESIGN (persona keeps schema-valid
+  # ids / observer forces OBS-; candidate orders tuned per tier) — that
+  # divergence is intentional, not drift.
+  local root="$1" dir="$root/prelude" p
+  mkdir -p "$dir"
+  [ "$(grep -c 'JQ_VERDICT_PRELUDE' "$WORKSPACE_ROOT/scripts/night-shift.sh")" -ge 3 ] || return 1
+  # Shared synonym map still normalizes through both surfaces.
+  printf '{"persona":"P","stage":"plan","verdict":"PASS","findings":[],"documentation_changes":[]}' >"$dir/p.json"
+  [ "$(normalize_persona_result "$dir/p.json" | jq -r '.status')" = "APPROVE" ] || return 1
+  printf '{"status":"REQUEST_CHANGES","findings":[{"evidence":"e"}]}' >"$dir/o.json"
+  normalize_observer_output "$dir/o.json" "/spec.md" deadbeef
+  [ "$(jq -r '.status' "$dir/o.json")" = "BLOCK" ] || return 1
+  [ "$(jq -r '.findings[0].id' "$dir/o.json")" = "OBS-001" ] || return 1
+  # One preamble helper, used by both prompt builders; empty note renders nothing.
+  p="$(rejection_preamble 'the-reason')"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' || return 1
+  printf '%s' "$p" | grep -q 'the-reason' || return 1
+  [ -z "$(rejection_preamble '')" ] || return 1
+  [ "$(grep -c 'rejection_preamble' "$WORKSPACE_ROOT/scripts/night-shift.sh")" -ge 3 ] || return 1
   return 0
 }
 
