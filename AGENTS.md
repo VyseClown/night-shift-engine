@@ -194,7 +194,7 @@ If any step fails: fix it, re-run from step 1. Do not commit with failures.
 ## Commit Rules
 
 - One logical change per commit.
-- Message format: `type(scope): short description` — types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`.
+- Message format: `type(scope): short description` — types: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore`.
 - Never commit: `.env`, secrets, `node_modules/`, `ios/Pods/`, build artifacts.
 - Never force-push to `main`.
 

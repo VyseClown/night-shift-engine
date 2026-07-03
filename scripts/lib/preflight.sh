@@ -210,8 +210,10 @@ run_test_command() {
   jq -n --arg command "$command" --argjson exit_status "$rc" \
     --arg output "$(tail -c 20000 "$output")" \
     '{command:$command,exit_status:$exit_status,output:$output}' >"$target"
-  # Wrapper-owned evidence: seed the engine-private integrity anchor (night-shift.sh).
-  integrity_put "$target"
+  # Wrapper-owned evidence: seed the engine-private integrity anchor. Defined in
+  # night-shift.sh (the only sourcer today); the command -v guard keeps this lib
+  # safe to source standalone, and keeps the function's exit status clean.
+  ! command -v integrity_put >/dev/null 2>&1 || integrity_put "$target"
 }
 
 # Red-against-base proof for a spec that MODIFIES an already-tested module (the
@@ -284,8 +286,10 @@ EOF
   printf '\n]\n' >>"$tmp"
   [ "$first" -eq 0 ] || return 1
   mv "$tmp" "$target"
-  # Wrapper-owned evidence: seed the engine-private integrity anchor (night-shift.sh).
-  integrity_put "$target"
+  # Wrapper-owned evidence: seed the engine-private integrity anchor. Defined in
+  # night-shift.sh (the only sourcer today); the command -v guard keeps this lib
+  # safe to source standalone, and keeps the function's exit status clean.
+  ! command -v integrity_put >/dev/null 2>&1 || integrity_put "$target"
 }
 
 validation_not_regressed() {
