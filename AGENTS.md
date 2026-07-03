@@ -102,6 +102,12 @@ is not a git repo.
   finding IDs across amended candidate commits.
 - **`.night-shift/`** is ignored transient state. Successful runs retain only a
   compact archive; blocked and failed runs retain full state for recovery.
+- **`.night-shift/events.jsonl`** is the run's decision journal — one JSON line
+  per decision point (stage transitions, accepted/rejected signals with
+  reasons, persona verdicts with attempts and retry reasons, integrity
+  violations, reaps, blocks, completion). Study a finished or wrecked run
+  decision-by-decision with `jq . events.jsonl`; archived on success alongside
+  `costs.jsonl`.
 
 ---
 
