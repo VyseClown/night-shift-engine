@@ -130,6 +130,7 @@ run_dry_fixtures() {
   fixture_assert "log writes to stderr (command-substituted JSON stays parseable)" fixture_log_stderr_and_repair_accounting "$root"
   fixture_assert "wire contracts single-sourced (gate + rejection feedback + retry reminders) and integrity_guard owns check->quarantine->block" fixture_contract_single_source "$root"
   fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
+  fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
   fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
@@ -1260,6 +1261,33 @@ fixture_wrapper_owned_integrity() {
   grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_untracked_single_walk() {
+  # Process economics (behavior is guarded by fixture_bundle_untracked_diff and
+  # fixture_material_token_untracked): one untracked walk per bounded_diff call
+  # (the --stat header is derived from the same patch via `git apply --stat`,
+  # not a second per-file fork storm), and material_token uses a constant
+  # number of processes (ls-files + cat, no per-file `git diff --no-index`)
+  # while staying CONTENT-sensitive.
+  local root="$1" repo="$root/uwalk" t1 t2
+  [ "$(awk '/^bounded_diff\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -c 'untracked_diff')" -le 2 ] || return 1
+  awk '/^material_token\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'untracked_diff' && return 1
+  awk '/^material_token\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'ls-files' || return 1
+  mkdir -p "$repo"
+  ( PROJECT="$repo"
+    git -C "$repo" init -q
+    git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+    git -C "$repo" commit -q --allow-empty -m base
+    BASE_COMMIT="$(git -C "$repo" rev-parse HEAD)"
+    printf 'v1\n' >"$repo/gen.js"
+    t1="$(material_token)"
+    printf 'v2\n' >"$repo/gen.js"      # same file NAME, different CONTENT
+    t2="$(material_token)"
+    [ "$t1" != "$t2" ] || exit 1       # content changes still reset the stall counter
+    exit 0
+  ) || return 1
   return 0
 }
 

@@ -434,8 +434,13 @@ tools_available() {
 # changes, so legitimate resolution attempts are not falsely blocked as
 # "unchanged". Empty during the plan stage, where no code exists yet.
 material_token() {
+  # Constant process count regardless of how many untracked files exist (the
+  # per-file `git diff --no-index` walk is reserved for the review bundle):
+  # names via ls-files, contents via one xargs cat — still content-sensitive.
   { git -C "$PROJECT" diff "$BASE_COMMIT" 2>/dev/null
-    untracked_diff
+    git -C "$PROJECT" ls-files --others --exclude-standard -- ':(exclude).night-shift' 2>/dev/null
+    git -C "$PROJECT" ls-files --others --exclude-standard -z -- ':(exclude).night-shift' 2>/dev/null |
+      (cd "$PROJECT" 2>/dev/null && xargs -0 cat 2>/dev/null)
   } | cksum | awk '{print $1 ":" $2}'
 }
 
@@ -1553,19 +1558,27 @@ persona_lens() {
 untracked_diff() {
   git -C "$PROJECT" ls-files --others --exclude-standard -z -- ':(exclude).night-shift' 2>/dev/null |
     while IFS= read -r -d '' f; do
-      git -C "$PROJECT" diff --no-index "$@" -- /dev/null "$f" 2>/dev/null || true
+      git -C "$PROJECT" diff --no-index -- /dev/null "$f" 2>/dev/null || true
     done
 }
 
 bounded_diff() {
   local include_untracked=0
   if [ "${1:-}" = "--include-untracked" ]; then include_untracked=1; shift; fi
-  local budget="${NIGHT_SHIFT_DIFF_BUDGET:-400000}" body n
+  local budget="${NIGHT_SHIFT_DIFF_BUDGET:-400000}" body n ut_tmp=""
+  if [ "$include_untracked" -eq 1 ]; then
+    # ONE untracked walk per call: the per-file `git diff --no-index` forks
+    # dominate on repos with many untracked files, so the patch is generated
+    # once and reused for both the --stat header (derived from the same patch
+    # via `git apply --stat`, best-effort) and the body.
+    ut_tmp="$(tmp_base)/ns-untracked-$$.diff"
+    untracked_diff >"$ut_tmp" 2>/dev/null || true
+  fi
   git -C "$PROJECT" diff --stat "$@" 2>/dev/null
-  [ "$include_untracked" -eq 0 ] || untracked_diff --stat
+  [ -z "$ut_tmp" ] || [ ! -s "$ut_tmp" ] || git apply --stat "$ut_tmp" 2>/dev/null || true
   printf '\n'
   body="$( { git -C "$PROJECT" diff "$@" 2>/dev/null
-             [ "$include_untracked" -eq 0 ] || untracked_diff
+             [ -z "$ut_tmp" ] || cat "$ut_tmp" 2>/dev/null
            } | head -c "$((budget + 1))")"
   n="$(printf '%s' "$body" | wc -c | tr -d ' ')"
   if [ "$n" -gt "$budget" ]; then
@@ -1577,6 +1590,7 @@ bounded_diff() {
   else
     printf '%s\n' "$body"
   fi
+  [ -z "$ut_tmp" ] || rm -f "$ut_tmp" 2>/dev/null || true
 }
 
 assemble_review_bundle() {
