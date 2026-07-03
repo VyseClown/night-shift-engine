@@ -1300,15 +1300,15 @@ fixture_session_refresh() {
     RUN_ROOT="$dir"; STATE="$dir/state.json"; RUN_ID="sr-$$"
     printf '{"stage":"implementation","stage_turns":8,"session_id":"s1"}\n' >"$STATE"
     out="$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s1)"
-    [ -z "$out" ] || exit 1                                        # cleared at the boundary
-    [ "$(jq -r '.session_id' "$STATE")" = "null" ] || exit 1
-    jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl" >/dev/null || exit 1
+    [ -z "$out" ] || { echo "DBG sr check1 out=[$out]" >&2; exit 11; }   # cleared at the boundary
+    [ "$(jq -r '.session_id' "$STATE")" = "null" ] || { echo "DBG sr check2 sid=[$(jq -r '.session_id' "$STATE")]" >&2; exit 12; }
+    jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl" >/dev/null || { echo "DBG sr check3 events=[$(cat "$dir/events.jsonl" 2>&1)]" >&2; exit 13; }
     printf '{"stage":"implementation","stage_turns":7,"session_id":"s2"}\n' >"$STATE"
-    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2" ] || exit 1  # below: keep
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2" ] || { echo "DBG sr check4" >&2; exit 14; }  # below: keep
     printf '{"stage":"implementation","stage_turns":16,"session_id":"s3"}\n' >"$STATE"
-    [ -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)" ] || exit 1      # every Nth
+    [ -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)" ] || { echo "DBG sr check5" >&2; exit 15; }      # every Nth
     printf '{"stage":"implementation","stage_turns":8,"session_id":"s4"}\n' >"$STATE"
-    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4" ] || exit 1  # 0 = off
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4" ] || { echo "DBG sr check6" >&2; exit 16; }  # 0 = off
     exit 0 ) || return 1
   # Wired into the primary turn path.
   awk '/^invoke_primary\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'maybe_refresh_session' || return 1
