@@ -25,6 +25,12 @@ MAX_TASK_SECONDS="${NIGHT_SHIFT_MAX_TASK_SECONDS:-10800}"
 # healthy run (which produces a valid signal almost every turn) never trips it.
 MAX_MALFORMED_SIGNALS="${NIGHT_SHIFT_MAX_MALFORMED_SIGNALS:-5}"
 RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
+# The CLI version whose live 429 session-limit response shape was last verified
+# against is_rate_limit_response (lib/recovery.sh). A real 429 cannot be
+# provoked on demand, so the canary is a version tripwire: a differing
+# installed CLI logs a warning (never blocks) reminding to re-verify the
+# capture. Bump this after re-verifying against a real 429 on a newer CLI.
+RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.198"
 # Sanity ceiling on a rate-limit wait. A genuine session limit resets within a
 # few hours; a wait longer than this almost certainly means the reset time was
 # misparsed, so we block for manual resume instead of sleeping for ~a day.
@@ -383,6 +389,7 @@ write_json_atomic() {
   local tmp="${target}.tmp.$$"
   jq -n "$@" "$filter" >"$tmp" || return 1
   mv "$tmp" "$target"
+  durable_sync "$target"
 }
 
 # Rate-limit detection/reset-timing + recovery-state predicates (is_rate_limit_response,
@@ -634,12 +641,22 @@ integrity_guard() {
   block_run "wrapper-owned $what was modified outside the engine (divergent copy kept under raw/)"
 }
 
+# Best-effort per-file fsync: tmp+mv alone is not durable across power loss (a
+# crash can leave a truncated file the recovery path then refuses to resume).
+# perl's IO::Handle is stock on macOS + Linux; silently a no-op without it —
+# durability hardening must never fail the engine.
+durable_sync() {
+  [ -f "${1:-}" ] || return 0
+  perl -MIO::Handle -e 'open(my $f, "<", $ARGV[0]) or exit 0; $f->sync; exit 0' "$1" 2>/dev/null || true
+}
+
 state_set() {
   local filter="$1"
   shift
   local tmp="$STATE.tmp.$$"
   jq "$@" "$filter" "$STATE" >"$tmp" && mv "$tmp" "$STATE" ||
     die "failed to update run state; preserved at ${RUN_ROOT:-unknown}"
+  durable_sync "$STATE"
   integrity_put "$STATE"
 }
 
@@ -857,6 +874,27 @@ spec_has_design_contract() {
   [ -n "${1:-}" ] && grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
 }
 
+# A long grind inside ONE stage replays ever-growing session history every
+# turn (the cost/rot problem stage-scoped sessions solve at stage boundaries,
+# recurring within a stage). Clears the pinned session every
+# NIGHT_SHIFT_SESSION_REFRESH_TURNS stage turns (default 8; 0 disables): the
+# next turn starts fresh and reorients from the files on disk via the same
+# handoff note a stage boundary uses. Echoes the (possibly cleared) session.
+maybe_refresh_session() {
+  local session="$1" refresh turns
+  refresh="${NIGHT_SHIFT_SESSION_REFRESH_TURNS:-8}"
+  is_valid_int "$refresh" || refresh=0
+  { [ "$refresh" -gt 0 ] && [ -n "$session" ]; } || { printf '%s' "$session"; return 0; }
+  turns="$(state_int '.stage_turns')" || turns=0
+  if [ "$turns" -ge "$refresh" ] && [ $((turns % refresh)) -eq 0 ]; then
+    log "session refresh: $turns stage turns in this stage; starting a fresh session (file handoff)"
+    emit_event session_refresh "$(jq -cn --argjson t "$turns" '{stage_turns:$t}')"
+    state_set '.session_id=null'
+    return 0
+  fi
+  printf '%s' "$session"
+}
+
 # Pure: the model the primary should run on in a given session scope. Planning is
 # low-token, high-leverage judgment (a bad plan poisons the whole implement loop),
 # so it gets PLAN_MODEL; everything after the plan — the implement grind, the
@@ -1072,8 +1110,9 @@ invoke_primary() {
   is_valid_int "$consecutive_429" || consecutive_429=0
   enforce_limits
   archive_old_signal
-  primary_prompt "$prompt"
   session="$(jq -r '.session_id // empty' "$STATE")"
+  session="$(maybe_refresh_session "$session")"
+  primary_prompt "$prompt"
   # Model for this stage's scope, pinned only on a FRESH start. A session is born
   # inside one scope and the model is constant within a scope (a scope boundary
   # already nulls .session_id and starts a fresh session), so a --resume — whether
@@ -1252,6 +1291,21 @@ expected_action() {
   local actions
   actions="$(stage_forward_actions "$1")" || { printf 'BLOCKED'; return 0; }
   printf '%s' "$actions" | sed 's/ / or /g'
+}
+
+# Warn (never block) when the installed CLI differs from the version the live
+# 429 contract was verified against — is_rate_limit_response parses a
+# human-worded message that can change under us; a silent parser break would
+# turn a survivable session limit into a hard block at 3am.
+rate_limit_contract_canary() {
+  local found
+  found="$(claude --version 2>/dev/null | awk '{print $1}')" || found=""
+  [ -n "$found" ] || return 0
+  [ "$found" != "$RATE_LIMIT_CONTRACT_CLI_VERSION" ] || return 0
+  log "WARNING: CLI $found differs from $RATE_LIMIT_CONTRACT_CLI_VERSION, the version the 429 rate-limit contract was last verified against; re-verify against a real 429 capture and bump RATE_LIMIT_CONTRACT_CLI_VERSION"
+  emit_event contract_canary "$(jq -cn --arg expected "$RATE_LIMIT_CONTRACT_CLI_VERSION" --arg found "$found" \
+    '{contract:"rate-limit-429", expected:$expected, found:$found}')"
+  return 0
 }
 
 block_run() {
@@ -2647,6 +2701,7 @@ main_run() {
     initialize_run
   fi
   trap 'block_run "run interrupted by signal"' HUP INT TERM
+  rate_limit_contract_canary
 
   local malformed_n rc
   while :; do

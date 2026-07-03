@@ -132,6 +132,9 @@ run_dry_fixtures() {
   fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
+  fixture_assert "mid-stage session refresh clears the session every N stage turns (0 = off)" fixture_session_refresh "$root"
+  fixture_assert "state writes are best-effort fsynced (durable_sync never fails the engine)" fixture_durable_state_write "$root"
+  fixture_assert "429-contract canary warns (never blocks) on an unverified CLI version" fixture_rate_limit_contract_canary "$root"
   fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
@@ -1261,7 +1264,71 @@ fixture_wrapper_owned_integrity() {
   # gate, observer evidence) and state_set re-seeds after every engine write.
   grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
-  grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  grep -A 3 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_session_refresh() {
+  # A long grind inside ONE stage replays ever-growing session history each
+  # turn. maybe_refresh_session clears the pinned session every
+  # NIGHT_SHIFT_SESSION_REFRESH_TURNS stage turns (default 8; 0 = off) so the
+  # next turn starts fresh and picks up from the file handoff — the same
+  # mechanism stage boundaries already use — and journals the refresh.
+  local root="$1" dir="$root/refresh" out
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir"; STATE="$dir/state.json"; RUN_ID="sr-$$"
+    printf '{"stage":"implementation","stage_turns":8,"session_id":"s1"}\n' >"$STATE"
+    out="$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s1)"
+    [ -z "$out" ] || exit 1                                        # cleared at the boundary
+    [ "$(jq -r '.session_id' "$STATE")" = "null" ] || exit 1
+    jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl" >/dev/null || exit 1
+    printf '{"stage":"implementation","stage_turns":7,"session_id":"s2"}\n' >"$STATE"
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2" ] || exit 1  # below: keep
+    printf '{"stage":"implementation","stage_turns":16,"session_id":"s3"}\n' >"$STATE"
+    [ -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)" ] || exit 1      # every Nth
+    printf '{"stage":"implementation","stage_turns":8,"session_id":"s4"}\n' >"$STATE"
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4" ] || exit 1  # 0 = off
+    exit 0 ) || return 1
+  # Wired into the primary turn path.
+  awk '/^invoke_primary\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'maybe_refresh_session' || return 1
+  return 0
+}
+
+fixture_durable_state_write() {
+  # rename alone is not durable across power loss; state_set/write_json_atomic
+  # now best-effort fsync the renamed file (perl IO::Handle, stock on
+  # macOS/Linux; silently a no-op without it). Must never fail the engine.
+  local root="$1" dir="$root/fsync"
+  mkdir -p "$dir"
+  printf 'x\n' >"$dir/f"
+  durable_sync "$dir/f" || return 1
+  durable_sync "$dir/absent" || return 1                     # missing file: no-op ok
+  grep -A 3 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'durable_sync' || return 1
+  awk '/^write_json_atomic\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'durable_sync' || return 1
+  return 0
+}
+
+fixture_rate_limit_contract_canary() {
+  # is_rate_limit_response parses the CLI's human-worded 429 message; its own
+  # comment says to re-verify when the CLI changes. A real 429 cannot be
+  # provoked on demand, so the honest canary is a version tripwire: warn (and
+  # journal) when the installed CLI differs from the version the live 429
+  # shape was last verified against. NEVER blocks.
+  local root="$1" dir="$root/canary"
+  mkdir -p "$dir"
+  [ -n "${RATE_LIMIT_CONTRACT_CLI_VERSION:-}" ] || return 1
+  ( RUN_ROOT="$dir"; RUN_ID="can-$$"; STATE=""
+    warned=0; log() { case "$*" in *429*) warned=1 ;; esac; }
+    claude() { printf '%s (Claude Code)\n' "$RATE_LIMIT_CONTRACT_CLI_VERSION"; }
+    rate_limit_contract_canary || exit 1
+    [ "$warned" -eq 0 ] || exit 1                              # matching version: silent
+    claude() { printf '9.9.9 (Claude Code)\n'; }
+    rate_limit_contract_canary || exit 1                       # mismatch: still exit 0
+    [ "$warned" -eq 1 ] || exit 1                              # ...but warns
+    jq -e 'select(.type=="contract_canary") | .payload.found=="9.9.9"' "$dir/events.jsonl" >/dev/null || exit 1
+    exit 0 ) || return 1
+  awk '/^main_run\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'rate_limit_contract_canary' || return 1
   return 0
 }
 
