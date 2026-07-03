@@ -12,6 +12,7 @@ FIXTURE_TEST=0
 DRY_RUN=0
 FULL_PERSONA_LIVE_TEST=0
 LIST_OPTIONAL_PERSONAS=0
+LIST_CONFIG=0
 PREFLIGHT=0
 RESUME=0
 MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
@@ -24,6 +25,12 @@ MAX_TASK_SECONDS="${NIGHT_SHIFT_MAX_TASK_SECONDS:-10800}"
 # healthy run (which produces a valid signal almost every turn) never trips it.
 MAX_MALFORMED_SIGNALS="${NIGHT_SHIFT_MAX_MALFORMED_SIGNALS:-5}"
 RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
+# The CLI version whose live 429 session-limit response shape was last verified
+# against is_rate_limit_response (lib/recovery.sh). A real 429 cannot be
+# provoked on demand, so the canary is a version tripwire: a differing
+# installed CLI logs a warning (never blocks) reminding to re-verify the
+# capture. Bump this after re-verifying against a real 429 on a newer CLI.
+RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.198"
 # Sanity ceiling on a rate-limit wait. A genuine session limit resets within a
 # few hours; a wait longer than this almost certainly means the reset time was
 # misparsed, so we block for manual resume instead of sleeping for ~a day.
@@ -109,6 +116,16 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # state). See scripts/lib/recovery.sh.
 # shellcheck source=scripts/lib/recovery.sh
 . "$NIGHT_SHIFT_LIB/recovery.sh"
+# The run's decision journal (emit_event -> $RUN_ROOT/events.jsonl). See
+# scripts/lib/events.sh.
+# shellcheck source=scripts/lib/events.sh
+. "$NIGHT_SHIFT_LIB/events.sh"
+# Engine-private integrity anchor for wrapper-owned files. See scripts/lib/integrity.sh.
+# shellcheck source=scripts/lib/integrity.sh
+. "$NIGHT_SHIFT_LIB/integrity.sh"
+# Verdict extraction + live-model verdict normalization. See scripts/lib/normalize.sh.
+# shellcheck source=scripts/lib/normalize.sh
+. "$NIGHT_SHIFT_LIB/normalize.sh"
 # Spec validation, path canonicalization, preflight readiness, and validation-
 # command execution. See scripts/lib/preflight.sh.
 # shellcheck source=scripts/lib/preflight.sh
@@ -130,6 +147,7 @@ Usage:
   scripts/night-shift.sh --fixture-test --dry-run
   scripts/night-shift.sh --fixture-test [--full-persona-live-test]
   scripts/night-shift.sh --list-optional-personas   # JSON manifest, no run
+  scripts/night-shift.sh --list-config              # NIGHT_SHIFT_* knobs + defaults, no run
   scripts/night-shift.sh --preflight --project PATH --spec PATH  # JSON readiness, no run
   scripts/night-shift.sh --project PATH [--spec PATH] --resume    # resume a preserved blocked run
 
@@ -152,7 +170,11 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES. (--primary is accepted only as claude.)
 EOF
 }
 
-log() { printf '[night-shift] %s\n' "$*"; }
+# STDERR, deliberately: helper output (visual_repair_screen, workers) is
+# command-substituted by callers, and stdout log lines interleaved with that
+# JSON silently broke jq parsing (the visual-repair cap accounting). Every
+# other script's log (visual-review.sh) already writes to stderr.
+log() { printf '[night-shift] %s\n' "$*" >&2; }
 die() { printf '[night-shift] BLOCKED: %s\n' "$*" >&2; exit 1; }
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 now_epoch() { date '+%s'; }
@@ -166,6 +188,7 @@ while [ "$#" -gt 0 ]; do
     --dry-run) DRY_RUN=1; shift ;;
     --full-persona-live-test) FULL_PERSONA_LIVE_TEST=1; shift ;;
     --list-optional-personas) LIST_OPTIONAL_PERSONAS=1; shift ;;
+    --list-config) LIST_CONFIG=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
     --resume) RESUME=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -200,21 +223,68 @@ emit_optional_personas_manifest() {
   printf '\n  ]\n}\n'
 }
 
+# Single discoverable inventory of the NIGHT_SHIFT_* knobs, derived from the engine
+# source so it cannot drift from the actual `${VAR:-default}` defaults. Names + the
+# defaults the code applies; see CLAUDE.md / docs/COMMAND-PLAYBOOK.md for meanings.
+list_config() {
+  printf 'night-shift configuration knobs (NIGHT_SHIFT_*) and their engine defaults.\n'
+  printf 'Derived from source; see CLAUDE.md and docs/COMMAND-PLAYBOOK.md for meanings.\n\n'
+  grep -hoE 'NIGHT_SHIFT_[A-Z_]+:-[^}"]*' \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh" \
+    "$WORKSPACE_ROOT/scripts/visual-review.sh" \
+    "$WORKSPACE_ROOT/scripts/parallel-worktrees.sh" \
+    "$NIGHT_SHIFT_LIB"/*.sh 2>/dev/null \
+    | sort -u \
+    | while IFS= read -r entry; do
+        local name def
+        name="${entry%%:-*}"; def="${entry#*:-}"
+        [ -n "$def" ] || def="(empty)"
+        printf '  %-46s default: %s\n' "$name" "$def"
+      done
+}
+
+if [ "$LIST_CONFIG" -eq 1 ]; then
+  list_config
+  exit 0
+fi
 if [ "$LIST_OPTIONAL_PERSONAS" -eq 1 ]; then
   require_command jq
   emit_optional_personas_manifest
   exit 0
 fi
 
+# Single source for the wire contracts. The gate (json_schema_basic), the
+# correction feedback (signal_rejection_reason / evidence_rejection_reason),
+# and the retry contract reminders all consult THESE, so a schema edit cannot
+# leave the feedback teaching the model the old shape — the drift that turns a
+# correctable rejection into a loop into the malformed cap.
+NEXT_ACTION_KEYS='["action","artifacts","reason","stage","task"]'
+NEXT_ACTION_ACTIONS='RUN_PERSONAS|CREATE_CANDIDATE|REQUEST_OBSERVER|RUN_VISUAL|NEXT_TASK|BLOCKED|COMPLETE'
+EXECUTION_EVIDENCE_KEYS='["baseline","final_validation","task","test_first"]'
+TEST_FIRST_KEYS='["command","failing_exit_status","failing_output","passing_exit_status","passing_output"]'
+PERSONA_REVIEW_KEYS='["commit","documentation_changes","findings","persona","stage","status"]'
+OBSERVER_REVIEW_KEYS='["candidate_commit","documentation_changes","findings","observer","primary","status","task"]'
+
+# Per-action artifact requirement — the artifact-side sibling of
+# stage_forward_actions. What a signal's artifacts must carry for the wrapper
+# to act on it; the validate_signal gate and signal_rejection_reason's
+# explanation both consult this table so they cannot drift.
+action_artifact_requirement() {
+  case "$1" in
+    CREATE_CANDIDATE) printf 'execution-evidence' ;;
+    *) printf '' ;;
+  esac
+}
+
 json_schema_basic() {
   local kind="$1" file="$2"
   jq -e . "$file" >/dev/null 2>&1 || return 1
   case "$kind" in
     next-action)
-      jq -e '
+      jq -e --argjson akeys "$NEXT_ACTION_KEYS" --arg actions "$NEXT_ACTION_ACTIONS" '
         type == "object" and
-        ((keys | sort) == ["action","artifacts","reason","stage","task"]) and
-        (.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","RUN_VISUAL","NEXT_TASK","BLOCKED","COMPLETE")) and
+        ((keys | sort) == $akeys) and
+        (.action as $a | ($actions | split("|")) | index($a) != null) and
         (.task | type == "string" and length > 0) and
         (.stage | type == "string" and length > 0) and
         (.reason | type == "string" and length > 0) and
@@ -224,10 +294,10 @@ json_schema_basic() {
       ' "$file" >/dev/null 2>&1
       ;;
     persona-review)
-      jq -e --arg personas "$PERSONAS" '
+      jq -e --arg personas "$PERSONAS" --argjson pkeys "$PERSONA_REVIEW_KEYS" '
         ($personas | split("|")) as $p |
         type == "object" and
-        ((keys | sort) == ["commit","documentation_changes","findings","persona","stage","status"]) and
+        ((keys | sort) == $pkeys) and
         (.persona as $v | $p | index($v) != null) and
         (.stage | IN("plan","implementation")) and
         (.commit == null or (.commit | type == "string" and length > 0)) and
@@ -242,9 +312,9 @@ json_schema_basic() {
       ' "$file" >/dev/null 2>&1
       ;;
     observer-review)
-      jq -e '
+      jq -e --argjson okeys "$OBSERVER_REVIEW_KEYS" '
         type == "object" and
-        ((keys | sort) == ["candidate_commit","documentation_changes","findings","observer","primary","status","task"]) and
+        ((keys | sort) == $okeys) and
         (.observer == "claude") and (.primary == "claude") and
         (.task | type == "string" and length > 0) and
         (.candidate_commit | type == "string" and test("^[0-9a-f]{7,64}$")) and
@@ -259,9 +329,9 @@ json_schema_basic() {
       ' "$file" >/dev/null 2>&1
       ;;
     execution-evidence)
-      jq -e '
+      jq -e --argjson ekeys "$EXECUTION_EVIDENCE_KEYS" --argjson tkeys "$TEST_FIRST_KEYS" '
         type == "object" and
-        ((keys | sort) == ["baseline","final_validation","task","test_first"]) and
+        ((keys | sort) == $ekeys) and
         (.task | type == "string" and length > 0) and
         (.baseline | type == "array" and length > 0 and all(.[];
           ((keys | sort) == ["command","exit_status","output"]) and
@@ -274,7 +344,7 @@ json_schema_basic() {
           (.exit_status | type == "number" and floor == . and . >= 0) and
           (.output | type == "string"))) and
         (.test_first |
-          ((keys | sort) == ["command","failing_exit_status","failing_output","passing_exit_status","passing_output"]) and
+          ((keys | sort) == $tkeys) and
           (.command | type == "string" and length > 0) and
           (.failing_exit_status | type == "number" and floor == . and . > 0) and
           (.failing_output | type == "string" and length > 0) and
@@ -325,6 +395,7 @@ write_json_atomic() {
   local tmp="${target}.tmp.$$"
   jq -n "$@" "$filter" >"$tmp" || return 1
   mv "$tmp" "$target"
+  durable_sync "$target"
 }
 
 # Rate-limit detection/reset-timing + recovery-state predicates (is_rate_limit_response,
@@ -374,12 +445,20 @@ tools_available() {
   jq -e 'all(.[]; .exit_status != 127)' "$1" >/dev/null 2>&1
 }
 
-# A fingerprint of the work under review (full diff vs base). When real code or
-# tests change, this changes and resets the stall counter, so legitimate
-# resolution attempts are not falsely blocked as "unchanged". Empty during the
-# plan stage, where no code exists yet.
+# A fingerprint of the work under review (full diff vs base, INCLUDING untracked
+# files via untracked_diff — a fix round that only adds a new file is a material
+# change and must reset the stall counter). When real code or tests change, this
+# changes, so legitimate resolution attempts are not falsely blocked as
+# "unchanged". Empty during the plan stage, where no code exists yet.
 material_token() {
-  git -C "$PROJECT" diff "$BASE_COMMIT" 2>/dev/null | cksum | awk '{print $1 ":" $2}'
+  # Constant process count regardless of how many untracked files exist (the
+  # per-file `git diff --no-index` walk is reserved for the review bundle):
+  # names via ls-files, contents via one xargs cat — still content-sensitive.
+  { git -C "$PROJECT" diff "$BASE_COMMIT" 2>/dev/null
+    git -C "$PROJECT" ls-files --others --exclude-standard -- ':(exclude).night-shift' 2>/dev/null
+    git -C "$PROJECT" ls-files --others --exclude-standard -z -- ':(exclude).night-shift' 2>/dev/null |
+      (cd "$PROJECT" 2>/dev/null && xargs -0 cat 2>/dev/null)
+  } | cksum | awk '{print $1 ":" $2}'
 }
 
 # The isolated validation worktree has none of the ignored dependency dirs.
@@ -405,16 +484,20 @@ assert_tools_available() {
 # Tracks how many consecutive rounds a finding ID recurs with the same
 # fingerprint. Cosmetic-only rounds keep the same fingerprint and accumulate;
 # a materially changed fingerprint resets the count to 1. Echoes the max count.
+# Returns non-zero on a seed/jq/write failure — NEVER die(): callers invoke this
+# inside $(...), where die would kill only the subshell and leave the caller
+# comparing an empty string (same hazard state_int documents). The CALLER must
+# check the return code and block with the real reason.
 bump_finding_history() {
   local history="$1" findings="$2" tmp
-  [ -f "$history" ] || printf '{}\n' >"$history"
+  [ -f "$history" ] || printf '{}\n' >"$history" 2>/dev/null || return 1
   tmp="$history.tmp.$$"
   jq --argjson findings "$findings" '
     reduce $findings[] as $f (.;
       .[$f.id] = (if .[$f.id].fingerprint == $f.fp
         then {fingerprint:$f.fp, count:(.[$f.id].count + 1)}
         else {fingerprint:$f.fp, count:1} end))
-  ' "$history" >"$tmp" && mv "$tmp" "$history" || die "failed to update finding history"
+  ' "$history" >"$tmp" 2>/dev/null && mv "$tmp" "$history" || { rm -f "$tmp"; return 1; }
   jq -r '[to_entries[].value.count] | max // 0' "$history"
 }
 
@@ -434,17 +517,31 @@ record_cost() {
 }
 
 compact_success() {
-  local run_dir="$1" run_id="$2" archive ledger
+  local run_dir="$1" run_id="$2" archive ledger copy_ok=1
   archive="$run_dir/archive/$run_id"
-  mkdir -p "$archive"
-  [ -f "$run_dir/state.json" ] && cp "$run_dir/state.json" "$archive/state.json"
-  [ -d "$run_dir/validated" ] && cp -R "$run_dir/validated" "$archive/validated"
-  [ -f "$run_dir/summary.json" ] && cp "$run_dir/summary.json" "$archive/summary.json"
+  # Every copy is verified BEFORE the delete loop below: a failed copy (disk
+  # full, perms, a file squatting the archive path) must preserve the full run
+  # state rather than silently destroying a successful run's evidence. The run
+  # itself is still complete — we merely skip compaction and say so.
+  mkdir -p "$archive" 2>/dev/null || copy_ok=0
+  if [ "$copy_ok" -eq 1 ]; then
+    [ ! -f "$run_dir/state.json" ] || cp "$run_dir/state.json" "$archive/state.json" || copy_ok=0
+    [ ! -d "$run_dir/validated" ] || cp -R "$run_dir/validated" "$archive/validated" || copy_ok=0
+    [ ! -f "$run_dir/summary.json" ] || cp "$run_dir/summary.json" "$archive/summary.json" || copy_ok=0
+    # The decision journal is a first-class archive artifact (study the run later).
+    [ ! -f "$run_dir/events.jsonl" ] || cp "$run_dir/events.jsonl" "$archive/events.jsonl" || copy_ok=0
+  fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
   # survives even when a raw is gone by archive time; copy it and add a TOTAL row.
   ledger="$archive/costs.jsonl"
-  [ -f "$run_dir/cost-ledger.jsonl" ] && cp "$run_dir/cost-ledger.jsonl" "$ledger"
+  if [ "$copy_ok" -eq 1 ] && [ -f "$run_dir/cost-ledger.jsonl" ]; then
+    cp "$run_dir/cost-ledger.jsonl" "$ledger" || copy_ok=0
+  fi
+  if [ "$copy_ok" -eq 0 ]; then
+    log "archive copy failed; preserving the FULL run state at $run_dir (no compaction)"
+    return 0
+  fi
   if [ -s "$ledger" ]; then
     # Compute the TOTAL row into a temp first, then append: reading and appending
     # the same file in one pipeline (jq ... "$ledger" >>"$ledger") has undefined
@@ -470,12 +567,23 @@ compact_success() {
 # release_lock now live in scripts/lib/locking.sh (sourced above), shared with
 # device-registry.sh which reuses the atomic-claim idiom.
 
+# Best-effort per-file fsync: tmp+mv alone is not durable across power loss (a
+# crash can leave a truncated file the recovery path then refuses to resume).
+# perl's IO::Handle is stock on macOS + Linux; silently a no-op without it —
+# durability hardening must never fail the engine.
+durable_sync() {
+  [ -f "${1:-}" ] || return 0
+  perl -MIO::Handle -e 'open(my $f, "<", $ARGV[0]) or exit 0; $f->sync; exit 0' "$1" 2>/dev/null || true
+}
+
 state_set() {
   local filter="$1"
   shift
   local tmp="$STATE.tmp.$$"
   jq "$@" "$filter" "$STATE" >"$tmp" && mv "$tmp" "$STATE" ||
     die "failed to update run state; preserved at ${RUN_ROOT:-unknown}"
+  durable_sync "$STATE"
+  integrity_put "$STATE"
 }
 
 # Pure predicate: return 0 if $1 is a non-negative integer string, 1 otherwise.
@@ -540,6 +648,13 @@ initialize_run() {
     --arg base "$BASE_COMMIT" --arg branch "$BASE_BRANCH" \
     --arg baseline_status "$BASE_STATUS" ||
     die "could not initialize run state"
+  integrity_put "$STATE"
+  # Arm the interrupt trap now that state.json exists but BEFORE the minutes-long
+  # baseline validation below. Otherwise a signal during baseline validation frees
+  # the lock (EXIT trap) yet leaves status="running" with no block_reason, which the
+  # supervisor treats as a hard error and escalates instead of resuming. main_run
+  # re-arms the same trap after init for the recovery path; re-setting is harmless.
+  trap 'block_run "run interrupted by signal"' HUP INT TERM
   baseline_commands="$(extract_validation_commands "$SPEC" "Baseline validation commands")"
   run_validation_commands baseline "$RUN_ROOT/validated/baseline.json" "$baseline_commands" ||
     block_run "baseline validation commands are missing or could not run"
@@ -562,6 +677,9 @@ initialize_run() {
     state_set '.test_first_baseline_green=false'
   fi
   state_set '.baseline_complete=true'
+  emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
+    --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
+    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs}}')"
 }
 
 recover_run() {
@@ -613,6 +731,7 @@ recover_run() {
     state_set '.stage_started_at=$now | .task_started_at=$now | .stage_started[.stage]=$now | .updated_at=$iso' \
       --argjson now "$(now_epoch)" --arg iso "$(now_iso)"
   fi
+  emit_event run_recovered "$(jq -cn --argjson rb "$resume_block" '{resumed_block: ($rb == 1)}')"
 }
 
 archive_old_signal() {
@@ -681,6 +800,27 @@ spec_has_design_contract() {
   [ -n "${1:-}" ] && grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
 }
 
+# A long grind inside ONE stage replays ever-growing session history every
+# turn (the cost/rot problem stage-scoped sessions solve at stage boundaries,
+# recurring within a stage). Clears the pinned session every
+# NIGHT_SHIFT_SESSION_REFRESH_TURNS stage turns (default 8; 0 disables): the
+# next turn starts fresh and reorients from the files on disk via the same
+# handoff note a stage boundary uses. Echoes the (possibly cleared) session.
+maybe_refresh_session() {
+  local session="$1" refresh turns
+  refresh="${NIGHT_SHIFT_SESSION_REFRESH_TURNS:-8}"
+  is_valid_int "$refresh" || refresh=0
+  { [ "$refresh" -gt 0 ] && [ -n "$session" ]; } || { printf '%s' "$session"; return 0; }
+  turns="$(state_int '.stage_turns')" || turns=0
+  if [ "$turns" -ge "$refresh" ] && [ $((turns % refresh)) -eq 0 ]; then
+    log "session refresh: $turns stage turns in this stage; starting a fresh session (file handoff)"
+    emit_event session_refresh "$(jq -cn --argjson t "$turns" '{stage_turns:$t}')"
+    state_set '.session_id=null'
+    return 0
+  fi
+  printf '%s' "$session"
+}
+
 # Pure: the model the primary should run on in a given session scope. Planning is
 # low-token, high-leverage judgment (a bad plan poisons the whole implement loop),
 # so it gets PLAN_MODEL; everything after the plan — the implement grind, the
@@ -703,8 +843,9 @@ stage_model() {
 
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
-  local review_stage_name pending pending_stage review_set model_line reround_note
+  local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
+  local rejection_note malformed_prev
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
@@ -720,8 +861,6 @@ primary_prompt() {
   review_set="$(review_round_set "$active" "$pending" "$pending_stage" "$review_stage_name")"
   persona_list="$(printf '%s' "$review_set" | tr '|' '\n' | sed 's/^/  - /')"
   persona_count="$(printf '%s' "$review_set" | tr '|' '\n' | grep -c .)"
-  model_line=""
-  [ "$PERSONA_MODEL" = "inherit" ] || model_line=" launched with model \"$PERSONA_MODEL\","
   reround_note=""
   if [ "$review_set" != "$active" ]; then
     reround_note="
@@ -751,6 +890,21 @@ approved work or redo findings already resolved. Read what you need:
   - the latest observer verdict at .night-shift/validated/observer-*.json, if any;
   - the in-progress implementation IS the working tree — diff it against the base
     commit $BASE_COMMIT to see exactly what has been done so far.
+"
+  fi
+  # A correction turn (previous signal malformed/absent) must say WHAT was wrong:
+  # without this the re-prompt is byte-identical to the original and the model has
+  # no reason to change the file it believes it already wrote correctly.
+  rejection_note=""
+  malformed_prev="$(jq -r '.malformed_signal_consecutive // 0' "$STATE" 2>/dev/null)"
+  is_valid_int "$malformed_prev" || malformed_prev=0
+  if [ "$malformed_prev" -gt 0 ] && [ -s "$RUN_ROOT/control/signal-rejection.txt" ]; then
+    rejection_note="
+SIGNAL REJECTED — your previous turn's .night-shift/control/next-action.json was
+invalid and has been DISCARDED ($malformed_prev consecutive rejections; the run
+blocks at $MAX_MALFORMED_SIGNALS). The wrapper rejected it because:
+  $(cat "$RUN_ROOT/control/signal-rejection.txt")
+Fix exactly that and rewrite the WHOLE file this turn in the required shape below.
 "
   fi
   design_build_note=""
@@ -787,15 +941,17 @@ Base commit: $BASE_COMMIT
 $design_build_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
-You own planning, implementation, reviewer coordination, finding resolution,
-validation, candidate commits, documentation, and task completion.
+You own planning, implementation, resolving review findings, validation,
+candidate commits, documentation, and task completion. The ENGINE runs the
+review personas itself; you do not coordinate or run reviewers.
 
 Maintain the authoritative plan at .night-shift/control/plan.md: write it during
 planning (acceptance criteria, approach, file-level steps) and keep it current as
 work proceeds. It is the handoff record across stage sessions and the "current
 plan" section of the RUN_PERSONAS review bundle.
 $handoff_note
-The review personas to run on the next RUN_PERSONAS action ($persona_count required results) are:
+On the next RUN_PERSONAS action the ENGINE runs these $persona_count independent
+review personas itself (you do NOT run them or write their results):
 $persona_list
 $reround_note
 Stage gate — you are at stage "$stage". The wrapper advances stages ONE step at a
@@ -806,29 +962,34 @@ RUN_PERSONAS — the wrapper moves you to the candidate (CREATE_CANDIDATE) and t
 independent observer (REQUEST_OBSERVER) on later turns. Do not create the
 candidate commit or request the observer yourself from an earlier stage; any
 out-of-stage signal is rejected and wastes a turn.
-
+$rejection_note
 Before ending this turn, write a fresh JSON signal to:
   .night-shift/control/next-action.json
-It must validate against $SCHEMA_DIR/next-action.json. "task" must equal
-$SPEC. "artifacts" lists only project-relative files (no absolute paths, no
-"..") the wrapper must consume for the chosen action:
+It must validate against $SCHEMA_DIR/next-action.json: a single JSON object with
+EXACTLY these five top-level keys — no more, no fewer — shaped like:
+  {"action":"<$expected or BLOCKED>","artifacts":[],"reason":"<one sentence>","stage":"$stage","task":"$SPEC"}
+"task" must equal $SPEC exactly and "stage" must equal "$stage". "artifacts"
+lists only project-relative files (no absolute paths, no "..") the wrapper must
+consume for the chosen action:
 
-- RUN_PERSONAS: first assemble ONE review bundle at
-  .night-shift/control/review-bundle.md containing the spec, the current plan,
-  the full diff against the base commit, and the latest test output. Then run
-  each persona listed above as a separate sub-agent,${model_line} each scoped to
-  its own domain and judging from the bundle — personas must not re-explore the
-  repo themselves. Write exactly $persona_count result files, one per listed
-  persona, each validating against $SCHEMA_DIR/persona-review.json, with the
-  persona's exact name and "stage" set to "plan" during plan_review or
-  "implementation" during implementation_review. In "artifacts" list ONLY those
-  persona result files — do NOT list the review bundle or the plan doc (they are
-  written to disk but are not persona results). Do not run personas outside the
-  listed set. Every finding is a blocker; APPROVE carries no findings.
+- RUN_PERSONAS: ensure the authoritative plan at .night-shift/control/plan.md is
+  current (it is the plan the reviewers judge), then signal RUN_PERSONAS with an
+  EMPTY "artifacts" array. The ENGINE assembles the review bundle (spec, plan, the
+  diff against the base commit, validation output) and runs each of the
+  $persona_count active personas as an independent, context-isolated sub-agent
+  itself — you do NOT run personas, write persona result files, or list them. On a
+  re-review round, resolve every finding the engine reported last round before you
+  signal RUN_PERSONAS again.
 - CREATE_CANDIDATE: create ONE local commit on the feature branch containing
   only files this run changed (never baseline dirty paths). Then write an
   execution-evidence file validating against $SCHEMA_DIR/execution-evidence.json
-  whose baseline, test_first, and final_validation match the spec's commands.
+  whose baseline, test_first, and final_validation match the spec's commands,
+  shaped EXACTLY like (all four top-level keys; test_first carries BOTH the
+  failing and the passing evidence; integer exit statuses, key name exit_status):
+    {"task":"$SPEC",
+     "baseline":[{"command":"<cmd>","exit_status":0,"output":"<output>"}],
+     "test_first":{"command":"<cmd>","failing_exit_status":1,"failing_output":"<red>","passing_exit_status":0,"passing_output":"<green>"},
+     "final_validation":[{"command":"<cmd>","exit_status":0,"output":"<output>"}]}
   List that evidence file in artifacts.
 - REQUEST_OBSERVER: list the candidate evidence, relevant tests, and docs the
   fresh observer needs. The wrapper runs the observer; do not run it yourself.
@@ -875,8 +1036,9 @@ invoke_primary() {
   is_valid_int "$consecutive_429" || consecutive_429=0
   enforce_limits
   archive_old_signal
-  primary_prompt "$prompt"
   session="$(jq -r '.session_id // empty' "$STATE")"
+  session="$(maybe_refresh_session "$session")"
+  primary_prompt "$prompt"
   # Model for this stage's scope, pinned only on a FRESH start. A session is born
   # inside one scope and the model is constant within a scope (a scope boundary
   # already nulls .session_id and starts a fresh session), so a --resume — whether
@@ -915,6 +1077,7 @@ invoke_primary() {
       session="$emitted"
       state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
         --arg session "$session" --argjson n "$consecutive_429" --arg now "$(now_iso)"
+      emit_event rate_limit_wait "$(jq -cn --argjson n "$consecutive_429" '{consecutive:$n}')"
       wait_for_rate_limit_reset "$raw"
       continue
     fi
@@ -924,6 +1087,10 @@ invoke_primary() {
   if [ -n "$session" ] && [ "$emitted" != "$session" ]; then
     block_run "primary session ID changed from $session to $emitted"
   fi
+  # The primary just had unattended write access to the whole project including
+  # .night-shift/. Verify the wrapper-owned state BEFORE the engine's own writes
+  # below would launder an out-of-band edit into the private copy.
+  integrity_guard "$STATE" "state-turn-$turn" "state.json (during the primary turn)"
   state_set '
     .session_id=$session |
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
@@ -1012,33 +1179,71 @@ set_stage() {
     .updated_at=\$now${session_clear}${scope_reset}
   " \
     --arg stage "$1" --argjson epoch "$(now_epoch)" --arg now "$(now_iso)"
+  emit_event stage_transition "$(jq -cn --arg from "$old_stage" --arg to "$1" \
+    --argjson sc "$([ -n "$session_clear" ] && printf true || printf false)" \
+    '{from:$from, to:$to, session_cleared:$sc}')"
 }
 
-transition_allowed() {
-  case "$1:$2" in
-    planning:RUN_PERSONAS|plan_review:RUN_PERSONAS|implementation:RUN_PERSONAS|implementation_review:RUN_PERSONAS|implementation_ready:CREATE_CANDIDATE|visual_review:RUN_VISUAL|observer_review:REQUEST_OBSERVER|completion:NEXT_TASK|completion:COMPLETE|*:BLOCKED) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Pure: the single forward action a stage may emit (BLOCKED is always also valid).
-# Mirrors transition_allowed so the prompt can tell the primary exactly which
-# signal to write — the wrapper advances stages one step at a time, so a primary
-# that skips ahead (e.g. REQUEST_OBSERVER straight from implementation) is blocked.
-# Keep in sync with transition_allowed above.
-expected_action() {
+# SINGLE SOURCE OF TRUTH for the stage state machine: the forward action(s) a
+# stage may legally emit (space-separated; most stages have one, `completion` has
+# two). transition_allowed (the gate) and expected_action (the prompt) both derive
+# from this, so the gate and the prompt can never drift apart. BLOCKED is always
+# also valid and is handled directly in transition_allowed. An unknown stage
+# returns non-zero so callers reject it.
+stage_forward_actions() {
   case "$1" in
     planning|plan_review|implementation|implementation_review) printf 'RUN_PERSONAS' ;;
     implementation_ready) printf 'CREATE_CANDIDATE' ;;
     visual_review) printf 'RUN_VISUAL' ;;
     observer_review) printf 'REQUEST_OBSERVER' ;;
-    completion) printf 'NEXT_TASK or COMPLETE' ;;
-    *) printf 'BLOCKED' ;;
+    completion) printf 'NEXT_TASK COMPLETE' ;;
+    *) return 1 ;;
   esac
+}
+
+transition_allowed() {
+  local actions
+  [ "$2" = "BLOCKED" ] && return 0
+  actions="$(stage_forward_actions "$1")" || return 1
+  case " $actions " in *" $2 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# Pure: the forward action(s) a stage may emit, in display form ("A or B" when a
+# stage permits more than one). Derived from stage_forward_actions so the prompt
+# always matches the gate; an unknown stage shows BLOCKED. The wrapper advances
+# stages one step at a time, so a primary that skips ahead (e.g. REQUEST_OBSERVER
+# straight from implementation) is blocked.
+expected_action() {
+  local actions
+  actions="$(stage_forward_actions "$1")" || { printf 'BLOCKED'; return 0; }
+  printf '%s' "$actions" | sed 's/ / or /g'
+}
+
+# Warn (never block) when the installed CLI differs from the version the live
+# 429 contract was verified against — is_rate_limit_response parses a
+# human-worded message that can change under us; a silent parser break would
+# turn a survivable session limit into a hard block at 3am.
+rate_limit_contract_canary() {
+  local found
+  found="$(claude --version 2>/dev/null | awk '{print $1}')" || found=""
+  [ -n "$found" ] || return 0
+  [ "$found" != "$RATE_LIMIT_CONTRACT_CLI_VERSION" ] || return 0
+  log "WARNING: CLI $found differs from $RATE_LIMIT_CONTRACT_CLI_VERSION, the version the 429 rate-limit contract was last verified against; re-verify against a real 429 capture and bump RATE_LIMIT_CONTRACT_CLI_VERSION"
+  emit_event contract_canary "$(jq -cn --arg expected "$RATE_LIMIT_CONTRACT_CLI_VERSION" --arg found "$found" \
+    '{contract:"rate-limit-429", expected:$expected, found:$found}')"
+  return 0
 }
 
 block_run() {
   local reason="$1"
+  # Disarm the interrupt trap first: block_run's cleanup below is slow, and a second
+  # signal arriving mid-cleanup would re-enter block_run (double cleanup, garbled
+  # reason). The EXIT trap still runs release_lock. (HUP/INT/TERM only; not EXIT.)
+  trap '' HUP INT TERM
+  # BEFORE cleanup_observer_tmp (which removes the workers' neutral cwds): stop
+  # any live paid persona sessions and salvage the interrupted batch's costs.
+  reap_persona_workers 2>/dev/null || true
+  emit_event run_blocked "$(jq -cn --arg r "$reason" '{reason:$r}')"
   cleanup_validation_worktree >/dev/null 2>&1 || reason="$reason; validation worktree cleanup also failed"
   cleanup_observer_tmp
   # Record the blocked status best-effort: if state.json is corrupt, state_set
@@ -1073,6 +1278,8 @@ cleanup_validation_worktree() {
 cleanup_observer_tmp() {
   [ -n "${RUN_ID:-}" ] || return 0
   rm -rf "${TMPDIR:-/tmp}/night-shift-observer-$RUN_ID" 2>/dev/null || true
+  # The engine-spawned personas use a sibling neutral dir; clean it up too.
+  rm -rf "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID" "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID"-* 2>/dev/null || true
 }
 
 validate_signal() {
@@ -1080,77 +1287,497 @@ validate_signal() {
   [ -f "$signal" ] || return 2
   json_schema_basic next-action "$signal" || return 1
   [ "$(jq -r '.task' "$signal")" = "$SPEC" ] || return 1
+  # An action whose artifact requirement (per the action_artifact_requirement
+  # table) is unmet is rejected HERE, where the malformed-signal correction
+  # machinery feeds the reason back to the primary — not deep in the handler,
+  # whose gate (kept as defense in depth) is a terminal block the primary never
+  # gets to fix. A live model reliably mis-shapes the evidence on the first try
+  # (exit_code for exit_status, missing task, a flat test_first); that must
+  # cost a correction turn, not the run.
+  case "$(action_artifact_requirement "$(jq -r '.action' "$signal")")" in
+    execution-evidence) signal_has_valid_evidence "$signal" || return 1 ;;
+  esac
 }
 
-# Extracts the observer's JSON verdict from a `claude -p --output-format json`
-# envelope, trying the most reliable shapes in order.
-extract_claude_structured() {
-  local raw="$1" out="$2" result
-  # (0) An explicit structured_output field, if a future flag ever populates it.
-  if jq -e 'has("structured_output") and .structured_output != null' "$raw" >/dev/null 2>&1; then
-    jq '.structured_output' "$raw" >"$out" 2>/dev/null && return 0
-  fi
-  result="$(jq -r '.result // empty' "$raw" 2>/dev/null)"
-  [ -n "$result" ] || return 1
-  # (1) The whole result is already a JSON object.
-  printf '%s' "$result" | jq '.' >"$out" 2>/dev/null && return 0
-  # (2) The LAST fenced code block (``` or ```json) — the model's verdict block.
-  printf '%s\n' "$result" | awk '
-    /^[ \t]*```/ { if (infence) { infence=0; last=buf } else { infence=1; buf="" } next }
-    infence { buf = buf $0 "\n" }
-    END { printf "%s", last }
-  ' | jq '.' >"$out" 2>/dev/null && [ -s "$out" ] && return 0
-  # (3) The outermost {...} object embedded anywhere in prose.
-  printf '%s' "$result" | tr '\n' ' ' \
-    | sed -E 's/^[^{]*//; s/[^}]*$//' \
-    | jq '.' >"$out" 2>/dev/null && [ -s "$out" ] && return 0
+# True when any artifact in the signal is a schema-valid execution-evidence file
+# whose task matches the current spec (the same two checks verify_candidate makes).
+signal_has_valid_evidence() {
+  local signal="$1" artifact resolved
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
+    resolved="$(resolve_artifact "$artifact")" || continue
+    if json_schema_basic execution-evidence "$resolved" &&
+      [ "$(jq -r '.task' "$resolved")" = "$SPEC" ]; then
+      return 0
+    fi
+  done <<EOF
+$(jq -r '.artifacts[]' "$signal" 2>/dev/null)
+EOF
   return 1
 }
 
-# Normalize a near-miss persona-review record to the canonical schema shape so the
-# round gate (which reads .status) accepts a genuine APPROVE/BLOCK result instead
-# of rejecting it with a confusing downstream message ("BLOCK by <empty>"). The
-# primary occasionally writes `verdict` for the schema's `status`, and omits the
-# always-empty `commit`/`documentation_changes` on a clean APPROVE. Pure: reads $1,
-# prints normalized JSON; a non-record (review bundle, plan doc) passes through and
-# then fails json_schema_basic, exactly as before. (GH #20)
-normalize_persona_result() {
-  jq '
-    (if (has("verdict") and (has("status") | not)) then (.status = .verdict | del(.verdict)) else . end)
-    | (if has("commit") then . else .commit = null end)
-    | (if has("documentation_changes") then . else .documentation_changes = [] end)
-  ' "$1"
+# Specific reason an execution-evidence file fails the schema, in check order.
+evidence_rejection_reason() {
+  local f="$1" keys
+  if ! jq -e . "$f" >/dev/null 2>&1; then
+    printf 'the file is not valid JSON'
+    return 0
+  fi
+  keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$f")"
+  if [ "$keys" != "$EXECUTION_EVIDENCE_KEYS" ]; then
+    printf 'top-level keys must be EXACTLY %s; the file has %s' "$EXECUTION_EVIDENCE_KEYS" "$keys"
+    return 0
+  fi
+  if [ "$(jq -r '.task' "$f")" != "$SPEC" ]; then
+    printf '"task" must equal %s exactly' "$SPEC"
+    return 0
+  fi
+  keys="$(jq -c '.test_first | if type == "object" then (keys | sort) else type end' "$f")"
+  if [ "$keys" != "$TEST_FIRST_KEYS" ]; then
+    printf '"test_first" keys must be EXACTLY %s (failing AND passing evidence, not a single exit_code/output pair); the file has %s' "$TEST_FIRST_KEYS" "$keys"
+    return 0
+  fi
+  printf 'baseline/final_validation must be non-empty arrays of {"command","exit_status","output"} (integer exit_status >= 0), test_first needs failing_exit_status > 0 with non-empty failing_output and passing_exit_status == 0 with non-empty passing_output'
 }
 
-# Copies the persona-review artifacts listed in a RUN_PERSONAS signal into the
-# round result dir. Each artifact is resolved for safety first (an unsafe or
-# missing path is fatal — path-traversal guard). Each is normalized (verdict→status
-# etc.) then validated; artifacts that still do not validate as persona-review
-# records are SKIPPED, not fatal: the primary also lists non-persona deliverables it
-# produced (the review bundle, the plan doc), and the exact-set + count + stage gate
-# in run_personas is the real enforcement. The normalized result is written into the
-# round dir, overwriting any malformed copy the primary placed there directly (which
-# previously lingered and made the gate miscount). Returns non-zero only on an
-# unsafe/missing path or a write failure.
-collect_persona_results() {
-  local signal="$1" result_dir="$2" artifact out dst tmp
-  while IFS= read -r artifact; do
-    [ -n "$artifact" ] || continue
-    out="$(resolve_artifact "$artifact")" || return 1
-    tmp="$result_dir/.collect-$$.json"
-    if normalize_persona_result "$out" >"$tmp" 2>/dev/null && json_schema_basic persona-review "$tmp"; then
-      dst="$result_dir/$(basename "$out")"
-      mv "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
-    else
-      rm -f "$tmp"
+# Human-readable reason the last next-action signal was rejected, mirroring
+# validate_signal/json_schema_basic checks in order of likelihood. Fed back into
+# the correction turn (primary_prompt) so the model learns exactly what to fix —
+# without it the re-prompt is indistinguishable from the original and a weaker
+# model can loop the same mistake into the malformed cap.
+signal_rejection_reason() {
+  local signal="$1" rc="$2" keys
+  if [ "$rc" -eq 2 ] || [ ! -f "$signal" ]; then
+    printf 'no signal file was written to .night-shift/control/next-action.json before the turn ended'
+    return 0
+  fi
+  if ! jq -e . "$signal" >/dev/null 2>&1; then
+    printf 'the file is not valid JSON'
+    return 0
+  fi
+  keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$signal")"
+  if [ "$keys" != "$NEXT_ACTION_KEYS" ]; then
+    printf 'top-level keys must be EXACTLY %s (no more, no fewer); the file has %s' "$NEXT_ACTION_KEYS" "$keys"
+    return 0
+  fi
+  if ! jq -e --arg actions "$NEXT_ACTION_ACTIONS" '.action as $a | ($actions | split("|")) | index($a) != null' "$signal" >/dev/null 2>&1; then
+    printf '"action" %s is not one of %s' "$(jq -c '.action' "$signal")" "$NEXT_ACTION_ACTIONS"
+    return 0
+  fi
+  if [ "$(jq -r '.task' "$signal")" != "$SPEC" ]; then
+    printf '"task" must equal %s exactly; the file has %s' "$SPEC" "$(jq -c '.task' "$signal")"
+    return 0
+  fi
+  if ! jq -e '(.stage | type == "string" and length > 0) and (.reason | type == "string" and length > 0)' "$signal" >/dev/null 2>&1; then
+    printf '"stage" and "reason" must both be non-empty strings'
+    return 0
+  fi
+  if [ "$(action_artifact_requirement "$(jq -r '.action' "$signal")")" = "execution-evidence" ] &&
+    ! signal_has_valid_evidence "$signal"; then
+    local first resolved
+    first="$(jq -r '.artifacts[0] // empty' "$signal")"
+    if [ -z "$first" ]; then
+      printf '%s must list the execution-evidence file in "artifacts"' "$(jq -r '.action' "$signal")"
+      return 0
     fi
-  done <<EOF
-$(jq -r '.artifacts[]' "$signal")
+    if ! resolved="$(resolve_artifact "$first")"; then
+      printf 'the execution-evidence artifact %s is missing from the project (or unsafe: absolute/"..")' "$first"
+      return 0
+    fi
+    printf 'the execution-evidence artifact %s failed schema validation (%s/execution-evidence.json): %s' \
+      "$first" "$SCHEMA_DIR" "$(evidence_rejection_reason "$resolved")"
+    return 0
+  fi
+  printf '"artifacts" must be an array of unique, non-empty, project-relative paths (no absolute paths, no "..")'
+}
+
+# --- engine-spawned persona review (provenance: the WRAPPER runs each persona) --
+# Personas are run by the engine itself, not the primary, so a primary cannot
+# fabricate review approvals: it only signals RUN_PERSONAS (empty artifacts) and
+# the wrapper assembles the bundle, spawns each persona as an independent,
+# context-isolated sub-agent (mirroring the observer), stamps the result's
+# identity, validates it, and writes it into the round dir.
+
+persona_doc() {
+  case "$1" in
+    # node reuses the backend personas (Backend & Data Expert, TypeScript, …) that
+    # are documented in the web doc, so it prefers that doc for its lenses.
+    web|node) printf '%s' "$WORKSPACE_ROOT/docs/review-personas-web.md" ;;
+    *)        printf '%s' "$WORKSPACE_ROOT/docs/review-personas.md" ;;
+  esac
+}
+
+# Slug a persona name to a filesystem-safe, collision-free token. "TypeScript &
+# Code Quality Expert" -> "typescript-code-quality-expert".
+persona_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' |
+    sed -E 's/-+/-/g; s/^-//; s/-$//'
+}
+
+# Extract a persona's review-lens prose from the track's persona doc (falling back
+# to the other doc, since the node track reuses backend personas documented under
+# web). Matches a markdown heading whose text — after stripping #s and an optional
+# "N. " ordinal — equals the persona name, and prints the section body up to the
+# next heading. Empty output is acceptable: persona_prompt falls back to a generic
+# instruction so a missing doc never blocks a run.
+persona_lens() {
+  local persona="$1" track="$2" doc body
+  for doc in "$(persona_doc "$track")" \
+             "$WORKSPACE_ROOT/docs/review-personas.md" \
+             "$WORKSPACE_ROOT/docs/review-personas-web.md"; do
+    [ -f "$doc" ] || continue
+    body="$(awk -v name="$persona" '
+      /^#{1,6}[ \t]/ {
+        lvl=0; while (substr($0, lvl+1, 1) == "#") lvl++;
+        h=$0; sub(/^#{1,6}[ \t]+/, "", h); sub(/^[0-9]+\.[ \t]+/, "", h);
+        sub(/[ \t]+$/, "", h);
+        # End the section only at a heading of the SAME-or-shallower level; a deeper
+        # sub-heading (e.g. #### Examples under a ## persona) is part of the body.
+        if (insec) { if (lvl <= seclvl) exit; else { print; next } }
+        if (h == name) { insec=1; seclvl=lvl; next }
+        next
+      }
+      insec { print }
+    ' "$doc")"
+    if [ -n "$body" ]; then printf '%s' "$body"; return 0; fi
+  done
+  return 0
+}
+
+# Assemble the review bundle the engine hands every persona: the spec, the
+# approved plan, and (for implementation) the diff against the base commit plus
+# the latest validation output. Wrapper-computed, so the evidence the reviewers
+# judge is independent of anything the primary chooses to surface.
+# Emit a size-bounded diff for a review bundle/observer context: a --stat summary
+# (always) then the full diff capped at NIGHT_SHIFT_DIFF_BUDGET bytes with an
+# explicit truncation marker. A large-but-legitimate diff (lockfile regen, vendored
+# or generated files, snapshot updates) otherwise overflows the model context and
+# garbles the verdict. $@ are git-diff args: a range (BASE..CAND) or a single
+# BASE for a working-tree diff.
+# `git diff <commit>` omits untracked files entirely, so a brand-new file the
+# primary has not yet staged would be invisible to a working-tree diff. Emit a
+# synthetic new-file diff (or --stat line, per the args) for every untracked,
+# non-ignored file. Engine state under .night-shift/ is excluded explicitly so
+# it never leaks into a review bundle even when the project forgot to gitignore
+# it. `diff --no-index` exits 1 whenever the files differ; that is the expected
+# case, not an error.
+untracked_diff() {
+  git -C "$PROJECT" ls-files --others --exclude-standard -z -- ':(exclude).night-shift' 2>/dev/null |
+    while IFS= read -r -d '' f; do
+      git -C "$PROJECT" diff --no-index -- /dev/null "$f" 2>/dev/null || true
+    done
+}
+
+bounded_diff() {
+  local include_untracked=0
+  if [ "${1:-}" = "--include-untracked" ]; then include_untracked=1; shift; fi
+  local budget="${NIGHT_SHIFT_DIFF_BUDGET:-400000}" body n ut_tmp=""
+  if [ "$include_untracked" -eq 1 ]; then
+    # ONE untracked walk per call: the per-file `git diff --no-index` forks
+    # dominate on repos with many untracked files, so the patch is generated
+    # once and reused for both the --stat header (derived from the same patch
+    # via `git apply --stat`, best-effort) and the body.
+    ut_tmp="$(tmp_base)/ns-untracked-$$.diff"
+    untracked_diff >"$ut_tmp" 2>/dev/null || true
+  fi
+  git -C "$PROJECT" diff --stat "$@" 2>/dev/null
+  [ -z "$ut_tmp" ] || [ ! -s "$ut_tmp" ] || git apply --stat "$ut_tmp" 2>/dev/null || true
+  printf '\n'
+  body="$( { git -C "$PROJECT" diff "$@" 2>/dev/null
+             [ -z "$ut_tmp" ] || cat "$ut_tmp" 2>/dev/null
+           } | head -c "$((budget + 1))")"
+  n="$(printf '%s' "$body" | wc -c | tr -d ' ')"
+  if [ "$n" -gt "$budget" ]; then
+    # head -c is byte-based and can cut mid-UTF-8; drop an incomplete trailing
+    # sequence so the emitted prompt is always valid UTF-8 (best-effort: pass
+    # through unchanged if iconv is unavailable).
+    printf '%s' "$body" | head -c "$budget" | { iconv -f UTF-8 -t UTF-8//IGNORE 2>/dev/null || cat; }
+    printf '\n[... diff truncated at %s bytes; full file list in the --stat above ...]\n' "$budget"
+  else
+    printf '%s\n' "$body"
+  fi
+  [ -z "$ut_tmp" ] || rm -f "$ut_tmp" 2>/dev/null || true
+}
+
+assemble_review_bundle() {
+  local stage="$1" out="$2"
+  {
+    printf '# Review bundle (engine-assembled) — stage: %s\n\n' "$stage"
+    printf '## Task spec\n\n'
+    cat "$SPEC"
+    if [ -s "$RUN_ROOT/control/plan.md" ]; then
+      printf '\n\n## Approved plan\n\n'
+      cat "$RUN_ROOT/control/plan.md"
+    fi
+    if [ "$stage" = "implementation" ]; then
+      # Working-tree diff (there is no candidate commit yet at persona-review time);
+      # size-bounded so a large change cannot overflow the reviewer's context.
+      printf '\n\n## Implementation diff against base commit %s (working tree)\n\n```diff\n' "$BASE_COMMIT"
+      bounded_diff --include-untracked "$BASE_COMMIT" -- .
+      printf '```\n'
+      if [ -s "$RUN_ROOT/validated/baseline.json" ]; then
+        printf '\n## Baseline validation output\n\n```json\n'
+        cat "$RUN_ROOT/validated/baseline.json"
+        printf '\n```\n'
+      fi
+    fi
+  } >"$out"
+}
+
+# The prompt for one engine-spawned persona. Mirrors observer_prompt: judge only
+# the supplied bundle, end with a single fenced json verdict block.
+# Shared retry-rejection wording for BOTH reviewer prompts — one voice for the
+# persona and observer tiers (the same principle as the primary's signal-
+# rejection feedback: a blind re-send reliably repeats the mistake). Empty
+# note renders nothing.
+rejection_preamble() {
+  [ -n "${1:-}" ] || return 0
+  printf '\nPREVIOUS ATTEMPT REJECTED: a previous attempt at this review was discarded\nbecause: %s\nAvoid that mistake; follow the verdict rules below exactly.\n' "$1"
+}
+
+persona_prompt() {
+  local persona="$1" stage="$2" bundle="$3" lens="$4" retry_note="${5:-}"
+  [ -n "$lens" ] || lens="Review strictly within the concerns of \"$persona\"; raise only issues a \"$persona\" would own."
+  retry_note="$(rejection_preamble "$retry_note")"
+  cat <<EOF
+You are the "$persona" review persona for night-shift run $RUN_ID, independently
+reviewing another Claude session's $stage work. You share no context with the
+implementer and cannot see the repository — judge ONLY the review bundle below,
+strictly through your persona's lens. This is unattended; never ask questions.
+$retry_note
+Your review lens:
+$lens
+
+Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
+block tagged json containing your verdict and NOTHING after it:
+
+\`\`\`json
+{"persona":"$persona","stage":"$stage","commit":null,"status":"APPROVE","findings":[],"documentation_changes":[]}
+\`\`\`
+
+Rules for that JSON object:
+- Use ONLY these six keys. "status" is EXACTLY "APPROVE" or "BLOCK" — APPROVE with
+  an empty "findings" array, or BLOCK with one or more findings. Every concern you
+  have is a blocker; an APPROVE carries no findings.
+- Each finding has a stable "id" matching ^[A-Z][A-Z0-9_-]*-[0-9]{3,}$ (e.g.
+  UX-001), concrete "evidence", and a binary "required_change".
+  "documentation_changes" is an array of strings.
+
+REVIEW BUNDLE:
+$(cat "$bundle")
 EOF
 }
 
+# One persona sub-agent, context-isolated like the observer: a fresh Claude
+# session launched from a neutral empty dir (no repo access), its JSON verdict
+# extracted from stdout. A discrete seam the fixtures override to test the spawn
+# loop deterministically without a live model.
+invoke_persona_once() {
+  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" retry_note="${6:-}" neutral lens
+  # Per-worker cwd (slug-suffixed): up to NIGHT_SHIFT_PERSONA_CONCURRENCY claude
+  # sessions run concurrently, and a shared cwd is an avoidable interference
+  # surface (the observer's shared-dir pattern was safe only because it is serial).
+  neutral="${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID-$(persona_slug "$persona")"
+  mkdir -p "$neutral"
+  lens="$(persona_lens "$persona" "$(spec_track "$SPEC")")"
+  # Prompt via STDIN (not argv): the bundle inlines a diff that can be large, and a
+  # positional arg risks the ARG_MAX/E2BIG exec limit (repair_agent pipes for the
+  # same reason). model_flag word-splits into `--model X` (or nothing).
+  # shellcheck disable=SC2046
+  (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
+    claude -p $(model_flag "$PERSONA_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
+  extract_claude_structured "$raw" "$out"
+}
+
+# Live persona-worker bookkeeping for the signal path. A directed HUP/INT/TERM
+# to the ENGINE pid (a supervisor kill or timeout — Ctrl-C signals the whole
+# process group, a directed kill does not) fires block_run in the parent while
+# workers run backgrounded `claude -p` sessions. Without this, those paid
+# sessions orphan and keep spending, the batch's costs are never recorded, and
+# cleanup_observer_tmp removes their cwd from under them.
+PERSONA_WORKER_PIDS=""
+PERSONA_BATCH_DIR=""
+PERSONA_BATCH_STAGE=""
+
+# Kill + reap any live persona workers (whole process group per worker — they
+# are spawned under set -m so each leads its own group and the `claude` child
+# dies too; fall back to the bare pid when no group exists), then salvage the
+# interrupted batch's per-attempt costs from the .attempts markers. Idempotent;
+# a no-op when no batch is in flight.
+reap_persona_workers() {
+  local pid slug attempts a raw marker reaped
+  [ -n "$PERSONA_WORKER_PIDS" ] || return 0
+  reaped="$PERSONA_WORKER_PIDS"
+  for pid in $PERSONA_WORKER_PIDS; do
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $PERSONA_WORKER_PIDS; do
+    wait "$pid" 2>/dev/null || true
+  done
+  PERSONA_WORKER_PIDS=""
+  emit_event workers_reaped "$(jq -cn --arg pids "$reaped" '{pids: ($pids | ltrimstr(" "))}')"
+  [ -n "$PERSONA_BATCH_DIR" ] || return 0
+  for marker in "$PERSONA_BATCH_DIR"/.attempts-*; do
+    [ -f "$marker" ] || continue
+    slug="${marker##*/.attempts-}"
+    attempts="$(cat "$marker" 2>/dev/null)" || attempts=0
+    is_valid_int "$attempts" || attempts=0
+    a=1
+    while [ "$a" -le "$attempts" ]; do
+      raw="$RUN_ROOT/raw/persona-$PERSONA_BATCH_STAGE-$slug.$a.json"
+      [ ! -f "$raw" ] || record_cost "$raw" "$(basename "$raw")"
+      a=$((a + 1))
+    done
+    rm -f "$marker"
+  done
+  PERSONA_BATCH_DIR=""; PERSONA_BATCH_STAGE=""
+}
+
+# One persona's full attempt loop, run as a (possibly backgrounded) worker.
+# NEVER calls block_run — a child's exit cannot stop its siblings, so failure is
+# reported through a .failed-<slug> marker the parent turns into block_run after
+# the batch joins. Writes .attempts-<slug> with the attempts actually made this
+# round so the parent records exactly those raws' costs (stale attempt-2 raws
+# from an earlier round must not be re-counted).
+spawn_persona_worker() {
+  local persona="$1" persona_stage="$2" bundle="$3" result_dir="$4"
+  local slug out raw tmp idd norm tries iv retry_note=""
+  slug="$(persona_slug "$persona")"
+  out="$result_dir/$slug.json"
+  tmp="$result_dir/.spawn-$slug.$$"; idd="$tmp.id"; norm="$tmp.norm"
+  tries=0
+  while :; do
+    tries=$((tries + 1))
+    printf '%s' "$tries" >"$result_dir/.attempts-$slug"
+    # Per-attempt raw path so a failed first attempt's cost is not overwritten by
+    # the retry before it is recorded.
+    raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$tries.json"
+    invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" "$retry_note"; iv=$?
+    if [ "$iv" -eq 0 ] &&
+      jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
+      normalize_persona_result "$idd" >"$norm" 2>/dev/null &&
+      json_schema_basic persona-review "$norm"; then
+      mv "$norm" "$out"
+      rm -f "$tmp" "$idd"
+      log "persona ($persona_stage): $persona → $(jq -r '.status' "$out")"
+      return 0
+    fi
+    # Say WHY on the retry: extraction failure vs a verdict the normalizer +
+    # schema still rejected. A blind identical re-send repeats the mistake.
+    if [ "$iv" -ne 0 ]; then
+      retry_note="no parseable JSON verdict could be extracted from the reply; end with EXACTLY one fenced json code block and nothing after it"
+    else
+      retry_note="the verdict failed the persona-review contract: exactly the keys $PERSONA_REVIEW_KEYS; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
+    fi
+    # Journal marker for the parent (workers must not write the shared journal
+    # concurrently): the retry and its reason are exactly the hiccups a
+    # post-run study needs.
+    printf '%s' "$retry_note" >"$result_dir/.retry-$slug"
+    rm -f "$tmp" "$idd" "$norm"
+    if [ "$tries" -ge 2 ]; then
+      printf '%s' "$persona" >"$result_dir/.failed-$slug"
+      return 1
+    fi
+  done
+}
+
+# Spawn every persona in $expected_set, writing one validated result per persona
+# into $result_dir. The wrapper STAMPS .persona/.stage authoritatively (identity =
+# who the engine asked, not a spoofable field) then normalizes + schema-validates;
+# a persona that cannot return a valid review after a retry blocks the run.
+#
+# Personas are independent, read-only reviewers of the same static bundle, so
+# they fan out in parallel batches of NIGHT_SHIFT_PERSONA_CONCURRENCY (default 4;
+# 1 = serial). The parent is the single writer of shared state: it enforces the
+# wall-clock budget once per batch of paid spawns, records costs from the
+# per-attempt raws after each join (children never touch the shared ledger — a
+# signal mid-batch can lose at most that batch's cost rows), and raises
+# block_run for any worker's failure marker.
+spawn_personas() {
+  local result_dir="$1" persona_stage="$2" expected_set="$3"
+  local bundle persona slug raw old_ifs concurrency i j k n a attempts pstatus
+  local -a queue pids names
+  bundle="$RUN_ROOT/control/review-bundle.md"
+  assemble_review_bundle "$persona_stage" "$bundle"
+  concurrency="${NIGHT_SHIFT_PERSONA_CONCURRENCY:-4}"
+  is_valid_int "$concurrency" && [ "$concurrency" -ge 1 ] || concurrency=1
+  queue=()
+  old_ifs="$IFS"; IFS='|'
+  for persona in $expected_set; do queue+=("$persona"); done
+  IFS="$old_ifs"
+  i=0; n="${#queue[@]}"
+  while [ "$i" -lt "$n" ]; do
+    # These are direct engine-spawned model sessions, outside invoke_primary's turn
+    # loop — enforce the wall-clock budget per BATCH so an over-time run halts
+    # before spawning more paid sessions.
+    enforce_elapsed_limits
+    pids=(); names=()
+    PERSONA_BATCH_DIR="$result_dir"; PERSONA_BATCH_STAGE="$persona_stage"
+    j=0
+    while [ "$j" -lt "$concurrency" ] && [ "$i" -lt "$n" ]; do
+      persona="${queue[$i]}"
+      # set -m: each worker leads its own process group, so the signal path can
+      # kill the worker AND its `claude` child (a bare kill to the subshell pid
+      # would reparent the paid session, not stop it).
+      set -m
+      spawn_persona_worker "$persona" "$persona_stage" "$bundle" "$result_dir" &
+      set +m
+      pids+=("$!"); names+=("$persona")
+      PERSONA_WORKER_PIDS="$PERSONA_WORKER_PIDS $!"
+      i=$((i + 1)); j=$((j + 1))
+    done
+    k=0
+    while [ "$k" -lt "${#pids[@]}" ]; do
+      wait "${pids[$k]}" || true
+      k=$((k + 1))
+    done
+    PERSONA_WORKER_PIDS=""
+    # Costs + journal: recorded by the parent from exactly the attempts each
+    # worker made this round (.attempts-<slug>), BEFORE any failure becomes
+    # block_run — so a blocked round still keeps every paid attempt's cost.
+    # The parent is also the single journal writer: per-persona verdicts,
+    # attempt counts, and retry reasons are emitted here from the markers.
+    for persona in "${names[@]}"; do
+      slug="$(persona_slug "$persona")"
+      attempts="$(cat "$result_dir/.attempts-$slug" 2>/dev/null)" || attempts=0
+      is_valid_int "$attempts" || attempts=0
+      a=1
+      while [ "$a" -le "$attempts" ]; do
+        raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$a.json"
+        [ ! -f "$raw" ] || record_cost "$raw" "$(basename "$raw")"
+        a=$((a + 1))
+      done
+      rm -f "$result_dir/.attempts-$slug"
+      # File-existence guard: a twice-failed persona writes NO result file, and
+      # `jq ... 2>/dev/null` on an absent file exits before the `// "invalid"`
+      # fallback, recording status:"" — which would obscure the journal of a
+      # run that blocked on that persona. Read the status only when the file exists.
+      if [ -f "$result_dir/$slug.json" ]; then
+        pstatus="$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)"
+      else
+        pstatus="invalid"
+      fi
+      emit_event persona_verdict "$(jq -cn --arg p "$persona" --argjson a "$attempts" \
+        --arg s "$pstatus" '{persona:$p, status:$s, attempts:$a}')"
+      if [ -f "$result_dir/.retry-$slug" ]; then
+        emit_event persona_retry "$(jq -cn --arg p "$persona" \
+          --arg reason "$(cat "$result_dir/.retry-$slug" 2>/dev/null)" '{persona:$p, reason:$reason}')"
+        rm -f "$result_dir/.retry-$slug"
+      fi
+    done
+    for persona in "${names[@]}"; do
+      slug="$(persona_slug "$persona")"
+      if [ -f "$result_dir/.failed-$slug" ]; then
+        rm -f "$result_dir/.failed-$slug"
+        block_run "engine-spawned persona '$persona' did not return a valid $persona_stage review after 2 attempts"
+      fi
+    done
+  done
+  PERSONA_BATCH_DIR=""; PERSONA_BATCH_STAGE=""
+}
+
 run_personas() {
-  local signal="$1" review_stage persona_stage result_dir out artifact
+  local review_stage persona_stage result_dir
   review_stage="$(jq -r '.stage' "$STATE")"
   case "$review_stage" in
     planning|plan_review) persona_stage="plan"; set_stage plan_review ;;
@@ -1160,12 +1787,6 @@ run_personas() {
   result_dir="$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/$persona_stage/round-$(( $(jq -r '.review_round' "$STATE") + 1 ))"
   mkdir -p "$result_dir"
   state_set '.review_round += 1'
-
-  # Claude primary runs the active personas as native sub-agents and lists their
-  # result files as artifacts. Collect the persona-review files into the round dir;
-  # the exact-set/count gate below does the real enforcement.
-  collect_persona_results "$signal" "$result_dir" ||
-    block_run "persona result artifacts are missing, unsafe, or malformed"
 
   local full_set expected_set expected_count pending pending_stage
   full_set="$(resolve_active_personas "$SPEC")" ||
@@ -1177,6 +1798,15 @@ run_personas() {
   pending_stage="$(jq -r '.pending_stage // empty' "$STATE")"
   expected_set="$(review_round_set "$full_set" "$pending" "$pending_stage" "$persona_stage")"
   expected_count="$(printf '%s' "$expected_set" | tr '|' '\n' | grep -c .)"
+
+  # The ENGINE — not the primary — spawns each active persona as an independent,
+  # context-isolated sub-agent and writes the validated result into the round dir.
+  # This is the provenance guarantee that closes the self-report hole: the gate
+  # below judges results the wrapper produced (the primary only signals
+  # RUN_PERSONAS with no artifacts), so a cost-cutting primary cannot fabricate
+  # persona approvals. Mirrors the independent-observer spawn.
+  spawn_personas "$result_dir" "$persona_stage" "$expected_set"
+
   [ "$(find "$result_dir" -type f -name '*.json' | wc -l | tr -d ' ')" -eq "$expected_count" ] ||
     block_run "persona gate requires exactly $expected_count validated results for this spec's active personas"
   jq -s -e --arg stage "$persona_stage" --arg personas "$expected_set" '
@@ -1219,13 +1849,14 @@ run_personas() {
 }
 
 record_findings() {
-  local dir="$1" ids tmp
+  local dir="$1" ids
   # Only review files carry .findings; baseline/final/evidence JSON do not (some
   # are arrays). Guard the type so those produce nothing instead of jq errors.
   ids="$(find "$dir" -type f -name '*.json' -exec jq -r 'if (type=="object" and (.findings|type=="array")) then (.findings[].id // empty) else empty end' {} \; | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
-  tmp="$STATE.tmp.$$"
-  jq --argjson ids "$ids" '.finding_ids = ((.finding_ids + $ids) | unique)' "$STATE" >"$tmp" && mv "$tmp" "$STATE" ||
-    die "failed to record findings; state preserved at ${RUN_ROOT:-unknown}"
+  # Through state_set — the ONLY state writer — so the integrity anchor is
+  # re-seeded. A direct jq/tmp/mv here left the anchor stale and the next
+  # primary-turn check false-blocked the run as out-of-band tampering.
+  state_set '.finding_ids = ((.finding_ids + $ids) | unique)' --argjson ids "$ids"
 }
 
 # path_in_baseline FILE PATH
@@ -1268,6 +1899,22 @@ path_in_baseline() {
   return 1
 }
 
+# Create the isolated candidate-validation worktree at <path>, first pruning a
+# pre-existing orphan there — left by a crash between `worktree add` and recording
+# the path on a prior attempt of THIS run. The path embeds RUN_ID+candidate, so a
+# pre-existing match is always our own orphan, never a concurrent run's. Returns
+# non-zero iff the worktree could not be created.
+prepare_validation_worktree() {
+  local project="$1" path="$2" commit="$3"
+  [ ! -e "$path" ] || git -C "$project" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+  # Prune UNCONDITIONALLY: a stale `.git/worktrees/<name>` admin entry can linger
+  # even when the directory is gone (crash mid-remove, or a /tmp cleaner deleting
+  # the dir over a long run), and `worktree add` then fails with exit 128. Pruning
+  # first makes the path reusable whether or not the dir still exists.
+  git -C "$project" worktree prune 2>/dev/null || true
+  git -C "$project" worktree add --detach "$path" "$commit" >/dev/null 2>&1
+}
+
 verify_candidate() {
   local candidate committed_path previous evidence artifact validation_worktree
   [ "$(jq -r '.baseline_complete and .plan_approved and .implementation_approved' "$STATE")" = "true" ] ||
@@ -1276,11 +1923,7 @@ verify_candidate() {
   [ "$candidate" != "$BASE_COMMIT" ] || block_run "CREATE_CANDIDATE did not create a commit"
   git -C "$PROJECT" merge-base --is-ancestor "$BASE_COMMIT" "$candidate" ||
     block_run "candidate is not descended from the recorded base commit"
-  # Use -z so both sides are NUL-delimited and paths are literal/unquoted —
-  # git diff --name-only (without -z) quotes paths with spaces just like status
-  # (without -z) does, making the match unreliable.
-  [ -n "$(git -C "$PROJECT" diff -z --name-only "$BASE_COMMIT..$candidate")" ] ||
-    block_run "candidate commit is empty"
+  require_nonempty_candidate_diff "$BASE_COMMIT" "$candidate"
   # For each path committed by the run, check whether it was pre-existing dirt.
   # Both sides are now unquoted bytes so spaces and unicode compare correctly.
   while IFS= read -r -d '' committed_path; do
@@ -1293,11 +1936,13 @@ verify_candidate() {
   [ "$candidate" != "$previous" ] ||
     block_run "CREATE_CANDIDATE did not produce a new candidate commit"
   validation_worktree="$(tmp_base)/night-shift-$RUN_ID-$candidate"
-  [ ! -e "$validation_worktree" ] ||
-    block_run "candidate validation worktree already exists: $validation_worktree"
-  git -C "$PROJECT" worktree add --detach "$validation_worktree" "$candidate" >/dev/null ||
-    block_run "could not create isolated candidate validation worktree"
+  # Record the intended worktree path BEFORE creating it, so a crash between the
+  # `worktree add` and the state write leaves a discoverable orphan rather than a
+  # silent wedge. prepare_validation_worktree prunes a pre-existing orphan at this
+  # exact (RUN_ID+candidate-unique) path on --resume instead of blocking on it.
   state_set '.validation_worktree=$path' --arg path "$validation_worktree"
+  prepare_validation_worktree "$PROJECT" "$validation_worktree" "$candidate" ||
+    block_run "could not create isolated candidate validation worktree"
   link_worktree_dependencies "$validation_worktree"
 
   evidence=""
@@ -1313,6 +1958,12 @@ EOF
   [ -n "$evidence" ] || block_run "candidate requires schema-valid execution evidence"
   [ "$(jq -r '.task' "$evidence")" = "$SPEC" ] ||
     block_run "execution evidence task does not match current spec"
+  # The red/green cross-checks below trust these as wrapper-run ground truth;
+  # verify the primary did not rewrite them in the project tree.
+  local owned
+  for owned in "$RUN_ROOT/validated/baseline.json" "$RUN_ROOT/validated/test-first-failing.json"; do
+    integrity_guard "$owned" "$(basename "$owned" .json)" "evidence $(basename "$owned")"
+  done
   # Modify-mode (the first-failing-test passed at baseline): establish the genuine red
   # proof now by overlaying the candidate's updated test files onto BASE production and
   # requiring RED there. This overwrites test-first-failing.json with a real failing
@@ -1325,6 +1976,7 @@ EOF
       block_run "could not run the test-first red-against-base overlay"
     [ "$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-failing.json")" -ne 0 ] ||
       block_run "test-first: candidate tests still pass against base production code (no genuine red→green)"
+    integrity_put "$RUN_ROOT/validated/test-first-failing.json"
   fi
   # Run the passing check with the WRAPPER's own failing command (not the primary's
   # echoed string), so a primary-supplied command never drives control flow.
@@ -1363,6 +2015,7 @@ EOF
   ' --arg candidate "$candidate" --arg now "$(now_iso)"
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
+  emit_event candidate_validated "$(jq -cn --arg c "$candidate" '{commit:$c}')"
   log "candidate $candidate validated; handing to observer"
   if visual_stage_enabled "$SPEC"; then
     set_stage visual_review
@@ -1372,10 +2025,16 @@ EOF
 }
 
 observer_prompt() {
-  local context="$1" candidate="$2"
+  local context="$1" candidate="$2" retry_note="${3:-}"
+  retry_note="$(rejection_preamble "$retry_note")"
   cat <<EOF
 You are an independent Claude observer reviewing another Claude session's work.
 You share no context with the implementer; judge only the supplied evidence.
+$retry_note
+The sections marked "authoritative" (the engine-computed base..candidate diff and
+the engine-run validation) are ground truth produced by the wrapper, not the
+implementer — weight them over any primary-supplied artifact, which is
+supplementary and may be incomplete.
 
 Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:
@@ -1405,7 +2064,7 @@ EOF
 }
 
 invoke_observer_once() {
-  local context="$1" candidate="$2" out="$3" raw="$4" neutral
+  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral
   # Context-isolated observer: a fresh Claude session (no --resume) launched from
   # a neutral empty directory. It runs in the default (non-bypass) permission
   # mode, so tool use is not auto-approved and, combined with the neutral cwd, it
@@ -1420,10 +2079,12 @@ invoke_observer_once() {
   # and hangs, producing nothing. Instead the prompt asks the observer to end its
   # reply with a fenced ```json verdict block, which extract_claude_structured
   # pulls out; json_schema_basic then enforces the strict contract.
+  # Prompt via STDIN (not argv): the context inlines a size-bounded diff that can
+  # still be sizeable, and a positional arg risks the ARG_MAX/E2BIG exec limit.
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
-  (cd "$neutral" && claude -p $(model_flag "$OBSERVER_MODEL") --output-format json \
-    "$(observer_prompt "$context" "$candidate")") >"$raw" 2>"${raw}.err" || return 1
+  (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" |
+    claude -p $(model_flag "$OBSERVER_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }
 
@@ -1481,7 +2142,7 @@ run_visual_inloop_repair() {
   NO_BUILD="${NIGHT_SHIFT_VISUAL_REPAIR_NO_BUILD:-0}"
   repair_metro_start "$(device_label_to_name "$iter_dev")" || { log "visual_review: repair harness unavailable; proceeding unrepaired"; return 0; }
   visual_repair_for_spec "$SPEC" "$PROJECT" "$RUN_ROOT/validated" "$candidate" "$report" \
-    "${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-6}" \
+    "${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" \
     "$([ "${NIGHT_SHIFT_VISUAL_REPAIR_SHARED:-0}" = "1" ] && echo 'src/features/,src/ui/' || echo 'src/features/')" \
     "$iter_dev"
   repair_metro_stop
@@ -1501,11 +2162,56 @@ run_visual_inloop_repair() {
   log "visual_review: auto-repaired ($screens); committed $newsha; refreshed report for observer"
 }
 
+# Emptiness gate via --quiet (exit 1 = has changes): command-substituting the
+# -z --name-only output just to test non-emptiness triggers bash's "ignored null
+# byte in input" warning on every candidate. --quiet avoids capturing the NUL
+# stream entirely — but its error exits (>=2) must fail CLOSED, not be treated
+# as "has changes" (the old && form skipped the block on a git error).
+require_nonempty_candidate_diff() {
+  local base="$1" candidate="$2" rc=0
+  git -C "$PROJECT" diff --quiet "$base..$candidate" || rc=$?
+  [ "$rc" -ne 0 ] || block_run "candidate commit is empty"
+  [ "$rc" -eq 1 ] || block_run "could not compute the candidate diff (git exited $rc)"
+}
+
+# Engine-controlled evidence the observer can trust regardless of what the primary
+# attaches: the base..candidate diff the WRAPPER computes, and the validation the
+# WRAPPER ran at the candidate commit in the isolated worktree (final.json /
+# test-first-passing.json from verify_candidate). This makes the observer's
+# evidence independent, not just its judgment — a primary that omits or shades its
+# artifacts cannot hide the real diff or the real validation verdict.
+observer_wrapper_evidence() {
+  local candidate="$1"
+  printf '%s\n' '--- ENGINE-COMPUTED CANDIDATE DIFF (base..candidate; authoritative) ---'
+  printf 'base=%s candidate=%s\n\n' "$BASE_COMMIT" "$candidate"
+  bounded_diff "$BASE_COMMIT..$candidate"
+  if [ -s "$RUN_ROOT/validated/final.json" ]; then
+    printf '\n%s\n' '--- ENGINE-RUN FINAL VALIDATION (at candidate, isolated worktree; authoritative) ---'
+    cat "$RUN_ROOT/validated/final.json"
+  fi
+  if [ -s "$RUN_ROOT/validated/test-first-passing.json" ]; then
+    printf '\n%s\n' '--- ENGINE-RUN TEST-FIRST (passing at candidate; authoritative) ---'
+    cat "$RUN_ROOT/validated/test-first-passing.json"
+  fi
+}
+
 run_observer() {
   local signal="$1" candidate context="$RUN_ROOT/prompts/observer-context.txt"
-  local out raw attempt=0 artifact
+  local out raw attempt=0 artifact plan_results implementation_results review_dir resolved owned
   candidate="$(jq -r '.candidate // .candidate_commits[-1] // empty' "$STATE")"
   [ -n "$candidate" ] || block_run "observer requested without a candidate commit"
+  # observer_wrapper_evidence presents these as authoritative ground truth;
+  # verify the primary did not rewrite them in the project tree.
+  for owned in "$RUN_ROOT/validated/final.json" "$RUN_ROOT/validated/test-first-passing.json"; do
+    integrity_guard "$owned" "$(basename "$owned" .json)" "evidence $(basename "$owned")"
+  done
+  # Fail closed: the observer prompt treats the engine diff as authoritative ground
+  # truth, so an unresolvable range must NOT hand it an empty diff (which would invite
+  # a spurious APPROVE of a candidate it never saw). Verify both ends resolve first.
+  git -C "$PROJECT" rev-parse --verify -q "$candidate^{commit}" >/dev/null ||
+    block_run "observer: candidate commit $candidate does not resolve in the project"
+  git -C "$PROJECT" rev-parse --verify -q "$BASE_COMMIT^{commit}" >/dev/null ||
+    block_run "observer: base commit $BASE_COMMIT does not resolve in the project"
   plan_results="$(find "$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/plan" -maxdepth 1 -type d -name 'round-*' 2>/dev/null | sort -V | tail -n 1)"
   implementation_results="$(find "$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/implementation" -maxdepth 1 -type d -name 'round-*' 2>/dev/null | sort -V | tail -n 1)"
   {
@@ -1517,6 +2223,7 @@ run_observer() {
       find "$review_dir" -type f -name '*.json' -exec jq -c \
         '{persona,stage,commit,status,findings,documentation_changes}' {} \;
     done
+    observer_wrapper_evidence "$candidate"
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30
@@ -1529,6 +2236,7 @@ run_observer() {
     block_run "observer output remained invalid after one retry"
   append_observer_review "$out"
   record_findings "$(dirname "$out")"
+  emit_event observer_verdict "$(jq -c '{status, findings: (.findings | length)}' "$out" 2>/dev/null)"
   if [ "$(jq -r '.status' "$out")" = "APPROVE" ]; then
     log "observer: APPROVE — task complete, ready to commit/next"
     set_stage completion
@@ -1540,58 +2248,11 @@ run_observer() {
   fi
 }
 
-# Coerces a substantively-valid but sloppily-formatted observer verdict into the
-# strict observer-review shape: forces the identity fields the wrapper already
-# knows (observer/primary/task/candidate_commit), maps status synonyms like
-# REQUEST_CHANGES to BLOCK, pads finding ids to OBS-NNN, drops unknown keys, and
-# keeps APPROVE<->findings consistent. This stops a well-meaning verdict from
-# wedging the run on a format nit.
-#
-# TRADEOFF (deliberate): when a finding omits `evidence`/`required_change`, or a
-# BLOCK arrives with no structured finding at all, this fills generic placeholders
-# ("see observer notes", "observer requested changes without a structured
-# finding") so a malformed-but-blocking verdict still HALTS the run rather than
-# being discarded. The cost is that an evidence string is therefore not guaranteed
-# to be observer-authored, concrete evidence — only that a blocking verdict is
-# never silently dropped. This is preferred over the alternative (rejecting the
-# verdict, which fails-open toward "no findings"). We cannot instead use the CLI's
-# --json-schema to force a clean shape: in this CLI it waits on stdin and hangs
-# (see run_observer). Bias: fail-closed on BLOCK, never fabricate an APPROVE.
-normalize_observer_output() {
-  local file="$1" task="$2" candidate="$3" tmp="$1.norm.$$"
-  jq --arg task "$task" --arg candidate "$candidate" '
-    {
-      observer: "claude",
-      primary: "claude",
-      task: $task,
-      candidate_commit: $candidate,
-      status: ((.status // "BLOCK") | tostring | ascii_upcase
-        | if (. == "APPROVE" or . == "APPROVED" or . == "PASS" or . == "OK" or . == "LGTM")
-          then "APPROVE" else "BLOCK" end),
-      findings: ((.findings // []) | to_entries | map(
-        (.key + 1) as $k | .value as $f |
-        (($f.id // "") | tostring) as $idstr |
-        (if ($idstr | test("[0-9]")) then ($idstr | capture("(?<n>[0-9]+)").n) else ($k | tostring) end) as $num |
-        {
-          id: ("OBS-" + (if ($num | length) < 3 then (("000" + $num)[-3:]) else $num end)),
-          evidence: (($f.evidence // $f.location // $f.summary // "see observer notes") | tostring),
-          required_change: (($f.required_change // $f.summary // $f.recommendation // "address the observer finding") | tostring)
-        }
-      )),
-      documentation_changes: ((.documentation_changes // []) | map(select(type == "string" and length > 0)))
-    }
-    | if .status == "APPROVE" then .findings = []
-      elif (.findings | length) == 0 then
-        .findings = [{id: "OBS-001", evidence: "observer requested changes without a structured finding", required_change: "address the observer feedback"}]
-      else . end
-  ' "$file" >"$tmp" 2>/dev/null && mv "$tmp" "$file"
-}
-
 validated_observer_retry() {
-  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0
+  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note=""
   while [ "$attempt" -lt 2 ]; do
     enforce_limits
-    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" || true
+    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note" || true
     # Record the cost of THIS attempt immediately after the call returns,
     # regardless of whether the verdict validates. This ensures the cost is
     # never lost when both attempts fail and we fall through to block_run. On
@@ -1608,6 +2269,7 @@ validated_observer_retry() {
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
       return 0
     fi
+    retry_note="the verdict failed the observer-review contract: exactly the keys $OBSERVER_REVIEW_KEYS with the exact task and candidate values shown; status APPROVE or BLOCK only; finding ids match OBS-NNN"
     attempt=$((attempt + 1))
   done
   return 1
@@ -1640,7 +2302,8 @@ detect_stalled_findings() {
   findings="$(jq -c --arg e "$evidence_hash" --arg t "$token" \
     '[.findings[] | {id, fp:(.required_change + "|" + $e + "|" + $t)}]' "$out")"
   [ "$findings" = "[]" ] && return 0
-  maxc="$(bump_finding_history "$history" "$findings")"
+  maxc="$(bump_finding_history "$history" "$findings")" ||
+    block_run "failed to update the observer finding history at $history"
   [ "$maxc" -lt 3 ] ||
     block_run "an observer finding remained materially unchanged for three rounds"
 }
@@ -1652,18 +2315,23 @@ detect_stalled_personas() {
   findings="$(find "$result_dir" -type f -name '*.json' \
     -exec jq -c --arg t "$token" '.findings[] | {id, fp:(.required_change + "|" + $t)}' {} \; | jq -sc '.')"
   [ "$findings" = "[]" ] && return 0
-  maxc="$(bump_finding_history "$history" "$findings")"
+  maxc="$(bump_finding_history "$history" "$findings")" ||
+    block_run "failed to update the persona finding history at $history"
   [ "$maxc" -lt 3 ] ||
     block_run "a persona finding stayed materially unchanged for three $stage rounds"
 }
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  emit_event run_complete null
   state_set '.status="complete" | .completed_at=$now | .updated_at=$now' --arg now "$(now_iso)"
   jq '{run_id,status,primary,observer,task,base_commit,candidate_commits,
     primary_turns,review_round,finding_ids,started_at,completed_at}' "$STATE" >"$summary"
   compact_success "$RUN_ROOT" "$RUN_ID"
   cleanup_observer_tmp
+  # Only on SUCCESS: a blocked run keeps the anchor so --resume retains
+  # integrity continuity across the gap.
+  integrity_cleanup
   log "run $RUN_ID complete; compact archive: $RUN_ROOT/archive/$RUN_ID"
   exit 0
 }
@@ -1710,6 +2378,7 @@ EOF
   ' --arg task "$SPEC" --argjson epoch "$epoch" --arg base "$BASE_COMMIT" \
     --arg branch "$BASE_BRANCH" --arg baseline_status "$BASE_STATUS" \
     --arg now "$(now_iso)"
+  emit_event next_task "$(jq -cn --arg spec "$SPEC" '{spec:$spec}')"
   log "starting next bug-first task: $SPEC"
   check_branch_and_worktree "$SPEC" ||
     block_run "next task branch or worktree routing is unsafe"
@@ -1717,6 +2386,7 @@ EOF
   run_validation_commands baseline "$RUN_ROOT/validated/baseline-$(basename "$SPEC" .md).json" "$baseline_commands" ||
     block_run "next task baseline validation could not run"
   cp "$RUN_ROOT/validated/baseline-$(basename "$SPEC" .md).json" "$RUN_ROOT/validated/baseline.json"
+  integrity_put "$RUN_ROOT/validated/baseline.json"
   assert_tools_available "$RUN_ROOT/validated/baseline.json" "next task baseline"
   test_command="$(sed -nE 's/^- First failing test or executable check: `([^`]+)`.*/\1/p' "$SPEC" | head -n 1)"
   run_test_command failing "$test_command" "$RUN_ROOT/validated/test-first-failing.json"
@@ -1742,13 +2412,13 @@ handle_signal() {
   transition_allowed "$(jq -r '.stage' "$STATE")" "$action" ||
     block_run "action $action is invalid from stage $(jq -r '.stage' "$STATE")"
   case "$action" in
-    RUN_PERSONAS) run_personas "$signal" ;;
+    RUN_PERSONAS) run_personas ;;
     CREATE_CANDIDATE) verify_candidate ;;
     REQUEST_OBSERVER) run_observer "$signal" ;;
     RUN_VISUAL) run_visual ;;
     NEXT_TASK)
-      [ "$(jq -r '.stage' "$STATE")" = "completion" ] ||
-        block_run "NEXT_TASK requires observer approval"
+      # NEXT_TASK is legal only from the completion stage — already enforced by the
+      # transition_allowed gate above (no redundant re-check here).
       # An explicit `--spec` run is a single task — the caller (e.g. a wrapper that
       # owns cross-spec sequencing + per-spec branch routing) advances to the next
       # spec itself. Treat NEXT_TASK as COMPLETE so the run exits 0 cleanly instead
@@ -1762,8 +2432,8 @@ handle_signal() {
       ;;
     BLOCKED) block_run "primary reported: $(jq -r '.reason' "$signal")" ;;
     COMPLETE)
-      [ "$(jq -r '.stage' "$STATE")" = "completion" ] ||
-        block_run "COMPLETE requires observer approval"
+      # COMPLETE is legal only from the completion stage — enforced by the
+      # transition_allowed gate above.
       complete_run
       ;;
     *) block_run "unsupported action $action" ;;
@@ -1821,6 +2491,7 @@ main_run() {
     initialize_run
   fi
   trap 'block_run "run interrupted by signal"' HUP INT TERM
+  rate_limit_contract_canary
 
   local malformed_n rc
   while :; do
@@ -1831,6 +2502,8 @@ main_run() {
       malformed_n="$(state_int '.malformed_signal_consecutive // 0')" || malformed_n=0
       [ "$malformed_n" -eq 0 ] ||
         state_set '.malformed_signal_consecutive=0 | .updated_at=$now' --arg now "$(now_iso)"
+      rm -f "$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null || true
+      emit_event signal_accepted "$(jq -c '{action, reason}' "$RUN_ROOT/control/next-action.json" 2>/dev/null)"
       handle_signal
     else
       rc=$?
@@ -1841,6 +2514,12 @@ main_run() {
       malformed_n=$((malformed_n + 1))
       state_set '.malformed_signal_consecutive=$n | .updated_at=$now' \
         --argjson n "$malformed_n" --arg now "$(now_iso)"
+      # Record WHY for the correction turn's prompt (primary_prompt embeds it).
+      signal_rejection_reason "$RUN_ROOT/control/next-action.json" "$rc" \
+        >"$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null || true
+      emit_event signal_rejected "$(jq -cn --argjson n "$malformed_n" \
+        --arg reason "$(cat "$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null)" \
+        '{consecutive:$n, reason:$reason}')"
       ! malformed_cap_reached "$malformed_n" ||
         block_run "primary produced $malformed_n consecutive malformed/absent signals (cap $MAX_MALFORMED_SIGNALS); aborting to avoid burning the turn budget"
       if [ "$rc" -eq 1 ]; then

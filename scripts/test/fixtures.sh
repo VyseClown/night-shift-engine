@@ -94,6 +94,7 @@ run_dry_fixtures() {
   fixture_assert "validation worktree gets linked dependencies" fixture_worktree_dependencies "$root"
   fixture_assert "validation worktree links nested (web-layout) dependencies" fixture_worktree_dependencies_nested "$root"
   fixture_assert "tmp base is canonical (worktree path matches cleanup prefix)" fixture_tmp_base_canonical "$root"
+  fixture_assert "prepare_validation_worktree prunes a re-entry orphan (no wedge)" fixture_worktree_reentry "$root"
   fixture_assert "test-first red-against-base: updated tests fail on base production" fixture_red_against_base "$root"
   fixture_assert "test-first red-against-base: change-blind tests stay green on base (caught)" fixture_red_against_base_blind "$root"
   fixture_assert "review fields are read only from the ## Review section" fixture_review_fields_scoped "$root"
@@ -112,8 +113,35 @@ run_dry_fixtures() {
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
   fixture_assert "observer temp dir cleanup is scoped, removing, and idempotent" fixture_observer_tmp_cleanup "$root"
   fixture_assert "observer cost is recorded from the retry's .attempt raw" fixture_observer_cost_capture "$root"
-  fixture_assert "persona collection skips non-persona artifacts" fixture_persona_collect "$root"
-  fixture_assert "persona collection normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
+  fixture_assert "observer gets engine-computed diff + engine-run validation (independent evidence)" fixture_observer_wrapper_evidence "$root"
+  fixture_assert "persona result normalizes verdict->status (GH #20)" fixture_persona_normalize "$root"
+  fixture_assert "persona findings coerced to schema (live models mis-shape them)" fixture_persona_coerce_findings "$root"
+  fixture_assert "persona_lens extracts a persona's doc section (cross-doc fallback)" fixture_persona_lens "$root"
+  fixture_assert "engine spawns personas itself + stamps identity (provenance)" fixture_persona_spawn "$root"
+  fixture_assert "spawn_personas enforces the elapsed budget + records per-attempt cost" fixture_persona_spawn_guards "$root"
+  fixture_assert "bounded_diff caps a large diff with --stat + truncation marker" fixture_bounded_diff "$root"
+  fixture_assert "review bundle shows untracked new files; gitignored + engine state excluded" fixture_bundle_untracked_diff "$root"
+  fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
+  fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
+  fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
+  fixture_assert "persona/observer retry attempts carry the rejection note (first attempts do not)" fixture_retry_feedback_note "$root"
+  fixture_assert "personas spawn concurrently (bounded by NIGHT_SHIFT_PERSONA_CONCURRENCY; 1 = serial)" fixture_persona_parallel_spawn "$root"
+  fixture_assert "signal path reaps live persona workers + salvages batch costs" fixture_worker_reap "$root"
+  fixture_assert "log writes to stderr (command-substituted JSON stays parseable)" fixture_log_stderr_and_repair_accounting "$root"
+  fixture_assert "wire contracts single-sourced (gate + rejection feedback + retry reminders) and integrity_guard owns check->quarantine->block" fixture_contract_single_source "$root"
+  fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
+  fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
+  fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
+  fixture_assert "mid-stage session refresh clears the session every N stage turns (0 = off)" fixture_session_refresh "$root"
+  fixture_assert "integrity + normalize families live in libs (monolith does not regrow)" fixture_lib_split "$root"
+  fixture_assert "state writes are best-effort fsynced (durable_sync never fails the engine)" fixture_durable_state_write "$root"
+  fixture_assert "429-contract canary warns (never blocks) on an unverified CLI version" fixture_rate_limit_contract_canary "$root"
+  fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
+  fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
+  fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
+  fixture_assert "integrity mismatch quarantines forensics + restores engine truth" fixture_integrity_quarantine "$root"
+  fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
+  fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
   fixture_assert "set_stage clears the session at scope boundaries" fixture_stage_session_reset "$root"
   fixture_assert "set_stage resets review_round at scope boundaries (GH #18)" fixture_stage_round_reset "$root"
@@ -123,6 +151,7 @@ run_dry_fixtures() {
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
   fixture_assert "primary_prompt carries the build-from-Figma procedure iff a Design Contract" fixture_design_build_note "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
+  fixture_assert "schema enums stay in sync with the engine's state machine + personas" fixture_schema_inline_sync "$root"
   fixture_assert "visual_review stage machine wiring" fixture_visual_stage_machine "$root"
   fixture_assert "visual_review routing decision" fixture_visual_routing "$root"
   fixture_assert "visual capture grid includes device axis" fixture_visual_grid "$root"
@@ -171,6 +200,7 @@ run_dry_fixtures() {
   fixture_assert "visual pixel-diff parses odiff <count>;<pct> as a 0-1 fraction" fixture_visual_pixel_diff_parse "$root"
   fixture_assert "device registry root honours the dir override" fixture_device_registry_root "$root"
   fixture_assert "device_try_claim: claim, contend, reclaim stale" fixture_device_try_claim "$root"
+  fixture_assert "stale-lock reclaim is atomic + self-healing (no wedge, live untouched)" fixture_lock_reclaim "$root"
   fixture_assert "device_claim: concurrent claims get distinct devices" fixture_device_claim_distinct "$root"
   fixture_assert "device_claim: clones when matching devices exhausted" fixture_device_claim_clone_on_exhaustion "$root"
   fixture_assert "device_release deletes clones, keeps real devices" fixture_device_release "$root"
@@ -482,6 +512,52 @@ fixture_dirty_path_space() {
   path_in_baseline "$baseline" "clean.txt" && return 1
   # (d) A spaced committed path that is clean is not blocked.
   path_in_baseline "$baseline" "other clean.txt" && return 1
+  return 0
+}
+
+fixture_worktree_reentry() {
+  # A prior attempt's orphan worktree at the exact path must be pruned and recreated
+  # on re-entry, not block the run (the crash-between-add-and-record window).
+  local root="$1" repo="$root/wtre" wt="$root/wtre-vw"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+  printf 'a\n' >"$repo/f.txt"; git -C "$repo" add f.txt; git -C "$repo" commit -qm base
+  local commit; commit="$(git -C "$repo" rev-parse HEAD)"
+  prepare_validation_worktree "$repo" "$wt" "$commit" || return 1
+  [ -e "$wt/f.txt" ] || return 1
+  # Re-entry: the worktree already exists (simulated orphan). Must succeed, not wedge.
+  prepare_validation_worktree "$repo" "$wt" "$commit" || return 1
+  [ -e "$wt/f.txt" ] || return 1
+  # Vanished dir but a stale .git/worktrees/<name> admin entry remains (crash
+  # mid-remove / tmp cleaner): unconditional prune must still let `add` succeed
+  # (exit 0), not fail with git exit 128.
+  rm -rf "$wt"
+  prepare_validation_worktree "$repo" "$wt" "$commit" || return 1
+  [ -e "$wt/f.txt" ] || return 1
+  return 0
+}
+
+fixture_lock_reclaim() {
+  # Stale-lock reclaim is atomic (rename-aside) and SELF-HEALING: a crashed reclaimer
+  # must not permanently wedge the lock, and a live holder must never be reclaimed.
+  local root="$1" dir="$root/lockmx/run.lock"
+  mkdir -p "$dir"
+  # (a) stale lock (dead PID) -> reclaimed, pid becomes us, no leftover .stale/.reclaiming.
+  printf '2147483646\n' >"$dir/pid"
+  atomic_lock_acquire "$dir" || return 1
+  [ "$(cat "$dir/pid")" = "$$" ] || return 1
+  [ -z "$(find "$root/lockmx" -maxdepth 1 -name 'run.lock.stale.*' 2>/dev/null)" ] || return 1
+  [ ! -e "$dir/.reclaiming" ] || return 1
+  # (b) a LIVE holder ($$ is alive) is NOT reclaimed and its pid is left intact.
+  printf '%s\n' "$$" >"$dir/pid"
+  ! atomic_lock_acquire "$dir" || return 1
+  [ "$(cat "$dir/pid")" = "$$" ] || return 1
+  # (c) NO permanent wedge: repeated stale reclaims keep succeeding (the mkdir-mutex
+  #     version could orphan .reclaiming and block all future reclaims; rename-aside
+  #     cannot).
+  printf '2147483646\n' >"$dir/pid"; atomic_lock_acquire "$dir" || return 1
+  printf '2147483646\n' >"$dir/pid"; atomic_lock_acquire "$dir" || return 1
   return 0
 }
 
@@ -908,6 +984,31 @@ fixture_cost_ledger() {
   return 0
 }
 
+fixture_observer_wrapper_evidence() {
+  # The observer's evidence is wrapper-controlled, not primary-curated: the engine
+  # computes the base..candidate diff and surfaces its own validation output.
+  local root="$1" dir="$root/obsev"
+  mkdir -p "$dir"
+  ( PROJECT="$dir/proj"; RUN_ROOT="$dir/run"
+    mkdir -p "$PROJECT" "$RUN_ROOT/validated"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'line-a\n' >"$PROJECT/f.txt"
+    git -C "$PROJECT" add f.txt; git -C "$PROJECT" commit -qm base
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf 'line-a\nline-b-CANDIDATE\n' >"$PROJECT/f.txt"
+    git -C "$PROJECT" add f.txt; git -C "$PROJECT" commit -qm cand
+    cand="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '[{"command":"echo","exit_status":0,"output":"FINAL-OK"}]' >"$RUN_ROOT/validated/final.json"
+    out="$(observer_wrapper_evidence "$cand")"
+    printf '%s' "$out" | grep -q 'ENGINE-COMPUTED CANDIDATE DIFF' || exit 1
+    printf '%s' "$out" | grep -q 'line-b-CANDIDATE' || exit 1     # the real diff, engine-computed
+    printf '%s' "$out" | grep -q 'FINAL-OK' || exit 1            # engine-run validation surfaced
+    printf '%s' "$out" | grep -q "base=$BASE_COMMIT" || exit 1
+  ) || return 1
+  return 0
+}
+
 fixture_observer_tmp_cleanup() {
   local root="$1" dir="$root/obs-tmp"
   mkdir -p "$dir"
@@ -924,52 +1025,820 @@ fixture_observer_tmp_cleanup() {
   return 0
 }
 
-fixture_persona_collect() {
-  local root="$1" result_dir signal
-  local PROJECT="$root/collect"
-  result_dir="$PROJECT/.night-shift/out"
-  signal="$PROJECT/signal.json"
-  mkdir -p "$PROJECT" "$result_dir"
-  printf '{"persona":"Web Architect","stage":"plan","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/a.json"
-  printf '{"persona":"Human Advocate","stage":"plan","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/b.json"
-  # A non-persona deliverable the primary also lists (the review bundle).
-  printf '# review bundle\nnot persona-review json\n' >"$PROJECT/bundle.md"
-  printf '{"artifacts":["bundle.md","a.json","b.json"]}\n' >"$signal"
-  collect_persona_results "$signal" "$result_dir" || return 1
-  # Exactly the two persona files were collected; the bundle was skipped.
-  [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || return 1
-  [ -f "$result_dir/a.json" ] && [ -f "$result_dir/b.json" ] || return 1
-  [ ! -f "$result_dir/bundle.md" ] || return 1
-  # An unsafe/absolute path anywhere in the list is still fatal (traversal guard).
-  printf '{"artifacts":["/etc/hosts","a.json"]}\n' >"$signal"
-  collect_persona_results "$signal" "$result_dir" && return 1
+# GH #20: an agent result written with `verdict` instead of the schema's `status`
+# (and omitting the always-empty commit/documentation_changes on a clean APPROVE)
+# is normalized to the canonical shape by normalize_persona_result, which
+# spawn_personas applies to every engine-spawned persona result before validation.
+fixture_persona_normalize() {
+  local root="$1" dir="$root/normalize"
+  mkdir -p "$dir"
+  # The agent slip: `verdict` not `status`, and omitted empty fields.
+  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"APPROVE","findings":[]}\n' >"$dir/ha.json"
+  normalize_persona_result "$dir/ha.json" >"$dir/ha.norm" || return 1
+  [ "$(jq -r '.status' "$dir/ha.norm")" = "APPROVE" ] || return 1
+  [ "$(jq -r 'has("verdict")' "$dir/ha.norm")" = "false" ] || return 1
+  json_schema_basic persona-review "$dir/ha.norm" || return 1
+  # A canonical result stays schema-valid.
+  printf '{"persona":"React Native Architect","stage":"implementation","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$dir/rn.json"
+  json_schema_basic persona-review "$dir/rn.json" || return 1
+  # Faithful, not masking: a verdict BLOCK maps to status BLOCK.
+  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"BLOCK","findings":[{"id":"HA-001","evidence":"x","required_change":"y"}]}\n' >"$dir/blk.json"
+  [ "$(normalize_persona_result "$dir/blk.json" | jq -r '.status')" = "BLOCK" ] || return 1
   return 0
 }
 
-# GH #20: a primary result written with `verdict` instead of the schema's `status`
-# (and omitting the always-empty commit/documentation_changes on a clean APPROVE)
-# is normalized to the canonical shape on collection, so the round gate accepts it.
-fixture_persona_normalize() {
-  local root="$1" result_dir signal
-  local PROJECT="$root/normalize"
-  result_dir="$PROJECT/.night-shift/out"
-  signal="$PROJECT/signal.json"
-  mkdir -p "$PROJECT" "$result_dir"
-  # The primary slip: `verdict` not `status`, and omitted empty fields.
-  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"APPROVE","findings":[]}\n' >"$PROJECT/ha.json"
-  # A canonical result is left untouched.
-  printf '{"persona":"React Native Architect","stage":"implementation","status":"APPROVE","commit":null,"findings":[],"documentation_changes":[]}\n' >"$PROJECT/rn.json"
-  printf '{"artifacts":["ha.json","rn.json"]}\n' >"$signal"
-  collect_persona_results "$signal" "$result_dir" || return 1
-  # Both collected; the verdict one now carries a canonical, schema-valid status.
-  [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || return 1
-  [ "$(jq -r '.status' "$result_dir/ha.json")" = "APPROVE" ] || return 1
-  [ "$(jq -r 'has("verdict")' "$result_dir/ha.json")" = "false" ] || return 1
-  json_schema_basic persona-review "$result_dir/ha.json" || return 1
-  [ "$(jq -r '.status' "$result_dir/rn.json")" = "APPROVE" ] || return 1
-  # Faithful, not masking: a verdict BLOCK maps to status BLOCK.
-  printf '{"persona":"Human Advocate","stage":"implementation","verdict":"BLOCK","findings":[{"id":"HA-001","evidence":"x","required_change":"y"}]}\n' >"$PROJECT/blk.json"
-  [ "$(normalize_persona_result "$PROJECT/blk.json" | jq -r '.status')" = "BLOCK" ] || return 1
+fixture_persona_coerce_findings() {
+  # Regression for a LIVE-discovered failure: a real model returns the right STATUS
+  # but mis-shapes findings (file/line/summary/details instead of
+  # id/evidence/required_change). Coercion must yield a schema-valid, still-BLOCKing
+  # result rather than failing the gate and blocking the run on a format nit.
+  local root="$1" d="$root/pcoerce"
+  mkdir -p "$d"
+  printf '%s' '{"persona":"TypeScript & Code Quality Expert","stage":"implementation","verdict":"REQUEST_CHANGES","findings":[{"file":"x.ts","line":1,"summary":"missing types","details":"annotate params"}]}' >"$d/in.json"
+  normalize_persona_result "$d/in.json" >"$d/out.json" || return 1
+  json_schema_basic persona-review "$d/out.json" || return 1                    # now valid
+  [ "$(jq -r '.status' "$d/out.json")" = "BLOCK" ] || return 1                  # fail-closed: still BLOCK
+  [ "$(jq -r '.findings[0].id' "$d/out.json")" = "REV-001" ] || return 1        # synthesized id
+  jq -e '.findings[0].evidence|test("missing types")' "$d/out.json" >/dev/null || return 1  # evidence from summary
+  # A well-formed id is preserved, not rewritten.
+  printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":[{"id":"HA-007","evidence":"e","required_change":"r"}]}' >"$d/in2.json"
+  [ "$(normalize_persona_result "$d/in2.json" | jq -r '.findings[0].id')" = "HA-007" ] || return 1
+  # A BLOCK with no usable finding still halts (placeholder), never coerced to APPROVE.
+  local out3; out3="$(normalize_persona_result <(printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":[]}'))"
+  [ "$(printf '%s' "$out3" | jq -r '.status')" = "BLOCK" ] || return 1
+  [ "$(printf '%s' "$out3" | jq -r '.findings|length')" -ge 1 ] || return 1
+  # required_change as a BOOLEAN (a live model treated it as a flag) must fall through
+  # to real text, not become the useless string "true" (found via a live model call).
+  printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":[{"id":"HA-002","evidence":"real evidence text","required_change":true}]}' >"$d/in4.json"
+  normalize_persona_result "$d/in4.json" >"$d/out4.json" || return 1
+  json_schema_basic persona-review "$d/out4.json" || return 1
+  [ "$(jq -r '.findings[0].required_change' "$d/out4.json")" != "true" ] || return 1
+  jq -e '.findings[0].required_change|test("real evidence")' "$d/out4.json" >/dev/null || return 1
+  # A non-object findings element (bare string, or a mixed array) must NOT throw jq
+  # (which would empty the output and spuriously block); coerce it to a finding.
+  printf '%s' '{"persona":"Human Advocate","stage":"plan","status":"BLOCK","findings":["stray prose",{"id":"UX-001","evidence":"real bug","required_change":"fix it"}]}' >"$d/in5.json"
+  normalize_persona_result "$d/in5.json" >"$d/out5.json" || return 1
+  json_schema_basic persona-review "$d/out5.json" || return 1
+  [ "$(jq -r '.findings|length' "$d/out5.json")" -eq 2 ] || return 1
+  jq -e '.findings[1].evidence|test("real bug")' "$d/out5.json" >/dev/null || return 1
+  return 0
+}
+
+fixture_persona_lens() {
+  # Extracts a persona's documented review lens from the track doc, with a
+  # cross-doc fallback (node reuses a persona documented under web), and yields
+  # empty (not an error) for an unknown persona.
+  [ -n "$(persona_lens "React Native Architect" rn)" ] || return 1
+  [ -n "$(persona_lens "Backend & Data Expert" node)" ] || return 1
+  [ -z "$(persona_lens "No Such Persona" rn)" ] || return 1
+  # A deeper sub-heading inside a persona section must NOT truncate the lens; only a
+  # same-or-shallower heading ends it.
+  local d="$1/plsub"; mkdir -p "$d/docs"
+  cat > "$d/docs/review-personas.md" <<'MD'
+## 1. Test Persona
+Focus: the focus line.
+#### Examples
+an example here.
+Checklist: the checklist line.
+## 2. Next Persona
+other persona body.
+MD
+  ( WORKSPACE_ROOT="$d"
+    b="$(persona_lens "Test Persona" rn)"
+    printf '%s' "$b" | grep -q 'checklist line' || exit 1   # sub-heading did not truncate
+    printf '%s' "$b" | grep -q 'an example here' || exit 1   # sub-heading body included
+    printf '%s' "$b" | grep -q 'Next Persona' && exit 1      # stopped at the next ## persona
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_persona_spawn() {
+  # The ENGINE spawns each persona itself and writes the result — there is no
+  # signal/artifact input, so a primary cannot supply (or fabricate) reviews.
+  # Stub the live model call (invoke_persona_once) to return a status-only verdict;
+  # assert the wrapper STAMPS the persona/stage identity, validates, and that the
+  # exact-set gate passes against the engine-written files.
+  local root="$1" dir="$root/pspawn"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="pspawn"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    cat >"$SPEC" <<'SPEC'
+## Review
+- Track: node
+- Review Profile: logic
+SPEC
+    printf '# the plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _now="$(now_epoch)"   # spawn_personas enforces the elapsed budget
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_now" "$_now" >"$STATE"
+    # Stub the only live seam: write a status-only APPROVE to $out (the wrapper
+    # stamps persona+stage), and a cost-less raw to $raw.
+    invoke_persona_once() {
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{"result":"ok"}' >"$5"
+    }
+    set="$(profile_personas logic node)" || exit 1
+    n="$(printf '%s' "$set" | tr '|' '\n' | grep -c .)"
+    result_dir="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$result_dir"
+    spawn_personas "$result_dir" "plan" "$set"
+    # the engine assembled the bundle from its own inputs (spec + plan)
+    grep -q 'Task spec' "$RUN_ROOT/control/review-bundle.md" || exit 1
+    grep -q 'Approved plan' "$RUN_ROOT/control/review-bundle.md" || exit 1
+    # exactly one validated result per active persona, written by the wrapper
+    [ "$(find "$result_dir" -name '*.json' | wc -l | tr -d ' ')" -eq "$n" ] || exit 1
+    # identity is wrapper-stamped: the exact active set + stage gate passes
+    jq -s -e --arg personas "$set" \
+      '($personas|split("|")|sort) as $e | (map(.persona)|sort)==$e and all(.[]; .stage=="plan")' \
+      "$result_dir"/*.json >/dev/null || exit 1
+    # every written result is schema-valid
+    for f in "$result_dir"/*.json; do json_schema_basic persona-review "$f" || exit 1; done
+  ) || return 1
+  return 0
+}
+
+fixture_bounded_diff() {
+  # bounded_diff caps the diff at NIGHT_SHIFT_DIFF_BUDGET with a --stat summary and a
+  # truncation marker, so a huge diff can't overflow the reviewer/observer context.
+  local root="$1" repo="$root/bd"
+  mkdir -p "$repo"
+  ( PROJECT="$repo"
+    git -C "$repo" init -q; git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+    printf 'base\n' >"$repo/f.txt"; git -C "$repo" add f.txt; git -C "$repo" commit -qm base
+    base="$(git -C "$repo" rev-parse HEAD)"
+    yes 'a-long-line-of-content-to-inflate-the-diff-well-past-the-budget' | head -n 800 >"$repo/f.txt"
+    NIGHT_SHIFT_DIFF_BUDGET=2000
+    out="$(bounded_diff "$base" -- .)"
+    printf '%s' "$out" | grep -q 'diff truncated at 2000 bytes' || exit 1   # marker present
+    printf '%s' "$out" | grep -q 'f.txt' || exit 1                          # --stat names the file
+    [ "$(printf '%s' "$out" | wc -c)" -lt 6000 ] || exit 1                  # actually bounded
+    # A small change under budget is emitted in full, no truncation.
+    printf 'base\nsmall-change\n' >"$repo/f.txt"
+    out2="$(bounded_diff "$base" -- .)"
+    printf '%s' "$out2" | grep -q 'diff truncated' && exit 1
+    printf '%s' "$out2" | grep -q 'small-change' || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_record_findings_integrity() {
+  # record_findings is a state WRITER and must route through state_set so the
+  # integrity anchor is re-seeded. Live false-positive regression: its direct
+  # jq/tmp/mv write left the anchor stale, and the next primary-turn check
+  # blocked the run as "state.json was modified outside the engine" when the
+  # divergence was the engine's own unseeded finding_ids write.
+  local root="$1" dir="$root/rf-integ"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="rfinteg-$$"
+    mkdir -p "$RUN_ROOT/validated/rd"
+    printf '{"finding_ids":[]}\n' >"$STATE"
+    integrity_put "$STATE"
+    printf '{"persona":"P","stage":"plan","status":"BLOCK","commit":null,"documentation_changes":[],"findings":[{"id":"UA-001","evidence":"e","required_change":"r"}]}' \
+      >"$RUN_ROOT/validated/rd/p.json"
+    record_findings "$RUN_ROOT/validated/rd"
+    jq -e '.finding_ids == ["UA-001"]' "$STATE" >/dev/null || exit 1
+    integrity_check "$STATE" || exit 1   # the engine write re-seeded the anchor
+    integrity_cleanup
+    exit 0 ) || return 1
+  return 0
+}
+
+fixture_integrity_quarantine() {
+  # On an integrity mismatch the engine must (a) preserve the divergent project
+  # copy for forensics under raw/, and (b) restore the engine's last write from
+  # the anchor — otherwise block_run's own status write launders the edit into
+  # the anchor and a later --resume proceeds from the edited state.
+  local root="$1" dir="$root/quarantine"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="quar-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    printf '{"stage":"planning","plan_approved":false}\n' >"$STATE"
+    integrity_put "$STATE"
+    jq '.plan_approved=true' "$STATE" >"$STATE.t" && mv "$STATE.t" "$STATE"
+    integrity_check "$STATE" && exit 1
+    integrity_quarantine "$STATE" "state-test"
+    jq -e '.plan_approved == false' "$STATE" >/dev/null || exit 1   # restored to engine truth
+    tampered="$(find "$RUN_ROOT/raw" -name 'tampered-state-test*' -print -quit)"
+    [ -n "$tampered" ] || exit 1                                       # forensics kept
+    jq -e '.plan_approved == true' "$tampered" >/dev/null || exit 1
+    integrity_check "$STATE" || exit 1
+    integrity_cleanup
+    exit 0 ) || return 1
+  return 0
+}
+
+fixture_wrapper_owned_integrity() {
+  # state.json and the validated/* evidence are wrapper-owned, but they live in
+  # $PROJECT/.night-shift where the primary runs unattended with
+  # bypassPermissions — an out-of-band edit (an in-distribution "helpful" fix,
+  # not necessarily malice) to approvals, stage, or the red/green record would
+  # be trusted by the engine on its next read. The engine keeps private copies
+  # outside the project, verifies at trust points, and degrades to
+  # seed-on-first-check when the private copy is missing (tmp cleared).
+  local root="$1" dir="$root/integrity"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="integ-fixture-$$"
+    mkdir -p "$RUN_ROOT/validated"
+    printf '{"stage":"planning","plan_approved":false}\n' >"$STATE"
+    integrity_put "$STATE"
+    integrity_check "$STATE" || exit 1                    # untouched -> ok
+    jq '.plan_approved=true' "$STATE" >"$STATE.t" && mv "$STATE.t" "$STATE"
+    integrity_check "$STATE" && exit 1                    # out-of-band edit detected
+    integrity_put "$STATE"                                # an engine write blesses it
+    integrity_check "$STATE" || exit 1
+    # Validated evidence follows the same contract.
+    printf '{"exit_status":1}\n' >"$RUN_ROOT/validated/test-first-failing.json"
+    integrity_put "$RUN_ROOT/validated/test-first-failing.json"
+    printf '{"exit_status":0}\n' >"$RUN_ROOT/validated/test-first-failing.json"
+    integrity_check "$RUN_ROOT/validated/test-first-failing.json" && exit 1
+    # Degraded mode: a missing private copy seeds instead of blocking, then re-arms.
+    rm -rf "$(integrity_dir)"
+    integrity_check "$STATE" || exit 1
+    jq '.stage="completion"' "$STATE" >"$STATE.t" && mv "$STATE.t" "$STATE"
+    integrity_check "$STATE" && exit 1
+    integrity_cleanup
+    [ ! -d "$(integrity_dir)" ] || exit 1
+    exit 0 ) || return 1
+  # Wiring: the trust points consult the guard (primary-turn return, candidate
+  # gate, observer evidence) and state_set re-seeds after every engine write.
+  grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/lib/integrity.sh" || return 1
+  case "$(declare -f state_set)" in *'integrity_put "$STATE"'*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_lib_split() {
+  # The orchestrator keeps only the run flow; self-contained families live in
+  # libs (the locking/recovery/preflight/personas/events pattern): the
+  # integrity anchor in lib/integrity.sh, the verdict extraction/normalization
+  # in lib/normalize.sh. Their behavior fixtures run unchanged — this pins the
+  # layout so the monolith does not silently regrow.
+  [ -f "$WORKSPACE_ROOT/scripts/lib/integrity.sh" ] || return 1
+  [ -f "$WORKSPACE_ROOT/scripts/lib/normalize.sh" ] || return 1
+  grep -q 'lib/integrity\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q 'lib/normalize\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q '^integrity_guard()' "$WORKSPACE_ROOT/scripts/lib/integrity.sh" || return 1
+  grep -q '^normalize_persona_result()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
+  grep -q '^normalize_observer_output()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
+  grep -q '^extract_claude_structured()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
+  grep -qE '^(integrity_guard|integrity_put|normalize_persona_result|extract_claude_structured)\(\)' \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh" && return 1
+  return 0
+}
+
+fixture_session_refresh() {
+  # A long grind inside ONE stage replays ever-growing session history each
+  # turn. maybe_refresh_session clears the pinned session every
+  # NIGHT_SHIFT_SESSION_REFRESH_TURNS stage turns (default 8; 0 = off) so the
+  # next turn starts fresh and picks up from the file handoff — the same
+  # mechanism stage boundaries already use — and journals the refresh.
+  local root="$1" dir="$root/refresh" out
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir"; STATE="$dir/state.json"; RUN_ID="sr-$$"
+    printf '{"stage":"implementation","stage_turns":8,"session_id":"s1"}\n' >"$STATE"
+    out="$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s1)"
+    [ -z "$out" ] || exit 1                                        # cleared at the boundary
+    [ "$(jq -r '.session_id' "$STATE")" = "null" ] || exit 1
+    jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl" >/dev/null || exit 1
+    printf '{"stage":"implementation","stage_turns":7,"session_id":"s2"}\n' >"$STATE"
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2" ] || exit 1  # below: keep
+    printf '{"stage":"implementation","stage_turns":16,"session_id":"s3"}\n' >"$STATE"
+    [ -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)" ] || exit 1      # every Nth
+    printf '{"stage":"implementation","stage_turns":8,"session_id":"s4"}\n' >"$STATE"
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4" ] || exit 1  # 0 = off
+    exit 0 ) || return 1
+  # Wired into the primary turn path. declare -f (not awk|grep -q): the latter
+  # SIGPIPEs awk when grep -q exits early, and under pipefail that races to a
+  # false failure on Linux (green on macOS) — the CI-only flake this fixture hit.
+  case "$(declare -f invoke_primary)" in *maybe_refresh_session*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_durable_state_write() {
+  # rename alone is not durable across power loss; state_set/write_json_atomic
+  # now best-effort fsync the renamed file (perl IO::Handle, stock on
+  # macOS/Linux; silently a no-op without it). Must never fail the engine.
+  local root="$1" dir="$root/fsync"
+  mkdir -p "$dir"
+  printf 'x\n' >"$dir/f"
+  durable_sync "$dir/f" || return 1
+  durable_sync "$dir/absent" || return 1                     # missing file: no-op ok
+  # Pipe-free wiring checks (see session-refresh fixture for the pipefail rationale).
+  case "$(declare -f state_set)" in *durable_sync*) ;; *) return 1 ;; esac
+  case "$(declare -f write_json_atomic)" in *durable_sync*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_rate_limit_contract_canary() {
+  # is_rate_limit_response parses the CLI's human-worded 429 message; its own
+  # comment says to re-verify when the CLI changes. A real 429 cannot be
+  # provoked on demand, so the honest canary is a version tripwire: warn (and
+  # journal) when the installed CLI differs from the version the live 429
+  # shape was last verified against. NEVER blocks.
+  local root="$1" dir="$root/canary"
+  mkdir -p "$dir"
+  [ -n "${RATE_LIMIT_CONTRACT_CLI_VERSION:-}" ] || return 1
+  ( RUN_ROOT="$dir"; RUN_ID="can-$$"; STATE=""
+    warned=0; log() { case "$*" in *429*) warned=1 ;; esac; }
+    claude() { printf '%s (Claude Code)\n' "$RATE_LIMIT_CONTRACT_CLI_VERSION"; }
+    rate_limit_contract_canary || exit 1
+    [ "$warned" -eq 0 ] || exit 1                              # matching version: silent
+    claude() { printf '9.9.9 (Claude Code)\n'; }
+    rate_limit_contract_canary || exit 1                       # mismatch: still exit 0
+    [ "$warned" -eq 1 ] || exit 1                              # ...but warns
+    jq -e 'select(.type=="contract_canary") | .payload.found=="9.9.9"' "$dir/events.jsonl" >/dev/null || exit 1
+    exit 0 ) || return 1
+  case "$(declare -f main_run)" in *rate_limit_contract_canary*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_event_stream() {
+  # events.jsonl is the run's decision journal: one {ts, run, stage, type,
+  # payload} line at every decision point (stage transitions, accepted AND
+  # rejected signals with the reason, persona verdicts with attempt counts and
+  # retry reasons, integrity violations, blocks, completion) so a finished or
+  # wrecked run can be studied hiccup-by-hiccup afterwards. Archived on
+  # success alongside costs.jsonl; log lines are unchanged (events are
+  # additive forensics, not a replacement).
+  local root="$1" dir="$root/events" e
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="ev-$$"
+    SESSION_SCOPE=stage
+    mkdir -p "$RUN_ROOT"
+    printf '{"stage":"planning","stage_turns":1,"stage_counters":{},"session_id":"s"}\n' >"$STATE"
+    emit_event probe '{"n":1}'
+    emit_event probe-text 'not json'
+    [ "$(grep -c . "$RUN_ROOT/events.jsonl")" -eq 2 ] || exit 1
+    jq -e 'select(.type=="probe") | .run and .ts and (.stage=="planning") and (.payload.n==1)' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    jq -e 'select(.type=="probe-text") | .payload == "not json"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # set_stage journals the transition (with session_cleared).
+    set_stage implementation >/dev/null 2>&1
+    jq -e 'select(.type=="stage_transition") | .payload.from=="planning" and .payload.to=="implementation" and .payload.session_cleared==true' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # compact_success preserves the journal in the archive.
+    printf '{"s":1}\n' >"$RUN_ROOT/summary.json"
+    compact_success "$RUN_ROOT" "arch1"
+    [ -f "$RUN_ROOT/archive/arch1/events.jsonl" ] || exit 1
+    exit 0 ) || return 1
+  # Wiring: the decision points actually emit.
+  for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
+    run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry; do
+    grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
+  done
+  return 0
+}
+
+fixture_untracked_single_walk() {
+  # Process economics (behavior is guarded by fixture_bundle_untracked_diff and
+  # fixture_material_token_untracked): one untracked walk per bounded_diff call
+  # (the --stat header is derived from the same patch via `git apply --stat`,
+  # not a second per-file fork storm), and material_token uses a constant
+  # number of processes (ls-files + cat, no per-file `git diff --no-index`)
+  # while staying CONTENT-sensitive.
+  local root="$1" repo="$root/uwalk" t1 t2
+  # Pipe-free wiring checks against the sourced functions (see session-refresh
+  # fixture for the pipefail+grep-q SIGPIPE rationale).
+  [ "$(grep -c 'untracked_diff' <<<"$(declare -f bounded_diff)")" -le 2 ] || return 1
+  case "$(declare -f material_token)" in *untracked_diff*) return 1 ;; esac
+  case "$(declare -f material_token)" in *ls-files*) ;; *) return 1 ;; esac
+  mkdir -p "$repo"
+  ( PROJECT="$repo"
+    git -C "$repo" init -q
+    git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+    git -C "$repo" commit -q --allow-empty -m base
+    BASE_COMMIT="$(git -C "$repo" rev-parse HEAD)"
+    printf 'v1\n' >"$repo/gen.js"
+    t1="$(material_token)"
+    printf 'v2\n' >"$repo/gen.js"      # same file NAME, different CONTENT
+    t2="$(material_token)"
+    [ "$t1" != "$t2" ] || exit 1       # content changes still reset the stall counter
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_verdict_prelude_and_preamble() {
+  # The status-synonym map + nonempty helper live in ONE jq prelude used by
+  # BOTH verdict normalizers (a synonym added to one side would make the
+  # persona and observer tiers read the same sloppy verdict differently), and
+  # the PREVIOUS ATTEMPT REJECTED wording is one helper for both prompts. The
+  # findings-coercion bodies stay separate BY DESIGN (persona keeps schema-valid
+  # ids / observer forces OBS-; candidate orders tuned per tier) — that
+  # divergence is intentional, not drift.
+  local root="$1" dir="$root/prelude" p
+  mkdir -p "$dir"
+  [ "$(grep -c 'JQ_VERDICT_PRELUDE' "$WORKSPACE_ROOT/scripts/lib/normalize.sh")" -ge 3 ] || return 1
+  # Shared synonym map still normalizes through both surfaces.
+  printf '{"persona":"P","stage":"plan","verdict":"PASS","findings":[],"documentation_changes":[]}' >"$dir/p.json"
+  [ "$(normalize_persona_result "$dir/p.json" | jq -r '.status')" = "APPROVE" ] || return 1
+  printf '{"status":"REQUEST_CHANGES","findings":[{"evidence":"e"}]}' >"$dir/o.json"
+  normalize_observer_output "$dir/o.json" "/spec.md" deadbeef
+  [ "$(jq -r '.status' "$dir/o.json")" = "BLOCK" ] || return 1
+  [ "$(jq -r '.findings[0].id' "$dir/o.json")" = "OBS-001" ] || return 1
+  # One preamble helper, used by both prompt builders; empty note renders nothing.
+  p="$(rejection_preamble 'the-reason')"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' || return 1
+  printf '%s' "$p" | grep -q 'the-reason' || return 1
+  [ -z "$(rejection_preamble '')" ] || return 1
+  [ "$(grep -c 'rejection_preamble' "$WORKSPACE_ROOT/scripts/night-shift.sh")" -ge 3 ] || return 1
+  return 0
+}
+
+fixture_contract_single_source() {
+  # The wire contracts (signal keys, action enum, evidence keys) must have ONE
+  # source consulted by both the gate and the correction feedback: a gate-only
+  # schema edit used to leave the rejection reasons teaching the OLD shape,
+  # looping a weak model into the malformed cap. Likewise artifact requirements
+  # are per-action via a table (the artifact sibling of stage_forward_actions).
+  local root="$1" dir="$root/contract" reason
+  mkdir -p "$dir/control"
+  local SPEC="$dir/spec.md" RUN_ROOT="$dir" PROJECT="$dir"
+  fixture_write_min_spec "$SPEC"
+  # Table: only CREATE_CANDIDATE requires evidence.
+  [ "$(action_artifact_requirement CREATE_CANDIDATE)" = "execution-evidence" ] || return 1
+  [ -z "$(action_artifact_requirement RUN_PERSONAS)" ] || return 1
+  [ -z "$(action_artifact_requirement COMPLETE)" ] || return 1
+  # The rejection reason quotes the SAME constants the gate validates with.
+  jq -cn --arg t "$SPEC" '{task:$t,action:"COMPLETE",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF "$NEXT_ACTION_KEYS" || return 1
+  jq -cn --arg t "$SPEC" '{task:$t,stage:"completion",action:"FINISH",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF "$NEXT_ACTION_ACTIONS" || return 1
+  # Retry reminders derive from the same key constants as the review gates.
+  printf '%s' "$PERSONA_REVIEW_KEYS" | grep -qF '"persona"' || return 1
+  printf '%s' "$OBSERVER_REVIEW_KEYS" | grep -qF '"observer"' || return 1
+  grep -qF 'PERSONA_REVIEW_KEYS' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  # integrity_guard owns check->quarantine->block as one verb; all trust points use it.
+  ( log() { :; }
+    RUN_ROOT="$dir/ig"; STATE="$RUN_ROOT/state.json"; RUN_ID="igfix-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    printf '{"a":1}\n' >"$STATE"
+    integrity_put "$STATE"
+    integrity_guard "$STATE" "state-test" "state.json" || exit 1   # clean passes
+    printf '{"a":2}\n' >"$STATE"
+    block_run() { printf '%s' "$1" >"$RUN_ROOT/reason"; exit 7; }
+    ( integrity_guard "$STATE" "state-test" "state.json" ); [ "$?" -eq 7 ] || exit 1
+    grep -q 'modified outside the engine' "$RUN_ROOT/reason" || exit 1
+    [ -n "$(find "$RUN_ROOT/raw" -name 'tampered-state-test*' -print -quit)" ] || exit 1  # quarantined
+    jq -e '.a == 1' "$STATE" >/dev/null || exit 1                            # restored
+    integrity_cleanup
+    exit 0 ) || return 1
+  [ "$(grep -c '^\s*integrity_guard ' "$WORKSPACE_ROOT/scripts/night-shift.sh")" -ge 3 ] || return 1
+  return 0
+}
+
+fixture_log_stderr_and_repair_accounting() {
+  # log() must write to STDERR: visual_repair_screen's output is command-
+  # substituted into _screen_json, and stdout log lines interleaved with the
+  # JSON made the _consumed jq parse fail every time — the per-screen cap
+  # accounting silently degraded to charging $max (the pre-fix behavior),
+  # masked in fixtures by log(){ :; } stubs. Also aligns with every other
+  # script's log (visual-review.sh uses >&2).
+  local root="$1" dir="$root/logfd" out err
+  mkdir -p "$dir"
+  out="$(log 'stdout-must-stay-clean' 2>"$dir/err")"
+  [ -z "$out" ] || return 1
+  grep -q 'stdout-must-stay-clean' "$dir/err" || return 1
+  # End-to-end: a capture that mixes log output with JSON stays parseable.
+  emit_screen() { log 'progress line'; printf '{"attempts":[{"attempt":2}]}'; }
+  captured="$(emit_screen 2>/dev/null)"
+  [ "$(printf '%s' "$captured" | jq -r '[.attempts[]?|select(.attempt>1)]|length')" = "1" ] || return 1
+  return 0
+}
+
+fixture_require_nonempty_candidate_diff() {
+  # The empty-candidate guard must fail CLOSED: `git diff --quiet && block_run`
+  # skipped the block when git itself errored (exit 128 short-circuits &&) —
+  # a regression from the old command-substitution form, which blocked on any
+  # git failure. Review finding (CONFIRMED, low probability).
+  local root="$1" dir="$root/cand-empty"
+  mkdir -p "$dir/repo"
+  ( log() { :; }
+    PROJECT="$dir/repo"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'a\n' >"$PROJECT/f"; git -C "$PROJECT" add f; git -C "$PROJECT" commit -qm base
+    base="$(git -C "$PROJECT" rev-parse HEAD)"
+    git -C "$PROJECT" commit -q --allow-empty -m empty
+    empty="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf 'b\n' >>"$PROJECT/f"; git -C "$PROJECT" add f; git -C "$PROJECT" commit -qm change
+    real="$(git -C "$PROJECT" rev-parse HEAD)"
+    block_run() { printf '%s' "$1" >"$dir/reason"; exit 7; }
+    require_nonempty_candidate_diff "$base" "$real" || exit 1   # non-empty passes
+    ( require_nonempty_candidate_diff "$base" "$empty" ); [ "$?" -eq 7 ] || exit 1
+    grep -q 'empty' "$dir/reason" || exit 1
+    git() { return 128; }
+    ( require_nonempty_candidate_diff "$base" "$real" ); [ "$?" -eq 7 ] || exit 1
+    grep -q 'could not compute' "$dir/reason" || exit 1         # git error fails CLOSED
+    exit 0 ) || return 1
+  return 0
+}
+
+fixture_worker_reap() {
+  # A directed HUP/INT/TERM to the ENGINE pid during a parallel persona batch
+  # must not orphan the backgrounded paid `claude -p` workers: block_run's
+  # signal path reaps them (kill the worker's process group, fall back to the
+  # pid) and salvages the interrupted batch's per-attempt costs from the
+  # .attempts markers BEFORE exiting. Review finding: pre-fix, the trap exited
+  # without kill/reap (orphans kept spending), skipped the cost loop, and
+  # cleanup_observer_tmp rm -rf'd the workers' live cwd.
+  local root="$1" dir="$root/reap" w1 w2 c1
+  mkdir -p "$dir/rd" "$dir/raw"
+  ( log() { :; }
+    RUN_ROOT="$dir"
+    # Two fake worker trees: subshell + long-lived child (emulates claude).
+    set -m
+    ( sleep 30 & wait ) >/dev/null 2>&1 &
+    w1=$!
+    ( sleep 30 & wait ) >/dev/null 2>&1 &
+    w2=$!
+    set +m
+    PERSONA_WORKER_PIDS="$w1 $w2"
+    PERSONA_BATCH_DIR="$dir/rd"; PERSONA_BATCH_STAGE="plan"
+    printf '2' >"$dir/rd/.attempts-human-advocate"
+    printf '{"total_cost_usd":0.01,"num_turns":1}' >"$dir/raw/persona-plan-human-advocate.1.json"
+    printf '{"total_cost_usd":0.02,"num_turns":1}' >"$dir/raw/persona-plan-human-advocate.2.json"
+    reap_persona_workers
+    sleep 0.3
+    kill -0 "$w1" 2>/dev/null && exit 1   # worker 1 dead
+    kill -0 "$w2" 2>/dev/null && exit 1   # worker 2 dead
+    [ ! -f "$dir/rd/.attempts-human-advocate" ] || exit 1   # marker consumed
+    [ "$(grep -c . "$dir/cost-ledger.jsonl")" -eq 2 ] || exit 1  # costs salvaged
+    [ -z "$PERSONA_WORKER_PIDS" ] || exit 1
+    reap_persona_workers   # idempotent with no active batch
+    exit 0 ) || return 1
+  # Wiring: block_run reaps BEFORE cleanup_observer_tmp (which removes the
+  # workers' neutral cwds), and each worker gets its own per-slug neutral cwd.
+  # Pipe-free glob (`*A*B*` matches iff A precedes B) — no pipefail+grep-q race.
+  case "$(declare -f block_run)" in *reap_persona_workers*cleanup_observer_tmp*) ;; *) return 1 ;; esac
+  case "$(declare -f invoke_persona_once)" in *'night-shift-persona-$RUN_ID-'*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_persona_parallel_spawn() {
+  # Personas are independent read-only reviewers of the same static bundle, so
+  # the engine fans them out concurrently (NIGHT_SHIFT_PERSONA_CONCURRENCY,
+  # default 4) — a serial spawn made every review round pay N sequential model
+  # latencies. Proof of concurrency is a rendezvous: each stubbed persona waits
+  # (bounded) for the OTHER to have started; only overlapping workers ever see
+  # two started-markers.
+  local root="$1" dir="$root/pparallel"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="ppar"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      : >"$dir/started-$(persona_slug "$1")"
+      local i=0
+      while [ "$(find "$dir" -maxdepth 1 -name 'started-*' | wc -l | tr -d ' ')" -lt 2 ] && [ "$i" -lt 50 ]; do
+        sleep 0.1; i=$((i + 1))
+      done
+      [ "$i" -lt 50 ] || : >"$dir/.no-overlap"
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{}' >"$5"
+    }
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    NIGHT_SHIFT_PERSONA_CONCURRENCY=2 spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate"
+    [ ! -f "$dir/.no-overlap" ] || exit 1                                # truly concurrent
+    [ "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || exit 1
+    exit 0 ) || return 1
+  # Serial mode (concurrency=1) still produces every result.
+  ( log() { :; }
+    RUN_ROOT="$dir/run1"; SPEC="$dir/s1.md"; PROJECT="$dir/proj1"
+    BASE_COMMIT="HEAD"; RUN_ID="pser"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{}' >"$5"
+    }
+    rd="$RUN_ROOT/validated/personas/s1/plan/round-1"; mkdir -p "$rd"
+    NIGHT_SHIFT_PERSONA_CONCURRENCY=1 spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate"
+    [ "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || exit 1
+    exit 0 ) || return 1
+  return 0
+}
+
+fixture_retry_feedback_note() {
+  # Persona and observer retries used to blindly re-send the identical prompt —
+  # the model got no signal about WHY attempt 1 failed validation. The retry
+  # attempt must carry a rejection note (the same principle that fixed the
+  # primary's malformed-signal loops), and the first attempt must not.
+  local root="$1" dir="$root/retry-note" p
+  mkdir -p "$dir"
+  local RUN_ID=testrun SPEC="$dir/spec.md" PROJECT="$dir" BASE_COMMIT=deadbeef
+  fixture_write_min_spec "$SPEC"
+  printf 'bundle-body\n' >"$dir/bundle.md"
+  # (1) persona_prompt: note present iff supplied.
+  p="$(persona_prompt "Human Advocate" plan "$dir/bundle.md" "lens-text" "keys must be exactly six")"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' || return 1
+  printf '%s' "$p" | grep -q 'keys must be exactly six' || return 1
+  p="$(persona_prompt "Human Advocate" plan "$dir/bundle.md" "lens-text")"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' && return 1
+  # (2) observer_prompt: same contract.
+  printf 'ctx\n' >"$dir/ctx.txt"
+  p="$(observer_prompt "$dir/ctx.txt" deadbeef "verdict failed the observer-review schema")"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' || return 1
+  p="$(observer_prompt "$dir/ctx.txt" deadbeef)"
+  printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' && return 1
+  # (3) spawn_personas feeds a note to attempt 2 only.
+  ( log() { :; }
+    RUN_ROOT="$dir"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$dir/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      printf '%s' "${6:-}" >"$dir/note-args.$(basename "$5" | sed 's/.*\.\([0-9]*\)\.json/\1/')"
+      if [ -f "$dir/fail-once" ]; then
+        rm -f "$dir/fail-once"; printf 'junk' >"$4"; printf '{}' >"$5"; return 1
+      fi
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"
+      printf '{}' >"$5"
+    }
+    block_run() { exit 7; }
+    : >"$dir/fail-once"
+    rd="$dir/validated/personas/spec/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    exit 0 ) || return 1
+  [ -s "$dir/note-args.1" ] && return 1   # attempt 1: no note
+  [ -s "$dir/note-args.2" ] || return 1   # attempt 2: rejection note present
+  return 0
+}
+
+fixture_compact_success_copy_guard() {
+  # compact_success deletes everything but archive/ AFTER copying state +
+  # validated evidence into it. The copies used to be unchecked, so a failed
+  # copy (disk full, perms, a file squatting the archive path) silently
+  # DESTROYED a successful run's evidence. On any copy failure the full run
+  # state must be preserved (no deletion).
+  local root="$1" dir="$root/compact-guard" run="rid"
+  mkdir -p "$dir/validated"
+  printf '{"ok":true}\n' >"$dir/state.json"
+  printf 'evidence\n' >"$dir/validated/final.json"
+  printf '{"s":1}\n' >"$dir/summary.json"
+  # A FILE squatting the archive run path makes mkdir -p fail.
+  mkdir -p "$dir/archive"
+  printf 'squatter\n' >"$dir/archive/$run"
+  ( log() { :; }; compact_success "$dir" "$run" ) || return 1
+  [ -f "$dir/state.json" ] || return 1          # nothing was deleted
+  [ -f "$dir/validated/final.json" ] || return 1
+  [ -f "$dir/summary.json" ] || return 1
+  # The happy path still compacts: fresh dir, no squatter.
+  local dir2="$root/compact-ok"
+  mkdir -p "$dir2/validated"
+  printf '{"ok":true}\n' >"$dir2/state.json"
+  printf 'evidence\n' >"$dir2/validated/final.json"
+  ( log() { :; }; compact_success "$dir2" "$run" ) || return 1
+  [ -f "$dir2/archive/$run/state.json" ] || return 1
+  [ -f "$dir2/archive/$run/validated/final.json" ] || return 1
+  [ ! -f "$dir2/state.json" ] || return 1       # compacted away
+  return 0
+}
+
+fixture_finding_history_failure_reason() {
+  # bump_finding_history used to die() inside the caller's $(...) — killing only
+  # the subshell — so on a jq/write failure the caller continued with an empty
+  # maxc and `[ "" -lt 3 ]` errored into the MISLEADING "stayed materially
+  # unchanged" block. The failure must surface as its own reason.
+  local root="$1" dir="$root/fhist"
+  mkdir -p "$dir/results" "$dir/proj"
+  ( log() { :; }
+    RUN_ROOT="$dir"; SPEC="$dir/spec.md"; PROJECT="$dir/proj"
+    printf '# s\n' >"$SPEC"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    git -C "$PROJECT" commit -q --allow-empty -m base
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '{"persona":"P","stage":"implementation","status":"BLOCK","findings":[{"id":"X-001","evidence":"e","required_change":"r"}],"documentation_changes":[],"commit":null}' \
+      >"$dir/results/p.json"
+    # A DIRECTORY at the history path makes both the seed write and jq fail.
+    mkdir -p "$dir/persona-history-spec-implementation.json"
+    block_run() { printf '%s' "$1" >"$dir/reason"; exit 7; }
+    detect_stalled_personas "$dir/results" implementation
+    exit 0 )
+  [ "$?" -eq 7 ] || return 1
+  grep -q 'finding history' "$dir/reason" || return 1
+  grep -q 'materially unchanged' "$dir/reason" && return 1
+  return 0
+}
+
+fixture_material_token_untracked() {
+  # material_token fingerprints the work under review so a genuine change resets
+  # the finding-stall counter. `git diff <base>` omits untracked files, so a fix
+  # round that only ADDS files (a test, a doc) kept the old fingerprint and three
+  # recurring rounds could false-block as "materially unchanged". Engine state
+  # under .night-shift/ must never affect the fingerprint.
+  local root="$1" repo="$root/mtok" t0 t1 t2
+  mkdir -p "$repo"
+  ( PROJECT="$repo"
+    git -C "$repo" init -q
+    git -C "$repo" config user.email t@t; git -C "$repo" config user.name t
+    printf 'base\n' >"$repo/f.txt"
+    git -C "$repo" add f.txt; git -C "$repo" commit -qm base
+    BASE_COMMIT="$(git -C "$repo" rev-parse HEAD)"
+    t0="$(material_token)"
+    printf 'added\n' >"$repo/added.js"
+    t1="$(material_token)"
+    [ "$t0" != "$t1" ] || exit 1   # a new untracked file IS material change
+    mkdir -p "$repo/.night-shift"; printf 'x\n' >"$repo/.night-shift/state.json"
+    t2="$(material_token)"
+    [ "$t1" = "$t2" ] || exit 1    # engine state never shifts the fingerprint
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_bundle_untracked_diff() {
+  # `git diff <base>` omits untracked files, so a brand-new file the primary had
+  # not yet staged was invisible to the engine-assembled review bundle — the
+  # personas then (correctly) BLOCKed on an empty diff and burned a fix round.
+  # The bundle must show untracked file content while still excluding gitignored
+  # files and .night-shift/ engine state (even when the project forgot to
+  # gitignore .night-shift/).
+  local root="$1" dir="$root/bundle-untracked"
+  mkdir -p "$dir/repo"
+  ( PROJECT="$dir/repo"; RUN_ROOT="$dir/rs"; SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    fixture_write_min_spec "$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'ignored.txt\n' >"$PROJECT/.gitignore"
+    printf 'base\n' >"$PROJECT/tracked.txt"
+    git -C "$PROJECT" add .gitignore tracked.txt
+    git -C "$PROJECT" commit -qm base
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf 'base\ntracked-change\n' >"$PROJECT/tracked.txt"
+    printf 'module.exports.answer = 42;\n' >"$PROJECT/newfile.js"
+    mkdir -p "$PROJECT/.night-shift"
+    printf 'engine-state\n' >"$PROJECT/.night-shift/state.json"
+    printf 'ignored-junk\n' >"$PROJECT/ignored.txt"
+    out="$dir/bundle.md"
+    assemble_review_bundle implementation "$out"
+    grep -q 'tracked-change' "$out" || exit 1  # tracked working-tree diff intact
+    grep -q 'newfile.js' "$out" || exit 1      # untracked file is named
+    grep -q 'answer = 42' "$out" || exit 1     # ...and its content is reviewable
+    grep -q 'ignored-junk' "$out" && exit 1    # .gitignore respected
+    grep -q 'engine-state' "$out" && exit 1    # .night-shift/ never leaks
+    # The observer's committed-range diff is untouched by the untracked handling.
+    range_out="$(bounded_diff "$BASE_COMMIT..$BASE_COMMIT")"
+    printf '%s' "$range_out" | grep -q 'newfile.js' && exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_persona_spawn_guards() {
+  # spawn_personas must (a) halt an over-budget run before spawning another paid
+  # session, and (b) record cost for EVERY paid attempt, not just the successful one.
+  local root="$1" dir="$root/pguard"
+  mkdir -p "$dir"
+  # (a) task started in 1970 -> elapsed exceeds the budget -> block before any spawn.
+  ( log() { :; }
+    RUN_ROOT="$dir/a"; SPEC="$dir/a.md"; PROJECT="$dir/ap"; RUN_ID="pga"; PERSONA_MODEL="inherit"; BASE_COMMIT="HEAD"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage_started_at":1,"task_started_at":1}' >"$STATE"
+    invoke_persona_once() { printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"; printf '{}' >"$5"; }
+    block_run() { exit 7; }
+    rd="$RUN_ROOT/validated/personas/a/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate"
+    exit 0 )
+  [ "$?" -eq 7 ] || return 1
+  # (b) attempt 1 returns invalid, attempt 2 valid; both raws carry cost -> 2 ledger lines.
+  ( log() { :; }
+    RUN_ROOT="$dir/b"; SPEC="$dir/b.md"; PROJECT="$dir/bp"; RUN_ID="pgb"; PERSONA_MODEL="inherit"; BASE_COMMIT="HEAD"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"; printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    _try=0
+    invoke_persona_once() { _try=$((_try+1))
+      if [ "$_try" -eq 1 ]; then printf 'not json' >"$4"; else printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$4"; fi
+      printf '{"total_cost_usd":0.01,"num_turns":1}' >"$5"; }
+    rd="$RUN_ROOT/validated/personas/b/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    [ "$(grep -c . "$RUN_ROOT/cost-ledger.jsonl")" -eq 2 ] || exit 1
+    exit 0 ) || return 1
   return 0
 }
 
@@ -1034,6 +1903,25 @@ fixture_stage_round_reset() {
   printf '{"stage":"plan_review","stage_turns":2,"stage_counters":{},"review_round":2}\n' >"$STATE"
   set_stage implementation >/dev/null 2>&1
   [ "$(jq -r '.review_round' "$STATE")" = "0" ] || return 1
+  return 0
+}
+
+fixture_schema_inline_sync() {
+  # Anti-drift: the schemas/*.json enums must match the engine's canonical sources
+  # — the state machine (stage_forward_actions) and the $PERSONAS union — so a
+  # divergence between the JSON Schemas and the inline jq validators is caught here
+  # rather than at runtime.
+  local stages s acts engine_actions schema_actions schema_personas
+  stages="planning plan_review implementation implementation_review implementation_ready visual_review observer_review completion"
+  acts=""
+  for s in $stages; do acts="$acts $(stage_forward_actions "$s")"; done
+  acts="$acts BLOCKED"
+  # shellcheck disable=SC2086  # word-split $acts into one action per line on purpose
+  engine_actions="$(printf '%s\n' $acts | sort -u | paste -sd'|' -)"
+  schema_actions="$(jq -r '.properties.action.enum | sort | join("|")' "$WORKSPACE_ROOT/schemas/next-action.json")"
+  [ "$engine_actions" = "$schema_actions" ] || return 1
+  schema_personas="$(jq -r '.properties.persona.enum | sort | join("|")' "$WORKSPACE_ROOT/schemas/persona-review.json")"
+  [ "$schema_personas" = "$(printf '%s' "$PERSONAS" | tr '|' '\n' | sort | paste -sd'|' -)" ] || return 1
   return 0
 }
 
@@ -1241,6 +2129,97 @@ fixture_handoff_prompt() {
   printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
   primary_prompt "$prompt"
   grep -q "FRESH stage session" "$prompt" && return 1
+  return 0
+}
+
+fixture_signal_rejection_feedback() {
+  # A malformed/absent signal must feed the NEXT correction turn the exact
+  # rejection reason. The correction re-prompt used to be byte-identical to the
+  # original (only the turns-remaining counter changed), so the model was never
+  # told its signal was rejected or why — a weaker tier looped a missing "stage"
+  # key straight into the malformed cap AFTER observer approval.
+  local root="$1" dir="$root/sig-reject" prompt reason
+  mkdir -p "$dir/control"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  fixture_write_min_spec "$SPEC"
+  # (1) signal_rejection_reason is specific per failure mode.
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 2)"
+  printf '%s' "$reason" | grep -qi 'no signal file' || return 1
+  printf 'not-json' >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qi 'not valid JSON' || return 1
+  jq -cn --arg t "$SPEC" '{task:$t,action:"COMPLETE",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF '"action","artifacts","reason","stage","task"' || return 1
+  printf '%s' "$reason" | grep -q 'stage' || return 1
+  jq -cn --arg t "$SPEC" '{task:$t,stage:"completion",action:"FINISH",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -q 'FINISH' || return 1
+  jq -cn '{task:"/other.md",stage:"completion",action:"COMPLETE",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF "$SPEC" || return 1
+  # (2) A correction turn carries the recorded rejection verbatim.
+  prompt="$dir/prompt.txt"
+  printf '{"stage":"completion","stage_turns":1,"primary_turns":8,"session_id":"s1","malformed_signal_consecutive":2}\n' >"$STATE"
+  printf 'top-level keys must be EXACTLY [...]; missing: stage\n' >"$dir/control/signal-rejection.txt"
+  primary_prompt "$prompt"
+  grep -q 'SIGNAL REJECTED' "$prompt" || return 1
+  grep -q 'missing: stage' "$prompt" || return 1
+  # (3) No rejection -> no feedback block; the exact five-key example is ALWAYS
+  # present with the live stage and spec baked in.
+  printf '{"stage":"completion","stage_turns":0,"primary_turns":7,"session_id":null}\n' >"$STATE"
+  rm -f "$dir/control/signal-rejection.txt"
+  primary_prompt "$prompt"
+  grep -q 'SIGNAL REJECTED' "$prompt" && return 1
+  grep -qF '"stage":"completion"' "$prompt" || return 1
+  grep -qF '"artifacts":[]' "$prompt" || return 1
+  grep -qF "\"task\":\"$SPEC\"" "$prompt" || return 1
+  return 0
+}
+
+fixture_candidate_evidence_feedback() {
+  # A CREATE_CANDIDATE whose execution evidence fails the schema must be a
+  # correctable rejection (exact reason fed to the next turn via the fix-B
+  # machinery), not a terminal block: a live haiku primary wrote test_first as
+  # {command, exit_code, output} (no failing/passing split, no task) and the run
+  # died at the gate AFTER 4/4 persona approval. verify_candidate keeps its own
+  # gate as defense in depth.
+  local root="$1" dir="$root/cand-ev" reason ev ev_rel
+  mkdir -p "$dir/proj/.night-shift/validated" "$dir/control"
+  local RUN_ROOT="$dir" PROJECT="$dir/proj" SPEC="$dir/spec.md" RUN_ID=testrun
+  local BASE_COMMIT=deadbeef STATE="$dir/state.json"
+  fixture_write_min_spec "$SPEC"
+  ev_rel=".night-shift/validated/execution-evidence.json"
+  ev="$PROJECT/$ev_rel"
+  jq -cn --arg t "$SPEC" --arg a "$ev_rel" \
+    '{action:"CREATE_CANDIDATE",artifacts:[$a],reason:"r",stage:"implementation_ready",task:$t}' \
+    >"$dir/control/next-action.json"
+  # (1) Mis-shaped evidence (the live-haiku shape) -> signal rejected, reason specific.
+  jq -cn '{baseline:[{command:"c",exit_code:0,output:"o"}],final_validation:[{command:"c",exit_code:0,output:"o"}],test_first:{command:"c",exit_code:1,output:"o"}}' >"$ev"
+  validate_signal && return 1
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -q 'execution-evidence' || return 1
+  printf '%s' "$reason" | grep -qF '"baseline","final_validation","task","test_first"' || return 1
+  # (2) Evidence artifact listed but the file is absent -> named as missing.
+  rm -f "$ev"
+  validate_signal && return 1
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qi 'missing' || return 1
+  # (3) Schema-valid evidence with the matching task -> the signal passes.
+  jq -cn --arg t "$SPEC" '{task:$t,
+    baseline:[{command:"c",exit_status:0,output:"o"}],
+    test_first:{command:"c",failing_exit_status:1,failing_output:"red",passing_exit_status:0,passing_output:"green"},
+    final_validation:[{command:"c",exit_status:0,output:"o"}]}' >"$ev"
+  validate_signal || return 1
+  # (4) The CREATE_CANDIDATE prompt bullet inlines the exact evidence shape.
+  printf '{"stage":"implementation_ready","stage_turns":0,"primary_turns":3,"session_id":"s"}\n' >"$STATE"
+  primary_prompt "$dir/prompt.txt"
+  grep -qF '"failing_exit_status"' "$dir/prompt.txt" || return 1
+  grep -qF '"exit_status"' "$dir/prompt.txt" || return 1
   return 0
 }
 
@@ -1884,6 +2863,19 @@ fixture_observer_normalization() {
   json_schema_basic observer-review "$in" &&
     [ "$(jq -r '.status' "$in")" = "APPROVE" ] &&
     [ "$(jq -r '.findings|length' "$in")" = "0" ] || ok=0
+  # required_change as a BOOLEAN (a live observer treated it as a flag) must fall
+  # through to real text, not become the useless string "true" (found via a live call).
+  printf '%s\n' '{"status":"BLOCK","findings":[{"id":"OBS-9","evidence":"real evidence here","required_change":true}]}' >"$in"
+  normalize_observer_output "$in" "specs/x.md" "abcdef1234567"
+  json_schema_basic observer-review "$in" &&
+    [ "$(jq -r '.findings[0].required_change' "$in")" != "true" ] &&
+    { jq -e '.findings[0].required_change|test("real evidence")' "$in" >/dev/null; } || ok=0
+  # A non-object findings element must not throw jq (which would leave the raw verdict
+  # and force a spurious block); it is coerced to a finding.
+  printf '%s\n' '{"status":"BLOCK","findings":["stray",{"id":"OBS-3","evidence":"e","required_change":"r"}]}' >"$in"
+  normalize_observer_output "$in" "specs/x.md" "abcdef1234567"
+  json_schema_basic observer-review "$in" &&
+    [ "$(jq -r '.findings|length' "$in")" -eq 2 ] || ok=0
   [ "$ok" -eq 1 ]
 }
 
@@ -1951,19 +2943,58 @@ run_live_fixtures() {
   [ "${NIGHT_SHIFT_ACCEPT_COSTS:-}" = "YES" ] ||
     die "live fixture tests make paid model calls; set NIGHT_SHIFT_ACCEPT_COSTS=YES"
   require_command claude
-  log "running minimal paid Claude startup, session-ID, resume, unattended-tool, and observer checks"
+  log "running minimal paid Claude startup, session-ID, resume, unattended-tool, observer, and reap checks"
   log "(each live check is silent on success and only prints on failure)"
-  log "1/3 startup + session-id + resume..."
+  log "1/4 startup + session-id + resume..."
   live_adapter_check claude
-  log "2/3 unattended tool use (bypassPermissions)..."
+  log "2/4 unattended tool use (bypassPermissions)..."
   live_primary_tool_check
-  log "3/3 observer (neutral cwd, no tools, schema)..."
+  log "3/4 observer (neutral cwd, no tools, schema)..."
   live_observer_check
+  log "4/4 worker reap (kills one live persona call mid-flight)..."
+  live_worker_reap_check
   if [ "$FULL_PERSONA_LIVE_TEST" -eq 1 ]; then
     log "cost warning accepted: running six live persona calls"
     live_persona_checks
   fi
   log "all live checks passed — the workflow can run unattended"
+}
+
+# Live proof of the signal-path worker reap against a REAL paid session (the
+# deterministic fixture kills fake process trees; this kills an actual
+# `claude -p` persona mid-flight): spawn one haiku worker under set -m, wait
+# for the claude child to appear in its process group, reap, and require the
+# group to be empty. Cost: one short-lived killed call.
+live_worker_reap_check() {
+  local root rc
+  root="$WORKSPACE_ROOT/.night-shift-live-reap.$$"
+  ( log() { :; }
+    RUN_ROOT="$root"; RUN_ID="live-reap-$$"; PROJECT="$root/proj"; SPEC="$root/spec.md"
+    PERSONA_MODEL="claude-haiku-4-5"
+    mkdir -p "$RUN_ROOT/raw" "$RUN_ROOT/control" "$PROJECT" "$root/rd"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# review bundle\n(worker will be killed before finishing)\n' >"$root/bundle.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage":"plan_review","stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    set -m
+    spawn_persona_worker "Human Advocate" plan "$root/bundle.md" "$root/rd" &
+    set +m
+    w=$!
+    PERSONA_WORKER_PIDS="$w"; PERSONA_BATCH_DIR="$root/rd"; PERSONA_BATCH_STAGE=plan
+    i=0
+    while [ "$i" -lt 60 ]; do
+      pgrep -g "$w" -f claude >/dev/null 2>&1 && break
+      kill -0 "$w" 2>/dev/null || break
+      sleep 0.5; i=$((i + 1))
+    done
+    reap_persona_workers
+    sleep 1
+    pgrep -g "$w" >/dev/null 2>&1 && exit 1   # anything surviving in the group = orphan
+    exit 0 )
+  rc=$?
+  rm -rf "$root" 2>/dev/null || true
+  [ "$rc" -eq 0 ] ||
+    die "live worker-reap check failed: a reaped persona batch left a running process"
 }
 
 # Proves the primary can actually edit files / run tools UNATTENDED with the same
@@ -2135,7 +3166,7 @@ fixture_device_release() {
     device_try_claim UDID-AAA run-A false || exit 1     # real device
     device_release UDID-AAA
     [ -d "$stub/reg/UDID-AAA.lock" ] && exit 1          # lock removed
-    grep -q "delete UDID-AAA" "$stub/calls.log" && exit 1   # NOT deleted (real)
+    grep -q "delete UDID-AAA" "$stub/calls.log" 2>/dev/null && exit 1   # NOT deleted (real)
     device_try_claim UDID-CLONE-x run-B true || exit 1  # a clone
     device_release UDID-CLONE-x
     grep -q "delete UDID-CLONE-x" "$stub/calls.log" || exit 1  # clone deleted
@@ -3040,7 +4071,7 @@ fixture_recapture_wrapper() {
     log() { :; }
     repair_metro_restart() { printf 'restart\n' >>"$d/order.log"; }
     __visual_wait_bundle_ready() { printf 'wait\n' >>"$d/order.log"; return 0; }
-    visual_recapture_screen() { printf 'capture\n' >>"$d/order.log"; : >"$2.touch" 2>/dev/null; printf x >"$4"; }
+    visual_recapture_screen() { printf 'capture\n' >>"$d/order.log"; printf x >"$4"; }
     repair_recapture_screen Home default iphone-15 "$d/out.png"
     [ "$(cat "$d/order.log")" = "$(printf 'restart\nwait\ncapture')" ] || exit 1
     exit 0

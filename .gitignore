@@ -33,3 +33,6 @@
 # Node (in case any helper ever adds deps at the root).
 node_modules/
 agui-jsonrender-rn/
+
+# Deterministic fixture scratch roots (cleaned on normal exit; orphaned only if a run is SIGKILLed).
+.night-shift-fixture*/
