@@ -237,15 +237,38 @@ if [ "$LIST_OPTIONAL_PERSONAS" -eq 1 ]; then
   exit 0
 fi
 
+# Single source for the wire contracts. The gate (json_schema_basic), the
+# correction feedback (signal_rejection_reason / evidence_rejection_reason),
+# and the retry contract reminders all consult THESE, so a schema edit cannot
+# leave the feedback teaching the model the old shape — the drift that turns a
+# correctable rejection into a loop into the malformed cap.
+NEXT_ACTION_KEYS='["action","artifacts","reason","stage","task"]'
+NEXT_ACTION_ACTIONS='RUN_PERSONAS|CREATE_CANDIDATE|REQUEST_OBSERVER|RUN_VISUAL|NEXT_TASK|BLOCKED|COMPLETE'
+EXECUTION_EVIDENCE_KEYS='["baseline","final_validation","task","test_first"]'
+TEST_FIRST_KEYS='["command","failing_exit_status","failing_output","passing_exit_status","passing_output"]'
+PERSONA_REVIEW_KEYS='["commit","documentation_changes","findings","persona","stage","status"]'
+OBSERVER_REVIEW_KEYS='["candidate_commit","documentation_changes","findings","observer","primary","status","task"]'
+
+# Per-action artifact requirement — the artifact-side sibling of
+# stage_forward_actions. What a signal's artifacts must carry for the wrapper
+# to act on it; the validate_signal gate and signal_rejection_reason's
+# explanation both consult this table so they cannot drift.
+action_artifact_requirement() {
+  case "$1" in
+    CREATE_CANDIDATE) printf 'execution-evidence' ;;
+    *) printf '' ;;
+  esac
+}
+
 json_schema_basic() {
   local kind="$1" file="$2"
   jq -e . "$file" >/dev/null 2>&1 || return 1
   case "$kind" in
     next-action)
-      jq -e '
+      jq -e --argjson akeys "$NEXT_ACTION_KEYS" --arg actions "$NEXT_ACTION_ACTIONS" '
         type == "object" and
-        ((keys | sort) == ["action","artifacts","reason","stage","task"]) and
-        (.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","RUN_VISUAL","NEXT_TASK","BLOCKED","COMPLETE")) and
+        ((keys | sort) == $akeys) and
+        (.action as $a | ($actions | split("|")) | index($a) != null) and
         (.task | type == "string" and length > 0) and
         (.stage | type == "string" and length > 0) and
         (.reason | type == "string" and length > 0) and
@@ -255,10 +278,10 @@ json_schema_basic() {
       ' "$file" >/dev/null 2>&1
       ;;
     persona-review)
-      jq -e --arg personas "$PERSONAS" '
+      jq -e --arg personas "$PERSONAS" --argjson pkeys "$PERSONA_REVIEW_KEYS" '
         ($personas | split("|")) as $p |
         type == "object" and
-        ((keys | sort) == ["commit","documentation_changes","findings","persona","stage","status"]) and
+        ((keys | sort) == $pkeys) and
         (.persona as $v | $p | index($v) != null) and
         (.stage | IN("plan","implementation")) and
         (.commit == null or (.commit | type == "string" and length > 0)) and
@@ -273,9 +296,9 @@ json_schema_basic() {
       ' "$file" >/dev/null 2>&1
       ;;
     observer-review)
-      jq -e '
+      jq -e --argjson okeys "$OBSERVER_REVIEW_KEYS" '
         type == "object" and
-        ((keys | sort) == ["candidate_commit","documentation_changes","findings","observer","primary","status","task"]) and
+        ((keys | sort) == $okeys) and
         (.observer == "claude") and (.primary == "claude") and
         (.task | type == "string" and length > 0) and
         (.candidate_commit | type == "string" and test("^[0-9a-f]{7,64}$")) and
@@ -290,9 +313,9 @@ json_schema_basic() {
       ' "$file" >/dev/null 2>&1
       ;;
     execution-evidence)
-      jq -e '
+      jq -e --argjson ekeys "$EXECUTION_EVIDENCE_KEYS" --argjson tkeys "$TEST_FIRST_KEYS" '
         type == "object" and
-        ((keys | sort) == ["baseline","final_validation","task","test_first"]) and
+        ((keys | sort) == $ekeys) and
         (.task | type == "string" and length > 0) and
         (.baseline | type == "array" and length > 0 and all(.[];
           ((keys | sort) == ["command","exit_status","output"]) and
@@ -305,7 +328,7 @@ json_schema_basic() {
           (.exit_status | type == "number" and floor == . and . >= 0) and
           (.output | type == "string"))) and
         (.test_first |
-          ((keys | sort) == ["command","failing_exit_status","failing_output","passing_exit_status","passing_output"]) and
+          ((keys | sort) == $tkeys) and
           (.command | type == "string" and length > 0) and
           (.failing_exit_status | type == "number" and floor == . and . > 0) and
           (.failing_output | type == "string" and length > 0) and
@@ -584,6 +607,19 @@ integrity_quarantine() {
   local file="$1" label="$2"
   cp "$file" "$RUN_ROOT/raw/tampered-$label.$$.json" 2>/dev/null || true
   cp "$(integrity_dir)/$(integrity_key "$file")" "$file" 2>/dev/null || true
+}
+
+# THE verb every trust point uses. check -> quarantine -> block is a security
+# invariant (the quarantine restore MUST precede block_run, or block_run's own
+# state write launders the tampered content into the anchor); owning the
+# ordering here means a future trust point cannot get it wrong. Missing file =
+# nothing to verify (the consumer's own read will fail loudly if it matters).
+integrity_guard() {
+  local file="$1" label="$2" what="$3"
+  [ -f "$file" ] || return 0
+  integrity_check "$file" && return 0
+  integrity_quarantine "$file" "$label"
+  block_run "wrapper-owned $what was modified outside the engine (divergent copy kept under raw/)"
 }
 
 state_set() {
@@ -1072,10 +1108,7 @@ invoke_primary() {
   # The primary just had unattended write access to the whole project including
   # .night-shift/. Verify the wrapper-owned state BEFORE the engine's own writes
   # below would launder an out-of-band edit into the private copy.
-  if ! integrity_check "$STATE"; then
-    integrity_quarantine "$STATE" "state-turn-$turn"
-    block_run "wrapper-owned state.json was modified outside the engine during the primary turn (divergent copy kept under raw/)"
-  fi
+  integrity_guard "$STATE" "state-turn-$turn" "state.json (during the primary turn)"
   state_set '
     .session_id=$session |
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
@@ -1253,14 +1286,16 @@ validate_signal() {
   [ -f "$signal" ] || return 2
   json_schema_basic next-action "$signal" || return 1
   [ "$(jq -r '.task' "$signal")" = "$SPEC" ] || return 1
-  # A CREATE_CANDIDATE without schema-valid execution evidence is rejected HERE,
-  # where the malformed-signal correction machinery feeds the reason back to the
-  # primary — not deep in verify_candidate, whose evidence gate (kept as defense
-  # in depth) is a terminal block the primary never gets to fix. A live model
-  # reliably mis-shapes the evidence on the first try (exit_code for exit_status,
-  # missing task, a flat test_first); that must cost a correction turn, not the run.
-  [ "$(jq -r '.action' "$signal")" != "CREATE_CANDIDATE" ] ||
-    signal_has_valid_evidence "$signal" || return 1
+  # An action whose artifact requirement (per the action_artifact_requirement
+  # table) is unmet is rejected HERE, where the malformed-signal correction
+  # machinery feeds the reason back to the primary — not deep in the handler,
+  # whose gate (kept as defense in depth) is a terminal block the primary never
+  # gets to fix. A live model reliably mis-shapes the evidence on the first try
+  # (exit_code for exit_status, missing task, a flat test_first); that must
+  # cost a correction turn, not the run.
+  case "$(action_artifact_requirement "$(jq -r '.action' "$signal")")" in
+    execution-evidence) signal_has_valid_evidence "$signal" || return 1 ;;
+  esac
 }
 
 # True when any artifact in the signal is a schema-valid execution-evidence file
@@ -1288,8 +1323,8 @@ evidence_rejection_reason() {
     return 0
   fi
   keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$f")"
-  if [ "$keys" != '["baseline","final_validation","task","test_first"]' ]; then
-    printf 'top-level keys must be EXACTLY ["baseline","final_validation","task","test_first"]; the file has %s' "$keys"
+  if [ "$keys" != "$EXECUTION_EVIDENCE_KEYS" ]; then
+    printf 'top-level keys must be EXACTLY %s; the file has %s' "$EXECUTION_EVIDENCE_KEYS" "$keys"
     return 0
   fi
   if [ "$(jq -r '.task' "$f")" != "$SPEC" ]; then
@@ -1297,8 +1332,8 @@ evidence_rejection_reason() {
     return 0
   fi
   keys="$(jq -c '.test_first | if type == "object" then (keys | sort) else type end' "$f")"
-  if [ "$keys" != '["command","failing_exit_status","failing_output","passing_exit_status","passing_output"]' ]; then
-    printf '"test_first" keys must be EXACTLY ["command","failing_exit_status","failing_output","passing_exit_status","passing_output"] (failing AND passing evidence, not a single exit_code/output pair); the file has %s' "$keys"
+  if [ "$keys" != "$TEST_FIRST_KEYS" ]; then
+    printf '"test_first" keys must be EXACTLY %s (failing AND passing evidence, not a single exit_code/output pair); the file has %s' "$TEST_FIRST_KEYS" "$keys"
     return 0
   fi
   printf 'baseline/final_validation must be non-empty arrays of {"command","exit_status","output"} (integer exit_status >= 0), test_first needs failing_exit_status > 0 with non-empty failing_output and passing_exit_status == 0 with non-empty passing_output'
@@ -1320,13 +1355,12 @@ signal_rejection_reason() {
     return 0
   fi
   keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$signal")"
-  if [ "$keys" != '["action","artifacts","reason","stage","task"]' ]; then
-    printf 'top-level keys must be EXACTLY ["action","artifacts","reason","stage","task"] (no more, no fewer); the file has %s' "$keys"
+  if [ "$keys" != "$NEXT_ACTION_KEYS" ]; then
+    printf 'top-level keys must be EXACTLY %s (no more, no fewer); the file has %s' "$NEXT_ACTION_KEYS" "$keys"
     return 0
   fi
-  if ! jq -e '.action | IN("RUN_PERSONAS","CREATE_CANDIDATE","REQUEST_OBSERVER","RUN_VISUAL","NEXT_TASK","BLOCKED","COMPLETE")' "$signal" >/dev/null 2>&1; then
-    printf '"action" %s is not one of RUN_PERSONAS|CREATE_CANDIDATE|REQUEST_OBSERVER|RUN_VISUAL|NEXT_TASK|BLOCKED|COMPLETE' \
-      "$(jq -c '.action' "$signal")"
+  if ! jq -e --arg actions "$NEXT_ACTION_ACTIONS" '.action as $a | ($actions | split("|")) | index($a) != null' "$signal" >/dev/null 2>&1; then
+    printf '"action" %s is not one of %s' "$(jq -c '.action' "$signal")" "$NEXT_ACTION_ACTIONS"
     return 0
   fi
   if [ "$(jq -r '.task' "$signal")" != "$SPEC" ]; then
@@ -1337,11 +1371,12 @@ signal_rejection_reason() {
     printf '"stage" and "reason" must both be non-empty strings'
     return 0
   fi
-  if [ "$(jq -r '.action' "$signal")" = "CREATE_CANDIDATE" ] && ! signal_has_valid_evidence "$signal"; then
+  if [ "$(action_artifact_requirement "$(jq -r '.action' "$signal")")" = "execution-evidence" ] &&
+    ! signal_has_valid_evidence "$signal"; then
     local first resolved
     first="$(jq -r '.artifacts[0] // empty' "$signal")"
     if [ -z "$first" ]; then
-      printf 'CREATE_CANDIDATE must list the execution-evidence file in "artifacts"'
+      printf '%s must list the execution-evidence file in "artifacts"' "$(jq -r '.action' "$signal")"
       return 0
     fi
     if ! resolved="$(resolve_artifact "$first")"; then
@@ -1699,7 +1734,7 @@ spawn_persona_worker() {
     if [ "$iv" -ne 0 ]; then
       retry_note="no parseable JSON verdict could be extracted from the reply; end with EXACTLY one fenced json code block and nothing after it"
     else
-      retry_note="the verdict failed the persona-review contract: exactly the six keys persona/stage/commit/status/findings/documentation_changes; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
+      retry_note="the verdict failed the persona-review contract: exactly the keys $PERSONA_REVIEW_KEYS; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
     fi
     rm -f "$tmp" "$idd" "$norm"
     if [ "$tries" -ge 2 ]; then
@@ -1972,10 +2007,7 @@ EOF
   # verify the primary did not rewrite them in the project tree.
   local owned
   for owned in "$RUN_ROOT/validated/baseline.json" "$RUN_ROOT/validated/test-first-failing.json"; do
-    if ! integrity_check "$owned"; then
-      integrity_quarantine "$owned" "$(basename "$owned" .json)"
-      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine (divergent copy kept under raw/)"
-    fi
+    integrity_guard "$owned" "$(basename "$owned" .json)" "evidence $(basename "$owned")"
   done
   # Modify-mode (the first-failing-test passed at baseline): establish the genuine red
   # proof now by overlaying the candidate's updated test files onto BASE production and
@@ -2222,11 +2254,7 @@ run_observer() {
   # observer_wrapper_evidence presents these as authoritative ground truth;
   # verify the primary did not rewrite them in the project tree.
   for owned in "$RUN_ROOT/validated/final.json" "$RUN_ROOT/validated/test-first-passing.json"; do
-    [ -f "$owned" ] || continue
-    if ! integrity_check "$owned"; then
-      integrity_quarantine "$owned" "$(basename "$owned" .json)"
-      block_run "wrapper-owned evidence $(basename "$owned") was modified outside the engine (divergent copy kept under raw/)"
-    fi
+    integrity_guard "$owned" "$(basename "$owned" .json)" "evidence $(basename "$owned")"
   done
   # Fail closed: the observer prompt treats the engine diff as authoritative ground
   # truth, so an unresolvable range must NOT hand it an empty diff (which would invite
@@ -2348,7 +2376,7 @@ validated_observer_retry() {
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
       return 0
     fi
-    retry_note="the verdict failed the observer-review contract: exactly the seven keys observer/primary/task/candidate_commit/status/findings/documentation_changes with the exact task and candidate values shown; status APPROVE or BLOCK only; finding ids match OBS-NNN"
+    retry_note="the verdict failed the observer-review contract: exactly the keys $OBSERVER_REVIEW_KEYS with the exact task and candidate values shown; status APPROVE or BLOCK only; finding ids match OBS-NNN"
     attempt=$((attempt + 1))
   done
   return 1

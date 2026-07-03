@@ -128,6 +128,7 @@ run_dry_fixtures() {
   fixture_assert "personas spawn concurrently (bounded by NIGHT_SHIFT_PERSONA_CONCURRENCY; 1 = serial)" fixture_persona_parallel_spawn "$root"
   fixture_assert "signal path reaps live persona workers + salvages batch costs" fixture_worker_reap "$root"
   fixture_assert "log writes to stderr (command-substituted JSON stays parseable)" fixture_log_stderr_and_repair_accounting "$root"
+  fixture_assert "wire contracts single-sourced (gate + rejection feedback + retry reminders) and integrity_guard owns check->quarantine->block" fixture_contract_single_source "$root"
   fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
@@ -1253,11 +1254,57 @@ fixture_wrapper_owned_integrity() {
     integrity_cleanup
     [ ! -d "$(integrity_dir)" ] || exit 1
     exit 0 ) || return 1
-  # Wiring: the trust points consult the check (primary-turn return, candidate
+  # Wiring: the trust points consult the guard (primary-turn return, candidate
   # gate, observer evidence) and state_set re-seeds after every engine write.
-  grep -q 'integrity_check "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_contract_single_source() {
+  # The wire contracts (signal keys, action enum, evidence keys) must have ONE
+  # source consulted by both the gate and the correction feedback: a gate-only
+  # schema edit used to leave the rejection reasons teaching the OLD shape,
+  # looping a weak model into the malformed cap. Likewise artifact requirements
+  # are per-action via a table (the artifact sibling of stage_forward_actions).
+  local root="$1" dir="$root/contract" reason
+  mkdir -p "$dir/control"
+  local SPEC="$dir/spec.md" RUN_ROOT="$dir" PROJECT="$dir"
+  fixture_write_min_spec "$SPEC"
+  # Table: only CREATE_CANDIDATE requires evidence.
+  [ "$(action_artifact_requirement CREATE_CANDIDATE)" = "execution-evidence" ] || return 1
+  [ -z "$(action_artifact_requirement RUN_PERSONAS)" ] || return 1
+  [ -z "$(action_artifact_requirement COMPLETE)" ] || return 1
+  # The rejection reason quotes the SAME constants the gate validates with.
+  jq -cn --arg t "$SPEC" '{task:$t,action:"COMPLETE",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF "$NEXT_ACTION_KEYS" || return 1
+  jq -cn --arg t "$SPEC" '{task:$t,stage:"completion",action:"FINISH",reason:"r",artifacts:[]}' \
+    >"$dir/control/next-action.json"
+  reason="$(signal_rejection_reason "$dir/control/next-action.json" 1)"
+  printf '%s' "$reason" | grep -qF "$NEXT_ACTION_ACTIONS" || return 1
+  # Retry reminders derive from the same key constants as the review gates.
+  printf '%s' "$PERSONA_REVIEW_KEYS" | grep -qF '"persona"' || return 1
+  printf '%s' "$OBSERVER_REVIEW_KEYS" | grep -qF '"observer"' || return 1
+  grep -qF 'PERSONA_REVIEW_KEYS' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  # integrity_guard owns check->quarantine->block as one verb; all trust points use it.
+  ( log() { :; }
+    RUN_ROOT="$dir/ig"; STATE="$RUN_ROOT/state.json"; RUN_ID="igfix-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    printf '{"a":1}\n' >"$STATE"
+    integrity_put "$STATE"
+    integrity_guard "$STATE" "state-test" "state.json" || exit 1   # clean passes
+    printf '{"a":2}\n' >"$STATE"
+    block_run() { printf '%s' "$1" >"$RUN_ROOT/reason"; exit 7; }
+    ( integrity_guard "$STATE" "state-test" "state.json" ); [ "$?" -eq 7 ] || exit 1
+    grep -q 'modified outside the engine' "$RUN_ROOT/reason" || exit 1
+    find "$RUN_ROOT/raw" -name 'tampered-state-test*' | grep -q . || exit 1  # quarantined
+    jq -e '.a == 1' "$STATE" >/dev/null || exit 1                            # restored
+    integrity_cleanup
+    exit 0 ) || return 1
+  [ "$(grep -c '^\s*integrity_guard ' "$WORKSPACE_ROOT/scripts/night-shift.sh")" -ge 3 ] || return 1
   return 0
 }
 
