@@ -1220,8 +1220,9 @@ fixture_integrity_quarantine() {
     integrity_check "$STATE" && exit 1
     integrity_quarantine "$STATE" "state-test"
     jq -e '.plan_approved == false' "$STATE" >/dev/null || exit 1   # restored to engine truth
-    find "$RUN_ROOT/raw" -name 'tampered-state-test*' | grep -q . || exit 1   # forensics kept
-    jq -e '.plan_approved == true' "$(find "$RUN_ROOT/raw" -name 'tampered-state-test*' | head -1)" >/dev/null || exit 1
+    tampered="$(find "$RUN_ROOT/raw" -name 'tampered-state-test*' -print -quit)"
+    [ -n "$tampered" ] || exit 1                                       # forensics kept
+    jq -e '.plan_approved == true' "$tampered" >/dev/null || exit 1
     integrity_check "$STATE" || exit 1
     integrity_cleanup
     exit 0 ) || return 1
@@ -1487,7 +1488,7 @@ fixture_contract_single_source() {
     block_run() { printf '%s' "$1" >"$RUN_ROOT/reason"; exit 7; }
     ( integrity_guard "$STATE" "state-test" "state.json" ); [ "$?" -eq 7 ] || exit 1
     grep -q 'modified outside the engine' "$RUN_ROOT/reason" || exit 1
-    find "$RUN_ROOT/raw" -name 'tampered-state-test*' | grep -q . || exit 1  # quarantined
+    [ -n "$(find "$RUN_ROOT/raw" -name 'tampered-state-test*' -print -quit)" ] || exit 1  # quarantined
     jq -e '.a == 1' "$STATE" >/dev/null || exit 1                            # restored
     integrity_cleanup
     exit 0 ) || return 1

@@ -1695,7 +1695,7 @@ spawn_persona_worker() {
 # block_run for any worker's failure marker.
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
-  local bundle persona slug raw old_ifs concurrency i j k n a attempts
+  local bundle persona slug raw old_ifs concurrency i j k n a attempts pstatus
   local -a queue pids names
   bundle="$RUN_ROOT/control/review-bundle.md"
   assemble_review_bundle "$persona_stage" "$bundle"
@@ -1748,9 +1748,17 @@ spawn_personas() {
         a=$((a + 1))
       done
       rm -f "$result_dir/.attempts-$slug"
+      # File-existence guard: a twice-failed persona writes NO result file, and
+      # `jq ... 2>/dev/null` on an absent file exits before the `// "invalid"`
+      # fallback, recording status:"" — which would obscure the journal of a
+      # run that blocked on that persona. Read the status only when the file exists.
+      if [ -f "$result_dir/$slug.json" ]; then
+        pstatus="$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)"
+      else
+        pstatus="invalid"
+      fi
       emit_event persona_verdict "$(jq -cn --arg p "$persona" --argjson a "$attempts" \
-        --arg s "$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)" \
-        '{persona:$p, status:$s, attempts:$a}')"
+        --arg s "$pstatus" '{persona:$p, status:$s, attempts:$a}')"
       if [ -f "$result_dir/.retry-$slug" ]; then
         emit_event persona_retry "$(jq -cn --arg p "$persona" \
           --arg reason "$(cat "$result_dir/.retry-$slug" 2>/dev/null)" '{persona:$p, reason:$reason}')"
