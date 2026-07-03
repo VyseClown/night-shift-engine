@@ -1265,7 +1265,7 @@ fixture_wrapper_owned_integrity() {
   # gate, observer evidence) and state_set re-seeds after every engine write.
   grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/lib/integrity.sh" || return 1
-  grep -A 3 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  case "$(declare -f state_set)" in *'integrity_put "$STATE"'*) ;; *) return 1 ;; esac
   return 0
 }
 
@@ -1300,18 +1300,20 @@ fixture_session_refresh() {
     RUN_ROOT="$dir"; STATE="$dir/state.json"; RUN_ID="sr-$$"
     printf '{"stage":"implementation","stage_turns":8,"session_id":"s1"}\n' >"$STATE"
     out="$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s1)"
-    [ -z "$out" ] || { echo "DBG sr check1 out=[$out]" >&2; exit 11; }   # cleared at the boundary
-    [ "$(jq -r '.session_id' "$STATE")" = "null" ] || { echo "DBG sr check2 sid=[$(jq -r '.session_id' "$STATE")]" >&2; exit 12; }
-    jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl" >/dev/null || { echo "DBG sr check3 events=[$(cat "$dir/events.jsonl" 2>&1)]" >&2; exit 13; }
+    [ -z "$out" ] || exit 1                                        # cleared at the boundary
+    [ "$(jq -r '.session_id' "$STATE")" = "null" ] || exit 1
+    jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl" >/dev/null || exit 1
     printf '{"stage":"implementation","stage_turns":7,"session_id":"s2"}\n' >"$STATE"
-    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2" ] || { echo "DBG sr check4" >&2; exit 14; }  # below: keep
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2" ] || exit 1  # below: keep
     printf '{"stage":"implementation","stage_turns":16,"session_id":"s3"}\n' >"$STATE"
-    [ -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)" ] || { echo "DBG sr check5" >&2; exit 15; }      # every Nth
+    [ -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)" ] || exit 1      # every Nth
     printf '{"stage":"implementation","stage_turns":8,"session_id":"s4"}\n' >"$STATE"
-    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4" ] || { echo "DBG sr check6" >&2; exit 16; }  # 0 = off
+    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4" ] || exit 1  # 0 = off
     exit 0 ) || return 1
-  # Wired into the primary turn path.
-  awk '/^invoke_primary\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'maybe_refresh_session' || return 1
+  # Wired into the primary turn path. declare -f (not awk|grep -q): the latter
+  # SIGPIPEs awk when grep -q exits early, and under pipefail that races to a
+  # false failure on Linux (green on macOS) — the CI-only flake this fixture hit.
+  case "$(declare -f invoke_primary)" in *maybe_refresh_session*) ;; *) return 1 ;; esac
   return 0
 }
 
@@ -1324,8 +1326,9 @@ fixture_durable_state_write() {
   printf 'x\n' >"$dir/f"
   durable_sync "$dir/f" || return 1
   durable_sync "$dir/absent" || return 1                     # missing file: no-op ok
-  grep -A 3 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'durable_sync' || return 1
-  awk '/^write_json_atomic\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'durable_sync' || return 1
+  # Pipe-free wiring checks (see session-refresh fixture for the pipefail rationale).
+  case "$(declare -f state_set)" in *durable_sync*) ;; *) return 1 ;; esac
+  case "$(declare -f write_json_atomic)" in *durable_sync*) ;; *) return 1 ;; esac
   return 0
 }
 
@@ -1348,7 +1351,7 @@ fixture_rate_limit_contract_canary() {
     [ "$warned" -eq 1 ] || exit 1                              # ...but warns
     jq -e 'select(.type=="contract_canary") | .payload.found=="9.9.9"' "$dir/events.jsonl" >/dev/null || exit 1
     exit 0 ) || return 1
-  awk '/^main_run\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'rate_limit_contract_canary' || return 1
+  case "$(declare -f main_run)" in *rate_limit_contract_canary*) ;; *) return 1 ;; esac
   return 0
 }
 
@@ -1398,9 +1401,11 @@ fixture_untracked_single_walk() {
   # number of processes (ls-files + cat, no per-file `git diff --no-index`)
   # while staying CONTENT-sensitive.
   local root="$1" repo="$root/uwalk" t1 t2
-  [ "$(awk '/^bounded_diff\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -c 'untracked_diff')" -le 2 ] || return 1
-  awk '/^material_token\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'untracked_diff' && return 1
-  awk '/^material_token\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'ls-files' || return 1
+  # Pipe-free wiring checks against the sourced functions (see session-refresh
+  # fixture for the pipefail+grep-q SIGPIPE rationale).
+  [ "$(grep -c 'untracked_diff' <<<"$(declare -f bounded_diff)")" -le 2 ] || return 1
+  case "$(declare -f material_token)" in *untracked_diff*) return 1 ;; esac
+  case "$(declare -f material_token)" in *ls-files*) ;; *) return 1 ;; esac
   mkdir -p "$repo"
   ( PROJECT="$repo"
     git -C "$repo" init -q
@@ -1572,10 +1577,9 @@ fixture_worker_reap() {
     exit 0 ) || return 1
   # Wiring: block_run reaps BEFORE cleanup_observer_tmp (which removes the
   # workers' neutral cwds), and each worker gets its own per-slug neutral cwd.
-  awk '/^block_run\(\)/,/^}/' "$WORKSPACE_ROOT/scripts/night-shift.sh" |
-    grep -nE '^[[:space:]]*(reap_persona_workers|cleanup_observer_tmp)' |
-    head -2 | paste -sd '|' - | grep -q 'reap_persona_workers.*|.*cleanup_observer_tmp' || return 1
-  grep -q 'night-shift-persona-\$RUN_ID-' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  # Pipe-free glob (`*A*B*` matches iff A precedes B) — no pipefail+grep-q race.
+  case "$(declare -f block_run)" in *reap_persona_workers*cleanup_observer_tmp*) ;; *) return 1 ;; esac
+  case "$(declare -f invoke_persona_once)" in *'night-shift-persona-$RUN_ID-'*) ;; *) return 1 ;; esac
   return 0
 }
 
