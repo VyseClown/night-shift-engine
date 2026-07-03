@@ -2938,19 +2938,58 @@ run_live_fixtures() {
   [ "${NIGHT_SHIFT_ACCEPT_COSTS:-}" = "YES" ] ||
     die "live fixture tests make paid model calls; set NIGHT_SHIFT_ACCEPT_COSTS=YES"
   require_command claude
-  log "running minimal paid Claude startup, session-ID, resume, unattended-tool, and observer checks"
+  log "running minimal paid Claude startup, session-ID, resume, unattended-tool, observer, and reap checks"
   log "(each live check is silent on success and only prints on failure)"
-  log "1/3 startup + session-id + resume..."
+  log "1/4 startup + session-id + resume..."
   live_adapter_check claude
-  log "2/3 unattended tool use (bypassPermissions)..."
+  log "2/4 unattended tool use (bypassPermissions)..."
   live_primary_tool_check
-  log "3/3 observer (neutral cwd, no tools, schema)..."
+  log "3/4 observer (neutral cwd, no tools, schema)..."
   live_observer_check
+  log "4/4 worker reap (kills one live persona call mid-flight)..."
+  live_worker_reap_check
   if [ "$FULL_PERSONA_LIVE_TEST" -eq 1 ]; then
     log "cost warning accepted: running six live persona calls"
     live_persona_checks
   fi
   log "all live checks passed — the workflow can run unattended"
+}
+
+# Live proof of the signal-path worker reap against a REAL paid session (the
+# deterministic fixture kills fake process trees; this kills an actual
+# `claude -p` persona mid-flight): spawn one haiku worker under set -m, wait
+# for the claude child to appear in its process group, reap, and require the
+# group to be empty. Cost: one short-lived killed call.
+live_worker_reap_check() {
+  local root rc
+  root="$WORKSPACE_ROOT/.night-shift-live-reap.$$"
+  ( log() { :; }
+    RUN_ROOT="$root"; RUN_ID="live-reap-$$"; PROJECT="$root/proj"; SPEC="$root/spec.md"
+    PERSONA_MODEL="claude-haiku-4-5"
+    mkdir -p "$RUN_ROOT/raw" "$RUN_ROOT/control" "$PROJECT" "$root/rd"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# review bundle\n(worker will be killed before finishing)\n' >"$root/bundle.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage":"plan_review","stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    set -m
+    spawn_persona_worker "Human Advocate" plan "$root/bundle.md" "$root/rd" &
+    set +m
+    w=$!
+    PERSONA_WORKER_PIDS="$w"; PERSONA_BATCH_DIR="$root/rd"; PERSONA_BATCH_STAGE=plan
+    i=0
+    while [ "$i" -lt 60 ]; do
+      pgrep -g "$w" -f claude >/dev/null 2>&1 && break
+      kill -0 "$w" 2>/dev/null || break
+      sleep 0.5; i=$((i + 1))
+    done
+    reap_persona_workers
+    sleep 1
+    pgrep -g "$w" >/dev/null 2>&1 && exit 1   # anything surviving in the group = orphan
+    exit 0 )
+  rc=$?
+  rm -rf "$root" 2>/dev/null || true
+  [ "$rc" -eq 0 ] ||
+    die "live worker-reap check failed: a reaped persona batch left a running process"
 }
 
 # Proves the primary can actually edit files / run tools UNATTENDED with the same
