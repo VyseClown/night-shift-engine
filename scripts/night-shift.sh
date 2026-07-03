@@ -110,6 +110,10 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # state). See scripts/lib/recovery.sh.
 # shellcheck source=scripts/lib/recovery.sh
 . "$NIGHT_SHIFT_LIB/recovery.sh"
+# The run's decision journal (emit_event -> $RUN_ROOT/events.jsonl). See
+# scripts/lib/events.sh.
+# shellcheck source=scripts/lib/events.sh
+. "$NIGHT_SHIFT_LIB/events.sh"
 # Spec validation, path canonicalization, preflight readiness, and validation-
 # command execution. See scripts/lib/preflight.sh.
 # shellcheck source=scripts/lib/preflight.sh
@@ -511,6 +515,8 @@ compact_success() {
     [ ! -f "$run_dir/state.json" ] || cp "$run_dir/state.json" "$archive/state.json" || copy_ok=0
     [ ! -d "$run_dir/validated" ] || cp -R "$run_dir/validated" "$archive/validated" || copy_ok=0
     [ ! -f "$run_dir/summary.json" ] || cp "$run_dir/summary.json" "$archive/summary.json" || copy_ok=0
+    # The decision journal is a first-class archive artifact (study the run later).
+    [ ! -f "$run_dir/events.jsonl" ] || cp "$run_dir/events.jsonl" "$archive/events.jsonl" || copy_ok=0
   fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
@@ -623,6 +629,7 @@ integrity_guard() {
   local file="$1" label="$2" what="$3"
   [ -f "$file" ] || return 0
   integrity_check "$file" && return 0
+  emit_event integrity_violation "$(jq -cn --arg f "$(integrity_key "$file")" --arg l "$label" '{file:$f, label:$l}')"
   integrity_quarantine "$file" "$label"
   block_run "wrapper-owned $what was modified outside the engine (divergent copy kept under raw/)"
 }
@@ -727,6 +734,9 @@ initialize_run() {
     state_set '.test_first_baseline_green=false'
   fi
   state_set '.baseline_complete=true'
+  emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
+    --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
+    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs}}')"
 }
 
 recover_run() {
@@ -778,6 +788,7 @@ recover_run() {
     state_set '.stage_started_at=$now | .task_started_at=$now | .stage_started[.stage]=$now | .updated_at=$iso' \
       --argjson now "$(now_epoch)" --arg iso "$(now_iso)"
   fi
+  emit_event run_recovered "$(jq -cn --argjson rb "$resume_block" '{resumed_block: ($rb == 1)}')"
 }
 
 archive_old_signal() {
@@ -1101,6 +1112,7 @@ invoke_primary() {
       session="$emitted"
       state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
         --arg session "$session" --argjson n "$consecutive_429" --arg now "$(now_iso)"
+      emit_event rate_limit_wait "$(jq -cn --argjson n "$consecutive_429" '{consecutive:$n}')"
       wait_for_rate_limit_reset "$raw"
       continue
     fi
@@ -1202,6 +1214,9 @@ set_stage() {
     .updated_at=\$now${session_clear}${scope_reset}
   " \
     --arg stage "$1" --argjson epoch "$(now_epoch)" --arg now "$(now_iso)"
+  emit_event stage_transition "$(jq -cn --arg from "$old_stage" --arg to "$1" \
+    --argjson sc "$([ -n "$session_clear" ] && printf true || printf false)" \
+    '{from:$from, to:$to, session_cleared:$sc}')"
 }
 
 # SINGLE SOURCE OF TRUTH for the stage state machine: the forward action(s) a
@@ -1248,6 +1263,7 @@ block_run() {
   # BEFORE cleanup_observer_tmp (which removes the workers' neutral cwds): stop
   # any live paid persona sessions and salvage the interrupted batch's costs.
   reap_persona_workers 2>/dev/null || true
+  emit_event run_blocked "$(jq -cn --arg r "$reason" '{reason:$r}')"
   cleanup_validation_worktree >/dev/null 2>&1 || reason="$reason; validation worktree cleanup also failed"
   cleanup_observer_tmp
   # Record the blocked status best-effort: if state.json is corrupt, state_set
@@ -1699,8 +1715,9 @@ PERSONA_BATCH_STAGE=""
 # interrupted batch's per-attempt costs from the .attempts markers. Idempotent;
 # a no-op when no batch is in flight.
 reap_persona_workers() {
-  local pid slug attempts a raw marker
+  local pid slug attempts a raw marker reaped
   [ -n "$PERSONA_WORKER_PIDS" ] || return 0
+  reaped="$PERSONA_WORKER_PIDS"
   for pid in $PERSONA_WORKER_PIDS; do
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   done
@@ -1708,6 +1725,7 @@ reap_persona_workers() {
     wait "$pid" 2>/dev/null || true
   done
   PERSONA_WORKER_PIDS=""
+  emit_event workers_reaped "$(jq -cn --arg pids "$reaped" '{pids: ($pids | ltrimstr(" "))}')"
   [ -n "$PERSONA_BATCH_DIR" ] || return 0
   for marker in "$PERSONA_BATCH_DIR"/.attempts-*; do
     [ -f "$marker" ] || continue
@@ -1761,6 +1779,10 @@ spawn_persona_worker() {
     else
       retry_note="the verdict failed the persona-review contract: exactly the keys $PERSONA_REVIEW_KEYS; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
     fi
+    # Journal marker for the parent (workers must not write the shared journal
+    # concurrently): the retry and its reason are exactly the hiccups a
+    # post-run study needs.
+    printf '%s' "$retry_note" >"$result_dir/.retry-$slug"
     rm -f "$tmp" "$idd" "$norm"
     if [ "$tries" -ge 2 ]; then
       printf '%s' "$persona" >"$result_dir/.failed-$slug"
@@ -1820,9 +1842,11 @@ spawn_personas() {
       k=$((k + 1))
     done
     PERSONA_WORKER_PIDS=""
-    # Costs: recorded by the parent from exactly the attempts each worker made
-    # this round (.attempts-<slug>), BEFORE any failure becomes block_run — so a
-    # blocked round still keeps every paid attempt's cost.
+    # Costs + journal: recorded by the parent from exactly the attempts each
+    # worker made this round (.attempts-<slug>), BEFORE any failure becomes
+    # block_run — so a blocked round still keeps every paid attempt's cost.
+    # The parent is also the single journal writer: per-persona verdicts,
+    # attempt counts, and retry reasons are emitted here from the markers.
     for persona in "${names[@]}"; do
       slug="$(persona_slug "$persona")"
       attempts="$(cat "$result_dir/.attempts-$slug" 2>/dev/null)" || attempts=0
@@ -1834,6 +1858,14 @@ spawn_personas() {
         a=$((a + 1))
       done
       rm -f "$result_dir/.attempts-$slug"
+      emit_event persona_verdict "$(jq -cn --arg p "$persona" --argjson a "$attempts" \
+        --arg s "$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)" \
+        '{persona:$p, status:$s, attempts:$a}')"
+      if [ -f "$result_dir/.retry-$slug" ]; then
+        emit_event persona_retry "$(jq -cn --arg p "$persona" \
+          --arg reason "$(cat "$result_dir/.retry-$slug" 2>/dev/null)" '{persona:$p, reason:$reason}')"
+        rm -f "$result_dir/.retry-$slug"
+      fi
     done
     for persona in "${names[@]}"; do
       slug="$(persona_slug "$persona")"
@@ -2085,6 +2117,7 @@ EOF
   ' --arg candidate "$candidate" --arg now "$(now_iso)"
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
+  emit_event candidate_validated "$(jq -cn --arg c "$candidate" '{commit:$c}')"
   log "candidate $candidate validated; handing to observer"
   if visual_stage_enabled "$SPEC"; then
     set_stage visual_review
@@ -2305,6 +2338,7 @@ run_observer() {
     block_run "observer output remained invalid after one retry"
   append_observer_review "$out"
   record_findings "$(dirname "$out")"
+  emit_event observer_verdict "$(jq -c '{status, findings: (.findings | length)}' "$out" 2>/dev/null)"
   if [ "$(jq -r '.status' "$out")" = "APPROVE" ]; then
     log "observer: APPROVE — task complete, ready to commit/next"
     set_stage completion
@@ -2445,6 +2479,7 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  emit_event run_complete null
   state_set '.status="complete" | .completed_at=$now | .updated_at=$now' --arg now "$(now_iso)"
   jq '{run_id,status,primary,observer,task,base_commit,candidate_commits,
     primary_turns,review_round,finding_ids,started_at,completed_at}' "$STATE" >"$summary"
@@ -2499,6 +2534,7 @@ EOF
   ' --arg task "$SPEC" --argjson epoch "$epoch" --arg base "$BASE_COMMIT" \
     --arg branch "$BASE_BRANCH" --arg baseline_status "$BASE_STATUS" \
     --arg now "$(now_iso)"
+  emit_event next_task "$(jq -cn --arg spec "$SPEC" '{spec:$spec}')"
   log "starting next bug-first task: $SPEC"
   check_branch_and_worktree "$SPEC" ||
     block_run "next task branch or worktree routing is unsafe"
@@ -2622,6 +2658,7 @@ main_run() {
       [ "$malformed_n" -eq 0 ] ||
         state_set '.malformed_signal_consecutive=0 | .updated_at=$now' --arg now "$(now_iso)"
       rm -f "$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null || true
+      emit_event signal_accepted "$(jq -c '{action, reason}' "$RUN_ROOT/control/next-action.json" 2>/dev/null)"
       handle_signal
     else
       rc=$?
@@ -2635,6 +2672,9 @@ main_run() {
       # Record WHY for the correction turn's prompt (primary_prompt embeds it).
       signal_rejection_reason "$RUN_ROOT/control/next-action.json" "$rc" \
         >"$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null || true
+      emit_event signal_rejected "$(jq -cn --argjson n "$malformed_n" \
+        --arg reason "$(cat "$RUN_ROOT/control/signal-rejection.txt" 2>/dev/null)" \
+        '{consecutive:$n, reason:$reason}')"
       ! malformed_cap_reached "$malformed_n" ||
         block_run "primary produced $malformed_n consecutive malformed/absent signals (cap $MAX_MALFORMED_SIGNALS); aborting to avoid burning the turn budget"
       if [ "$rc" -eq 1 ]; then

@@ -131,6 +131,7 @@ run_dry_fixtures() {
   fixture_assert "wire contracts single-sourced (gate + rejection feedback + retry reminders) and integrity_guard owns check->quarantine->block" fixture_contract_single_source "$root"
   fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
+  fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "empty-candidate guard fails closed on git error" fixture_require_nonempty_candidate_diff "$root"
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
@@ -1261,6 +1262,44 @@ fixture_wrapper_owned_integrity() {
   grep -q 'integrity_guard "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'modified outside the engine' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -A 2 'mv "\$tmp" "\$STATE"' "$WORKSPACE_ROOT/scripts/night-shift.sh" | grep -q 'integrity_put "\$STATE"' || return 1
+  return 0
+}
+
+fixture_event_stream() {
+  # events.jsonl is the run's decision journal: one {ts, run, stage, type,
+  # payload} line at every decision point (stage transitions, accepted AND
+  # rejected signals with the reason, persona verdicts with attempt counts and
+  # retry reasons, integrity violations, blocks, completion) so a finished or
+  # wrecked run can be studied hiccup-by-hiccup afterwards. Archived on
+  # success alongside costs.jsonl; log lines are unchanged (events are
+  # additive forensics, not a replacement).
+  local root="$1" dir="$root/events" e
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="ev-$$"
+    SESSION_SCOPE=stage
+    mkdir -p "$RUN_ROOT"
+    printf '{"stage":"planning","stage_turns":1,"stage_counters":{},"session_id":"s"}\n' >"$STATE"
+    emit_event probe '{"n":1}'
+    emit_event probe-text 'not json'
+    [ "$(grep -c . "$RUN_ROOT/events.jsonl")" -eq 2 ] || exit 1
+    jq -e 'select(.type=="probe") | .run and .ts and (.stage=="planning") and (.payload.n==1)' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    jq -e 'select(.type=="probe-text") | .payload == "not json"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # set_stage journals the transition (with session_cleared).
+    set_stage implementation >/dev/null 2>&1
+    jq -e 'select(.type=="stage_transition") | .payload.from=="planning" and .payload.to=="implementation" and .payload.session_cleared==true' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # compact_success preserves the journal in the archive.
+    printf '{"s":1}\n' >"$RUN_ROOT/summary.json"
+    compact_success "$RUN_ROOT" "arch1"
+    [ -f "$RUN_ROOT/archive/arch1/events.jsonl" ] || exit 1
+    exit 0 ) || return 1
+  # Wiring: the decision points actually emit.
+  for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
+    run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry; do
+    grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  done
   return 0
 }
 
