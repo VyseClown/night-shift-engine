@@ -113,6 +113,26 @@ is not a git repo.
   log line (the stderr stream dies with the terminal; this file does not).
   Archived on success next to the journal; the viewer renders it.
 
+## Testing the engine
+
+Three free, deterministic layers — run all of them before any engine commit:
+
+1. **Fixtures** — `NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --fixture-test --dry-run`.
+   Behavioral where possible (`fx "label" cmd` inside a fixture names the failing
+   sub-check), structural (`declare -f`/grep wiring) only where behavior is
+   unfakeable. The coverage ratchet (`scripts/test/untested-allowlist.txt`)
+   fails the suite if a new function has zero test references. A `(FLAKY)`
+   label on a failure means it passed an immediate rerun — still fix it, but
+   skip the bisect.
+2. **Happy-path integration** — `bash scripts/test/integration-run.sh`: the real
+   engine end-to-end on a scripted `claude` stub, asserting outcomes AND the
+   decision journal. On failure it preserves the full run log and a
+   timestamped `bash -x` trace at a printed path — read the trace tail first.
+3. **Adverse-path integration** — `bash scripts/test/integration-adverse.sh`:
+   the malformed-signal block and the observer-BLOCK→fresh-session recovery.
+
+All three gate CI (`.github/workflows/ci.yml`), alongside pinned shellcheck.
+
 ---
 
 ## Running the night shift (cost & usage)
