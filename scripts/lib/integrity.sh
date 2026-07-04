@@ -80,8 +80,11 @@ integrity_guard() {
   local file="$1" label="$2" what="$3"
   [ -f "$file" ] || return 0
   integrity_check "$file" && return 0
-  emit_event integrity_violation "$(jq -cn --arg f "$(integrity_key "$file")" --arg l "$label" '{file:$f, label:$l}')"
+  # Quarantine BEFORE journaling: emit_event stamps the envelope's stage from
+  # $STATE, and when the tampered file IS state.json the restore must happen
+  # first or the forensic event records an attacker-chosen stage.
   integrity_quarantine "$file" "$label"
+  emit_event integrity_violation "$(jq -cn --arg f "$(integrity_key "$file")" --arg l "$label" '{file:$f, label:$l}')"
   block_run "wrapper-owned $what was modified outside the engine (divergent copy kept under raw/)"
 }
 

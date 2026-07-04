@@ -174,8 +174,20 @@ EOF
 # command-substituted by callers, and stdout log lines interleaved with that
 # JSON silently broke jq parsing (the visual-repair cap accounting). Every
 # other script's log (visual-review.sh) already writes to stderr.
-log() { printf '[night-shift] %s\n' "$*" >&2; }
-die() { printf '[night-shift] BLOCKED: %s\n' "$*" >&2; exit 1; }
+log() {
+  printf '[night-shift] %s\n' "$*" >&2
+  # Also persist to $RUN_ROOT/run.log (timestamped) once a run exists: the
+  # stderr stream dies with the terminal, but the run's story must not (the
+  # viewer renders this file). Never fails the engine (unwritable -> stderr-only).
+  [ -z "${RUN_ROOT:-}" ] ||
+    printf '%s [night-shift] %s\n' "$(now_iso)" "$*" >>"$RUN_ROOT/run.log" 2>/dev/null || true
+}
+die() {
+  printf '[night-shift] BLOCKED: %s\n' "$*" >&2
+  [ -z "${RUN_ROOT:-}" ] ||
+    printf '%s [night-shift] BLOCKED: %s\n' "$(now_iso)" "$*" >>"$RUN_ROOT/run.log" 2>/dev/null || true
+  exit 1
+}
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 now_epoch() { date '+%s'; }
 
@@ -530,6 +542,8 @@ compact_success() {
     [ ! -f "$run_dir/summary.json" ] || cp "$run_dir/summary.json" "$archive/summary.json" || copy_ok=0
     # The decision journal is a first-class archive artifact (study the run later).
     [ ! -f "$run_dir/events.jsonl" ] || cp "$run_dir/events.jsonl" "$archive/events.jsonl" || copy_ok=0
+    # ...and so is the human log, run.log (the timestamped mirror of every log line).
+    [ ! -f "$run_dir/run.log" ] || cp "$run_dir/run.log" "$archive/run.log" || copy_ok=0
   fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
@@ -649,6 +663,12 @@ initialize_run() {
     --arg baseline_status "$BASE_STATUS" ||
     die "could not initialize run state"
   integrity_put "$STATE"
+  # Journal the moment the run exists: run_started only fires after the
+  # minutes-long baseline gate below, so a run blocked during baseline would
+  # otherwise leave a journal that starts mid-story. Also the one event that
+  # records the feature branch.
+  emit_event run_init "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
+    --arg branch "$BASE_BRANCH" '{spec:$spec, base:$base, branch:$branch}')"
   # Arm the interrupt trap now that state.json exists but BEFORE the minutes-long
   # baseline validation below. Otherwise a signal during baseline validation frees
   # the lock (EXIT trap) yet leaves status="running" with no block_reason, which the
@@ -724,6 +744,10 @@ recover_run() {
       .stage_started_at=$now | .task_started_at=$now | .stage_started[.stage]=$now | .updated_at=$iso' \
       --argjson now "$(now_epoch)" --arg iso "$(now_iso)"
   elif [ "$status" != "running" ]; then
+    # Journal BEFORE sleeping: a recovery waiting an hour on a 429 must not be
+    # invisible until it wakes (the in-loop wait already journals; this is the
+    # resume-path twin).
+    emit_event rate_limit_wait '{"context":"recovery"}'
     wait_for_rate_limit_reset "$recovery_raw"
   else
     # Normal resume: the gap since the run was interrupted must not count against
@@ -1671,8 +1695,9 @@ spawn_persona_worker() {
     fi
     # Journal marker for the parent (workers must not write the shared journal
     # concurrently): the retry and its reason are exactly the hiccups a
-    # post-run study needs.
-    printf '%s' "$retry_note" >"$result_dir/.retry-$slug"
+    # post-run study needs. Append-mode: a twice-failed persona has TWO
+    # reasons and both matter (overwrite kept only the last).
+    printf '%s\n' "$retry_note" >>"$result_dir/.retry-$slug"
     rm -f "$tmp" "$idd" "$norm"
     if [ "$tries" -ge 2 ]; then
       printf '%s' "$persona" >"$result_dir/.failed-$slug"
@@ -1693,6 +1718,31 @@ spawn_persona_worker() {
 # per-attempt raws after each join (children never touch the shared ledger — a
 # signal mid-batch can lose at most that batch's cost rows), and raises
 # block_run for any worker's failure marker.
+# Parent-only journal writer for one persona's round outcome, from the marker
+# files its worker left: the verdict (+attempt count) and one persona_retry per
+# recorded retry reason. File-existence guard on the result: a twice-failed
+# persona writes NO result file, and `jq ... 2>/dev/null` on an absent file
+# exits before the `// "invalid"` fallback, recording status:"" — which would
+# obscure the journal of a run that blocked on that persona.
+journal_persona_result() {
+  local persona="$1" slug="$2" result_dir="$3" attempts="$4" pstatus reason
+  if [ -f "$result_dir/$slug.json" ]; then
+    pstatus="$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)"
+  else
+    pstatus="invalid"
+  fi
+  emit_event persona_verdict "$(jq -cn --arg p "$persona" --argjson a "$attempts" \
+    --arg s "$pstatus" '{persona:$p, status:$s, attempts:$a}')"
+  if [ -f "$result_dir/.retry-$slug" ]; then
+    while IFS= read -r reason; do
+      [ -z "$reason" ] ||
+        emit_event persona_retry "$(jq -cn --arg p "$persona" \
+          --arg reason "$reason" '{persona:$p, reason:$reason}')"
+    done <"$result_dir/.retry-$slug"
+    rm -f "$result_dir/.retry-$slug"
+  fi
+}
+
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
   local bundle persona slug raw old_ifs concurrency i j k n a attempts pstatus
@@ -1748,22 +1798,7 @@ spawn_personas() {
         a=$((a + 1))
       done
       rm -f "$result_dir/.attempts-$slug"
-      # File-existence guard: a twice-failed persona writes NO result file, and
-      # `jq ... 2>/dev/null` on an absent file exits before the `// "invalid"`
-      # fallback, recording status:"" — which would obscure the journal of a
-      # run that blocked on that persona. Read the status only when the file exists.
-      if [ -f "$result_dir/$slug.json" ]; then
-        pstatus="$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)"
-      else
-        pstatus="invalid"
-      fi
-      emit_event persona_verdict "$(jq -cn --arg p "$persona" --argjson a "$attempts" \
-        --arg s "$pstatus" '{persona:$p, status:$s, attempts:$a}')"
-      if [ -f "$result_dir/.retry-$slug" ]; then
-        emit_event persona_retry "$(jq -cn --arg p "$persona" \
-          --arg reason "$(cat "$result_dir/.retry-$slug" 2>/dev/null)" '{persona:$p, reason:$reason}')"
-        rm -f "$result_dir/.retry-$slug"
-      fi
+      journal_persona_result "$persona" "$slug" "$result_dir" "$attempts"
     done
     for persona in "${names[@]}"; do
       slug="$(persona_slug "$persona")"
@@ -2118,11 +2153,18 @@ run_visual() {
   report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
   case "$(visual_report_status "$report")" in
     valid)
-      log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass)"
+      local vr_total vr_failed
+      vr_total="$(jq -r '.screens|length' "$report")"
+      vr_failed="$(jq -r '[.screens[]|select(.pass|not)]|length' "$report")"
+      log "visual_review: report accepted ($((vr_total - vr_failed))/$vr_total screens pass)"
+      emit_event visual_review "$(jq -cn --argjson t "$vr_total" --argjson f "$vr_failed" \
+        '{outcome: (if $f > 0 then "fail" else "pass" end), screens:$t, failed:$f}')"
       run_visual_inloop_repair "$report" "$candidate" ;;
     absent)
-      log "visual_review: no visual-diff report produced (capture skipped or tooling unavailable); proceeding to observer" ;;
+      log "visual_review: no visual-diff report produced (capture skipped or tooling unavailable); proceeding to observer"
+      emit_event visual_review '{"outcome":"skipped","reason":"capture skipped or tooling unavailable"}' ;;
     malformed)
+      emit_event visual_review '{"outcome":"malformed"}'
       block_run "visual_review produced a malformed visual-diff report" ;;
   esac
   set_stage observer_review
@@ -2137,22 +2179,37 @@ run_visual_inloop_repair() {
   local over; over="$(jq -r '[.screens[]|select(.pass|not)]|length' "$report")"
   [ "$over" -gt 0 ] || { log "visual_review: all screens within tolerance; no repair needed"; return 0; }
   local branch; branch="$(git -C "$PROJECT" branch --show-current)"
-  case "$branch" in main|master|'') log "visual_review: refusing to auto-repair on '$branch'; skipping repair"; return 0 ;; esac
+  case "$branch" in main|master|'')
+    log "visual_review: refusing to auto-repair on '$branch'; skipping repair"
+    emit_event visual_repair "$(jq -cn --arg b "$branch" \
+      '{outcome:"skipped", reason:("refusing to auto-repair on branch " + ($b | if . == "" then "(detached)" else . end))}')"
+    return 0 ;;
+  esac
   local iter_dev; iter_dev="$(visual_repair_devices "$SPEC" | head -n1)"
   NO_BUILD="${NIGHT_SHIFT_VISUAL_REPAIR_NO_BUILD:-0}"
-  repair_metro_start "$(device_label_to_name "$iter_dev")" || { log "visual_review: repair harness unavailable; proceeding unrepaired"; return 0; }
+  repair_metro_start "$(device_label_to_name "$iter_dev")" || {
+    log "visual_review: repair harness unavailable; proceeding unrepaired"
+    emit_event visual_repair '{"outcome":"skipped","reason":"repair harness unavailable"}'
+    return 0
+  }
   visual_repair_for_spec "$SPEC" "$PROJECT" "$RUN_ROOT/validated" "$candidate" "$report" \
     "${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" \
     "$([ "${NIGHT_SHIFT_VISUAL_REPAIR_SHARED:-0}" = "1" ] && echo 'src/features/,src/ui/' || echo 'src/features/')" \
     "$iter_dev"
   repair_metro_stop
   if git -C "$PROJECT" diff --quiet && git -C "$PROJECT" diff --cached --quiet; then
-    log "visual_review: repair made no edits; proceeding unrepaired"; return 0
+    log "visual_review: repair made no edits; proceeding unrepaired"
+    emit_event visual_repair '{"outcome":"no_edits"}'
+    return 0
   fi
   local screens; screens="$(jq -r '[.screens[]|select(.pass|not)|.screen]|unique|join(", ")' "$report")"
   git -C "$PROJECT" add -A
   git -C "$PROJECT" commit -q -m "fix(visual): auto-repair $screens" || { log "visual_review: repair commit failed; proceeding"; return 0; }
   local newsha; newsha="$(git -C "$PROJECT" rev-parse HEAD)"
+  # THE decision post-run forensics needs from this stage: the observer will
+  # review a different commit than the one the implement loop validated.
+  emit_event visual_repair "$(jq -cn --arg c "$newsha" --arg s "$screens" \
+    '{outcome:"committed", commit:$c, screens:$s}')"
   state_set '
     .candidate_commits = ((.candidate_commits + [$c])
       | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)) |
@@ -2236,7 +2293,7 @@ run_observer() {
     block_run "observer output remained invalid after one retry"
   append_observer_review "$out"
   record_findings "$(dirname "$out")"
-  emit_event observer_verdict "$(jq -c '{status, findings: (.findings | length)}' "$out" 2>/dev/null)"
+  emit_event observer_verdict "$(jq -c '{status, findings: (.findings | length), finding_ids: [.findings[]?.id]}' "$out" 2>/dev/null)"
   if [ "$(jq -r '.status' "$out")" = "APPROVE" ]; then
     log "observer: APPROVE — task complete, ready to commit/next"
     set_stage completion
@@ -2271,6 +2328,10 @@ validated_observer_retry() {
     fi
     retry_note="the verdict failed the observer-review contract: exactly the keys $OBSERVER_REVIEW_KEYS with the exact task and candidate values shown; status APPROVE or BLOCK only; finding ids match OBS-NNN"
     attempt=$((attempt + 1))
+    # persona_retry's twin: an observer that needed a second attempt (or burned
+    # both) is a decision point the journal must show, not just the final verdict.
+    emit_event observer_retry "$(jq -cn --argjson a "$attempt" --arg r "$retry_note" \
+      '{attempt:$a, reason:$r}')"
   done
   return 1
 }
@@ -2323,16 +2384,23 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  # The journal is anchored on every append (events.sh); verify it here — the
+  # last trust point before it becomes the archived record of the run.
+  integrity_guard "$RUN_ROOT/events.jsonl" events "the decision journal"
   emit_event run_complete null
   state_set '.status="complete" | .completed_at=$now | .updated_at=$now' --arg now "$(now_iso)"
   jq '{run_id,status,primary,observer,task,base_commit,candidate_commits,
     primary_turns,review_round,finding_ids,started_at,completed_at}' "$STATE" >"$summary"
+  # Log completion BEFORE compacting so the line reaches the archived run.log;
+  # afterwards drop RUN_ROOT so no late log line can recreate files inside the
+  # just-compacted directory (the engine promises "archive only" on success).
+  log "run $RUN_ID complete; compact archive: $RUN_ROOT/archive/$RUN_ID"
   compact_success "$RUN_ROOT" "$RUN_ID"
+  RUN_ROOT=""
   cleanup_observer_tmp
   # Only on SUCCESS: a blocked run keeps the anchor so --resume retains
   # integrity continuity across the gap.
   integrity_cleanup
-  log "run $RUN_ID complete; compact archive: $RUN_ROOT/archive/$RUN_ID"
   exit 0
 }
 

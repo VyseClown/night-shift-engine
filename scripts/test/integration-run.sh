@@ -146,4 +146,25 @@ grep -q 'observer: APPROVE' "$log"                            || fail "observer 
 ( cd "$PROJECT" && node --test add.test.js >/dev/null 2>&1 )  || fail "candidate test is not green"
 grep -q 'null byte' "$log"                                    && fail "unexpected 'null byte' warning in the run"
 
-printf 'ok - integration: full node-track run reaches completion (personas + TDD gate + observer, candidate green)\n'
+# --- behavioral journal assertions: the emit sites FIRE on a real run ---------
+# (the fixture suite's grep-wiring proves the strings exist; this proves the
+# events land, in order, with their payloads, and survive archiving)
+events="$(find "$PROJECT/.night-shift/archive" -name events.jsonl | head -1)"
+[ -n "$events" ] && [ -f "$events" ]                          || fail "archived events.jsonl is missing"
+jq -e . "$events" >/dev/null 2>&1                             || fail "events.jsonl has an unparseable line"
+for t in run_init run_started stage_transition signal_accepted persona_verdict \
+  candidate_validated observer_verdict run_complete; do
+  jq -e --arg t "$t" 'select(.type==$t)' "$events" >/dev/null || fail "journal is missing a $t event"
+done
+jq -e 'select(.type=="run_init") | .payload.branch != null and .payload.branch != ""' \
+  "$events" >/dev/null                                        || fail "run_init does not record the feature branch"
+jq -e 'select(.type=="observer_verdict") | .payload | has("finding_ids")' \
+  "$events" >/dev/null                                        || fail "observer_verdict lacks finding_ids"
+[ "$(jq -r 'select(.type=="run_init") | .ts' "$events" | head -1)" \
+  = "$(jq -r .ts "$events" | sort | head -1)" ]               || fail "run_init is not the earliest journal entry"
+# run.log is archived and mirrors the stderr log (same completion line).
+runlog="$(find "$PROJECT/.night-shift/archive" -name run.log | head -1)"
+{ [ -n "$runlog" ] && grep -q 'complete; compact archive' "$runlog"; } \
+                                                              || fail "archived run.log is missing or incomplete"
+
+printf 'ok - integration: full node-track run reaches completion (personas + TDD gate + observer, candidate green, journal + run.log archived)\n'

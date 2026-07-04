@@ -132,6 +132,9 @@ run_dry_fixtures() {
   fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
+  fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
+  fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
+  fixture_assert "visual_review journals its outcome (the candidate-repointing stage is no longer invisible)" fixture_visual_journal "$root"
   fixture_assert "mid-stage session refresh clears the session every N stage turns (0 = off)" fixture_session_refresh "$root"
   fixture_assert "integrity + normalize families live in libs (monolith does not regrow)" fixture_lib_split "$root"
   fixture_assert "state writes are best-effort fsynced (durable_sync never fails the engine)" fixture_durable_state_write "$root"
@@ -1386,11 +1389,129 @@ fixture_event_stream() {
     compact_success "$RUN_ROOT" "arch1"
     [ -f "$RUN_ROOT/archive/arch1/events.jsonl" ] || exit 1
     exit 0 ) || return 1
-  # Wiring: the decision points actually emit.
+  # Wiring: the decision points actually emit. COMPLETE list — every event type
+  # the engine can journal; deleting any emit site fails this loop.
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
-    run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry; do
+    run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
+    run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
+    stage_transition; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
+  return 0
+}
+
+fixture_run_log() {
+  # The human log also lands in $RUN_ROOT/run.log (timestamped) so a CLI run's
+  # story survives the terminal and the viewer can render it; stderr behavior
+  # is unchanged (guarded by fixture_log_stderr_and_repair_accounting). Before
+  # a run is initialized (no RUN_ROOT) logging stays stderr-only. On success
+  # compact_success archives run.log alongside events.jsonl.
+  local root="$1" dir="$root/runlog"
+  mkdir -p "$dir/run"
+  ( RUN_ROOT=""
+    log "no-root line" 2>/dev/null
+    [ ! -e "$dir/run/run.log" ] || exit 1
+    RUN_ROOT="$dir/run"; RUN_ID="rl-$$"; STATE="$RUN_ROOT/state.json"
+    log "hello file" 2>/dev/null
+    grep -Eq '^2[0-9]{3}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z \[night-shift\] hello file$' \
+      "$RUN_ROOT/run.log" || exit 1
+    printf '{"s":1}\n' >"$RUN_ROOT/summary.json"
+    compact_success "$RUN_ROOT" "arch-rl" 2>/dev/null
+    grep -q "hello file" "$RUN_ROOT/archive/arch-rl/run.log" || exit 1
+    exit 0 ) || return 1
+  return 0
+}
+
+fixture_journal_hardening() {
+  # Three invariants layered onto the journal after the deep review:
+  # (1) tamper-evidence — every append re-anchors events.jsonl, so an
+  #     out-of-band edit is caught by integrity_guard like state.json is;
+  # (2) integrity_guard quarantines (restores the anchor copy) BEFORE it
+  #     journals the violation, so the event's stage envelope is read from the
+  #     restored state, never from the file being reported as tampered;
+  # (3) a twice-failed persona journals BOTH retry reasons (the marker is
+  #     append-mode and the parent emits one persona_retry per line).
+  local root="$1" dir="$root/hardening" body
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="hd-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    printf '{"stage":"planning"}\n' >"$STATE"
+    # (1) append re-anchors: the private copy exists and matches byte-for-byte.
+    emit_event probe '{"n":1}'
+    cmp -s "$(integrity_dir)/events.jsonl" "$RUN_ROOT/events.jsonl" || exit 1
+    # ...and an out-of-band edit is detected, quarantined and restored.
+    printf '{"forged":true}\n' >>"$RUN_ROOT/events.jsonl"
+    integrity_check "$RUN_ROOT/events.jsonl" && exit 1
+    blocked=""
+    block_run() { blocked="$1"; }
+    integrity_guard "$RUN_ROOT/events.jsonl" events "the decision journal"
+    [ -n "$blocked" ] || exit 1
+    grep -q forged "$RUN_ROOT/events.jsonl" && exit 1
+    jq -e 'select(.type=="integrity_violation") | .payload.file=="events.jsonl"' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # (3) both retry reasons reach the journal, then the marker is consumed.
+    mkdir -p "$dir/results"
+    printf 'first reason\nsecond reason\n' >"$dir/results/.retry-tester"
+    journal_persona_result "Tester" "tester" "$dir/results" 2
+    [ "$(jq -s '[.[] | select(.type=="persona_retry")] | length' "$RUN_ROOT/events.jsonl")" -eq 2 ] || exit 1
+    jq -e 'select(.type=="persona_retry") | select(.payload.reason=="second reason")' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    jq -e 'select(.type=="persona_verdict") | .payload.status=="invalid" and .payload.attempts==2' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    [ ! -f "$dir/results/.retry-tester" ] || exit 1
+    exit 0 ) || return 1
+  # (2) ordering, structurally: no emit before the quarantine, one after.
+  body="$(declare -f integrity_guard)"
+  case "${body%%integrity_quarantine*}" in *emit_event*) return 1 ;; esac
+  case "${body#*integrity_quarantine}" in *emit_event*) ;; *) return 1 ;; esac
+  # Wiring: the parent loop journals through the helper; the observer verdict
+  # carries the finding ids; completion guards the journal before archiving.
+  case "$(declare -f spawn_personas)" in *journal_persona_result*) ;; *) return 1 ;; esac
+  grep -q 'finding_ids' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  case "$(declare -f complete_run)" in *'events.jsonl" events'*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_visual_journal() {
+  # The deep review's largest coverage gap: visual_review can auto-repair and
+  # REPOINT THE CANDIDATE the observer reviews, yet emitted nothing. Now the
+  # stage journals its outcome (valid pass/fail with screen counts, skipped,
+  # malformed) and every repair decision journals a visual_repair event.
+  local root="$1" dir="$root/visual"
+  mkdir -p "$dir/run/validated"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="vz-$$"
+    SPEC="$dir/spec.md"; PROJECT="$dir"
+    printf '# spec\n' >"$SPEC"
+    printf '{"stage":"visual_review","candidate":"c0ffee"}\n' >"$STATE"
+    # Stub the capture scaffold: a valid report with 1 of 2 screens failing.
+    printf '{"screens":[{"screen":"Home","pass":true},{"screen":"Ring","pass":false}]}\n' \
+      >"$RUN_ROOT/validated/visual-diff-spec.json"
+    visual_report_status() { printf 'valid'; }
+    run_visual_capture() { :; }
+    visual_stage_refs_for_spec() { :; }
+    run_visual_inloop_repair() { :; }
+    device_registry_prune() { :; }
+    set_stage() { :; }
+    block_run() { exit 9; }
+    run_visual
+    jq -e 'select(.type=="visual_review")
+      | .payload.outcome=="fail" and .payload.screens==2 and .payload.failed==1' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # Absent report -> journals the skip (the story must say WHY nothing happened).
+    rm -f "$RUN_ROOT/validated/visual-diff-spec.json"
+    visual_report_status() { printf 'absent'; }
+    run_visual
+    jq -e 'select(.type=="visual_review") | .payload.outcome=="skipped"' \
+      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    exit 0 ) || return 1
+  # Wiring: the repair path journals its decisions, including the commit that
+  # repoints the candidate.
+  for e in visual_review visual_repair; do
+    grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  done
+  case "$(declare -f run_visual_inloop_repair)" in *'outcome:"committed"'*) ;; *) return 1 ;; esac
   return 0
 }
 
