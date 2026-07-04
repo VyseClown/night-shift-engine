@@ -1308,6 +1308,10 @@ fixture_lib_split() {
   [ -f "$WORKSPACE_ROOT/scripts/lib/integrity.sh" ] || return 1
   [ -f "$WORKSPACE_ROOT/scripts/lib/normalize.sh" ] || return 1
   [ -f "$WORKSPACE_ROOT/scripts/lib/stages.sh" ] || return 1
+  [ -f "$WORKSPACE_ROOT/scripts/lib/signals.sh" ] || return 1
+  grep -q 'lib/signals\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q '^handle_signal()' "$WORKSPACE_ROOT/scripts/lib/signals.sh" || return 1
+  grep -q '^validate_signal()' "$WORKSPACE_ROOT/scripts/lib/signals.sh" || return 1
   grep -q 'lib/integrity\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'lib/normalize\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'lib/stages\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
