@@ -23,12 +23,17 @@ write_stub happy
 log="$WORK/run.log"
 if ! run_engine --spec "$SPEC"; then
   # Evidence retention: this harness has failed intermittently (~1 in many
-  # runs) and a one-line tail + deleted workdir left nothing to diagnose.
-  # Keep the full log at a stable path and print a real tail.
-  keep="${TMPDIR:-/tmp}/ns-integration-failure-$$.log"
-  cp "$log" "$keep" 2>/dev/null || true
+  # runs; observed as SIGALRM after 240s with an EMPTY run.log, i.e. an early
+  # hang) and a one-line tail + deleted workdir left nothing to diagnose.
+  # Keep the log AND the xtrace at stable paths; the trace tail names the
+  # exact command the engine was in when it died.
+  keep="${TMPDIR:-/tmp}/ns-integration-failure-$$"
+  cp "$log" "$keep.log" 2>/dev/null || true
+  cp "$WORK/xtrace.log" "$keep.xtrace" 2>/dev/null || true
   tail -15 "$log" >&2 || true
-  fail "engine exited non-zero (full log kept at $keep)"
+  printf -- '--- last traced commands before death: ---\n' >&2
+  tail -8 "$WORK/xtrace.log" >&2 2>/dev/null || true
+  fail "engine exited non-zero (evidence kept at $keep.log / $keep.xtrace)"
 fi
 
 # --- assertions: the full pipeline actually happened + the candidate is correct -

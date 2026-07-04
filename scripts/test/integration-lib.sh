@@ -110,6 +110,12 @@ write_stub() {
     printf 'MODE=%q\n' "$mode"
     printf 'WORK=%q\n' "$WORK"
     cat <<'STUB'
+# --version FIRST, before any stdin read: the engine's rate-limit contract
+# canary calls `claude --version`, and a stub that falls through to the
+# prompt path blocks on `cat` until the harness timeout whenever the
+# harness inherited an open stdin (the intermittent SIGALRM-at-240s flake:
+# see the run_engine xtrace note in this file's history).
+for a in "$@"; do [ "$a" = "--version" ] && { printf '9.9.9 (Claude Code)\n'; exit 0; }; done
 is_primary=0; for a in "$@"; do [ "$a" = "bypassPermissions" ] && is_primary=1; done
 emit(){ jq -cn --arg s "$1" --arg r "$2" '{session_id:$s,result:$r,total_cost_usd:0,num_turns:1,is_error:false}'; }
 if [ "$is_primary" = "1" ]; then
@@ -166,8 +172,18 @@ STUB
 }
 
 # Timeout-wrapped engine invocation; output appends to $WORK/run.log.
+# The engine runs under `bash -x` with a timestamped PS4 tracing to fd 9
+# ($WORK/xtrace.log): an intermittent early hang has been observed (SIGALRM
+# after 240s with ZERO engine output — see integration-run.sh's failure
+# branch), and the trace is the only way the next occurrence can name the
+# exact command that hung. On success the trace dies with $WORK; the failure
+# branch preserves it.
 run_engine() {
+  # </dev/null: no stub call may ever block on the harness's inherited stdin
+  # (belt to the stub's --version suspenders — the root cause of the flake).
   run_with_timeout "${NS_INTEGRATION_TIMEOUT:-240}" \
     env PATH="$BIN:$PATH" NIGHT_SHIFT_ACCEPT_COSTS=YES \
-    "$ENGINE" --project "$PROJECT" "$@" >>"$WORK/run.log" 2>&1
+    BASH_XTRACEFD=9 PS4='+ $EPOCHREALTIME ${BASH_SOURCE##*/}:$LINENO ' \
+    bash -x "$ENGINE" --project "$PROJECT" "$@" \
+    </dev/null 9>>"$WORK/xtrace.log" >>"$WORK/run.log" 2>&1
 }
