@@ -22,8 +22,13 @@ write_stub happy
 # --- run the real engine end-to-end ------------------------------------------
 log="$WORK/run.log"
 if ! run_engine --spec "$SPEC"; then
-  sed -n '$p;' "$log" >&2 || true
-  fail "engine exited non-zero (see run log tail above)"
+  # Evidence retention: this harness has failed intermittently (~1 in many
+  # runs) and a one-line tail + deleted workdir left nothing to diagnose.
+  # Keep the full log at a stable path and print a real tail.
+  keep="${TMPDIR:-/tmp}/ns-integration-failure-$$.log"
+  cp "$log" "$keep" 2>/dev/null || true
+  tail -15 "$log" >&2 || true
+  fail "engine exited non-zero (full log kept at $keep)"
 fi
 
 # --- assertions: the full pipeline actually happened + the candidate is correct -
