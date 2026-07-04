@@ -69,3 +69,6 @@ jobs:
 
       - name: Full-orchestration run (scripted stub, no paid calls)
         run: bash scripts/test/integration-run.sh
+
+      - name: Adverse paths (blocked run + observer-BLOCK recovery)
+        run: bash scripts/test/integration-adverse.sh
