@@ -1307,8 +1307,12 @@ fixture_lib_split() {
   # layout so the monolith does not silently regrow.
   [ -f "$WORKSPACE_ROOT/scripts/lib/integrity.sh" ] || return 1
   [ -f "$WORKSPACE_ROOT/scripts/lib/normalize.sh" ] || return 1
+  [ -f "$WORKSPACE_ROOT/scripts/lib/stages.sh" ] || return 1
   grep -q 'lib/integrity\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
   grep -q 'lib/normalize\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q 'lib/stages\.sh' "$WORKSPACE_ROOT/scripts/night-shift.sh" || return 1
+  grep -q '^set_stage()' "$WORKSPACE_ROOT/scripts/lib/stages.sh" || return 1
+  grep -q '^enforce_limits()' "$WORKSPACE_ROOT/scripts/lib/stages.sh" || return 1
   grep -q '^integrity_guard()' "$WORKSPACE_ROOT/scripts/lib/integrity.sh" || return 1
   grep -q '^normalize_persona_result()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
   grep -q '^normalize_observer_output()' "$WORKSPACE_ROOT/scripts/lib/normalize.sh" || return 1
