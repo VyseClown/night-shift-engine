@@ -126,6 +126,13 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # Verdict extraction + live-model verdict normalization. See scripts/lib/normalize.sh.
 # shellcheck source=scripts/lib/normalize.sh
 . "$NIGHT_SHIFT_LIB/normalize.sh"
+# Stage machine + turn/time budgets (set_stage/enforce_limits). See scripts/lib/stages.sh.
+# shellcheck source=scripts/lib/stages.sh
+. "$NIGHT_SHIFT_LIB/stages.sh"
+# The primary's signal contract (validate/reject-with-reason/dispatch). See
+# scripts/lib/signals.sh.
+# shellcheck source=scripts/lib/signals.sh
+. "$NIGHT_SHIFT_LIB/signals.sh"
 # Spec validation, path canonicalization, preflight readiness, and validation-
 # command execution. See scripts/lib/preflight.sh.
 # shellcheck source=scripts/lib/preflight.sh
@@ -174,8 +181,20 @@ EOF
 # command-substituted by callers, and stdout log lines interleaved with that
 # JSON silently broke jq parsing (the visual-repair cap accounting). Every
 # other script's log (visual-review.sh) already writes to stderr.
-log() { printf '[night-shift] %s\n' "$*" >&2; }
-die() { printf '[night-shift] BLOCKED: %s\n' "$*" >&2; exit 1; }
+log() {
+  printf '[night-shift] %s\n' "$*" >&2
+  # Also persist to $RUN_ROOT/run.log (timestamped) once a run exists: the
+  # stderr stream dies with the terminal, but the run's story must not (the
+  # viewer renders this file). Never fails the engine (unwritable -> stderr-only).
+  [ -z "${RUN_ROOT:-}" ] ||
+    printf '%s [night-shift] %s\n' "$(now_iso)" "$*" >>"$RUN_ROOT/run.log" 2>/dev/null || true
+}
+die() {
+  printf '[night-shift] BLOCKED: %s\n' "$*" >&2
+  [ -z "${RUN_ROOT:-}" ] ||
+    printf '%s [night-shift] BLOCKED: %s\n' "$(now_iso)" "$*" >>"$RUN_ROOT/run.log" 2>/dev/null || true
+  exit 1
+}
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 now_epoch() { date '+%s'; }
 
@@ -530,6 +549,8 @@ compact_success() {
     [ ! -f "$run_dir/summary.json" ] || cp "$run_dir/summary.json" "$archive/summary.json" || copy_ok=0
     # The decision journal is a first-class archive artifact (study the run later).
     [ ! -f "$run_dir/events.jsonl" ] || cp "$run_dir/events.jsonl" "$archive/events.jsonl" || copy_ok=0
+    # ...and so is the human log, run.log (the timestamped mirror of every log line).
+    [ ! -f "$run_dir/run.log" ] || cp "$run_dir/run.log" "$archive/run.log" || copy_ok=0
   fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
@@ -649,6 +670,12 @@ initialize_run() {
     --arg baseline_status "$BASE_STATUS" ||
     die "could not initialize run state"
   integrity_put "$STATE"
+  # Journal the moment the run exists: run_started only fires after the
+  # minutes-long baseline gate below, so a run blocked during baseline would
+  # otherwise leave a journal that starts mid-story. Also the one event that
+  # records the feature branch.
+  emit_event run_init "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
+    --arg branch "$BASE_BRANCH" '{spec:$spec, base:$base, branch:$branch}')"
   # Arm the interrupt trap now that state.json exists but BEFORE the minutes-long
   # baseline validation below. Otherwise a signal during baseline validation frees
   # the lock (EXIT trap) yet leaves status="running" with no block_reason, which the
@@ -724,6 +751,10 @@ recover_run() {
       .stage_started_at=$now | .task_started_at=$now | .stage_started[.stage]=$now | .updated_at=$iso' \
       --argjson now "$(now_epoch)" --arg iso "$(now_iso)"
   elif [ "$status" != "running" ]; then
+    # Journal BEFORE sleeping: a recovery waiting an hour on a 429 must not be
+    # invisible until it wakes (the in-loop wait already journals; this is the
+    # resume-path twin).
+    emit_event rate_limit_wait '{"context":"recovery"}'
     wait_for_rate_limit_reset "$recovery_raw"
   else
     # Normal resume: the gap since the run was interrupted must not count against
@@ -734,13 +765,7 @@ recover_run() {
   emit_event run_recovered "$(jq -cn --argjson rb "$resume_block" '{resumed_block: ($rb == 1)}')"
 }
 
-archive_old_signal() {
-  local signal="$RUN_ROOT/control/next-action.json"
-  if [ -f "$signal" ]; then
-    mkdir -p "$RUN_ROOT/control/previous"
-    mv "$signal" "$RUN_ROOT/control/previous/$(date -u '+%Y%m%dT%H%M%SZ').json"
-  fi
-}
+# archive_old_signal lives in lib/signals.sh with the rest of the signal contract.
 
 # Pure: which personas must produce results for the next review round. On the
 # first round of a stage (no pending blockers, or blockers recorded for a
@@ -1101,88 +1126,7 @@ invoke_primary() {
   enforce_elapsed_limits
 }
 
-enforce_limits() {
-  local now stage_elapsed task_elapsed stage_turns task_turns
-  local stage_started task_started
-  now="$(now_epoch)"
-  # Validate each field into a local before doing arithmetic or comparisons.
-  # state_int returns non-zero on null/corrupt input; a plain assignment's exit
-  # status IS the $(...) exit status, so || fires in THIS shell — block_run is
-  # reached in the parent, not swallowed by a subshell.  Declare locals
-  # separately from the guarded assignments so `local x="$(...)"` does not
-  # mask the exit status (local always returns 0 in bash/dash/sh).
-  stage_started="$(state_int '.stage_started_at')" ||
-    block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
-  task_started="$(state_int '.task_started_at')" ||
-    block_run "state field .task_started_at is not a valid integer; state may be corrupt"
-  stage_turns="$(state_int '.stage_turns')" ||
-    block_run "state field .stage_turns is not a valid integer; state may be corrupt"
-  task_turns="$(state_int '.task_turns')" ||
-    block_run "state field .task_turns is not a valid integer; state may be corrupt"
-  stage_elapsed=$((now - stage_started))
-  task_elapsed=$((now - task_started))
-  if limit_exceeded "$stage_turns" "$stage_elapsed" "$task_turns" "$task_elapsed"; then
-    block_run "turn/time limit reached (stage ${stage_turns}/${MAX_STAGE_TURNS}, task ${task_turns}/${MAX_TASK_TURNS})"
-  fi
-}
-
-enforce_elapsed_limits() {
-  local now stage_elapsed task_elapsed
-  local stage_started task_started
-  now="$(now_epoch)"
-  # Same pattern as enforce_limits: validate into locals first, then do
-  # arithmetic on the validated values in the parent shell.
-  stage_started="$(state_int '.stage_started_at')" ||
-    block_run "state field .stage_started_at is not a valid integer; state may be corrupt"
-  task_started="$(state_int '.task_started_at')" ||
-    block_run "state field .task_started_at is not a valid integer; state may be corrupt"
-  stage_elapsed=$((now - stage_started))
-  task_elapsed=$((now - task_started))
-  if [ "$stage_elapsed" -ge "$MAX_STAGE_SECONDS" ] ||
-    [ "$task_elapsed" -ge "$MAX_TASK_SECONDS" ]; then
-    block_run "time limit reached after the completed primary turn"
-  fi
-}
-
-set_stage() {
-  # Each stage ENTRY gets a fresh wall-clock start, so the per-stage time budget
-  # measures time in this entry — not stale time from an earlier visit (stages
-  # are re-entered on review blocks, and a long run/resume gap would otherwise
-  # restore an ancient start and trip the elapsed limit immediately). Turn counts
-  # still accumulate per stage via stage_counters.
-  local old_stage session_clear='' scope_reset=''
-  old_stage="$(jq -r '.stage' "$STATE")"
-  # Crossing a session-scope boundary clears the pinned session so the next
-  # primary turn starts fresh and hands off through files (see SESSION_SCOPE).
-  if session_boundary "$old_stage" "$1" "$SESSION_SCOPE"; then
-    session_clear=' | .session_id=null'
-    log "stage $old_stage → $1: starting a fresh stage session"
-  fi
-  # Persona review rounds are numbered PER stage scope: run_personas writes/reads
-  # round-$((review_round+1)) and the primary writes the latest round of the
-  # current stage. review_round must therefore reset to 0 when the stage SCOPE
-  # changes — otherwise a plan re-review round leaves the counter ahead, so the
-  # implementation gate reads an empty round-N dir the primary never wrote to (its
-  # results are in round-1) and blocks; --resume only bumps the counter further.
-  # Scope-based (via stage_session_scope), not session-based, so it also holds in
-  # SESSION_SCOPE=run. Carried re-review pending belongs to the old scope, so drop
-  # it too. (GH #18)
-  if [ "$(stage_session_scope "$old_stage")" != "$(stage_session_scope "$1")" ]; then
-    scope_reset=' | .review_round=0 | del(.pending_personas, .pending_stage)'
-  fi
-  state_set "
-    .stage_counters[.stage]=.stage_turns |
-    .stage=\$stage |
-    .stage_turns=(.stage_counters[\$stage] // 0) |
-    .stage_started_at=\$epoch |
-    .stage_started[\$stage]=\$epoch |
-    .updated_at=\$now${session_clear}${scope_reset}
-  " \
-    --arg stage "$1" --argjson epoch "$(now_epoch)" --arg now "$(now_iso)"
-  emit_event stage_transition "$(jq -cn --arg from "$old_stage" --arg to "$1" \
-    --argjson sc "$([ -n "$session_clear" ] && printf true || printf false)" \
-    '{from:$from, to:$to, session_cleared:$sc}')"
-}
+# enforce_limits / enforce_elapsed_limits / set_stage live in lib/stages.sh.
 
 # SINGLE SOURCE OF TRUTH for the stage state machine: the forward action(s) a
 # stage may legally emit (space-separated; most stages have one, `completion` has
@@ -1282,114 +1226,8 @@ cleanup_observer_tmp() {
   rm -rf "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID" "${TMPDIR:-/tmp}/night-shift-persona-$RUN_ID"-* 2>/dev/null || true
 }
 
-validate_signal() {
-  local signal="$RUN_ROOT/control/next-action.json"
-  [ -f "$signal" ] || return 2
-  json_schema_basic next-action "$signal" || return 1
-  [ "$(jq -r '.task' "$signal")" = "$SPEC" ] || return 1
-  # An action whose artifact requirement (per the action_artifact_requirement
-  # table) is unmet is rejected HERE, where the malformed-signal correction
-  # machinery feeds the reason back to the primary — not deep in the handler,
-  # whose gate (kept as defense in depth) is a terminal block the primary never
-  # gets to fix. A live model reliably mis-shapes the evidence on the first try
-  # (exit_code for exit_status, missing task, a flat test_first); that must
-  # cost a correction turn, not the run.
-  case "$(action_artifact_requirement "$(jq -r '.action' "$signal")")" in
-    execution-evidence) signal_has_valid_evidence "$signal" || return 1 ;;
-  esac
-}
-
-# True when any artifact in the signal is a schema-valid execution-evidence file
-# whose task matches the current spec (the same two checks verify_candidate makes).
-signal_has_valid_evidence() {
-  local signal="$1" artifact resolved
-  while IFS= read -r artifact; do
-    [ -n "$artifact" ] || continue
-    resolved="$(resolve_artifact "$artifact")" || continue
-    if json_schema_basic execution-evidence "$resolved" &&
-      [ "$(jq -r '.task' "$resolved")" = "$SPEC" ]; then
-      return 0
-    fi
-  done <<EOF
-$(jq -r '.artifacts[]' "$signal" 2>/dev/null)
-EOF
-  return 1
-}
-
-# Specific reason an execution-evidence file fails the schema, in check order.
-evidence_rejection_reason() {
-  local f="$1" keys
-  if ! jq -e . "$f" >/dev/null 2>&1; then
-    printf 'the file is not valid JSON'
-    return 0
-  fi
-  keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$f")"
-  if [ "$keys" != "$EXECUTION_EVIDENCE_KEYS" ]; then
-    printf 'top-level keys must be EXACTLY %s; the file has %s' "$EXECUTION_EVIDENCE_KEYS" "$keys"
-    return 0
-  fi
-  if [ "$(jq -r '.task' "$f")" != "$SPEC" ]; then
-    printf '"task" must equal %s exactly' "$SPEC"
-    return 0
-  fi
-  keys="$(jq -c '.test_first | if type == "object" then (keys | sort) else type end' "$f")"
-  if [ "$keys" != "$TEST_FIRST_KEYS" ]; then
-    printf '"test_first" keys must be EXACTLY %s (failing AND passing evidence, not a single exit_code/output pair); the file has %s' "$TEST_FIRST_KEYS" "$keys"
-    return 0
-  fi
-  printf 'baseline/final_validation must be non-empty arrays of {"command","exit_status","output"} (integer exit_status >= 0), test_first needs failing_exit_status > 0 with non-empty failing_output and passing_exit_status == 0 with non-empty passing_output'
-}
-
-# Human-readable reason the last next-action signal was rejected, mirroring
-# validate_signal/json_schema_basic checks in order of likelihood. Fed back into
-# the correction turn (primary_prompt) so the model learns exactly what to fix —
-# without it the re-prompt is indistinguishable from the original and a weaker
-# model can loop the same mistake into the malformed cap.
-signal_rejection_reason() {
-  local signal="$1" rc="$2" keys
-  if [ "$rc" -eq 2 ] || [ ! -f "$signal" ]; then
-    printf 'no signal file was written to .night-shift/control/next-action.json before the turn ended'
-    return 0
-  fi
-  if ! jq -e . "$signal" >/dev/null 2>&1; then
-    printf 'the file is not valid JSON'
-    return 0
-  fi
-  keys="$(jq -c 'if type == "object" then (keys | sort) else type end' "$signal")"
-  if [ "$keys" != "$NEXT_ACTION_KEYS" ]; then
-    printf 'top-level keys must be EXACTLY %s (no more, no fewer); the file has %s' "$NEXT_ACTION_KEYS" "$keys"
-    return 0
-  fi
-  if ! jq -e --arg actions "$NEXT_ACTION_ACTIONS" '.action as $a | ($actions | split("|")) | index($a) != null' "$signal" >/dev/null 2>&1; then
-    printf '"action" %s is not one of %s' "$(jq -c '.action' "$signal")" "$NEXT_ACTION_ACTIONS"
-    return 0
-  fi
-  if [ "$(jq -r '.task' "$signal")" != "$SPEC" ]; then
-    printf '"task" must equal %s exactly; the file has %s' "$SPEC" "$(jq -c '.task' "$signal")"
-    return 0
-  fi
-  if ! jq -e '(.stage | type == "string" and length > 0) and (.reason | type == "string" and length > 0)' "$signal" >/dev/null 2>&1; then
-    printf '"stage" and "reason" must both be non-empty strings'
-    return 0
-  fi
-  if [ "$(action_artifact_requirement "$(jq -r '.action' "$signal")")" = "execution-evidence" ] &&
-    ! signal_has_valid_evidence "$signal"; then
-    local first resolved
-    first="$(jq -r '.artifacts[0] // empty' "$signal")"
-    if [ -z "$first" ]; then
-      printf '%s must list the execution-evidence file in "artifacts"' "$(jq -r '.action' "$signal")"
-      return 0
-    fi
-    if ! resolved="$(resolve_artifact "$first")"; then
-      printf 'the execution-evidence artifact %s is missing from the project (or unsafe: absolute/"..")' "$first"
-      return 0
-    fi
-    printf 'the execution-evidence artifact %s failed schema validation (%s/execution-evidence.json): %s' \
-      "$first" "$SCHEMA_DIR" "$(evidence_rejection_reason "$resolved")"
-    return 0
-  fi
-  printf '"artifacts" must be an array of unique, non-empty, project-relative paths (no absolute paths, no "..")'
-}
+# validate_signal / signal_has_valid_evidence / evidence_rejection_reason /
+# signal_rejection_reason live in lib/signals.sh.
 
 # --- engine-spawned persona review (provenance: the WRAPPER runs each persona) --
 # Personas are run by the engine itself, not the primary, so a primary cannot
@@ -1671,8 +1509,9 @@ spawn_persona_worker() {
     fi
     # Journal marker for the parent (workers must not write the shared journal
     # concurrently): the retry and its reason are exactly the hiccups a
-    # post-run study needs.
-    printf '%s' "$retry_note" >"$result_dir/.retry-$slug"
+    # post-run study needs. Append-mode: a twice-failed persona has TWO
+    # reasons and both matter (overwrite kept only the last).
+    printf '%s\n' "$retry_note" >>"$result_dir/.retry-$slug"
     rm -f "$tmp" "$idd" "$norm"
     if [ "$tries" -ge 2 ]; then
       printf '%s' "$persona" >"$result_dir/.failed-$slug"
@@ -1693,6 +1532,31 @@ spawn_persona_worker() {
 # per-attempt raws after each join (children never touch the shared ledger — a
 # signal mid-batch can lose at most that batch's cost rows), and raises
 # block_run for any worker's failure marker.
+# Parent-only journal writer for one persona's round outcome, from the marker
+# files its worker left: the verdict (+attempt count) and one persona_retry per
+# recorded retry reason. File-existence guard on the result: a twice-failed
+# persona writes NO result file, and `jq ... 2>/dev/null` on an absent file
+# exits before the `// "invalid"` fallback, recording status:"" — which would
+# obscure the journal of a run that blocked on that persona.
+journal_persona_result() {
+  local persona="$1" slug="$2" result_dir="$3" attempts="$4" pstatus reason
+  if [ -f "$result_dir/$slug.json" ]; then
+    pstatus="$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)"
+  else
+    pstatus="invalid"
+  fi
+  emit_event persona_verdict "$(jq -cn --arg p "$persona" --argjson a "$attempts" \
+    --arg s "$pstatus" '{persona:$p, status:$s, attempts:$a}')"
+  if [ -f "$result_dir/.retry-$slug" ]; then
+    while IFS= read -r reason; do
+      [ -z "$reason" ] ||
+        emit_event persona_retry "$(jq -cn --arg p "$persona" \
+          --arg reason "$reason" '{persona:$p, reason:$reason}')"
+    done <"$result_dir/.retry-$slug"
+    rm -f "$result_dir/.retry-$slug"
+  fi
+}
+
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
   local bundle persona slug raw old_ifs concurrency i j k n a attempts pstatus
@@ -1748,22 +1612,7 @@ spawn_personas() {
         a=$((a + 1))
       done
       rm -f "$result_dir/.attempts-$slug"
-      # File-existence guard: a twice-failed persona writes NO result file, and
-      # `jq ... 2>/dev/null` on an absent file exits before the `// "invalid"`
-      # fallback, recording status:"" — which would obscure the journal of a
-      # run that blocked on that persona. Read the status only when the file exists.
-      if [ -f "$result_dir/$slug.json" ]; then
-        pstatus="$(jq -r '.status // "invalid"' "$result_dir/$slug.json" 2>/dev/null)"
-      else
-        pstatus="invalid"
-      fi
-      emit_event persona_verdict "$(jq -cn --arg p "$persona" --argjson a "$attempts" \
-        --arg s "$pstatus" '{persona:$p, status:$s, attempts:$a}')"
-      if [ -f "$result_dir/.retry-$slug" ]; then
-        emit_event persona_retry "$(jq -cn --arg p "$persona" \
-          --arg reason "$(cat "$result_dir/.retry-$slug" 2>/dev/null)" '{persona:$p, reason:$reason}')"
-        rm -f "$result_dir/.retry-$slug"
-      fi
+      journal_persona_result "$persona" "$slug" "$result_dir" "$attempts"
     done
     for persona in "${names[@]}"; do
       slug="$(persona_slug "$persona")"
@@ -2118,11 +1967,18 @@ run_visual() {
   report="$RUN_ROOT/validated/visual-diff-$(basename "$SPEC" .md).json"
   case "$(visual_report_status "$report")" in
     valid)
-      log "visual_review: report accepted ($(jq -r '[.screens[]|select(.pass)]|length' "$report")/$(jq -r '.screens|length' "$report") screens pass)"
+      local vr_total vr_failed
+      vr_total="$(jq -r '.screens|length' "$report")"
+      vr_failed="$(jq -r '[.screens[]|select(.pass|not)]|length' "$report")"
+      log "visual_review: report accepted ($((vr_total - vr_failed))/$vr_total screens pass)"
+      emit_event visual_review "$(jq -cn --argjson t "$vr_total" --argjson f "$vr_failed" \
+        '{outcome: (if $f > 0 then "fail" else "pass" end), screens:$t, failed:$f}')"
       run_visual_inloop_repair "$report" "$candidate" ;;
     absent)
-      log "visual_review: no visual-diff report produced (capture skipped or tooling unavailable); proceeding to observer" ;;
+      log "visual_review: no visual-diff report produced (capture skipped or tooling unavailable); proceeding to observer"
+      emit_event visual_review '{"outcome":"skipped","reason":"capture skipped or tooling unavailable"}' ;;
     malformed)
+      emit_event visual_review '{"outcome":"malformed"}'
       block_run "visual_review produced a malformed visual-diff report" ;;
   esac
   set_stage observer_review
@@ -2137,22 +1993,37 @@ run_visual_inloop_repair() {
   local over; over="$(jq -r '[.screens[]|select(.pass|not)]|length' "$report")"
   [ "$over" -gt 0 ] || { log "visual_review: all screens within tolerance; no repair needed"; return 0; }
   local branch; branch="$(git -C "$PROJECT" branch --show-current)"
-  case "$branch" in main|master|'') log "visual_review: refusing to auto-repair on '$branch'; skipping repair"; return 0 ;; esac
+  case "$branch" in main|master|'')
+    log "visual_review: refusing to auto-repair on '$branch'; skipping repair"
+    emit_event visual_repair "$(jq -cn --arg b "$branch" \
+      '{outcome:"skipped", reason:("refusing to auto-repair on branch " + ($b | if . == "" then "(detached)" else . end))}')"
+    return 0 ;;
+  esac
   local iter_dev; iter_dev="$(visual_repair_devices "$SPEC" | head -n1)"
   NO_BUILD="${NIGHT_SHIFT_VISUAL_REPAIR_NO_BUILD:-0}"
-  repair_metro_start "$(device_label_to_name "$iter_dev")" || { log "visual_review: repair harness unavailable; proceeding unrepaired"; return 0; }
+  repair_metro_start "$(device_label_to_name "$iter_dev")" || {
+    log "visual_review: repair harness unavailable; proceeding unrepaired"
+    emit_event visual_repair '{"outcome":"skipped","reason":"repair harness unavailable"}'
+    return 0
+  }
   visual_repair_for_spec "$SPEC" "$PROJECT" "$RUN_ROOT/validated" "$candidate" "$report" \
     "${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" \
     "$([ "${NIGHT_SHIFT_VISUAL_REPAIR_SHARED:-0}" = "1" ] && echo 'src/features/,src/ui/' || echo 'src/features/')" \
     "$iter_dev"
   repair_metro_stop
   if git -C "$PROJECT" diff --quiet && git -C "$PROJECT" diff --cached --quiet; then
-    log "visual_review: repair made no edits; proceeding unrepaired"; return 0
+    log "visual_review: repair made no edits; proceeding unrepaired"
+    emit_event visual_repair '{"outcome":"no_edits"}'
+    return 0
   fi
   local screens; screens="$(jq -r '[.screens[]|select(.pass|not)|.screen]|unique|join(", ")' "$report")"
   git -C "$PROJECT" add -A
   git -C "$PROJECT" commit -q -m "fix(visual): auto-repair $screens" || { log "visual_review: repair commit failed; proceeding"; return 0; }
   local newsha; newsha="$(git -C "$PROJECT" rev-parse HEAD)"
+  # THE decision post-run forensics needs from this stage: the observer will
+  # review a different commit than the one the implement loop validated.
+  emit_event visual_repair "$(jq -cn --arg c "$newsha" --arg s "$screens" \
+    '{outcome:"committed", commit:$c, screens:$s}')"
   state_set '
     .candidate_commits = ((.candidate_commits + [$c])
       | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)) |
@@ -2236,7 +2107,7 @@ run_observer() {
     block_run "observer output remained invalid after one retry"
   append_observer_review "$out"
   record_findings "$(dirname "$out")"
-  emit_event observer_verdict "$(jq -c '{status, findings: (.findings | length)}' "$out" 2>/dev/null)"
+  emit_event observer_verdict "$(jq -c '{status, findings: (.findings | length), finding_ids: [.findings[]?.id]}' "$out" 2>/dev/null)"
   if [ "$(jq -r '.status' "$out")" = "APPROVE" ]; then
     log "observer: APPROVE — task complete, ready to commit/next"
     set_stage completion
@@ -2271,6 +2142,10 @@ validated_observer_retry() {
     fi
     retry_note="the verdict failed the observer-review contract: exactly the keys $OBSERVER_REVIEW_KEYS with the exact task and candidate values shown; status APPROVE or BLOCK only; finding ids match OBS-NNN"
     attempt=$((attempt + 1))
+    # persona_retry's twin: an observer that needed a second attempt (or burned
+    # both) is a decision point the journal must show, not just the final verdict.
+    emit_event observer_retry "$(jq -cn --argjson a "$attempt" --arg r "$retry_note" \
+      '{attempt:$a, reason:$r}')"
   done
   return 1
 }
@@ -2323,16 +2198,23 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  # The journal is anchored on every append (events.sh); verify it here — the
+  # last trust point before it becomes the archived record of the run.
+  integrity_guard "$RUN_ROOT/events.jsonl" events "the decision journal"
   emit_event run_complete null
   state_set '.status="complete" | .completed_at=$now | .updated_at=$now' --arg now "$(now_iso)"
   jq '{run_id,status,primary,observer,task,base_commit,candidate_commits,
     primary_turns,review_round,finding_ids,started_at,completed_at}' "$STATE" >"$summary"
+  # Log completion BEFORE compacting so the line reaches the archived run.log;
+  # afterwards drop RUN_ROOT so no late log line can recreate files inside the
+  # just-compacted directory (the engine promises "archive only" on success).
+  log "run $RUN_ID complete; compact archive: $RUN_ROOT/archive/$RUN_ID"
   compact_success "$RUN_ROOT" "$RUN_ID"
+  RUN_ROOT=""
   cleanup_observer_tmp
   # Only on SUCCESS: a blocked run keeps the anchor so --resume retains
   # integrity continuity across the gap.
   integrity_cleanup
-  log "run $RUN_ID complete; compact archive: $RUN_ROOT/archive/$RUN_ID"
   exit 0
 }
 
@@ -2405,40 +2287,7 @@ EOF
   state_set '.baseline_complete=true'
 }
 
-handle_signal() {
-  local signal="$RUN_ROOT/control/next-action.json" action
-  action="$(jq -r '.action' "$signal")"
-  log "signal: $action — $(jq -r '.reason' "$signal")"
-  transition_allowed "$(jq -r '.stage' "$STATE")" "$action" ||
-    block_run "action $action is invalid from stage $(jq -r '.stage' "$STATE")"
-  case "$action" in
-    RUN_PERSONAS) run_personas ;;
-    CREATE_CANDIDATE) verify_candidate ;;
-    REQUEST_OBSERVER) run_observer "$signal" ;;
-    RUN_VISUAL) run_visual ;;
-    NEXT_TASK)
-      # NEXT_TASK is legal only from the completion stage — already enforced by the
-      # transition_allowed gate above (no redundant re-check here).
-      # An explicit `--spec` run is a single task — the caller (e.g. a wrapper that
-      # owns cross-spec sequencing + per-spec branch routing) advances to the next
-      # spec itself. Treat NEXT_TASK as COMPLETE so the run exits 0 cleanly instead
-      # of trying to chain to another TODO entry whose branch isn't checked out.
-      if [ "${EXPLICIT_SPEC:-0}" = "1" ]; then
-        log "explicit --spec run: task complete; not chaining to the next TODO entry"
-        complete_run
-      else
-        start_next_task
-      fi
-      ;;
-    BLOCKED) block_run "primary reported: $(jq -r '.reason' "$signal")" ;;
-    COMPLETE)
-      # COMPLETE is legal only from the completion stage — enforced by the
-      # transition_allowed gate above.
-      complete_run
-      ;;
-    *) block_run "unsupported action $action" ;;
-  esac
-}
+# handle_signal lives in lib/signals.sh.
 
 main_run() {
   require_command jq

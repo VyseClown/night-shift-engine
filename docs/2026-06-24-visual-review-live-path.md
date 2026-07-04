@@ -75,7 +75,7 @@ prompt-proof:
 #    OR — what we used here — the Figma MCP (no token): download each frame node via
 #    mcp__figma__download_figma_images, fan each out to design/<Screen>-<state>-<device>.png,
 #    then pass --no-refs so visual-review.sh reuses the staged refs.
-scripts/visual-review.sh --project ~/work/water-tracker-app --drive file --no-build --no-refs \
+scripts/visual-review.sh --project ~/work/personal/water-tracker-app --drive file --no-build --no-refs \
   --spec specs/visual-review-validation.md
 ```
 
