@@ -21,10 +21,18 @@ fixture_assert() {
   shift
   if "$@"; then
     printf 'ok - %s\n' "$description"
+    return
+  fi
+  # One immediate rerun, for the LABEL only: a nondeterministic failure is
+  # still a failure (the suite stays red), but "(FLAKY)" turns a debugging
+  # session into a one-glance diagnosis (eeb59e9 / 88603d6 / a180d32 — three
+  # separate commits spent chasing unlabeled CI-only flakes).
+  if "$@" 2>/dev/null; then
+    printf 'not ok - %s (FLAKY: failed once, passed on immediate rerun)\n' "$description" >&2
   else
     printf 'not ok - %s\n' "$description" >&2
-    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
+  FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
 }
 
 # Inside-fixture assertion with a diagnosis. Use in fixture bodies instead of
