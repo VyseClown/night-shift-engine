@@ -27,6 +27,22 @@ fixture_assert() {
   fi
 }
 
+# Inside-fixture assertion with a diagnosis. Use in fixture bodies instead of
+# bare `|| exit 1`: a red fixture then names WHICH sub-check broke (commit
+# 382b580 added throwaway debug markers to diagnose exactly this failure mode;
+# fx is the permanent version). fx_not asserts the command FAILS.
+fx() {
+  local label="$1"; shift
+  "$@" && return 0
+  printf '  # sub-check failed: %s\n' "$label" >&2
+  exit 1
+}
+fx_not() {
+  local label="$1"; shift
+  if "$@"; then printf '  # sub-check failed (expected failure): %s\n' "$label" >&2; exit 1; fi
+  return 0
+}
+
 fixture_reject() {
   local description="$1"
   shift
@@ -131,6 +147,7 @@ run_dry_fixtures() {
   fixture_assert "wire contracts single-sourced (gate + rejection feedback + retry reminders) and integrity_guard owns check->quarantine->block" fixture_contract_single_source "$root"
   fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
+  fixture_assert "fx names the failing sub-check (fixture diagnostics)" fixture_fx_helper "$root"
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
   fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
@@ -1304,16 +1321,20 @@ fixture_session_refresh() {
     RUN_ROOT="$dir"; STATE="$dir/state.json"; RUN_ID="sr-$$"
     printf '{"stage":"implementation","stage_turns":8,"session_id":"s1"}\n' >"$STATE"
     out="$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s1)"
-    [ -z "$out" ] || exit 1                                        # cleared at the boundary
-    [ "$(jq -r '.session_id' "$STATE")" = "null" ] || exit 1
-    jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl" >/dev/null || exit 1
+    fx "cleared at the boundary" test -z "$out"
+    fx "state session_id nulled" test "$(jq -r '.session_id' "$STATE")" = "null"
+    fx "refresh is journaled with the turn count" \
+      jq -e 'select(.type=="session_refresh") | .payload.stage_turns==8' "$dir/events.jsonl"
     printf '{"stage":"implementation","stage_turns":7,"session_id":"s2"}\n' >"$STATE"
-    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2" ] || exit 1  # below: keep
+    fx "below threshold keeps the session" \
+      test "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s2)" = "s2"
     printf '{"stage":"implementation","stage_turns":16,"session_id":"s3"}\n' >"$STATE"
-    [ -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)" ] || exit 1      # every Nth
+    fx "every Nth turn clears again" \
+      test -z "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=8 maybe_refresh_session s3)"
     printf '{"stage":"implementation","stage_turns":8,"session_id":"s4"}\n' >"$STATE"
-    [ "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4" ] || exit 1  # 0 = off
-    exit 0 ) || return 1
+    fx "0 disables refresh" \
+      test "$(NIGHT_SHIFT_SESSION_REFRESH_TURNS=0 maybe_refresh_session s4)" = "s4"
+    exit 0 ) >/dev/null || return 1
   # Wired into the primary turn path. declare -f (not awk|grep -q): the latter
   # SIGPIPEs awk when grep -q exits early, and under pipefail that races to a
   # false failure on Linux (green on macOS) — the CI-only flake this fixture hit.
@@ -1359,6 +1380,20 @@ fixture_rate_limit_contract_canary() {
   return 0
 }
 
+fixture_fx_helper() {
+  # fx/fx_not are the in-fixture assertion verbs: on failure they name the
+  # broken sub-check on stderr and exit the fixture subshell, so a red fixture
+  # says WHICH invariant died (382b580 added throwaway debug markers to
+  # diagnose exactly this; fx is the permanent version).
+  local out
+  out="$( (fx "always true" true; fx "always false" false; echo unreachable) 2>&1 )"
+  case "$out" in *'sub-check failed: always false'*) ;; *) return 1 ;; esac
+  case "$out" in *unreachable*) return 1 ;; esac
+  ( fx_not "false fails" false ) || return 1
+  ( fx_not "true fails" true 2>/dev/null ) && return 1
+  return 0
+}
+
 fixture_event_stream() {
   # events.jsonl is the run's decision journal: one {ts, run, stage, type,
   # payload} line at every decision point (stage transitions, accepted AND
@@ -1376,19 +1411,18 @@ fixture_event_stream() {
     printf '{"stage":"planning","stage_turns":1,"stage_counters":{},"session_id":"s"}\n' >"$STATE"
     emit_event probe '{"n":1}'
     emit_event probe-text 'not json'
-    [ "$(grep -c . "$RUN_ROOT/events.jsonl")" -eq 2 ] || exit 1
-    jq -e 'select(.type=="probe") | .run and .ts and (.stage=="planning") and (.payload.n==1)' \
-      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
-    jq -e 'select(.type=="probe-text") | .payload == "not json"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
-    # set_stage journals the transition (with session_cleared).
+    fx "exactly two journal lines" test "$(grep -c . "$RUN_ROOT/events.jsonl")" -eq 2
+    fx "json payload keeps envelope + parsed payload" \
+      jq -e 'select(.type=="probe") | .run and .ts and (.stage=="planning") and (.payload.n==1)' "$RUN_ROOT/events.jsonl"
+    fx "non-json payload falls back to a string" \
+      jq -e 'select(.type=="probe-text") | .payload == "not json"' "$RUN_ROOT/events.jsonl"
     set_stage implementation >/dev/null 2>&1
-    jq -e 'select(.type=="stage_transition") | .payload.from=="planning" and .payload.to=="implementation" and .payload.session_cleared==true' \
-      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
-    # compact_success preserves the journal in the archive.
+    fx "set_stage journals the transition with session_cleared" \
+      jq -e 'select(.type=="stage_transition") | .payload.from=="planning" and .payload.to=="implementation" and .payload.session_cleared==true' "$RUN_ROOT/events.jsonl"
     printf '{"s":1}\n' >"$RUN_ROOT/summary.json"
     compact_success "$RUN_ROOT" "arch1"
-    [ -f "$RUN_ROOT/archive/arch1/events.jsonl" ] || exit 1
-    exit 0 ) || return 1
+    fx "compact_success archives the journal" test -f "$RUN_ROOT/archive/arch1/events.jsonl"
+    exit 0 ) >/dev/null || return 1
   # Wiring: the decision points actually emit. COMPLETE list — every event type
   # the engine can journal; deleting any emit site fails this loop.
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
@@ -1439,28 +1473,32 @@ fixture_journal_hardening() {
     printf '{"stage":"planning"}\n' >"$STATE"
     # (1) append re-anchors: the private copy exists and matches byte-for-byte.
     emit_event probe '{"n":1}'
-    cmp -s "$(integrity_dir)/events.jsonl" "$RUN_ROOT/events.jsonl" || exit 1
+    fx "anchor matches journal byte-for-byte after append" \
+      cmp -s "$(integrity_dir)/events.jsonl" "$RUN_ROOT/events.jsonl"
     # ...and an out-of-band edit is detected, quarantined and restored.
     printf '{"forged":true}\n' >>"$RUN_ROOT/events.jsonl"
-    integrity_check "$RUN_ROOT/events.jsonl" && exit 1
+    fx_not "out-of-band journal edit passes integrity_check" \
+      integrity_check "$RUN_ROOT/events.jsonl"
     blocked=""
     block_run() { blocked="$1"; }
     integrity_guard "$RUN_ROOT/events.jsonl" events "the decision journal"
-    [ -n "$blocked" ] || exit 1
-    grep -q forged "$RUN_ROOT/events.jsonl" && exit 1
-    jq -e 'select(.type=="integrity_violation") | .payload.file=="events.jsonl"' \
-      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    fx "guard blocks on the tampered journal" test -n "$blocked"
+    fx_not "forged line survives the quarantine restore" \
+      grep -q forged "$RUN_ROOT/events.jsonl"
+    fx "violation event names the journal file" \
+      jq -e 'select(.type=="integrity_violation") | .payload.file=="events.jsonl"' "$RUN_ROOT/events.jsonl"
     # (3) both retry reasons reach the journal, then the marker is consumed.
     mkdir -p "$dir/results"
     printf 'first reason\nsecond reason\n' >"$dir/results/.retry-tester"
     journal_persona_result "Tester" "tester" "$dir/results" 2
-    [ "$(jq -s '[.[] | select(.type=="persona_retry")] | length' "$RUN_ROOT/events.jsonl")" -eq 2 ] || exit 1
-    jq -e 'select(.type=="persona_retry") | select(.payload.reason=="second reason")' \
-      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
-    jq -e 'select(.type=="persona_verdict") | .payload.status=="invalid" and .payload.attempts==2' \
-      "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
-    [ ! -f "$dir/results/.retry-tester" ] || exit 1
-    exit 0 ) || return 1
+    fx "two persona_retry events (one per reason)" \
+      test "$(jq -s '[.[] | select(.type=="persona_retry")] | length' "$RUN_ROOT/events.jsonl")" -eq 2
+    fx "the SECOND reason survives (overwrite kept only the last)" \
+      jq -e 'select(.type=="persona_retry") | select(.payload.reason=="second reason")' "$RUN_ROOT/events.jsonl"
+    fx "twice-failed persona journals status invalid, attempts 2" \
+      jq -e 'select(.type=="persona_verdict") | .payload.status=="invalid" and .payload.attempts==2' "$RUN_ROOT/events.jsonl"
+    fx "retry marker is consumed after journaling" test ! -f "$dir/results/.retry-tester"
+    exit 0 ) >/dev/null || return 1
   # (2) ordering, structurally: no emit before the quarantine, one after.
   body="$(declare -f integrity_guard)"
   case "${body%%integrity_quarantine*}" in *emit_event*) return 1 ;; esac
