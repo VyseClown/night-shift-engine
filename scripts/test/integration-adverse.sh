@@ -42,3 +42,23 @@ jq -e 'select(.type=="stage_transition") | select(.payload.from=="observer_revie
 [ "$(jq -r 'select(.type=="candidate_validated") | .payload.commit' "$ev" | sort -u | wc -l | tr -d ' ')" = "2" ] \
                                                                || fail "expected two distinct validated candidates"
 printf 'ok - adverse: observer BLOCK returns to a fresh implement session and the repaired candidate completes\n'
+
+# ── Scenario C: --resume re-enters a logic-blocked run and completes ─────────
+# resumable_blocked_state (lib/recovery.sh) requires status=blocked, no
+# rate_limit_reset_at, and a session_id — all true after Scenario A's
+# malformed-signal block. --resume takes no --spec: the task comes from state.
+integration_setup
+write_stub malformed
+run_engine --spec "$SPEC" && fail "setup: malformed run unexpectedly succeeded"
+[ "$(jq -r .status "$PROJECT/.night-shift/state.json")" = "blocked" ] || fail "setup: not blocked"
+write_stub happy
+if ! run_engine --resume; then
+  tail -15 "$WORK/run.log" >&2 || true
+  fail "--resume run exited non-zero"
+fi
+ev="$(find "$PROJECT/.night-shift/archive" -name events.jsonl | head -1)"
+[ -n "$ev" ]                                                   || fail "no archived journal after resume"
+jq -e 'select(.type=="run_recovered") | .payload.resumed_block==true' "$ev" >/dev/null \
+                                                               || fail "journal missing run_recovered{resumed_block:true}"
+jq -e 'select(.type=="run_complete")' "$ev" >/dev/null         || fail "resumed run did not complete"
+printf 'ok - adverse: --resume clears a logic block and the run completes\n'
