@@ -148,6 +148,7 @@ run_dry_fixtures() {
   fixture_assert "verdict normalizers share the status/nonempty jq prelude; one rejection preamble for both prompts" fixture_verdict_prelude_and_preamble "$root"
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
   fixture_assert "fx names the failing sub-check (fixture diagnostics)" fixture_fx_helper "$root"
+  fixture_assert "coverage ratchet: new functions cannot be silently untested" fixture_coverage_ratchet "$root"
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
   fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
@@ -1378,6 +1379,23 @@ fixture_rate_limit_contract_canary() {
     exit 0 ) || return 1
   case "$(declare -f main_run)" in *rate_limit_contract_canary*) ;; *) return 1 ;; esac
   return 0
+}
+
+fixture_coverage_ratchet() {
+  # Every engine function is either referenced by the test corpus or listed in
+  # untested-allowlist.txt. The list is a RATCHET: entries may be removed as
+  # coverage grows, and adding one is a reviewed, deliberate act — so a new
+  # function can never be silently untested. "Referenced" is by name anywhere
+  # under scripts/test/ (behavioral call, stub, or structural check all count;
+  # this is a tripwire for total blind spots, not a quality meter).
+  local allow="$WORKSPACE_ROOT/scripts/test/untested-allowlist.txt" fn missing=""
+  while IFS= read -r fn; do
+    case "$fn" in fixture_*|fx|fx_not) continue ;; esac
+    grep -rq --exclude=untested-allowlist.txt -- "$fn" "$WORKSPACE_ROOT/scripts/test/" && continue
+    grep -qx -- "$fn" "$allow" 2>/dev/null && continue
+    missing="$missing $fn"
+  done < <(declare -F | awk '{print $3}')
+  fx "no unreferenced, unallowlisted engine functions:${missing}" test -z "$missing"
 }
 
 fixture_fx_helper() {
