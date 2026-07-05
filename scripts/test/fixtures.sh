@@ -147,6 +147,7 @@ run_dry_fixtures() {
   fixture_assert "bounded_diff caps a large diff with --stat + truncation marker" fixture_bounded_diff "$root"
   fixture_assert "review bundle shows untracked new files; gitignored + engine state excluded" fixture_bundle_untracked_diff "$root"
   fixture_assert "review bundle + observer context carry project conventions, size-capped" fixture_bundle_conventions "$root"
+  fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
   fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
@@ -2084,6 +2085,48 @@ fixture_bundle_conventions() {
     assemble_review_bundle plan "$out"
     fx_not "no conventions section without convention docs" \
       grep -q 'Project conventions' "$out" || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_worktree_pnpm_links() {
+  # link_worktree_dependencies must cover a pnpm/Nx monorepo: every workspace
+  # package's node_modules (enumerated from pnpm-workspace.yaml's `packages:`
+  # globs) plus .nx/cache must reach the validation worktree, or final
+  # validation runs against missing deps and a cold Nx cache. Non-pnpm projects
+  # keep the exact DEPENDENCY_LINKS behavior.
+  local root="$1" dir="$root/pnpm-links"
+  mkdir -p "$dir/proj" "$dir/wt" "$dir/plain" "$dir/wt2"
+  ( PROJECT="$dir/proj"
+    block_run() { exit 9; }
+    mkdir -p "$PROJECT/node_modules" "$PROJECT/apps/api/node_modules" \
+      "$PROJECT/packages/core/node_modules" "$PROJECT/apps/bare" "$PROJECT/.nx/cache"
+    cat >"$PROJECT/pnpm-workspace.yaml" <<'YAML'
+packages:
+  - 'apps/*'
+  - packages/*
+  - '!**/test/**'
+injectWorkspacePackages: false
+YAML
+    fx "pnpm_workspace_links names workspace node_modules" \
+      grep -q 'apps/api/node_modules' <<<"$(pnpm_workspace_links)" || exit 1
+    fx_not "pnpm_workspace_links skips packages without node_modules" \
+      grep -q 'apps/bare' <<<"$(pnpm_workspace_links)" || exit 1
+    link_worktree_dependencies "$dir/wt"
+    fx "root node_modules linked" [ -L "$dir/wt/node_modules" ] || exit 1
+    fx "workspace app node_modules linked" [ -L "$dir/wt/apps/api/node_modules" ] || exit 1
+    fx "workspace package node_modules linked" [ -L "$dir/wt/packages/core/node_modules" ] || exit 1
+    fx ".nx/cache linked for warm worktree builds" [ -L "$dir/wt/.nx/cache" ] || exit 1
+    fx_not "package without node_modules not linked" [ -e "$dir/wt/apps/bare/node_modules" ] || exit 1
+    exit 0
+  ) || return 1
+  ( PROJECT="$dir/plain"
+    block_run() { exit 9; }
+    mkdir -p "$PROJECT/node_modules"
+    link_worktree_dependencies "$dir/wt2"
+    fx "non-pnpm project still links root node_modules" [ -L "$dir/wt2/node_modules" ] || exit 1
+    fx_not "no .nx link when the project has none" [ -e "$dir/wt2/.nx" ] || exit 1
     exit 0
   ) || return 1
   return 0

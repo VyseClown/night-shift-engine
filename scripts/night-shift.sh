@@ -144,7 +144,9 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # layout where node_modules live in sub-packages (e.g. the viewer's server/ and
 # web/). link_worktree_dependencies skips any entry that does not exist, so listing
 # all of them is safe — each project only links what it actually has. Override with
-# NIGHT_SHIFT_DEPENDENCY_LINKS for a non-standard layout.
+# NIGHT_SHIFT_DEPENDENCY_LINKS for a non-standard layout. pnpm monorepos need no
+# override: every workspace package's node_modules (from pnpm-workspace.yaml)
+# and the .nx/cache are auto-linked on top (see pnpm_workspace_links).
 DEPENDENCY_LINKS="${NIGHT_SHIFT_DEPENDENCY_LINKS:-node_modules ios/Pods server/node_modules web/node_modules}"
 
 usage() {
@@ -482,9 +484,35 @@ material_token() {
 
 # The isolated validation worktree has none of the ignored dependency dirs.
 # Symlink them from the project so type-check/lint/test run without reinstalling.
+# Enumerate a pnpm workspace's per-package node_modules (project-relative),
+# from the `packages:` globs in pnpm-workspace.yaml. Single-level `*` globs
+# expand via the shell; negations and `**` recursive patterns are skipped
+# (best-effort — a package they would match just falls back to
+# NIGHT_SHIFT_DEPENDENCY_LINKS). Emits nothing for non-pnpm projects, so
+# single-repo behavior is untouched.
+pnpm_workspace_links() {
+  local yaml="$PROJECT/pnpm-workspace.yaml" glob dir
+  [ -f "$yaml" ] || return 0
+  awk '/^packages:/{inp=1;next} /^[^ \t-]/{inp=0} inp && /^[ \t]*-/' "$yaml" |
+    sed -E "s/^[ \t]*-[ \t]*//; s/^['\"]//; s/['\"].*$//; s/[ \t]*$//" |
+    while IFS= read -r glob; do
+      case "$glob" in ''|'!'*|*'**'*) continue ;; esac
+      glob="${glob%/}"
+      # Unquoted on purpose: the glob must expand relative to the project.
+      for dir in "$PROJECT"/$glob; do
+        [ -d "$dir/node_modules" ] || continue
+        printf '%s\n' "${dir#"$PROJECT"/}/node_modules"
+      done
+    done
+}
+
 link_worktree_dependencies() {
   local worktree="$1" rel src dst
-  for rel in $DEPENDENCY_LINKS; do
+  # Beyond DEPENDENCY_LINKS: a pnpm workspace's per-package node_modules, and
+  # the Nx cache so worktree rebuilds of workspace packages start warm instead
+  # of cold-compiling the whole monorepo per candidate.
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
     src="$PROJECT/$rel"
     dst="$worktree/$rel"
     [ -e "$src" ] || continue
@@ -492,7 +520,12 @@ link_worktree_dependencies() {
     mkdir -p "$(dirname "$dst")"
     ln -s "$src" "$dst" ||
       block_run "could not link dependency $rel into validation worktree"
-  done
+  done < <(
+    # shellcheck disable=SC2086 # DEPENDENCY_LINKS is a space-separated knob
+    printf '%s\n' $DEPENDENCY_LINKS
+    pnpm_workspace_links
+    [ ! -d "$PROJECT/.nx/cache" ] || printf '.nx/cache\n'
+  )
 }
 
 assert_tools_available() {
