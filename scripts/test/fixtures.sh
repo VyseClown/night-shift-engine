@@ -146,6 +146,7 @@ run_dry_fixtures() {
   fixture_assert "spawn_personas enforces the elapsed budget + records per-attempt cost" fixture_persona_spawn_guards "$root"
   fixture_assert "bounded_diff caps a large diff with --stat + truncation marker" fixture_bounded_diff "$root"
   fixture_assert "review bundle shows untracked new files; gitignored + engine state excluded" fixture_bundle_untracked_diff "$root"
+  fixture_assert "review bundle + observer context carry project conventions, size-capped" fixture_bundle_conventions "$root"
   fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
   fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
@@ -2032,6 +2033,57 @@ fixture_bundle_untracked_diff() {
     # The observer's committed-range diff is untouched by the untracked handling.
     range_out="$(bounded_diff "$BASE_COMMIT..$BASE_COMMIT")"
     printf '%s' "$range_out" | grep -q 'newfile.js' && exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_bundle_conventions() {
+  # Personas and the observer are context-isolated (neutral cwd, no repo
+  # access), so the target repo's own engineering rules — AGENTS.md, CLAUDE.md,
+  # .claude/rules/*.md — never reach reviewers unless the engine-assembled
+  # bundle carries them. The bundle must include them when present, omit the
+  # section when the project declares none, and bound the total size so a
+  # doc-heavy repo cannot overflow the reviewer's context.
+  local root="$1" dir="$root/bundle-conventions"
+  mkdir -p "$dir/repo" "$dir/bare"
+  ( PROJECT="$dir/repo"; RUN_ROOT="$dir/rs"; SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated" "$PROJECT/.claude/rules"
+    fixture_write_min_spec "$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'base\n' >"$PROJECT/f.txt"; git -C "$PROJECT" add f.txt; git -C "$PROJECT" commit -qm base
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '# House rules\nNEVER-USE-BARREL-IMPORTS\n' >"$PROJECT/AGENTS.md"
+    printf 'TESTING-RULE-MARKER applies\n' >"$PROJECT/.claude/rules/testing.md"
+    out="$dir/bundle.md"
+    assemble_review_bundle plan "$out"
+    fx "bundle has a conventions section" grep -q 'Project conventions' "$out" || exit 1
+    fx "AGENTS.md content reaches reviewers" grep -q 'NEVER-USE-BARREL-IMPORTS' "$out" || exit 1
+    fx ".claude/rules/*.md content reaches reviewers" grep -q 'TESTING-RULE-MARKER' "$out" || exit 1
+    fx "sections name their source file" grep -q 'AGENTS.md' "$out" || exit 1
+    # Size cap: an oversized rules file is truncated with an explicit marker.
+    head -c 60000 /dev/zero | tr '\0' 'x' >"$PROJECT/.claude/rules/huge.md"
+    NIGHT_SHIFT_CONVENTIONS_BUDGET=5000 assemble_review_bundle plan "$out"
+    fx "over-budget conventions carry a truncation marker" \
+      grep -q 'conventions truncated' "$out" || exit 1
+    fx "capped bundle stays near the budget" \
+      [ "$(wc -c <"$out")" -lt 20000 ] || exit 1
+    exit 0
+  ) || return 1
+  # A project with no convention docs gets no section at all (no noise):
+  # project_conventions itself emits nothing, and the bundle drops the heading.
+  ( PROJECT="$dir/bare"; RUN_ROOT="$dir/rs2"; SPEC="$dir/spec2.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    fixture_write_min_spec "$SPEC"
+    git -C "$PROJECT" init -q
+    fx "project_conventions emits nothing without convention docs" \
+      [ -z "$(project_conventions)" ] || exit 1
+    out="$dir/bundle2.md"
+    assemble_review_bundle plan "$out"
+    fx_not "no conventions section without convention docs" \
+      grep -q 'Project conventions' "$out" || exit 1
     exit 0
   ) || return 1
   return 0

@@ -1337,12 +1337,44 @@ bounded_diff() {
   [ -z "$ut_tmp" ] || rm -f "$ut_tmp" 2>/dev/null || true
 }
 
+# The target repo's own engineering rules, for reviewers. Personas and the
+# observer are context-isolated (neutral cwd, no repo access), so AGENTS.md /
+# CLAUDE.md / .claude/rules/*.md never reach them unless the engine-assembled
+# context carries them — without this, a persona approves a diff that violates
+# the house rules it never saw. Size-bounded (NIGHT_SHIFT_CONVENTIONS_BUDGET
+# bytes, default 30000) with an explicit truncation marker, same UTF-8-safe
+# cut as bounded_diff. Emits nothing when the project declares no conventions.
+project_conventions() {
+  local budget="${NIGHT_SHIFT_CONVENTIONS_BUDGET:-30000}" f body n
+  body="$(
+    for f in "$PROJECT/AGENTS.md" "$PROJECT/CLAUDE.md" "$PROJECT/.claude/rules"/*.md; do
+      [ -f "$f" ] || continue
+      printf '### %s\n\n' "${f#"$PROJECT"/}"
+      cat "$f" 2>/dev/null
+      printf '\n\n'
+    done | head -c "$((budget + 1))"
+  )"
+  [ -n "$body" ] || return 0
+  n="$(printf '%s' "$body" | wc -c | tr -d ' ')"
+  if [ "$n" -gt "$budget" ]; then
+    printf '%s' "$body" | head -c "$budget" | { iconv -f UTF-8 -t UTF-8//IGNORE 2>/dev/null || cat; }
+    printf '\n[... conventions truncated at %s bytes; raise NIGHT_SHIFT_CONVENTIONS_BUDGET to include more ...]\n' "$budget"
+  else
+    printf '%s\n' "$body"
+  fi
+}
+
 assemble_review_bundle() {
-  local stage="$1" out="$2"
+  local stage="$1" out="$2" conventions
+  conventions="$(project_conventions)"
   {
     printf '# Review bundle (engine-assembled) — stage: %s\n\n' "$stage"
     printf '## Task spec\n\n'
     cat "$SPEC"
+    if [ -n "$conventions" ]; then
+      printf '\n\n## Project conventions (target repo rules — findings may cite them)\n\n'
+      printf '%s\n' "$conventions"
+    fi
     if [ -s "$RUN_ROOT/control/plan.md" ]; then
       printf '\n\n## Approved plan\n\n'
       cat "$RUN_ROOT/control/plan.md"
@@ -2068,7 +2100,7 @@ observer_wrapper_evidence() {
 
 run_observer() {
   local signal="$1" candidate context="$RUN_ROOT/prompts/observer-context.txt"
-  local out raw attempt=0 artifact plan_results implementation_results review_dir resolved owned
+  local out raw attempt=0 artifact plan_results implementation_results review_dir resolved owned conventions
   candidate="$(jq -r '.candidate // .candidate_commits[-1] // empty' "$STATE")"
   [ -n "$candidate" ] || block_run "observer requested without a candidate commit"
   # observer_wrapper_evidence presents these as authoritative ground truth;
@@ -2088,6 +2120,11 @@ run_observer() {
   {
     printf '%s\n' '--- CURRENT SPEC ---'
     cat "$SPEC"
+    conventions="$(project_conventions)"
+    if [ -n "$conventions" ]; then
+      printf '%s\n' '--- PROJECT CONVENTIONS (target repo rules) ---'
+      printf '%s\n' "$conventions"
+    fi
     printf '%s\n' '--- VALIDATED PERSONA SUMMARY ---'
     for review_dir in "$plan_results" "$implementation_results"; do
       [ -d "$review_dir" ] || continue
