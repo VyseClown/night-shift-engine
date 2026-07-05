@@ -1238,10 +1238,10 @@ cleanup_observer_tmp() {
 
 persona_doc() {
   case "$1" in
-    # node reuses the backend personas (Backend & Data Expert, TypeScript, …) that
-    # are documented in the web doc, so it prefers that doc for its lenses.
-    web|node) printf '%s' "$WORKSPACE_ROOT/docs/review-personas-web.md" ;;
-    *)        printf '%s' "$WORKSPACE_ROOT/docs/review-personas.md" ;;
+    # node and fullstack reuse the backend/web personas (Backend & Data Expert,
+    # TypeScript, …) documented in the web doc, so they prefer it for lenses.
+    web|node|fullstack) printf '%s' "$WORKSPACE_ROOT/docs/review-personas-web.md" ;;
+    *)                  printf '%s' "$WORKSPACE_ROOT/docs/review-personas.md" ;;
   esac
 }
 

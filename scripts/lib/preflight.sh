@@ -79,7 +79,7 @@ validate_spec() {
         if persona_set "$track" >/dev/null 2>&1; then
           missing="${missing}\n- valid Review Profile for track ${track} (one of: $(valid_profiles_for_track "$track"))"
         else
-          missing="${missing}\n- valid Track (one of: rn, web, node)"
+          missing="${missing}\n- valid Track (one of: rn, web, node, fullstack)"
         fi ;;
     esac
   else

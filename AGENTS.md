@@ -8,12 +8,15 @@ This file is the entry point for any AI agent (Claude Code, Codex, or subagent) 
 
 ## What This Workspace Is
 
-A multi-project development environment spanning three **tracks**: **React
-Native** (mobile, iOS/Android — Expo or bare), **web** (Next.js / React), and
-**node** (plain Node / CLI / backend repos with no UI surface). The shared stack
+A multi-project development environment spanning four **tracks**: **React
+Native** (mobile, iOS/Android — Expo or bare), **web** (Next.js / React),
+**node** (plain Node / CLI / backend repos with no UI surface), and
+**fullstack** (one change spanning an API/backend surface AND a web UI surface,
+e.g. in a monorepo — the web persona bench with Backend & Data Expert promoted
+into the always-run floor; profiles `full`/`logic` only). The shared stack
 is TypeScript; the developer works in Ghostty on macOS (Apple Silicon). Each spec
-declares its track (`- Track: rn | web | node`, default `rn`), which selects the
-review persona set and the validation checklist below. See the per-project
+declares its track (`- Track: rn | web | node | fullstack`, default `rn`), which
+selects the review persona set and the validation checklist below. See the per-project
 `CLAUDE.md` for a project's exact stack and commands.
 
 ---

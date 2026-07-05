@@ -11,6 +11,7 @@
 /specs/*
 !/specs/_template.md
 !/specs/_template-web.md
+!/specs/_template-fullstack.md
 
 # Feature design + implementation-plan docs are the spec's counterparts and carry
 # the same per-project/product detail, so they stay LOCAL ONLY too (same rule as

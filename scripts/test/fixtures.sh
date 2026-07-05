@@ -132,6 +132,7 @@ run_dry_fixtures() {
   fixture_assert "review profile resolves to floor + scoped personas" fixture_review_profile "$root"
   fixture_assert "web track resolves to web personas + floor" fixture_review_profile_web "$root"
   fixture_assert "node track resolves to backend personas, no UX, no UI profiles" fixture_review_profile_node "$root"
+  fixture_assert "fullstack track unions web+node; floor guards both architects" fixture_review_profile_fullstack "$root"
   fixture_assert "persona gate enforces the active profile set" fixture_profile_gate "$root"
   fixture_assert "re-review rounds require only pending blockers" fixture_review_round_subset "$root"
   fixture_assert "compact archive preserves the per-turn cost ledger" fixture_cost_ledger "$root"
@@ -942,6 +943,43 @@ fixture_review_profile_node() {
   # A spec declaring Track: node resolves to the node set (4 for full).
   spec="$root/node.md"; printf -- '- Track: node\n- Review Profile: full\n' >"$spec"
   [ "$(resolve_active_personas "$spec" | tr '|' '\n' | grep -c .)" -eq 4 ] || return 1
+  return 0
+}
+
+fixture_review_profile_fullstack() {
+  local root="$1" set spec
+  # fullstack `full` = the whole web set (6): the union of web+node IS the web
+  # set (web already contains the node bench), so the track's value is its
+  # FLOOR — Backend & Data Expert can never be dropped the way web `frontend`
+  # drops it.
+  set="$(profile_personas full fullstack)" || return 1
+  fx "fullstack full has 6 personas" \
+    [ "$(printf '%s' "$set" | tr '|' '\n' | grep -c .)" -eq 6 ] || return 1
+  fx "fullstack full keeps the web designer" \
+    grep -q "Web UX & Accessibility Designer" <<<"$set" || return 1
+  fx "fullstack full keeps the backend expert" \
+    grep -q "Backend & Data Expert" <<<"$set" || return 1
+  # fullstack `logic` = floor + Performance (5); both architects present, no UX.
+  set="$(profile_personas logic fullstack)" || return 1
+  fx "fullstack logic has 5 personas" \
+    [ "$(printf '%s' "$set" | tr '|' '\n' | grep -c .)" -eq 5 ] || return 1
+  fx "fullstack logic keeps Web Architect" grep -q "Web Architect" <<<"$set" || return 1
+  fx "fullstack logic keeps Backend & Data Expert" grep -q "Backend & Data Expert" <<<"$set" || return 1
+  fx_not "fullstack logic drops UX" grep -q "UX" <<<"$set" || return 1
+  # A lighter frontend-only bench is what Track: web is for; fullstack rejects
+  # profiles that would drop one side of the stack.
+  fx_not "frontend rejected on fullstack" profile_personas frontend fullstack || return 1
+  fx_not "native rejected on fullstack" profile_personas native fullstack || return 1
+  fx_not "data rejected on fullstack" profile_personas data fullstack || return 1
+  fx "fullstack exposes exactly full+logic" \
+    [ "$(valid_profiles_for_track fullstack)" = "full, logic" ] || return 1
+  # A spec declaring Track: fullstack resolves end-to-end.
+  spec="$root/fullstack.md"; printf -- '- Track: fullstack\n- Review Profile: full\n' >"$spec"
+  fx "Track: fullstack spec resolves to 6 personas" \
+    [ "$(resolve_active_personas "$spec" | tr '|' '\n' | grep -c .)" -eq 6 ] || return 1
+  # Lenses come from the web persona doc (all six are documented there).
+  fx "fullstack lenses use the web persona doc" \
+    grep -q "review-personas-web" <<<"$(persona_doc fullstack)" || return 1
   return 0
 }
 
