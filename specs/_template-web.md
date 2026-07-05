@@ -25,9 +25,11 @@
 <!-- Monorepo apps only: uncomment to run EVERY validation phase (baseline,
      test-first red/green, final) inside a project subdirectory, so commands
      stay app-local while --project remains the repo root. Rejected unless the
-     directory exists under the project. Example (indented so this example is
-     not itself parsed as the field):
-       - Workdir: apps/my-app
+     directory exists under the project, is tracked at HEAD, and resolves
+     inside it (backticks around the value are REQUIRED — a bare value fails
+     loudly at spec selection). Example (indented so this example is not
+     itself parsed as the field):
+       - Workdir: `apps/my-app`
 -->
 
 The project path must resolve to the repository that will be changed. Night-shift

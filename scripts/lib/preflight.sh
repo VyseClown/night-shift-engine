@@ -203,39 +203,78 @@ extract_validation_commands() {
   ' "$file"
 }
 
-# Optional `- Workdir: <subdir>` spec field: every validation phase (baseline,
-# test-first red/green, final) runs in this project-relative subdirectory, so a
-# monorepo app spec can use natural app-local commands while --project stays
-# the repo root. Git worktrees always root at the repo top level, which is why
-# the subdir must be re-applied on BOTH $PROJECT and the validation worktree —
-# workdir_path composes it onto whichever base a phase runs against.
+# Optional `- Workdir: `<subdir>`` spec field: every validation phase
+# (baseline, test-first red/green, final) runs in this project-relative
+# subdirectory, so a monorepo app spec can use natural app-local commands while
+# --project stays the repo root. Git worktrees always root at the repo top
+# level, which is why the subdir must be re-applied on BOTH $PROJECT and the
+# validation worktree — workdir_path composes it onto whichever base a phase
+# runs against. Same dialect as the other Repository fields (Base branch,
+# Project path): mandatory backticks, trailing annotation tolerated.
 spec_workdir() {
-  sed -nE 's/^- Workdir: ?`?([^`]+)`?[[:space:]]*$/\1/p' "$1" | head -n 1 |
-    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+  sed -nE 's/^- Workdir: `([^`]+)`.*/\1/p' "$1" | head -n 1
 }
 
 # Validate + install the spec's workdir into the WORKDIR global. An absent
 # field (or `none`) leaves WORKDIR empty — single-repo behavior byte-for-byte.
-# Rejects absolute paths, any `..` traversal, and a directory that does not
-# exist under $PROJECT, so a typo'd workdir fails loudly at spec selection
-# instead of silently validating the wrong directory.
+# Everything else fails LOUDLY at spec selection, never silently mid-run:
+# - a present-but-unparseable field (bare value, missing backticks) is an
+#   error, not an ignored line — otherwise app-local commands silently run at
+#   the repo root and fail confusingly at baseline;
+# - absolute paths and `..` traversal are rejected lexically, and the resolved
+#   physical path must stay under the project (a committed symlink pointing at
+#   a sibling repo passes -d but must not route validation outside the repo);
+# - the directory must be TRACKED at HEAD: validation worktrees are fresh
+#   `git worktree add` checkouts that materialize only tracked files, so an
+#   untracked/gitignored dir would pass here and then cd-fail hours later in
+#   the candidate worktree (and, worse, make a red-against-base cd failure
+#   read as a genuine RED — see verify_red_against_base).
 set_spec_workdir() {
-  local wd
+  local wd resolved projreal
   wd="$(spec_workdir "$1")"
-  case "$wd" in ""|none) WORKDIR=""; return 0 ;; esac
+  if [ -z "$wd" ]; then
+    if grep -Eq '^- Workdir:' "$1" &&
+       ! grep -Eq '^- Workdir:[[:space:]]*(`none`|none)?[[:space:]]*$' "$1"; then
+      printf 'malformed Workdir field — use: - Workdir: `apps/<app>` (backticks required)\n' >&2
+      return 1
+    fi
+    WORKDIR=""; return 0
+  fi
+  case "$wd" in none) WORKDIR=""; return 0 ;; esac
   case "$wd" in /*) printf 'Workdir must be project-relative: %s\n' "$wd" >&2; return 1 ;; esac
   case "/$wd/" in *"/../"*) printf 'Workdir escapes the project: %s\n' "$wd" >&2; return 1 ;; esac
   [ -d "$PROJECT/$wd" ] ||
     { printf 'Workdir does not exist under the project: %s\n' "$wd" >&2; return 1; }
+  resolved="$(cd "$PROJECT/$wd" 2>/dev/null && pwd -P)" &&
+    projreal="$(cd "$PROJECT" 2>/dev/null && pwd -P)" ||
+    { printf 'Workdir could not be resolved: %s\n' "$wd" >&2; return 1; }
+  case "$resolved/" in
+    "$projreal"/*) ;;
+    *) printf 'Workdir resolves outside the project (symlink?): %s -> %s\n' "$wd" "$resolved" >&2; return 1 ;;
+  esac
+  if git -C "$PROJECT" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    [ -n "$(git -C "$PROJECT" ls-tree -d HEAD -- "$wd" 2>/dev/null)" ] ||
+      { printf 'Workdir is not tracked at HEAD (fresh validation worktrees would lack it): %s\n' "$wd" >&2; return 1; }
+  fi
   WORKDIR="$wd"
 }
 
 workdir_path() { printf '%s%s' "$1" "${WORKDIR:+/$WORKDIR}"; }
 
 run_test_command() {
-  local phase="$1" command="$2" target="$3" run_dir="${4:-$PROJECT}" output rc=0
+  local phase="$1" command="$2" target="$3" run_dir="${4:-$PROJECT}" output rc=0 exec_dir
   output="$RUN_ROOT/raw/test-first-$phase.log"
-  (cd "$(workdir_path "$run_dir")" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
+  exec_dir="$(workdir_path "$run_dir")"
+  # A missing exec dir must not masquerade as a test failure (cd exits 1, the
+  # same code a failing suite uses). 127 routes it to the tooling/infra
+  # diagnosis, and the output names the real cause.
+  if [ ! -d "$exec_dir" ]; then
+    printf 'night-shift: Workdir "%s" does not exist under %s — not present in this commit/worktree\n' \
+      "${WORKDIR:-}" "$run_dir" >"$output"
+    rc=127
+  else
+    (cd "$exec_dir" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
+  fi
   jq -n --arg command "$command" --argjson exit_status "$rc" \
     --arg output "$(tail -c 20000 "$output")" \
     '{command:$command,exit_status:$exit_status,output:$output}' >"$target"
@@ -259,6 +298,16 @@ verify_red_against_base() {
   wt="$(tmp_base)/ns-redbase-$candidate-$$"
   rm -rf "$wt" 2>/dev/null
   git -C "$repo" worktree add --detach "$wt" "$base" >/dev/null 2>&1 || return 2
+  # Fail CLOSED if the workdir is absent at BASE — checked BEFORE the overlay
+  # loop, which mkdir-p's test-file parents and would otherwise recreate the
+  # dir (leaving a test-files-only workdir whose runner exits 1 for missing
+  # scaffolding — the same code as a genuine RED). A workdir that does not
+  # exist at base has no base production code to prove red against anyway.
+  if [ ! -d "$(workdir_path "$wt")" ]; then
+    git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt" 2>/dev/null || true
+    return 6
+  fi
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     # Match conventional test files anywhere, INCLUDING a top-level __tests__/ dir
@@ -284,8 +333,9 @@ verify_red_against_base() {
   rm -rf "$wt" 2>/dev/null || true
   # Signal a setup failure (caller blocks with a clear message) when: no test file was
   # overlaid (the diff named none → the proof would be vacuous), the test runner was
-  # not found (127), or the result JSON could not be written (-1). A genuine run
-  # returns 0 and the caller judges red/green from the JSON exit_status.
+  # not found (127), the result JSON could not be written (-1), or — earlier, return
+  # 6 — the workdir is absent in the BASE worktree. A genuine run returns 0 and the
+  # caller judges red/green from the JSON exit_status.
   [ "$overlaid" -eq 1 ] || return 3
   [ "$rc" -ne 127 ] || return 4
   [ "$rc" -ne -1 ] || return 5
@@ -293,8 +343,9 @@ verify_red_against_base() {
 }
 
 run_validation_commands() {
-  local kind="$1" target="$2" commands="$3" run_dir="${4:-$PROJECT}" command output rc first=1 tmp
+  local kind="$1" target="$2" commands="$3" run_dir="${4:-$PROJECT}" command output rc first=1 tmp exec_dir
   tmp="$target.tmp.$$"
+  exec_dir="$(workdir_path "$run_dir")"
   printf '[\n' >"$tmp"
   while IFS= read -r command; do
     [ -n "$command" ] || continue
@@ -302,8 +353,15 @@ run_validation_commands() {
     rc=0
     # Redirect stdin from /dev/null: a command that reads stdin (e.g.
     # `docker compose exec`) would otherwise drain this while-read loop's heredoc
-    # and silently skip the remaining commands.
-    (cd "$(workdir_path "$run_dir")" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
+    # and silently skip the remaining commands. A missing exec dir is reported
+    # as 127 (infra), never as a command failure — see run_test_command.
+    if [ ! -d "$exec_dir" ]; then
+      printf 'night-shift: Workdir "%s" does not exist under %s — not present in this commit/worktree\n' \
+        "${WORKDIR:-}" "$run_dir" >"$output"
+      rc=127
+    else
+      (cd "$exec_dir" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
+    fi
     [ "$first" -eq 1 ] || printf ',\n' >>"$tmp"
     jq -n --arg command "$command" --argjson exit_status "$rc" \
       --arg output "$(tail -c 20000 "$output")" \

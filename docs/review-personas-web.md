@@ -1,7 +1,8 @@
 # Review Personas — Web Track
 
 The **web** counterpart to `review-personas.md` (the React Native track). A spec
-selects this set by declaring `- Track: web`. Six specialized reviewers used for
+selects this set by declaring `- Track: web`; the `node` and `fullstack` tracks
+also draw their persona lenses from this file. Six specialized reviewers used for
 plan and implementation review. All active reviewers respond. Each persona has a
 narrow focus and owns the matching documentation assessment. When no
 domain-relevant behavior or documentation exists, return `APPROVE` and state that
@@ -32,6 +33,11 @@ profile.
 
 **Floor (always runs):** Web Architect, TypeScript & Code Quality Expert, Human
 Advocate.
+
+> **Fullstack track note (`- Track: fullstack`):** the same six personas review,
+> but the floor additionally includes **Backend & Data Expert** (neither side of
+> an API + web UI change can be dropped), and only the `full` and `logic`
+> profiles are valid — the `frontend`/`data` rows above are web-track only.
 
 The profile→persona mapping is enforced in `scripts/night-shift.sh`
 (`profile_personas`, with the spec's `Track`), which independently asserts the

@@ -49,7 +49,10 @@ PERSONAS="Mobile UX Designer|React Native Architect|Mobile Domain Expert|Web UX 
 PERSONA_FLOOR_RN="React Native Architect|TypeScript & Code Quality Expert|Human Advocate"
 PERSONA_FLOOR_WEB="Web Architect|TypeScript & Code Quality Expert|Human Advocate"
 PERSONA_FLOOR_NODE="Backend & Data Expert|TypeScript & Code Quality Expert|Human Advocate"
-PERSONA_FLOOR_FULLSTACK="Web Architect|Backend & Data Expert|TypeScript & Code Quality Expert|Human Advocate"
+# Compose from the web floor (mirroring PERSONAS_FULLSTACK="$PERSONAS_WEB")
+# so a future web-floor change can never silently diverge the fullstack floor
+# — the track's entire value IS its floor.
+PERSONA_FLOOR_FULLSTACK="$PERSONA_FLOOR_WEB|Backend & Data Expert"
 # Default track for specs that omit the `- Track:` field (backward compatible:
 # every existing React Native spec keeps resolving to the RN persona set).
 DEFAULT_TRACK="rn"

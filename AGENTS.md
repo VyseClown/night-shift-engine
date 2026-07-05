@@ -44,6 +44,7 @@ is not a git repo.
     specs/             ← one markdown file per feature, before implementation starts
       _template.md     ← copy this for a React Native (rn-track) spec
       _template-web.md ← copy this for a web-track spec
+      _template-fullstack.md ← copy this for a fullstack-track (API + web UI) spec
     docs/
       review-personas.md     ← rn-track + the 4 optional cross-track personas
       review-personas-web.md ← web-track review personas and their checklists
@@ -220,6 +221,22 @@ node --test                    # 3. Test suite (or npm test / the project's runn
 npm run build                  # 4. Build/package (only if the project produces one)
 ```
 
+**Fullstack track (`Track: fullstack`):**
+
+For one change spanning an API/backend surface AND a web UI surface (e.g. a
+monorepo touching an API app and a web app together). Both sides must pass; in
+a monorepo, run from the repo root filtered to the touched projects (e.g.
+`pnpm nx run-many -t typecheck lint test build --projects <api>,<web>`), or set
+the spec's `- Workdir:` and keep commands app-local per phase.
+
+```bash
+npx tsc --noEmit               # 1. Type errors — API and web sides
+npm run lint                   # 2. Lint warnings — both sides
+npm test                       # 3. Test suite — unit + the seam/integration tests
+npm run build                  # 4. Build — BOTH sides must build
+npm run test:e2e               # 5. E2E through the real UI against the real API (when flows change)
+```
+
 If any step fails: fix it, re-run from step 1. Do not commit with failures.
 
 ---
@@ -236,16 +253,21 @@ If any step fails: fix it, re-run from step 1. Do not commit with failures.
 ## Review
 
 The spec's **Track** selects the persona set — `docs/review-personas.md` for
-`rn`, `docs/review-personas-web.md` for `web` — and its **Review Profile** selects
+`rn`, `docs/review-personas-web.md` for `web`, `node`, and `fullstack` — and its
+**Review Profile** selects
 which of those personas review the plan and implementation (see the chosen file
 for the profile→persona table). The mandatory floor runs in every profile and
 differs by track: for `rn` it is React Native Architect, TypeScript & Code
 Quality Expert, and Human Advocate; for `web` it is Web Architect, TypeScript &
 Code Quality Expert, and Human Advocate; for `node` it is Backend & Data Expert,
-TypeScript & Code Quality Expert, and Human Advocate. `full` runs the whole track
-set (six for `rn`/`web`, four for `node`); the `node` track has no UI surface, so
-it carries no UX/accessibility persona and offers only the `full` and `logic`
-profiles. Each
+TypeScript & Code Quality Expert, and Human Advocate; for `fullstack` it is the
+web floor PLUS Backend & Data Expert — neither side of the stack can be dropped
+by a profile. `full` runs the whole track
+set (six for `rn`/`web`/`fullstack`, four for `node`); the `node` track has no UI
+surface, so it carries no UX/accessibility persona, and `node` and `fullstack`
+offer only the `full` and `logic`
+profiles (a change narrow enough for a lighter fullstack bench belongs on the
+`web` or `node` track instead). Each
 active persona owns its corresponding documentation assessment. Every finding is
 a blocker; progress requires an approval from each active persona. Approvals do
 not expire: a re-review round re-runs only the personas with open findings (each
@@ -311,5 +333,5 @@ NEED:    [what information or decision would unblock you]
 
 - `NIGHT_SHIFT_HOWTO.md` — human guide: what to write first and how a run works
 - `AGENT_LOOP.md` — step-by-step process for overnight autonomous runs
-- `specs/_template.md` / `specs/_template-web.md` — how to write a feature spec (rn / web)
+- `specs/_template.md` / `specs/_template-web.md` / `specs/_template-fullstack.md` — how to write a feature spec (rn / web / fullstack)
 - `docs/review-personas.md` / `docs/review-personas-web.md` — how to run a review pass (rn / web)
