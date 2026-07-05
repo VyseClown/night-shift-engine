@@ -89,7 +89,12 @@ directory; run engine/workflow git inside the engine directory.
   Override with `NSV_PROJECT_DIRS=/abs/a:/abs/b`. A repo that does not gitignore
   `.night-shift/` is intentionally skipped (a run there would commit artifacts).
 - A target project must gitignore `.night-shift/` and be on the spec's feature
-  branch before a run. `NEXT_TASK` only continues to same-project TODO specs,
+  branch before a run. **Monorepos:** point `--project` at the repo root; a
+  spec may declare `- Workdir: apps/<app>` to run every validation phase in
+  that subdir (validated at spec selection: must exist, no escapes). pnpm
+  workspaces need no `NIGHT_SHIFT_DEPENDENCY_LINKS` override — each workspace
+  package's `node_modules` (from `pnpm-workspace.yaml`) plus `.nx/cache` are
+  auto-linked into the validation worktree. `NEXT_TASK` only continues to same-project TODO specs,
   and only on runs started *without* `--spec` (the engine picks the task from
   TODO). An explicit `--spec` run is a single task: on `NEXT_TASK` it completes
   and exits 0 so an external wrapper can own cross-spec sequencing/branching.

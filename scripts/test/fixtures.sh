@@ -148,6 +148,7 @@ run_dry_fixtures() {
   fixture_assert "review bundle shows untracked new files; gitignored + engine state excluded" fixture_bundle_untracked_diff "$root"
   fixture_assert "review bundle + observer context carry project conventions, size-capped" fixture_bundle_conventions "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
+  fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
   fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
   fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
@@ -2127,6 +2128,58 @@ YAML
     link_worktree_dependencies "$dir/wt2"
     fx "non-pnpm project still links root node_modules" [ -L "$dir/wt2/node_modules" ] || exit 1
     fx_not "no .nx link when the project has none" [ -e "$dir/wt2/.nx" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_workdir_field() {
+  # `- Workdir:` scopes every validation phase to a project subdirectory (a
+  # monorepo app dir): spec_workdir extracts bare or backticked values;
+  # set_spec_workdir rejects escapes and missing dirs; run_test_command and
+  # run_validation_commands execute in <run_dir>/<workdir> — both against
+  # $PROJECT (baseline) and against a supplied run_dir (validation worktree).
+  local root="$1" dir="$root/workdir"
+  mkdir -p "$dir/proj/apps/api" "$dir/rs/raw" "$dir/rs/validated"
+  ( PROJECT="$dir/proj"; RUN_ROOT="$dir/rs"; RUN_ID="wdfx"
+    spec="$dir/s.md"
+    printf -- '- Workdir: `apps/api`\n' >"$spec"
+    fx "spec_workdir strips backticks" [ "$(spec_workdir "$spec")" = "apps/api" ] || exit 1
+    printf -- '- Workdir: apps/api\n' >"$spec"
+    fx "spec_workdir reads bare values" [ "$(spec_workdir "$spec")" = "apps/api" ] || exit 1
+    printf '# none\n' >"$spec"
+    fx "absent field is empty" [ -z "$(spec_workdir "$spec")" ] || exit 1
+    printf -- '- Workdir: apps/api\n' >"$spec"
+    set_spec_workdir "$spec" || exit 1
+    fx "WORKDIR set from the spec" [ "$WORKDIR" = "apps/api" ] || exit 1
+    printf -- '- Workdir: ../outside\n' >"$spec"
+    fx_not "traversal rejected" set_spec_workdir "$spec" || exit 1
+    printf -- '- Workdir: /abs\n' >"$spec"
+    fx_not "absolute path rejected" set_spec_workdir "$spec" || exit 1
+    printf -- '- Workdir: apps/missing\n' >"$spec"
+    fx_not "missing directory rejected" set_spec_workdir "$spec" || exit 1
+    WORKDIR="apps/api"
+    fx "workdir_path composes base + workdir" \
+      [ "$(workdir_path /x)" = "/x/apps/api" ] || exit 1
+    WORKDIR=""
+    fx "workdir_path passes the base through when empty" \
+      [ "$(workdir_path /x)" = "/x" ] || exit 1
+    WORKDIR="apps/api"
+    run_test_command probe 'pwd' "$dir/rs/tf.json" || exit 1
+    fx "run_test_command runs in the workdir" \
+      grep -q 'apps/api' <<<"$(jq -r '.output' "$dir/rs/tf.json")" || exit 1
+    run_validation_commands probe "$dir/rs/val.json" 'pwd' || exit 1
+    fx "run_validation_commands runs in the workdir" \
+      grep -q 'apps/api' <<<"$(jq -r '.[0].output' "$dir/rs/val.json")" || exit 1
+    mkdir -p "$dir/wt/apps/api"
+    run_test_command probe2 'pwd' "$dir/rs/tf2.json" "$dir/wt" || exit 1
+    fx "workdir composes with an explicit run_dir (worktree path)" \
+      grep -q 'wt/apps/api' <<<"$(jq -r '.output' "$dir/rs/tf2.json")" || exit 1
+    # Empty WORKDIR keeps today's behavior byte-for-byte.
+    WORKDIR=""
+    run_test_command probe3 'pwd' "$dir/rs/tf3.json" || exit 1
+    fx_not "empty Workdir leaves the cwd at the project root" \
+      grep -q 'apps/api' <<<"$(jq -r '.output' "$dir/rs/tf3.json")" || exit 1
     exit 0
   ) || return 1
   return 0

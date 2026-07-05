@@ -24,11 +24,19 @@
 - Base branch: `main`
 - Feature branch: `feat/[name]`
 - Existing worktree path (if any): none
+<!-- Monorepo apps only: uncomment to run EVERY validation phase (baseline,
+     test-first red/green, final) inside a project subdirectory, so commands
+     stay app-local while --project remains the repo root. Rejected unless the
+     directory exists under the project. Example (indented so this example is
+     not itself parsed as the field):
+       - Workdir: apps/my-app
+-->
 
 The project path must resolve to the repository that will be changed (for a
 monorepo: the repo root, with validation commands written to run from the
-root, e.g. `pnpm --filter <app> test`). Night-shift runs do not infer a
-repository from the workspace root.
+root, e.g. `pnpm --filter <app> test` — or set `- Workdir:` above and write
+them app-local). Night-shift runs do not infer a repository from the
+workspace root.
 
 ---
 

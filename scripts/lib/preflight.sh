@@ -203,10 +203,39 @@ extract_validation_commands() {
   ' "$file"
 }
 
+# Optional `- Workdir: <subdir>` spec field: every validation phase (baseline,
+# test-first red/green, final) runs in this project-relative subdirectory, so a
+# monorepo app spec can use natural app-local commands while --project stays
+# the repo root. Git worktrees always root at the repo top level, which is why
+# the subdir must be re-applied on BOTH $PROJECT and the validation worktree —
+# workdir_path composes it onto whichever base a phase runs against.
+spec_workdir() {
+  sed -nE 's/^- Workdir: ?`?([^`]+)`?[[:space:]]*$/\1/p' "$1" | head -n 1 |
+    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+# Validate + install the spec's workdir into the WORKDIR global. An absent
+# field (or `none`) leaves WORKDIR empty — single-repo behavior byte-for-byte.
+# Rejects absolute paths, any `..` traversal, and a directory that does not
+# exist under $PROJECT, so a typo'd workdir fails loudly at spec selection
+# instead of silently validating the wrong directory.
+set_spec_workdir() {
+  local wd
+  wd="$(spec_workdir "$1")"
+  case "$wd" in ""|none) WORKDIR=""; return 0 ;; esac
+  case "$wd" in /*) printf 'Workdir must be project-relative: %s\n' "$wd" >&2; return 1 ;; esac
+  case "/$wd/" in *"/../"*) printf 'Workdir escapes the project: %s\n' "$wd" >&2; return 1 ;; esac
+  [ -d "$PROJECT/$wd" ] ||
+    { printf 'Workdir does not exist under the project: %s\n' "$wd" >&2; return 1; }
+  WORKDIR="$wd"
+}
+
+workdir_path() { printf '%s%s' "$1" "${WORKDIR:+/$WORKDIR}"; }
+
 run_test_command() {
   local phase="$1" command="$2" target="$3" run_dir="${4:-$PROJECT}" output rc=0
   output="$RUN_ROOT/raw/test-first-$phase.log"
-  (cd "$run_dir" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
+  (cd "$(workdir_path "$run_dir")" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
   jq -n --arg command "$command" --argjson exit_status "$rc" \
     --arg output "$(tail -c 20000 "$output")" \
     '{command:$command,exit_status:$exit_status,output:$output}' >"$target"
@@ -247,7 +276,7 @@ verify_red_against_base() {
   done < <(git -C "$repo" diff -z --name-only "$base..$candidate")
   link_worktree_dependencies "$wt" 2>/dev/null || true
   log="$target.log"
-  (cd "$wt" && bash -lc "$command") >"$log" 2>&1 </dev/null || rc=$?
+  (cd "$(workdir_path "$wt")" && bash -lc "$command") >"$log" 2>&1 </dev/null || rc=$?
   jq -n --arg command "$command" --argjson exit_status "$rc" \
     --arg output "$(tail -c 20000 "$log")" \
     '{command:$command,exit_status:$exit_status,output:$output}' >"$target" || rc=-1
@@ -274,7 +303,7 @@ run_validation_commands() {
     # Redirect stdin from /dev/null: a command that reads stdin (e.g.
     # `docker compose exec`) would otherwise drain this while-read loop's heredoc
     # and silently skip the remaining commands.
-    (cd "$run_dir" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
+    (cd "$(workdir_path "$run_dir")" && bash -lc "$command") >"$output" 2>&1 </dev/null || rc=$?
     [ "$first" -eq 1 ] || printf ',\n' >>"$tmp"
     jq -n --arg command "$command" --argjson exit_status "$rc" \
       --arg output "$(tail -c 20000 "$output")" \

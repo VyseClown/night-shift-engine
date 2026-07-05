@@ -767,6 +767,7 @@ recover_run() {
     die "existing run belongs to primary $(jq -r '.primary' "$STATE")"
   RUN_ID="$(jq -r '.run_id' "$STATE")"
   SPEC="$(jq -r '.task' "$STATE")"
+  set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
   OBSERVER="$(jq -r '.observer' "$STATE")"
   BASE_COMMIT="$(jq -r '.base_commit' "$STATE")"
   BASE_BRANCH="$(jq -r '.base_branch' "$STATE")"
@@ -2310,6 +2311,7 @@ EOF
   [ -n "$next_spec" ] || { complete_run; return; }
   validate_spec "$next_spec" || block_run "next TODO spec is incomplete"
   SPEC="$next_spec"
+  set_spec_workdir "$SPEC" || block_run "next TODO spec has an invalid Workdir"
   BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
   BASE_BRANCH="$(git -C "$PROJECT" branch --show-current)"
   BASE_STATUS="$RUN_ROOT/baseline-status-$(basename "$SPEC" .md).txt"
@@ -2405,6 +2407,7 @@ main_run() {
     validate_spec "$SPEC" || exit 1
     validate_spec_project "$SPEC" ||
       die "spec Project path does not match --project"
+    set_spec_workdir "$SPEC" || die "spec Workdir is invalid"
     check_branch_and_worktree "$SPEC" ||
       die "current branch or worktree does not safely match the spec"
     initialize_run
