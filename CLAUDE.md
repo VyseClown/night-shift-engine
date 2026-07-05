@@ -111,6 +111,13 @@ directory; run engine/workflow git inside the engine directory.
   spec with a `## Design Contract` (judgment-heavy design-fidelity build — Flow B), and
   `NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) for the independent final gate —
   any set to `inherit` to fall back to the CLI's startup model.
+- **Codex second opinion (opt-in, default OFF):** `NIGHT_SHIFT_CODEX_REVIEW=1`
+  adds one bounded `codex exec -s read-only` advisory review per candidate
+  (gpt-5.5 via the Codex CLI), handed to the observer as supplementary,
+  NON-gating evidence (`NIGHT_SHIFT_CODEX_TIMEOUT`, default 300s). Missing
+  CLI / failure / timeout skip cleanly and are journaled (`codex_review`
+  events). The verdict pipeline stays Claude-only either way — leave this off
+  unless you deliberately want a second vendor's perspective.
 - **Visual fidelity (opt-in):** set `NIGHT_SHIFT_VISUAL_CAPTURE=1` and give an rn
   spec a `## Design Contract` to enable the `visual_review` stage (Figma-MCP
   reference + iOS-simulator capture + `odiff` pixel-diff + agent auto-repair).

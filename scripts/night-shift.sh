@@ -79,6 +79,13 @@ IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
 # the IMPLEMENT scope bumps to this stronger model. inherit/sonnet to override.
 DESIGN_IMPLEMENT_MODEL="${NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL:-opus}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
+# Optional external second perspective via the Codex CLI (gpt-5.5). OFF by
+# default and strictly ADVISORY when on: one bounded `codex exec` review per
+# candidate, handed to the observer as supplementary (non-gating) evidence.
+# Absent CLI / failure / timeout all skip cleanly — the Claude-only verdict
+# pipeline and wire contracts are untouched either way.
+CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
+CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
@@ -2060,6 +2067,67 @@ EOF
   fi
 }
 
+# Seam for fixtures: is the Codex CLI available? (command -v inline would make
+# the missing-CLI path untestable on machines that have codex installed.)
+codex_available() { command -v codex >/dev/null 2>&1; }
+
+# One advisory external review per candidate (NIGHT_SHIFT_CODEX_REVIEW=1; see
+# the knob comment). Runs `codex exec -s read-only` on spec + committed-range
+# diff with a portable watchdog (macOS has no coreutils `timeout`), captures
+# to validated/, integrity-anchors, and journals the outcome. EVERY failure
+# mode returns 0 — this must never gate or block a run.
+codex_review_candidate() {
+  local candidate="$1" out prompt rc=0 pid wd
+  [ "$CODEX_REVIEW" = "1" ] || return 0
+  out="$RUN_ROOT/validated/codex-review-$candidate.md"
+  [ ! -s "$out" ] || return 0
+  if ! codex_available; then
+    log "codex review: enabled but the codex CLI is not on PATH; skipping (advisory only)"
+    emit_event codex_review "$(jq -cn --arg c "$candidate" '{outcome:"skipped", reason:"codex CLI not found", candidate:$c}')"
+    return 0
+  fi
+  prompt="$RUN_ROOT/prompts/codex-review-$candidate.txt"
+  {
+    printf 'You are an independent external code reviewer giving a second opinion.\n'
+    printf 'Review the diff against the task spec. Be concise: list concrete findings\n'
+    printf '(file, issue, why it matters) or state LGTM if none. You are advisory —\n'
+    printf 'another reviewer makes the final call.\n\nTASK SPEC:\n'
+    cat "$SPEC"
+    printf '\nDIFF (base %s -> candidate %s):\n' "$BASE_COMMIT" "$candidate"
+    bounded_diff "$BASE_COMMIT..$candidate"
+  } >"$prompt"
+  codex exec -s read-only - <"$prompt" >"$out.tmp" 2>"$out.err" &
+  pid=$!
+  ( sleep "$CODEX_TIMEOUT"; kill "$pid" 2>/dev/null ) &
+  wd=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  if [ "$rc" -ne 0 ] || [ ! -s "$out.tmp" ]; then
+    rm -f "$out.tmp" 2>/dev/null || true
+    log "codex review: rc=$rc or empty output; skipping (advisory only)"
+    emit_event codex_review "$(jq -cn --arg c "$candidate" --argjson rc "$rc" '{outcome:"error", rc:$rc, candidate:$c}')"
+    return 0
+  fi
+  mv "$out.tmp" "$out"
+  integrity_put "$out"
+  emit_event codex_review "$(jq -cn --arg c "$candidate" '{outcome:"completed", candidate:$c}')"
+  log "codex review: advisory second opinion captured for $candidate"
+}
+
+# Supplementary observer-context section for the codex advisory review.
+# Indented like conventions_section so external model text can never forge an
+# engine-authoritative section marker; integrity-guarded against mid-run edits.
+codex_review_section() {
+  local candidate="$1" f
+  f="$RUN_ROOT/validated/codex-review-$candidate.md"
+  [ -s "$f" ] || return 0
+  integrity_guard "$f" "codex-review-$candidate" "the codex advisory review"
+  printf '%s\n' '--- EXTERNAL CODEX REVIEW (advisory; supplementary, NOT authoritative) ---'
+  printf 'A second-opinion review from an external model, indented verbatim. Weigh it\nas one more input; it does not gate and may be wrong.\n\n'
+  sed 's/^/    /' "$f"
+}
+
 observer_prompt() {
   local context="$1" candidate="$2" retry_note="${3:-}"
   retry_note="$(rejection_preamble "$retry_note")"
@@ -2270,6 +2338,7 @@ run_observer() {
     block_run "observer: candidate commit $candidate does not resolve in the project"
   git -C "$PROJECT" rev-parse --verify -q "$BASE_COMMIT^{commit}" >/dev/null ||
     block_run "observer: base commit $BASE_COMMIT does not resolve in the project"
+  codex_review_candidate "$candidate"
   plan_results="$(find "$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/plan" -maxdepth 1 -type d -name 'round-*' 2>/dev/null | sort -V | tail -n 1)"
   implementation_results="$(find "$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/implementation" -maxdepth 1 -type d -name 'round-*' 2>/dev/null | sort -V | tail -n 1)"
   {
@@ -2283,6 +2352,7 @@ run_observer() {
         '{persona,stage,commit,status,findings,documentation_changes}' {} \;
     done
     observer_wrapper_evidence "$candidate"
+    codex_review_section "$candidate"
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30

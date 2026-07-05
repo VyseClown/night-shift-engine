@@ -149,6 +149,7 @@ run_dry_fixtures() {
   fixture_assert "review bundle + observer context carry project conventions, size-capped" fixture_bundle_conventions "$root"
   fixture_assert "conventions are snapshot-frozen, indented (no section forgery), provenance-labeled" fixture_conventions_hardening "$root"
   fixture_assert "truncate_to_budget: marker survives a cut landing on newline bytes" fixture_truncate_budget "$root"
+  fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
   fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
@@ -1509,7 +1510,7 @@ fixture_event_stream() {
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
-    stage_transition; do
+    stage_transition codex_review; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -2152,6 +2153,78 @@ fixture_truncate_budget() {
     fx_not "under-budget input passes through markerless" \
       grep -q 'MARKER' <<<"$out" || exit 1
     fx "under-budget input intact" grep -q 'tiny' <<<"$out" || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_codex_review() {
+  # NIGHT_SHIFT_CODEX_REVIEW is default-OFF and strictly advisory: OFF means
+  # zero codex invocations even with the CLI on PATH; ON without the CLI is a
+  # clean journaled skip; ON with the CLI captures the artifact, journals
+  # completion, and the observer section renders it INDENTED and labeled
+  # non-authoritative. A failing codex journals an error. Nothing ever gates.
+  local root="$1" dir="$root/codexrev"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/bin" "$dir/rs/validated" "$dir/rs/prompts" "$dir/rs/raw" "$dir/proj"
+  cat >"$dir/bin/codex" <<'STUB'
+#!/bin/bash
+touch "$(dirname "$0")/invoked.marker"
+cat >/dev/null
+printf 'STUB-CODEX-REVIEW: LGTM\n'
+STUB
+  chmod +x "$dir/bin/codex"
+  ( log() { :; }
+    RUN_ROOT="$dir/rs"; RUN_ID="cxfx"; SPEC="$dir/spec.md"; PROJECT="$dir/proj"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"observer_review"}' >"$STATE"
+    printf '# spec\n' >"$SPEC"
+    git -C "$PROJECT" init -q
+    git -C "$PROJECT" config user.email t@t; git -C "$PROJECT" config user.name t
+    printf 'a\n' >"$PROJECT/f.txt"; git -C "$PROJECT" add f.txt; git -C "$PROJECT" commit -qm a
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf 'b\n' >"$PROJECT/f.txt"; git -C "$PROJECT" add f.txt; git -C "$PROJECT" commit -qm b
+    cand="$(git -C "$PROJECT" rev-parse HEAD)"
+    PATH="$dir/bin:$PATH"
+    # Default OFF: never invokes, writes, or journals — even with codex on PATH.
+    CODEX_REVIEW=0
+    codex_review_candidate "$cand" || exit 1
+    fx_not "default OFF never invokes codex" [ -e "$dir/bin/invoked.marker" ] || exit 1
+    fx_not "default OFF writes no artifact" [ -e "$RUN_ROOT/validated/codex-review-$cand.md" ] || exit 1
+    fx_not "default OFF journals nothing" grep -q codex_review "$RUN_ROOT/events.jsonl" || exit 1
+    # ON but the CLI is absent (seam override): clean journaled skip, rc 0.
+    CODEX_REVIEW=1
+    codex_available() { return 1; }
+    codex_review_candidate "$cand" || exit 1
+    fx "missing CLI journals a skip" \
+      jq -e 'select(.type=="codex_review") | .payload.outcome=="skipped"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    fx_not "missing CLI writes no artifact" [ -e "$RUN_ROOT/validated/codex-review-$cand.md" ] || exit 1
+    # Restore the real seam (unset -f would DELETE the function — the
+    # subshell override replaced the engine's copy, it didn't shadow it).
+    codex_available() { command -v codex >/dev/null 2>&1; }
+    # ON with the CLI: artifact captured + journaled; observer section indents
+    # the external text and labels it advisory (never engine-authoritative).
+    codex_review_candidate "$cand" || exit 1
+    fx "review artifact captured" \
+      grep -q 'STUB-CODEX-REVIEW' "$RUN_ROOT/validated/codex-review-$cand.md" || exit 1
+    fx "completion journaled" \
+      jq -e 'select(.type=="codex_review") | .payload.outcome=="completed"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    sec="$(codex_review_section "$cand")"
+    fx "observer section indents the external text" \
+      grep -q '^    STUB-CODEX-REVIEW' <<<"$sec" || exit 1
+    fx "observer section labeled advisory/non-authoritative" \
+      grep -q 'NOT authoritative' <<<"$sec" || exit 1
+    # Idempotent per candidate: a second call never re-invokes.
+    rm -f "$dir/bin/invoked.marker"
+    codex_review_candidate "$cand" || exit 1
+    fx_not "captured candidate is never re-reviewed" [ -e "$dir/bin/invoked.marker" ] || exit 1
+    # A failing codex journals an error and still returns 0 (advisory only).
+    printf '#!/bin/bash\ncat >/dev/null\nexit 1\n' >"$dir/bin/codex"
+    rm -f "$RUN_ROOT/validated/codex-review-$cand.md"
+    codex_review_candidate "$cand" || exit 1
+    fx "failing codex journals an error" \
+      jq -e 'select(.type=="codex_review") | .payload.outcome=="error"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    fx_not "failing codex leaves no artifact" [ -e "$RUN_ROOT/validated/codex-review-$cand.md" ] || exit 1
+    fx_not "no artifact -> no observer section" [ -n "$(codex_review_section "$cand")" ] || exit 1
     exit 0
   ) || return 1
   return 0
