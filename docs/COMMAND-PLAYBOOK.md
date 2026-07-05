@@ -19,7 +19,7 @@ workspace container (`<workspace>/<app>`).
 | Auto-fix an RN screen until it matches the Figma design | `scripts/visual-review.sh … --repair` | §3 |
 | Auto-fix design drift *during* a night-shift build | `NIGHT_SHIFT_VISUAL_REPAIR=1 … scripts/night-shift.sh …` | §4 |
 | Capture by driving the **real** app (no preview harness) | `--drive maestro` (+ a per-screen flow) | §5 |
-| Build a feature end-to-end (rn / web / node) | `scripts/night-shift.sh --project <app> --spec <spec>` | §6 |
+| Build a feature end-to-end (rn / web / node / fullstack) | `scripts/night-shift.sh --project <app> --spec <spec>` | §6 |
 | Convert a Figma design into a web component | Figma MCP → web-track generate → visual review | §7 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
@@ -116,7 +116,7 @@ frame via `get_figma_data` + the downloaded frame image, and (b) the app's scree
 navigation files; have it infer which screen/state the frame depicts and write the
 `<Screen>-<state>.yaml`. Anchor on a *stable* text (not a time-of-day greeting).
 
-## §6 — Run a full night-shift (rn / web / node)
+## §6 — Run a full night-shift (rn / web / node / fullstack)
 
 ```bash
 # free deterministic pre-flight (no cost):
@@ -124,8 +124,10 @@ scripts/night-shift.sh --project <workspace>/<app> --spec specs/<name>.md --fixt
 # real (paid) run:
 NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <workspace>/<app> --spec specs/<name>.md
 ```
-The spec's `- Track:` (`rn` | `web` | `node`, default `rn`) selects the review persona
-set, template, and validation checklist. Model tiering: `NIGHT_SHIFT_PLAN_MODEL`
+The spec's `- Track:` (`rn` | `web` | `node` | `fullstack`, default `rn`) selects the
+review persona set, template, and validation checklist (`fullstack` = API + web UI in
+one change: the web bench with Backend & Data Expert promoted into the always-run
+floor, profiles `full`/`logic` only, template `specs/_template-fullstack.md`). Model tiering: `NIGHT_SHIFT_PLAN_MODEL`
 (opus), `NIGHT_SHIFT_IMPLEMENT_MODEL` (sonnet), `NIGHT_SHIFT_OBSERVER_MODEL` (opus),
 `NIGHT_SHIFT_PERSONA_MODEL` (sonnet); set any to `inherit` for the CLI's startup model.
 The target repo must gitignore `.night-shift/` and be on the spec's feature branch.

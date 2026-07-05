@@ -9,9 +9,10 @@
 # state beyond the constants below — which is why it carries the bulk of the
 # deterministic fixture suite.
 
-# Persona sets per track. A spec's `- Track:` field (rn | web | node, default rn)
-# selects which set and floor apply, so a React Native spec, a web spec and a
-# plain Node/CLI/backend spec each get reviewers that fit their stack. PERSONAS
+# Persona sets per track. A spec's `- Track:` field (rn | web | node | fullstack,
+# default rn) selects which set and floor apply, so a React Native spec, a web
+# spec and a plain Node/CLI/backend spec each get reviewers that fit their stack.
+# PERSONAS
 # (the union) is used ONLY for the persona-review schema membership check; the
 # per-track sets + floors below drive which personas a spec actually runs (see
 # profile_personas/resolve_active_personas).
@@ -22,6 +23,13 @@ PERSONAS_WEB="Web UX & Accessibility Designer|Web Architect|Backend & Data Exper
 # personas — Backend & Data Expert stands in for the architecture role — so it
 # adds nothing to the PERSONAS union or the persona-review schema enum.
 PERSONAS_NODE="Backend & Data Expert|TypeScript & Code Quality Expert|Performance Expert|Human Advocate"
+# The `fullstack` track is for one change spanning an API/backend surface AND a
+# web UI surface (e.g. a monorepo touching apps/api + apps/web together). The
+# union of the web and node sets IS the web set (web already carries the whole
+# node bench), so the track's value lives in its FLOOR below: Backend & Data
+# Expert joins Web Architect as always-run, so no profile can drop one side of
+# the stack. It adds nothing to the PERSONAS union or the schema enum.
+PERSONAS_FULLSTACK="$PERSONAS_WEB"
 # Optional, cross-track personas. They never run unless a spec opts in (an
 # `- Optional reviewers:` field listing them, or a matching contract section —
 # see optional_contract_heading / resolve_active_personas). They add nothing to
@@ -41,6 +49,10 @@ PERSONAS="Mobile UX Designer|React Native Architect|Mobile Domain Expert|Web UX 
 PERSONA_FLOOR_RN="React Native Architect|TypeScript & Code Quality Expert|Human Advocate"
 PERSONA_FLOOR_WEB="Web Architect|TypeScript & Code Quality Expert|Human Advocate"
 PERSONA_FLOOR_NODE="Backend & Data Expert|TypeScript & Code Quality Expert|Human Advocate"
+# Compose from the web floor (mirroring PERSONAS_FULLSTACK="$PERSONAS_WEB")
+# so a future web-floor change can never silently diverge the fullstack floor
+# — the track's entire value IS its floor.
+PERSONA_FLOOR_FULLSTACK="$PERSONA_FLOOR_WEB|Backend & Data Expert"
 # Default track for specs that omit the `- Track:` field (backward compatible:
 # every existing React Native spec keeps resolving to the RN persona set).
 DEFAULT_TRACK="rn"
@@ -49,28 +61,33 @@ DEFAULT_TRACK="rn"
 # list. An unknown track returns non-zero so callers can reject it.
 persona_set() {
   case "$1" in
-    rn)   printf '%s' "$PERSONAS_RN" ;;
-    web)  printf '%s' "$PERSONAS_WEB" ;;
-    node) printf '%s' "$PERSONAS_NODE" ;;
-    *)    return 1 ;;
+    rn)        printf '%s' "$PERSONAS_RN" ;;
+    web)       printf '%s' "$PERSONAS_WEB" ;;
+    node)      printf '%s' "$PERSONAS_NODE" ;;
+    fullstack) printf '%s' "$PERSONAS_FULLSTACK" ;;
+    *)         return 1 ;;
   esac
 }
 
 persona_floor() {
   case "$1" in
-    rn)   printf '%s' "$PERSONA_FLOOR_RN" ;;
-    web)  printf '%s' "$PERSONA_FLOOR_WEB" ;;
-    node) printf '%s' "$PERSONA_FLOOR_NODE" ;;
-    *)    return 1 ;;
+    rn)        printf '%s' "$PERSONA_FLOOR_RN" ;;
+    web)       printf '%s' "$PERSONA_FLOOR_WEB" ;;
+    node)      printf '%s' "$PERSONA_FLOOR_NODE" ;;
+    fullstack) printf '%s' "$PERSONA_FLOOR_FULLSTACK" ;;
+    *)         return 1 ;;
   esac
 }
 
 valid_profiles_for_track() {
   case "$1" in
-    rn)   printf 'full, frontend, logic, native' ;;
-    web)  printf 'full, frontend, logic, data' ;;
-    node) printf 'full, logic' ;;
-    *)    return 1 ;;
+    rn)        printf 'full, frontend, logic, native' ;;
+    web)       printf 'full, frontend, logic, data' ;;
+    node)      printf 'full, logic' ;;
+    # Deliberately no frontend/data here: a change narrow enough to drop one
+    # side of the stack belongs on the web or node track instead.
+    fullstack) printf 'full, logic' ;;
+    *)         return 1 ;;
   esac
 }
 
@@ -222,7 +239,7 @@ resolve_active_personas() {
   local file="$1" profile track set floor persona old_ifs optional explicit
   track="$(spec_track "$file")"
   persona_set "$track" >/dev/null 2>&1 ||
-    { printf 'unknown Track "%s"; valid: rn, web, node\n' "$track" >&2; return 1; }
+    { printf 'unknown Track "%s"; valid: rn, web, node, fullstack\n' "$track" >&2; return 1; }
   floor="$(persona_floor "$track")"
   # Explicit per-spec override. A `- Personas:` field names the exact specialists
   # to run; the active set is the floor plus those names. The Review Profile is

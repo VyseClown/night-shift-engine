@@ -22,6 +22,32 @@ a fresh session, so it is constant within a scope and resumes never re-pass it.
 Set any knob to `inherit` to use the CLI's startup model (e.g. a Pro plan without
 Opus access).
 
+## Model ruling
+
+Which model each knob should carry, by the kind of work the spec demands. Knobs
+pass their value verbatim to `claude --model`, so full IDs (`claude-fable-5`)
+work anywhere an alias is uncertain. "Strongest available" means the best
+judgment-tier model the current subscription carries — `claude-fable-5` while
+it lasts, `opus` after it leaves the subscription (the built-in defaults
+already say `opus`, so the fable choice is an explicit opt-in, never a default
+that silently breaks).
+
+| Role (knob) | Ruling |
+|---|---|
+| `NIGHT_SHIFT_PLAN_MODEL` | Strongest available. Planning quality bounds the whole run. |
+| `NIGHT_SHIFT_IMPLEMENT_MODEL` | `sonnet`. The grind; the observer backstops it. |
+| `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL` | Strongest available — design-contract builds are judgment-heavy. |
+| `NIGHT_SHIFT_PERSONA_MODEL` | `sonnet`. Breadth over depth; the observer is the deep gate. |
+| `NIGHT_SHIFT_OBSERVER_MODEL` | Strongest available. Never weaker than the implement model. |
+| `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` | Strongest available for design-contract work; `sonnet` for cosmetic-only specs. |
+
+Spec-type adjustments: scratch/demo targets (`nightshift-demo`, throwaway
+specs) run everything on `sonnet` — never spend judgment-tier budget there.
+Specs touching money math, wire contracts, or engine safety invariants keep
+plan AND observer on the strongest available even when implement stays
+`sonnet`. Fixture/dry runs (`--fixture-test`, `--dry-run`) never need a model
+choice at all. The global per-project defaults live in `~/.claude/CLAUDE.md`.
+
 ## Workspace Map
 
 The **night-shift engine repo** (`night-shift-engine/` — the orchestrator
@@ -63,7 +89,14 @@ directory; run engine/workflow git inside the engine directory.
   Override with `NSV_PROJECT_DIRS=/abs/a:/abs/b`. A repo that does not gitignore
   `.night-shift/` is intentionally skipped (a run there would commit artifacts).
 - A target project must gitignore `.night-shift/` and be on the spec's feature
-  branch before a run. `NEXT_TASK` only continues to same-project TODO specs,
+  branch before a run. **Monorepos:** point `--project` at the repo root; a
+  spec may declare ``- Workdir: `apps/<app>` `` (backticks required) to run every
+  validation phase in that subdir (validated at spec selection: must exist,
+  be tracked at HEAD, and resolve inside the project — no symlink escapes;
+  malformed fields fail loudly). pnpm
+  workspaces need no `NIGHT_SHIFT_DEPENDENCY_LINKS` override — each workspace
+  package's `node_modules` (from `pnpm-workspace.yaml`) plus `.nx/cache` are
+  auto-linked into the validation worktree. `NEXT_TASK` only continues to same-project TODO specs,
   and only on runs started *without* `--spec` (the engine picks the task from
   TODO). An explicit `--spec` run is a single task: on `NEXT_TASK` it completes
   and exits 0 so an external wrapper can own cross-spec sequencing/branching.
@@ -78,6 +111,13 @@ directory; run engine/workflow git inside the engine directory.
   spec with a `## Design Contract` (judgment-heavy design-fidelity build — Flow B), and
   `NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) for the independent final gate —
   any set to `inherit` to fall back to the CLI's startup model.
+- **Codex second opinion (opt-in, default OFF):** `NIGHT_SHIFT_CODEX_REVIEW=1`
+  adds one bounded `codex exec -s read-only` advisory review per candidate
+  (gpt-5.5 via the Codex CLI), handed to the observer as supplementary,
+  NON-gating evidence (`NIGHT_SHIFT_CODEX_TIMEOUT`, default 300s). Missing
+  CLI / failure / timeout skip cleanly and are journaled (`codex_review`
+  events). The verdict pipeline stays Claude-only either way — leave this off
+  unless you deliberately want a second vendor's perspective.
 - **Visual fidelity (opt-in):** set `NIGHT_SHIFT_VISUAL_CAPTURE=1` and give an rn
   spec a `## Design Contract` to enable the `visual_review` stage (Figma-MCP
   reference + iOS-simulator capture + `odiff` pixel-diff + agent auto-repair).
@@ -139,13 +179,16 @@ directory; run engine/workflow git inside the engine directory.
 > screen-state in the matrix. Sample: `docs/examples/maestro/Home-default.yaml`.
 
 > **Note:** the night-shift workflow is multi-track. A spec declares `- Track: rn`,
-> `- Track: web`, or `- Track: node` (default `rn`), which selects the review
-> persona set (`docs/review-personas.md` for `rn`, `docs/review-personas-web.md`
-> for `web`; `node` reuses existing backend personas — Backend & Data Expert,
-> TypeScript & Code Quality Expert, Performance Expert, Human Advocate — with no
-> UX persona and only the `full`/`logic` profiles), the spec template
-> (`specs/_template.md` vs `specs/_template-web.md`), and the matching Validation
-> Checklist in `AGENTS.md`. `rn-sandbox` is the `rn` track; `web-app` is the
+> `- Track: web`, `- Track: node`, or `- Track: fullstack` (default `rn`), which
+> selects the review persona set (`docs/review-personas.md` for `rn`,
+> `docs/review-personas-web.md` for `web`; `node` reuses existing backend
+> personas — Backend & Data Expert, TypeScript & Code Quality Expert, Performance
+> Expert, Human Advocate — with no UX persona and only the `full`/`logic`
+> profiles; `fullstack` runs the web bench with Backend & Data Expert promoted
+> into the always-run floor, `full`/`logic` profiles only — for changes spanning
+> API + web UI, e.g. in a monorepo), the spec template (`specs/_template.md` vs
+> `specs/_template-web.md` vs `specs/_template-fullstack.md`), and the matching
+> Validation Checklist in `AGENTS.md`. `rn-sandbox` is the `rn` track; `web-app` is the
 > `web` track; plain Node/CLI repos (e.g. `slack-status`) are the `node` track.
 > Always use each project's own `CLAUDE.md` for its real commands. The night-shift
 > process rules in `AGENTS.md` apply to all tracks.
