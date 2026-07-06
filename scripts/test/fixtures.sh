@@ -4450,6 +4450,12 @@ fixture_visual_review_repair_args() {
   # unknown drive still rejected (regression guard); capture so pipefail doesn't mask grep's exit
   out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$root" --drive bogus 2>&1 || true)"
   printf '%s\n' "$out" | grep -qi "unknown --drive" || return 1
+  # --drive auto (the default) must be accepted, never rejected as unknown.
+  # Use a missing project so the run dies at project validation (right after
+  # the drive-mode check) instead of entering the real pipeline.
+  out="$("$WORKSPACE_ROOT/scripts/visual-review.sh" --project "$root/__no_such_project__" --drive auto 2>&1 || true)"
+  if printf '%s\n' "$out" | grep -qi "unknown --drive"; then return 1; fi
+  printf '%s\n' "$out" | grep -q "project not found" || return 1
   return 0
 }
 

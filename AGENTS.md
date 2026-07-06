@@ -2,7 +2,7 @@
 
 > Read this first. Every time. It takes 2 minutes and prevents 2 hours of wrong decisions.
 
-This file is the entry point for any AI agent (Claude Code, Codex, or subagent) working in this workspace. It tells you where things live, what tools to use, and what the rules are.
+This file is the entry point for any AI agent (Claude Code or subagent) working in this workspace. (Codex/gpt-5.5 is DORMANT per the global CLAUDE.md — do not route work to it.) It tells you where things live, what tools to use, and what the rules are.
 
 ---
 
@@ -61,9 +61,6 @@ is not a git repo.
 | Tool | Command | Use for |
 |---|---|---|
 | Claude Code | `claude` | Implementation, refactoring, architecture decisions |
-| Codex CLI | `c` (alias) | Parallel implementation, cross-review of Claude's output |
-| Resume Codex | `cr` | Resume the last Codex session |
-| Fork Codex | `cf` | Branch a Codex session for a variant |
 | RN diagnostics | `rninfo` | Check Node, Xcode, ADB, Watchman status |
 | Pods | `pods` | Install CocoaPods (runs from project root) |
 

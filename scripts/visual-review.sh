@@ -21,8 +21,11 @@
 #                     `## Design Contract` (repeatable)
 #   --scheme NAME     URL scheme the preview route answers (default: app.json scheme)
 #   --drive MODE      how capture pushes each screen into the app:
-#                       openurl (default) — custom-scheme deep link; iOS 16+ may
-#                         show an "Open in app?" prompt that blocks capture.
+#                       auto (default) — file when the simulator runtime is
+#                         iOS 26+ (openurl's "Open in app?" prompt blocks
+#                         unattended capture there), openurl otherwise.
+#                       openurl — custom-scheme deep link; iOS 26+ shows an
+#                         "Open in app?" prompt that blocks capture.
 #                       file — write "<screen>:<state>" into the app's document dir
 #                         and cold-launch (prompt-free; app reads it on boot). Needs
 #                         the project's file-driven preview boot.
@@ -70,7 +73,7 @@ die() { log "ERROR: $*"; exit 2; }
 . "$SCRIPT_DIR/lib/visual-repair.sh"
 
 # ---- args -------------------------------------------------------------------
-PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="openurl" PREVIEW_FILE="" MAESTRO_DIR=""
+PROJECT="" SCHEME="" OUT="" NO_BUILD=0 NO_REFS=0 DRIVE="auto" PREVIEW_FILE="" MAESTRO_DIR=""
 REPAIR=0 MAX_ATTEMPTS="${NIGHT_SHIFT_VISUAL_MAX_ATTEMPTS:-3}" REPAIR_SHARED=0
 SPECS=()
 while [ "$#" -gt 0 ]; do
@@ -87,12 +90,12 @@ while [ "$#" -gt 0 ]; do
     --repair=*)      REPAIR=1; MAX_ATTEMPTS="${1#--repair=}"; shift ;;
     --repair)        REPAIR=1; case "${2:-}" in ''|--*) : ;; *) MAX_ATTEMPTS="$2"; shift ;; esac; shift ;;
     --repair-shared) REPAIR_SHARED=1; shift ;;
-    -h|--help) sed -n '4,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '4,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
-case "$DRIVE" in openurl|file|maestro) : ;; *) die "unknown --drive '$DRIVE' (expected: openurl | file | maestro)" ;; esac
+case "$DRIVE" in auto|openurl|file|maestro) : ;; *) die "unknown --drive '$DRIVE' (expected: auto | openurl | file | maestro)" ;; esac
 [ -n "$PROJECT" ] || die "--project is required"
 PROJECT="$(cd "$PROJECT" 2>/dev/null && pwd)" || die "project not found: $PROJECT"
 [ -f "$PROJECT/app.json" ] || die "no app.json under $PROJECT (is this an Expo app?)"
@@ -112,11 +115,32 @@ export NIGHT_SHIFT_VISUAL_CAPTURE=1
 export NIGHT_SHIFT_PREVIEW_SCHEME="$SCHEME"
 
 # Drive mode (how capture pushes each screen into the app):
-#   openurl (default) — custom-scheme deep link; iOS 16+ may show an "Open in app?"
+#   openurl — custom-scheme deep link; iOS 26+ shows an "Open in app?"
 #     confirmation that blocks unattended capture.
-#   file              — write "<screen>:<state>" into the app's document dir and
+#   file    — write "<screen>:<state>" into the app's document dir and
 #     cold-launch (prompt-free; the app reads it on boot). Needs the app's
 #     file-driven preview boot (built with EXPO_PUBLIC_PREVIEW=1 for this project).
+# --drive auto (the default) resolves by simulator runtime: the booted device's
+# iOS major if one is booted, else the newest available runtime. 26+ → file
+# (openurl is prompt-blocked there anyway); older → openurl (no preview-boot
+# build needed). An explicit --drive always wins; unreadable version fails
+# open to openurl (the pre-iOS-26 behavior).
+if [ "$DRIVE" = "auto" ]; then
+  ios_major="$(xcrun simctl list devices available -j 2>/dev/null | jq -r '
+    [ .devices | to_entries[]
+      | select(.key | test("SimRuntime.iOS-")) | .key as $rt | .value[]?
+      | { v: ($rt | capture("iOS-(?<M>[0-9]+)") | .M | tonumber),
+          booted: (.state == "Booted") } ]
+    | (map(select(.booted)) + sort_by(-.v)) | .[0].v // empty
+  ' 2>/dev/null)"
+  if [ -n "$ios_major" ] && [ "$ios_major" -ge 26 ] 2>/dev/null; then
+    DRIVE="file"
+    log "drive=auto → file (iOS $ios_major simulator: openurl hits the 'Open in app?' prompt; pass --drive openurl to force)"
+  else
+    DRIVE="openurl"
+    log "drive=auto → openurl (iOS ${ios_major:-unknown} simulator; pass --drive to override)"
+  fi
+fi
 case "$DRIVE" in
   openurl) : ;;
   file)
