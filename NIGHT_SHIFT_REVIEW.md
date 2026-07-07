@@ -174,3 +174,44 @@ output is transient and must not be copied here.
   "documentation_changes": []
 }
 ```
+
+## Run 20260707T002652Z-34468 - 2026-07-07T01:05:17Z
+
+- Task: `/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-foundation.md`
+- Base: `4593a8729ac9f434da28beac13cba1955773f966`
+- Candidate: `4407347aa6bb2eeaa5ba6130b99c0688d5f309f1`
+
+```json
+{
+  "observer": "claude",
+  "primary": "claude",
+  "task": "/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-foundation.md",
+  "candidate_commit": "4407347aa6bb2eeaa5ba6130b99c0688d5f309f1",
+  "status": "APPROVE",
+  "findings": [],
+  "documentation_changes": [
+    "Add the Human Advocate round-2 note to CLAUDE.md: isAuthenticated at boot is optimistic (token presence only, not a verified live session) — protected screens in the next spec must not assume validity until an API call confirms it.",
+    "Add to the manual test checklist: visually confirm each tab's SF Symbol renders (not blank) on-device, since an invalid symbol name string is invisible to tsc/eslint/jest."
+  ]
+}
+```
+
+## Run 20260707T002652Z-34468 - 2026-07-07T09:03:36Z
+
+- Task: `/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-auth-login.md`
+- Base: `cebef24854eadcd962942df63d2c9f2cf7e378f9`
+- Candidate: `dbeb5c9a2200bf9a67bd6b532271fb38676cf2b8`
+
+```json
+{
+  "observer": "claude",
+  "primary": "claude",
+  "task": "/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-auth-login.md",
+  "candidate_commit": "dbeb5c9a2200bf9a67bd6b532271fb38676cf2b8",
+  "status": "APPROVE",
+  "findings": [],
+  "documentation_changes": [
+    "CLAUDE.md § Auth state: replace the claim 'A probe-id ref guards races: every deliberate transition (signIn/signOut/401) invalidates any in-flight probe result' with the actual mechanism — probe results are applied via a functional setStatus that only lands while status === 'checking', so any deliberate transition out of 'checking' drops a stale in-flight probe result. No probe-id ref exists in src/api/ApiProvider.tsx."
+  ]
+}
+```
