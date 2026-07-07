@@ -159,7 +159,9 @@ specs that do too little waste a full persona bench on a one-liner.
 
 - **Good size:** one user-visible behavior change, 3–7 ACs, a diff one observer
   can judge in a single review. Roughly "one focused PR".
-- **Too big? Split into a sequenced suite.** Give each part its own spec with
+- **Too big? Split into a sequenced suite.** (Execution topologies for a suite —
+  the one-launch sequential chain, parallel worktree fan-out, and the hybrid —
+  live in `docs/PARALLEL-AND-SEQUENCING.md`.) Give each part its own spec with
   its own branch-able validation story, order them in `TODO.md` (the queue is
   ordered; bugs before features), and link them via each spec's `Related:`
   section. Sequencing rules that matter:
@@ -255,6 +257,7 @@ Run down this list before flipping Status to *Ready for implementation*:
 ## Related
 
 - `specs/_template.md` / `_template-web.md` / `_template-fullstack.md` — the skeletons
+- `docs/PARALLEL-AND-SEQUENCING.md` — running a multi-spec suite: chain, fan-out, hybrid
 - `NIGHT_SHIFT_HOWTO.md` — what happens on a run, stage by stage
 - `AGENTS.md` — validation checklists per track; review floor and profiles
 - `AGENT_LOOP.md` — the loop your ACs drive

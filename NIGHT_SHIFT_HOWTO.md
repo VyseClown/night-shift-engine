@@ -181,6 +181,7 @@ loop, the observer, and every safety rail are identical for both tracks.
 - `AGENT_LOOP.md` — the agent's step-by-step overnight procedure.
 - `specs/_template.md` / `specs/_template-web.md` — the spec templates.
 - `docs/SPEC-AUTHORING.md` — how to fill a template so the run produces the best output.
+- `docs/PARALLEL-AND-SEQUENCING.md` — running a multi-spec feature: sequenced queue, parallel worktrees, or both.
 - `docs/review-personas.md` / `docs/review-personas-web.md` — the reviewer personas.
 - `TODO.md` — the work queue (bugs before features).
 - `CHANGELOG.md` — completed changes.

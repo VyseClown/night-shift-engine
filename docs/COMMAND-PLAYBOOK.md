@@ -20,6 +20,8 @@ workspace container (`<workspace>/<app>`).
 | Auto-fix design drift *during* a night-shift build | `NIGHT_SHIFT_VISUAL_REPAIR=1 … scripts/night-shift.sh …` | §4 |
 | Capture by driving the **real** app (no preview harness) | `--drive maestro` (+ a per-screen flow) | §5 |
 | Build a feature end-to-end (rn / web / node / fullstack) | `scripts/night-shift.sh --project <app> --spec <spec>` | §6 |
+| Run a multi-spec feature in one launch (sequenced, one branch) | queue in `TODO.md` → `scripts/night-shift.sh --project <app>` (no `--spec`) | §8 |
+| Run several independent specs at once (fan-out, one branch each) | `scripts/parallel-worktrees.sh --project <app> specs/a.md specs/b.md` | §8 |
 | Convert a Figma design into a web component | Figma MCP → web-track generate → visual review | §7 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
@@ -146,6 +148,29 @@ No single script; it's an MCP-fed, agent-driven flow:
    downloaded frame image with `odiff` (the same diff the rn path uses), iterating
    until close. (A web capture harness is not yet a single command — render + screenshot
    the route, then `odiff <figma-frame.png> <screenshot.png> <diff.png> --parsable-stdout`.)
+
+## §8 — Scale a night: sequence a queue or fan out worktrees
+
+Two topologies, one decision rule — *does a spec need a sibling's landed code to
+pass its own validation?* Yes → chain; no → eligible for fan-out. Full
+constraints and the hybrid pattern: `docs/PARALLEL-AND-SEQUENCING.md`.
+
+```bash
+# A) Sequential chain — one launch works the same-project TODO.md queue in order,
+#    ALL queued specs on ONE shared feature branch (candidates stack; engine
+#    never switches branches):
+NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <workspace>/<app>
+
+# B) Parallel fan-out — one worktree + one DISTINCT feature branch per spec,
+#    own .night-shift/ per run; --jobs default 2 (rate limits); morning merge
+#    is yours. --dry-run first = free preflight across all worktrees:
+scripts/parallel-worktrees.sh --project <workspace>/<app> --jobs 2 \
+    specs/part-a.md specs/part-b.md
+```
+
+Not possible today (don't hunt for a knob): parallelism *inside* one run, two
+runs in the same checkout (run-lock), parallel runs sharing a branch, or a
+TODO-driven fan-out.
 
 ## Prerequisites & environment
 

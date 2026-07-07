@@ -139,7 +139,9 @@ directory; run engine/workflow git inside the engine directory.
 > concurrent run then claims a dedicated iOS simulator from a machine-global registry at
 > `~/.night-shift/devices/`, cloning `ns-<run-id>` devices when the matching pool is
 > exhausted and pruning them on the next registry-mode run. A single run is unaffected.
-> Requires pre-bundled preview builds (no Metro).
+> Requires pre-bundled preview builds (no Metro). The full multi-spec topology guide
+> (sequential `NEXT_TASK` chain vs worktree fan-out, constraints of each, hybrid):
+> `docs/PARALLEL-AND-SEQUENCING.md`.
 
 > **Driving the preview on newer iOS (`scripts/visual-review.sh --drive file`).**
 > Capture pushes each screen into the app one of three ways (`__visual_capture_screenshot`,

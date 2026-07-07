@@ -332,4 +332,5 @@ NEED:    [what information or decision would unblock you]
 - `AGENT_LOOP.md` — step-by-step process for overnight autonomous runs
 - `specs/_template.md` / `specs/_template-web.md` / `specs/_template-fullstack.md` — how to write a feature spec (rn / web / fullstack)
 - `docs/SPEC-AUTHORING.md` — what makes a spec produce the best autonomous output (tiered anatomy, right-sizing, checklist, anti-patterns)
+- `docs/PARALLEL-AND-SEQUENCING.md` — multi-spec nights: the sequential `NEXT_TASK` chain vs `scripts/parallel-worktrees.sh` fan-out, constraints of each, and what is not possible
 - `docs/review-personas.md` / `docs/review-personas-web.md` — how to run a review pass (rn / web)
