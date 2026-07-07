@@ -257,6 +257,7 @@ Run down this list before flipping Status to *Ready for implementation*:
 ## Related
 
 - `specs/_template.md` / `_template-web.md` / `_template-fullstack.md` — the skeletons
+- `docs/SPEC-INTAKE-PROMPT.md` — the reusable prompt that produces a spec suite from a feature ticket
 - `docs/PARALLEL-AND-SEQUENCING.md` — running a multi-spec suite: chain, fan-out, hybrid
 - `NIGHT_SHIFT_HOWTO.md` — what happens on a run, stage by stage
 - `AGENTS.md` — validation checklists per track; review floor and profiles

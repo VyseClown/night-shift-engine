@@ -19,6 +19,7 @@ workspace container (`<workspace>/<app>`).
 | Auto-fix an RN screen until it matches the Figma design | `scripts/visual-review.sh … --repair` | §3 |
 | Auto-fix design drift *during* a night-shift build | `NIGHT_SHIFT_VISUAL_REPAIR=1 … scripts/night-shift.sh …` | §4 |
 | Capture by driving the **real** app (no preview harness) | `--drive maestro` (+ a per-screen flow) | §5 |
+| Turn a feature ticket into a launch-ready spec suite | paste the prompt from `docs/SPEC-INTAKE-PROMPT.md` into a Claude session | — |
 | Build a feature end-to-end (rn / web / node / fullstack) | `scripts/night-shift.sh --project <app> --spec <spec>` | §6 |
 | Run a multi-spec feature in one launch (sequenced, one branch) | queue in `TODO.md` → `scripts/night-shift.sh --project <app>` (no `--spec`) | §8 |
 | Run several independent specs at once (fan-out, one branch each) | `scripts/parallel-worktrees.sh --project <app> specs/a.md specs/b.md` | §8 |
