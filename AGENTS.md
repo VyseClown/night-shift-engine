@@ -331,4 +331,5 @@ NEED:    [what information or decision would unblock you]
 - `NIGHT_SHIFT_HOWTO.md` — human guide: what to write first and how a run works
 - `AGENT_LOOP.md` — step-by-step process for overnight autonomous runs
 - `specs/_template.md` / `specs/_template-web.md` / `specs/_template-fullstack.md` — how to write a feature spec (rn / web / fullstack)
+- `docs/SPEC-AUTHORING.md` — what makes a spec produce the best autonomous output (tiered anatomy, right-sizing, checklist, anti-patterns)
 - `docs/review-personas.md` / `docs/review-personas-web.md` — how to run a review pass (rn / web)
