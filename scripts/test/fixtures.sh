@@ -171,6 +171,7 @@ run_dry_fixtures() {
   fixture_assert "mutate.sh --run: baseline sanity guard (broken suite-cmd never self-disables)" fixture_mutate_baseline_guard
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
+  fixture_assert "task plan survives success compaction (validated/plan-<spec>.md)" fixture_archive_task_plan "$root"
   fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
   fixture_assert "visual_review journals its outcome (the candidate-repointing stage is no longer invisible)" fixture_visual_journal "$root"
   fixture_assert "mid-stage session refresh clears the session every N stage turns (0 = off)" fixture_session_refresh "$root"
@@ -1677,6 +1678,31 @@ fixture_event_stream() {
     sweep sweep_fix sweep_fix_reverted run_feedback test_audit; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
+  return 0
+}
+
+fixture_archive_task_plan() {
+  # Both task-completion paths (COMPLETE and NEXT_TASK) preserve the finishing
+  # task's approved plan: control/plan.md → validated/plan-<spec>.md, so the
+  # plan survives success compaction (control/ is deleted) and the viewer can
+  # render it for archived runs.
+  local root="$1" dir="$root/planarch"
+  mkdir -p "$dir/run/control" "$dir/run/validated"
+  ( RUN_ROOT="$dir/run"; SPEC="$dir/specs/demo-task.md"
+    printf '# plan body\n' >"$RUN_ROOT/control/plan.md"
+    archive_task_plan
+    fx "plan copied under the spec name" test -s "$RUN_ROOT/validated/plan-demo-task.md"
+    printf '{"s":1}\n' >"$RUN_ROOT/summary.json"
+    compact_success "$RUN_ROOT" "arch-plan" >/dev/null 2>&1
+    fx "archived copy survives compaction" test -s "$RUN_ROOT/archive/arch-plan/validated/plan-demo-task.md"
+    fx "control/ itself is still compacted away" test ! -e "$RUN_ROOT/control"
+    # Missing plan (fixture/dry runs, blocked-before-plan) is a no-op, never an error.
+    RUN_ROOT="$dir/empty"; mkdir -p "$RUN_ROOT"
+    fx "no plan is a clean no-op" archive_task_plan
+    exit 0 ) || return 1
+  # Wiring: both completion paths call the helper (deleting either fails here).
+  case "$(declare -f complete_run)" in *archive_task_plan*) ;; *) return 1 ;; esac
+  case "$(declare -f start_next_task)" in *archive_task_plan*) ;; *) return 1 ;; esac
   return 0
 }
 

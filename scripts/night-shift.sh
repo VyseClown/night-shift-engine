@@ -802,6 +802,20 @@ compact_success() {
   done
 }
 
+# The approved plan (control/plan.md) is the context a human reviews the
+# archived diff against, but control/ is deleted on success compaction. Copy
+# the finishing task's plan into validated/ (which IS archived) under the
+# task's spec name, at both task-completion paths (COMPLETE and NEXT_TASK —
+# the next task overwrites control/plan.md during its planning stage).
+# Best-effort: fixture/dry runs may have no plan, and a failed copy must never
+# fail a completed task.
+archive_task_plan() {
+  [ -n "${RUN_ROOT:-}" ] && [ -s "$RUN_ROOT/control/plan.md" ] || return 0
+  mkdir -p "$RUN_ROOT/validated" 2>/dev/null || return 0
+  cp "$RUN_ROOT/control/plan.md" \
+    "$RUN_ROOT/validated/plan-$(basename "$SPEC" .md).md" 2>/dev/null || true
+}
+
 # Spec validation + path canonicalization + launch-readiness preflight + validation-
 # command execution/evidence (canonical_dir, validate_spec, emit_preflight,
 # validate_spec_project, run_validation_commands, …) now live in scripts/lib/preflight.sh.
@@ -3399,6 +3413,7 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  archive_task_plan
   # Run feedback (Task 3, agentic-gaps tranche): a short fresh session
   # distills this run's journal into <project>/.night-shift/feedback.md for
   # the human who authors specs. Deliberately BEFORE the BRANCH_SWEEP block
@@ -3443,6 +3458,9 @@ complete_run() {
 
 start_next_task() {
   local next_spec="" epoch cand canon
+  # $SPEC still names the task that just completed; preserve its plan before
+  # anything moves on (the next task rewrites control/plan.md).
+  archive_task_plan
   # Walk the unchecked queue and pick the first spec that belongs to THIS run's
   # project. Specs for other projects are skipped (a run is pinned to one
   # --project and cannot switch). If none remain for this project, the run is
