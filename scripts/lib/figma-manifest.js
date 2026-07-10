@@ -505,8 +505,14 @@ function buildRollup(elements) {
     palette: uniqSorted(elements.flatMap((e) => [e.color, e.background])),
     fontFamilies: uniqSorted(elements.map((e) => e.typography && e.typography.fontFamily)),
     fontSizes: uniqSorted(elements.map((e) => e.typography && e.typography.fontSize), true),
+    // Negative values (e.g. gapToPrev when a container overlaps its children
+    // in the y-sorted gap chain, or negative margins) stay raw on the
+    // elements but are excluded here: a spacing SCALE is the set of design
+    // tokens a port should reuse, and negatives are overlap artifacts.
     spacingScale: uniqSorted(
-      elements.flatMap((e) => [e.spacing.marginTop, e.spacing.paddingH, e.spacing.gapToPrev]),
+      elements
+        .flatMap((e) => [e.spacing.marginTop, e.spacing.paddingH, e.spacing.gapToPrev])
+        .filter((v) => v !== null && v >= 0),
       true
     ),
     radii: uniqSorted(elements.map((e) => e.radius), true),

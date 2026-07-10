@@ -1996,9 +1996,9 @@ handle_persona_rate_limits() {
     done
     [ -n "$first_raw" ] || break
     if is_rate_limit_response "$first_raw"; then
-      handle_rate_limit_wait "$first_raw"
+      handle_rate_limit_wait "$first_raw" subagent
     elif is_per_model_limit_response "$first_raw"; then
-      handle_per_model_limit "$first_raw" "$(resolve_effective_model "$PERSONA_MODEL")"
+      handle_per_model_limit "$first_raw" "$(resolve_effective_model "$PERSONA_MODEL")" subagent
     fi
     for marker in "$result_dir"/.ratelimited-*; do
       [ -f "$marker" ] || continue
@@ -2931,9 +2931,9 @@ validated_observer_retry() {
       # times it got rate-limited first).
       record_cost "$raw.$attempt" "$(basename "$raw")"
       if is_rate_limit_response "$raw.$attempt"; then
-        handle_rate_limit_wait "$raw.$attempt"
+        handle_rate_limit_wait "$raw.$attempt" subagent
       elif is_per_model_limit_response "$raw.$attempt"; then
-        handle_per_model_limit "$raw.$attempt" "$(resolve_effective_model "$OBSERVER_MODEL")"
+        handle_per_model_limit "$raw.$attempt" "$(resolve_effective_model "$OBSERVER_MODEL")" subagent
       fi
       continue
     fi

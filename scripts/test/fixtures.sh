@@ -1533,7 +1533,7 @@ fixture_event_stream() {
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
-    stage_transition codex_review model_fallback; do
+    stage_transition codex_review model_fallback reuse_violation port_audit; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -3452,7 +3452,13 @@ fixture_recovery_persona_session_wait() {
     printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
     printf '# plan\n' >"$RUN_ROOT/control/plan.md"
     STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
-    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    # session_id seeded to the PRIMARY's pinned session: handle_rate_limit_wait
+    # is called here in subagent mode (the raw belongs to the rate-limited
+    # persona, not the primary) and must NOT overwrite it — a persona-BLOCK
+    # routes back to implementation within the same session scope, so an
+    # overwritten .session_id would resume the primary inside a reviewer's
+    # session (the bug this fixture's assertion below guards against).
+    printf '{"stage_started_at":%s,"task_started_at":%s,"session_id":"PRIMARY-SESSION"}' "$_n" "$_n" >"$STATE"
     wait_for_rate_limit_reset() { printf '%s\n' "$1" >>"$dir/waited.txt"; }
     invoke_persona_once() {
       local persona="$1" out="$4" raw="$5" slug n
@@ -3484,6 +3490,8 @@ fixture_recovery_persona_session_wait() {
       jq -e 'select(.type=="rate_limit_wait")' "$RUN_ROOT/events.jsonl" >/dev/null
     fx "no persona_retry 'no parseable JSON' event for the rate-limited persona" \
       test -z "$(jq -r 'select(.type=="persona_retry" and .payload.persona=="Human Advocate" and (.payload.reason|test("no parseable JSON")))' "$RUN_ROOT/events.jsonl" 2>/dev/null)"
+    fx "primary's pinned session_id is UNCHANGED by the persona-path 429 wait" \
+      test "$(jq -r '.session_id' "$STATE")" = "PRIMARY-SESSION"
     exit 0
   ) >/dev/null || return 1
   return 0
@@ -3556,6 +3564,12 @@ fixture_recovery_persona_permodel_fallback() {
     fx "model_fallback event journaled" \
       jq -e 'select(.type=="model_fallback") | .payload.from=="fable-test" and .payload.to=="opus"' \
         "$RUN_ROOT/events.jsonl" >/dev/null
+    # handle_per_model_limit is called here in subagent mode: .model_fallbacks
+    # must still be recorded (every model consumer needs the mapping) but the
+    # PRIMARY's pinned .session_id must NOT be force-refreshed — only a
+    # primary-mode call nulls it.
+    fx "primary's pinned session_id is UNCHANGED by the persona-path fallback" \
+      test "$(jq -r '.session_id' "$STATE")" = "old"
     exit 0
   ) >/dev/null || return 1
   return 0
@@ -3569,7 +3583,11 @@ fixture_recovery_observer_session_wait() {
   (
     RUN_ROOT="$dir"; OBSERVER=claude; PRIMARY=claude; SPEC="/x/spec.md"
     STATE="$dir/state.json"; RUN_ID="rosw"
-    printf '{"status":"running"}' >"$STATE"
+    # session_id seeded to the PRIMARY's pinned session: handle_rate_limit_wait
+    # is called here in subagent mode (the raw belongs to the observer, not the
+    # primary) and must NOT overwrite it (same contamination risk as the
+    # persona path above).
+    printf '{"status":"running","session_id":"PRIMARY-SESSION"}' >"$STATE"
     enforce_limits() { :; }
     enforce_elapsed_limits() { :; }
     normalize_observer_output() { :; }
@@ -3594,6 +3612,8 @@ fixture_recovery_observer_session_wait() {
       jq -e 'select(.type=="rate_limit_wait")' "$dir/events.jsonl" >/dev/null
     fx "no observer_retry event (the 429 never counted as a contract failure)" \
       test -z "$(jq -r 'select(.type=="observer_retry")' "$dir/events.jsonl" 2>/dev/null)"
+    fx "primary's pinned session_id is UNCHANGED by the observer-path 429 wait" \
+      test "$(jq -r '.session_id' "$STATE")" = "PRIMARY-SESSION"
     exit 0
   ) >/dev/null || return 1
   return 0
@@ -5296,6 +5316,17 @@ _fixture_design_extract_figma_run() {
     "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
   fx "rollup palette contains #30437a" bash -c \
     "jq -e '.rollup.palette | index(\"#30437a\") != null' '$manifest' >/dev/null"
+  # Negative-gap rollup filter: an absolutely-positioned TEXT node ("Overlap
+  # Label") overlaps the button's vertical extent, producing a negative
+  # gapToPrev (-8) on that element (kept raw — negatives are real overlap
+  # facts about the layout). spacingScale is a design-token SCALE, so it must
+  # filter negatives out — the identical rule cdp-extract.js applies (Task 2)
+  # must also apply here (Task 3), or web-mode and figma-mode manifests
+  # diverge on the same rollup semantic.
+  fx "overlapping text element keeps its raw negative gapToPrev (-8)" bash -c \
+    "jq -e '[.elements[] | select(.text == \"Overlap Label\")][0].spacing.gapToPrev == -8' '$manifest' >/dev/null"
+  fx "rollup.spacingScale has no negative values (overlap artifacts excluded)" bash -c \
+    "jq -e '.rollup.spacingScale | all(. >= 0)' '$manifest' >/dev/null"
   return 0
 }
 
@@ -5858,8 +5889,10 @@ EOF
   # must carry no duplicates. Same Task 3 manifest + Task 7 tree as the
   # offline block; the reply reports heading.sample-title/fontSize TWICE
   # (both would match) -> exactly ONE entry for the pair, match counted once,
-  # every summary count asserted exactly (1 match + the 8 checklist-derived
-  # missing entries, nothing else).
+  # every summary count asserted exactly (1 match + the 11 checklist-derived
+  # missing entries, nothing else — 11 includes the 3 properties of the
+  # "Overlap Label" element added to the node fixture for the negative-gap
+  # rollup cover in design-extract-figma).
   ( dir="$root/dup-dedupe"; mkdir -p "$dir"
     repo="$dir/repo"
     mkdir -p "$repo"
@@ -5879,8 +5912,8 @@ EOF
     fx "dup-dedupe: exit 0" test "$status" -eq 0
     fx "dup-dedupe: exactly ONE entry for the twice-reported pair" bash -c \
       "jq -e '([.entries[] | select(.elementId==\"heading.sample-title\" and .property==\"fontSize\")] | length) == 1' '$out' >/dev/null"
-    fx "dup-dedupe: summary counts the pair once (match=1, off=0, missing=8, extra=0, unknown=0)" bash -c \
-      "jq -e '.summary == {match:1, off:0, missing:8, extra:0, unknown:0, pct:11}' '$out' >/dev/null"
+    fx "dup-dedupe: summary counts the pair once (match=1, off=0, missing=11, extra=0, unknown=0)" bash -c \
+      "jq -e '.summary == {match:1, off:0, missing:11, extra:0, unknown:0, pct:8}' '$out' >/dev/null"
     exit 0
   ) || return 1
 

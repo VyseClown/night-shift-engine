@@ -230,10 +230,18 @@ wait_for_rate_limit_reset() {
 # iterations — invoke_primary persists it every pass, so re-reading here equals
 # the old local), blocks at the cap to prevent an infinite sleep-and-retry
 # spiral, pins the emitted session, journals the wait, and sleeps until the
-# reported reset. $1 = the raw 429 JSON response file. The caller re-pins its
-# own session variable to the raw's session_id and retries.
+# reported reset. $1 = the raw 429 JSON response file. $2 = mode, "primary"
+# (default, backward compat) or "subagent". The counter/cap/event/wait happen
+# in BOTH modes; the `.session_id` PIN happens only in primary mode. A
+# sub-agent call site (handle_persona_rate_limits, validated_observer_retry)
+# passes a persona/observer raw whose session_id belongs to the REVIEWER, not
+# the primary — pinning it into `.session_id` would contaminate the primary's
+# pinned session (the next `--resume` would continue the primary inside a
+# reviewer's session). In subagent mode the caller re-pins its own local
+# variable to the raw's session_id and retries; state's `.session_id` (the
+# primary's) is left untouched.
 handle_rate_limit_wait() {
-  local raw="$1" rate_limit_cap=5 consecutive_429 emitted
+  local raw="$1" mode="${2:-primary}" rate_limit_cap=5 consecutive_429 emitted
   consecutive_429="$(jq -r '.rate_limit_consecutive // 0' "$STATE" 2>/dev/null)"
   is_valid_int "$consecutive_429" || consecutive_429=0
   consecutive_429=$((consecutive_429 + 1))
@@ -243,9 +251,14 @@ handle_rate_limit_wait() {
   # session that keeps hitting the limit after each wait completes.
   [ "$consecutive_429" -lt "$rate_limit_cap" ] ||
     block_run "rate limit not clearing after $consecutive_429 consecutive resets; resume manually once the limit clears"
-  emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
-  state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
-    --arg session "$emitted" --argjson n "$consecutive_429" --arg now "$(now_iso)"
+  if [ "$mode" = "primary" ]; then
+    emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
+    state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
+      --arg session "$emitted" --argjson n "$consecutive_429" --arg now "$(now_iso)"
+  else
+    state_set '.rate_limit_consecutive=$n | .updated_at=$now' \
+      --argjson n "$consecutive_429" --arg now "$(now_iso)"
+  fi
   emit_event rate_limit_wait "$(jq -cn --argjson n "$consecutive_429" '{consecutive:$n}')"
   wait_for_rate_limit_reset "$raw"
 }
@@ -260,16 +273,28 @@ handle_rate_limit_wait() {
 # session (the next turn starts FRESH on the successor — a resume would re-pin
 # the capped model), journal a model_fallback event, and return 0 so the caller
 # retries. No successor (sonnet is the floor) still blocks.
+# $3 = mode, "primary" (default, backward compat) or "subagent". The
+# `.model_fallbacks` record + event happen in BOTH modes (every model consumer
+# must see the fallback); the `.session_id=null` happens ONLY in primary mode —
+# a sub-agent call site (handle_persona_rate_limits, validated_observer_retry)
+# passes a persona/observer raw, and unconditionally nulling `.session_id`
+# there would force-refresh the PRIMARY's session for no reason (the sub-agent
+# path re-spawns its own fresh worker regardless).
 handle_per_model_limit() {
-  local raw="$1" model="$2" line successor
+  local raw="$1" model="$2" mode="${3:-primary}" line successor
   line="$(jq -r '.result // empty' "$raw" 2>/dev/null)"
   if [ "${NIGHT_SHIFT_MODEL_FALLBACK:-0}" != "1" ]; then
     block_run "per-model usage cap hit on model '$model' ($line); set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
   fi
   successor="$(successor_model "$model")" ||
     block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor — set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
-  state_set '.model_fallbacks[$from]=$to | .session_id=null | .updated_at=$now' \
-    --arg from "$model" --arg to "$successor" --arg now "$(now_iso)"
+  if [ "$mode" = "primary" ]; then
+    state_set '.model_fallbacks[$from]=$to | .session_id=null | .updated_at=$now' \
+      --arg from "$model" --arg to "$successor" --arg now "$(now_iso)"
+  else
+    state_set '.model_fallbacks[$from]=$to | .updated_at=$now' \
+      --arg from "$model" --arg to "$successor" --arg now "$(now_iso)"
+  fi
   emit_event model_fallback "$(jq -cn --arg from "$model" --arg to "$successor" '{from:$from,to:$to}')"
   log "per-model usage cap on '$model'; falling back to '$successor' (NIGHT_SHIFT_MODEL_FALLBACK=1) with a fresh session"
 }
