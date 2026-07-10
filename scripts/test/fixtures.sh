@@ -5477,6 +5477,38 @@ EOF
     exit 0
   ) || return 1
 
+  # Case 3: duplicate (elementId, property) pairs in the reply are deduped
+  # KEEP-FIRST -- a sloppy/adversarial agent reporting the same pair twice
+  # must not inflate the summary counts/pct, and the entries array itself
+  # must carry no duplicates. Same Task 3 manifest + Task 7 tree as the
+  # offline block; the reply reports heading.sample-title/fontSize TWICE
+  # (both would match) -> exactly ONE entry for the pair, match counted once,
+  # every summary count asserted exactly (1 match + the 8 checklist-derived
+  # missing entries, nothing else).
+  ( dir="$root/dup-dedupe"; mkdir -p "$dir"
+    repo="$dir/repo"
+    mkdir -p "$repo"
+    cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen/." "$repo/"
+    mkdir -p "$dir/design/manifest"
+    node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+      --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+      --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+      --screen sample --out "$dir/design/manifest" >/dev/null || exit 1
+    good="$dir/dup-reply.json"
+    printf '{"entries":[{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"},{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"}]}\n' >"$good"
+
+    out="$repo/.night-shift/port-audit/sample.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen sample \
+      --manifest "$dir/design/manifest/sample.json" --scope src/features/sample --offline "$good" >/dev/null
+    status=$?
+    fx "dup-dedupe: exit 0" test "$status" -eq 0
+    fx "dup-dedupe: exactly ONE entry for the twice-reported pair" bash -c \
+      "jq -e '([.entries[] | select(.elementId==\"heading.sample-title\" and .property==\"fontSize\")] | length) == 1' '$out' >/dev/null"
+    fx "dup-dedupe: summary counts the pair once (match=1, off=0, missing=8, extra=0, unknown=0)" bash -c \
+      "jq -e '.summary == {match:1, off:0, missing:8, extra:0, unknown:0, pct:11}' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
   return 0
 }
 

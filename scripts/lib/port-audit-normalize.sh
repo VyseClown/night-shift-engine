@@ -181,7 +181,17 @@ port_audit_assemble() {
         end
       end;
 
-    ([$ae[]? | resolve_reported(.)]) as $reported |
+    # Dedupe on (elementId, property), KEEP-FIRST in reply order: a sloppy or
+    # adversarial agent reporting the same pair twice must not inflate the
+    # summary counts/pct (the one axis where reply CONTENT could otherwise
+    # move the summary), and the entries array itself must carry no
+    # duplicates. reduce (not unique_by) so "first reported wins" is explicit
+    # rather than an artifact of sort stability. null elementIds dedupe too —
+    # "extra" is informational, one entry per property is enough.
+    ([$ae[]? | resolve_reported(.)]
+      | reduce .[] as $e ([];
+          if any(.[]; .elementId == $e.elementId and .property == $e.property)
+          then . else . + [$e] end)) as $reported |
 
     # Deterministic "missing" checklist: manifest elements x a SMALL set of
     # always-checkable, cleanly-null-or-not properties (typography/color/
