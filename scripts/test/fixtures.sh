@@ -214,6 +214,9 @@ run_dry_fixtures() {
   fixture_assert "rate-limit resume rebases elapsed budgets" fixture_rate_limit_rebase "$root"
   fixture_assert "preserved rate-limit block is recoverable" fixture_rate_limit_recovery "$root"
   fixture_assert "runaway rate-limit wait hits the cap" fixture_rate_limit_cap "$root"
+  fixture_assert "recovery-permodel: detector discrimination" fixture_permodel_detector "$root"
+  fixture_assert "recovery-permodel: default block + fallback continue" fixture_permodel_block_fallback "$root"
+  fixture_assert "recovery-permodel: extracted session wait path (count, cap, pin, journal)" fixture_handle_rate_limit_wait "$root"
   fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
   fixture_assert "atomic lock: O_EXCL pid gate, no mkdir-write window, reclaims dead/pid-less" fixture_atomic_lock "$root"
   fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
@@ -1521,7 +1524,7 @@ fixture_event_stream() {
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
-    stage_transition codex_review; do
+    stage_transition codex_review model_fallback; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -3227,6 +3230,137 @@ fixture_rate_limit_cap() {
   (wait_for_rate_limit_reset "$raw") >/dev/null 2>&1 || rc=$?
   STATE="$saved_state"; RUN_ROOT="$saved_root"; RATE_LIMIT_MAX_WAIT_SECONDS="$saved_cap"
   [ "$rc" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# recovery-permodel fixtures (port-fidelity Task 10): the per-model 429 shape
+# ("You've reached your <Model> limit…", NO reset timestamp) vs the session
+# limit ("…resets 4:00pm (America/Sao_Paulo)"). Canned captures live at
+# scripts/test/fixtures/rate-limit/ — neutral fake model name, real field
+# shape (is_error:true, api_error_status:429).
+# ---------------------------------------------------------------------------
+
+# Detector discrimination on the canned files: session file -> session detector
+# only; per-model file -> per-model detector only; a 500-class error -> neither
+# (falls through to block_run exactly as before this feature).
+fixture_permodel_detector() {
+  local root="$1" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit" err="$root/permodel-500.json"
+  printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500,"result":"Internal server error","session_id":"fixed-id"}' >"$err"
+  (
+    fx "session file: session detector true" is_rate_limit_response "$fdir/session-limit.json"
+    fx_not "session file: per-model detector false" is_per_model_limit_response "$fdir/session-limit.json"
+    fx "per-model file: per-model detector true" is_per_model_limit_response "$fdir/per-model-limit.json"
+    fx_not "per-model file: session detector false" is_rate_limit_response "$fdir/per-model-limit.json"
+    fx_not "500 file: session detector false" is_rate_limit_response "$err"
+    fx_not "500 file: per-model detector false" is_per_model_limit_response "$err"
+    exit 0
+  ) || return 1
+  # The canary was re-verified against these live captures on CLI 2.1.202.
+  [ "$RATE_LIMIT_CONTRACT_CLI_VERSION" = "2.1.202" ] || return 1
+  return 0
+}
+
+# Branch behavior of handle_per_model_limit, driven directly with recording
+# shims (block_run records + exits like the real one dies; emit_event records).
+# Default -> block with the "per-model usage cap" reason; with
+# NIGHT_SHIFT_MODEL_FALLBACK=1 -> model_fallback journaled, .model_fallbacks
+# updated, session nulled, NO block — and resolve_effective_model then returns
+# the successor. Plus the successor_model ladder and the call-site wiring.
+fixture_permodel_block_fallback() {
+  local root="$1" d="$root/permodel" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit" rc out body
+  mkdir -p "$d"
+  # successor_model ladder: fable* -> opus, opus -> sonnet, else unchanged + rc 1.
+  [ "$(successor_model claude-fable-5)" = "opus" ] || return 1
+  [ "$(successor_model fable-test)" = "opus" ] || return 1
+  [ "$(successor_model opus)" = "sonnet" ] || return 1
+  rc=0; out="$(successor_model sonnet)" || rc=$?
+  [ "$rc" -eq 1 ] && [ "$out" = "sonnet" ] || return 1
+  # Default path: block_run fires with the actionable per-model reason, no event.
+  rc=0
+  (
+    STATE="$d/state-block.json"; RUN_ROOT="$d"; RUN_ID="pm-block-$$"
+    printf '%s\n' '{"status":"running","stage":"implementation","session_id":"old-sid"}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events-block.txt"; }
+    unset NIGHT_SHIFT_MODEL_FALLBACK
+    handle_per_model_limit "$fdir/per-model-limit.json" "fable-test" 2>/dev/null
+    exit 0
+  ) || rc=$?
+  [ "$rc" -eq 42 ] || return 1
+  grep -q "per-model usage cap hit on model 'fable-test'" "$d/blocked.txt" || return 1
+  grep -q "reached your Zephyr 9 limit" "$d/blocked.txt" || return 1
+  grep -q "NIGHT_SHIFT_\*_MODEL knob" "$d/blocked.txt" || return 1
+  grep -q "re-run with --resume" "$d/blocked.txt" || return 1
+  [ ! -f "$d/events-block.txt" ] || return 1
+  # Fallback path: NIGHT_SHIFT_MODEL_FALLBACK=1 records, nulls, journals, returns.
+  (
+    STATE="$d/state-fb.json"; RUN_ROOT="$d"; RUN_ID="pm-fb-$$"
+    printf '%s\n' '{"status":"running","stage":"implementation","session_id":"old-sid"}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked-fb.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events-fb.txt"; }
+    NIGHT_SHIFT_MODEL_FALLBACK=1 handle_per_model_limit "$fdir/per-model-limit.json" "fable-test" 2>/dev/null || exit 1
+    fx "no block on the fallback path" test ! -f "$d/blocked-fb.txt"
+    fx "fallback recorded in state" test "$(jq -r '.model_fallbacks["fable-test"]' "$STATE")" = "opus"
+    fx "session nulled (next turn starts fresh on the successor)" test "$(jq -r '.session_id' "$STATE")" = "null"
+    fx "model_fallback event journaled" grep -q '^model_fallback|' "$d/events-fb.txt"
+    fx "event payload carries from/to" \
+      jq -e '.from=="fable-test" and .to=="opus"' <<<"$(sed -n 's/^model_fallback|//p' "$d/events-fb.txt")"
+    fx "resolve_effective_model returns the successor afterward" \
+      test "$(resolve_effective_model fable-test)" = "opus"
+    fx "resolve_effective_model identity for unmapped models" \
+      test "$(resolve_effective_model sonnet)" = "sonnet"
+    exit 0
+  ) >/dev/null || return 1
+  # Wiring: the primary loop consults both handlers, the per-model branch sits
+  # AFTER the session-limit branch, and every model consumer routes through
+  # resolve_effective_model. declare -f, not grep -q pipes (pipefail flake).
+  body="$(declare -f invoke_primary)"
+  case "$body" in *handle_rate_limit_wait*) ;; *) return 1 ;; esac
+  case "${body#*is_rate_limit_response}" in *is_per_model_limit_response*) ;; *) return 1 ;; esac
+  local fn
+  for fn in invoke_primary invoke_persona_once invoke_observer_once port_audit_candidate; do
+    case "$(declare -f "$fn")" in *resolve_effective_model*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# handle_rate_limit_wait is the session-limit loop body extracted verbatim from
+# invoke_primary: it must increment + persist the consecutive counter, pin the
+# raw's session, journal rate_limit_wait, and hand off to
+# wait_for_rate_limit_reset — and block at the 5-cap (same predicate
+# fixture_rate_limit_consecutive guards) instead of sleeping forever.
+fixture_handle_rate_limit_wait() {
+  local root="$1" d="$root/hrlw" rc
+  mkdir -p "$d"
+  (
+    STATE="$d/state.json"; RUN_ROOT="$d"; RUN_ID="hw-$$"
+    printf '%s\n' '{"status":"running","stage":"planning","rate_limit_consecutive":1}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >"$d/waited.txt"; }
+    handle_rate_limit_wait "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json" || exit 1
+    fx "counter incremented + persisted" test "$(jq -r '.rate_limit_consecutive' "$STATE")" = "2"
+    fx "session pinned from the raw" test "$(jq -r '.session_id' "$STATE")" = "fixed-id"
+    fx "rate_limit_wait journaled with the count" \
+      jq -e '.consecutive==2' <<<"$(sed -n 's/^rate_limit_wait|//p' "$d/events.txt")"
+    fx "wait handed the raw file" grep -q 'session-limit.json' "$d/waited.txt"
+    exit 0
+  ) >/dev/null || return 1
+  # At the cap (4 prior consecutive -> 5th) it must block, not wait.
+  rc=0
+  (
+    STATE="$d/state-cap.json"; RUN_ROOT="$d"; RUN_ID="hw-cap-$$"
+    printf '%s\n' '{"status":"running","stage":"planning","rate_limit_consecutive":4}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked-cap.txt"; exit 42; }
+    emit_event() { :; }
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >"$d/waited-cap.txt"; }
+    handle_rate_limit_wait "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json"
+    exit 0
+  ) >/dev/null || rc=$?
+  [ "$rc" -eq 42 ] || return 1
+  grep -q "rate limit not clearing after 5 consecutive resets" "$d/blocked-cap.txt" || return 1
+  [ ! -f "$d/waited-cap.txt" ] || return 1
+  return 0
 }
 
 # ---------------------------------------------------------------------------

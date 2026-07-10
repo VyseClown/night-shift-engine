@@ -24,6 +24,55 @@ is_rate_limit_response() {
   ' "$raw" >/dev/null 2>&1
 }
 
+# Recognizes the OTHER live 429 shape: a PER-MODEL usage cap ("You've reached
+# your <Model> limit. Run /usage-credits to continue or switch models with
+# /model."). Unlike the session limit it carries NO reset timestamp, which is
+# exactly why is_rate_limit_response rejects it — waiting on a parsed reset is
+# impossible, only a model switch (or the quota window) clears it. Deliberately
+# mutually exclusive with is_rate_limit_response so the battle-tested
+# session-limit wait path can never be shadowed: a response matching BOTH
+# phrasings is treated as a session limit.
+is_per_model_limit_response() {
+  local raw="$1"
+  is_rate_limit_response "$raw" && return 1
+  jq -e '
+    .is_error == true and
+    .api_error_status == 429 and
+    (.result | type == "string" and test("reached your .* limit"; "i"))
+  ' "$raw" >/dev/null 2>&1
+}
+
+# Pure: the model to fall back to when a per-model usage cap hits. The ladder
+# only ever steps DOWN in scarcity (fable -> opus -> sonnet) so a fallback can
+# never burn a scarcer budget than the one that just capped. sonnet (and any
+# unknown name) has no successor: echo unchanged + return 1, and the caller
+# blocks for manual resume rather than guessing.
+successor_model() {
+  case "$1" in
+    claude-fable-5|fable*) printf 'opus' ;;
+    opus) printf 'sonnet' ;;
+    *) printf '%s' "$1"; return 1 ;;
+  esac
+}
+
+# Map a configured model through the run's persisted `.model_fallbacks` in
+# state (written by handle_per_model_limit under NIGHT_SHIFT_MODEL_FALLBACK=1),
+# so every consumer of a model knob — primary, personas, observer, port-audit —
+# honors a fallback recorded earlier in the run. Follows chains (fable->opus
+# recorded, then opus->sonnet later) with a small hop bound so a corrupt cyclic
+# map cannot loop. No state / no mapping -> echoes the input unchanged.
+resolve_effective_model() {
+  local model="$1" mapped hops=0
+  [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ] || { printf '%s' "$model"; return 0; }
+  while [ "$hops" -lt 4 ]; do
+    mapped="$(jq -r --arg m "$model" '.model_fallbacks[$m] // empty' "$STATE" 2>/dev/null)"
+    { [ -n "$mapped" ] && [ "$mapped" != "$model" ]; } || break
+    model="$mapped"
+    hops=$((hops + 1))
+  done
+  printf '%s' "$model"
+}
+
 rate_limit_reset_fields() {
   local raw="$1"
   jq -r '.result // empty' "$raw" 2>/dev/null |
@@ -172,4 +221,55 @@ wait_for_rate_limit_reset() {
     .updated_at=$iso
   ' --argjson now "$now" --argjson se "$stage_active" \
     --argjson te "$task_active" --arg iso "$(now_iso)"
+}
+
+# The session-limit 429 wait path, extracted verbatim from invoke_primary's
+# retry loop (behavior-preserving refactor; this path recovered real 429s in
+# production — do not change its behavior). Increments the PERSISTED
+# consecutive-429 counter (state carries it across crashes and across loop
+# iterations — invoke_primary persists it every pass, so re-reading here equals
+# the old local), blocks at the cap to prevent an infinite sleep-and-retry
+# spiral, pins the emitted session, journals the wait, and sleeps until the
+# reported reset. $1 = the raw 429 JSON response file. The caller re-pins its
+# own session variable to the raw's session_id and retries.
+handle_rate_limit_wait() {
+  local raw="$1" rate_limit_cap=5 consecutive_429 emitted
+  consecutive_429="$(jq -r '.rate_limit_consecutive // 0' "$STATE" 2>/dev/null)"
+  is_valid_int "$consecutive_429" || consecutive_429=0
+  consecutive_429=$((consecutive_429 + 1))
+  # Guard against an infinite sleep spiral: if the rate limit is not
+  # clearing after $rate_limit_cap consecutive resets with no successful
+  # turn in between, block for manual resume. This catches a misbehaving
+  # session that keeps hitting the limit after each wait completes.
+  [ "$consecutive_429" -lt "$rate_limit_cap" ] ||
+    block_run "rate limit not clearing after $consecutive_429 consecutive resets; resume manually once the limit clears"
+  emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
+  state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
+    --arg session "$emitted" --argjson n "$consecutive_429" --arg now "$(now_iso)"
+  emit_event rate_limit_wait "$(jq -cn --argjson n "$consecutive_429" '{consecutive:$n}')"
+  wait_for_rate_limit_reset "$raw"
+}
+
+# A PER-MODEL usage cap (is_per_model_limit_response) has no reset time to wait
+# on, so the wait path above cannot help — this is the incident where a run
+# pinned to a per-model-capped model hard-blocked and --resume could not escape.
+# Default posture: block with an actionable reason (name the capped model, quote
+# the CLI's own line, say which knob to change). Opt-in via
+# NIGHT_SHIFT_MODEL_FALLBACK=1: record the fallback in state's .model_fallbacks
+# map (resolve_effective_model consults it for every model consumer), null the
+# session (the next turn starts FRESH on the successor — a resume would re-pin
+# the capped model), journal a model_fallback event, and return 0 so the caller
+# retries. No successor (sonnet is the floor) still blocks.
+handle_per_model_limit() {
+  local raw="$1" model="$2" line successor
+  line="$(jq -r '.result // empty' "$raw" 2>/dev/null)"
+  if [ "${NIGHT_SHIFT_MODEL_FALLBACK:-0}" != "1" ]; then
+    block_run "per-model usage cap hit on model '$model' ($line); set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
+  fi
+  successor="$(successor_model "$model")" ||
+    block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor — set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
+  state_set '.model_fallbacks[$from]=$to | .session_id=null | .updated_at=$now' \
+    --arg from "$model" --arg to "$successor" --arg now "$(now_iso)"
+  emit_event model_fallback "$(jq -cn --arg from "$model" --arg to "$successor" '{from:$from,to:$to}')"
+  log "per-model usage cap on '$model'; falling back to '$successor' (NIGHT_SHIFT_MODEL_FALLBACK=1) with a fresh session"
 }

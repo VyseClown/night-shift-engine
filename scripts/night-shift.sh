@@ -29,12 +29,13 @@ MAX_TASK_SECONDS="${NIGHT_SHIFT_MAX_TASK_SECONDS:-10800}"
 # healthy run (which produces a valid signal almost every turn) never trips it.
 MAX_MALFORMED_SIGNALS="${NIGHT_SHIFT_MAX_MALFORMED_SIGNALS:-5}"
 RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
-# The CLI version whose live 429 session-limit response shape was last verified
-# against is_rate_limit_response (lib/recovery.sh). A real 429 cannot be
-# provoked on demand, so the canary is a version tripwire: a differing
-# installed CLI logs a warning (never blocks) reminding to re-verify the
-# capture. Bump this after re-verifying against a real 429 on a newer CLI.
-RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.198"
+# The CLI version whose live 429 response shapes (session limit AND per-model
+# usage cap) were last verified against is_rate_limit_response /
+# is_per_model_limit_response (lib/recovery.sh). A real 429 cannot be provoked
+# on demand, so the canary is a version tripwire: a differing installed CLI
+# logs a warning (never blocks) reminding to re-verify the capture. Bump this
+# after re-verifying against a real 429 on a newer CLI.
+RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.202"
 # Sanity ceiling on a rate-limit wait. A genuine session limit resets within a
 # few hours; a wait longer than this almost certainly means the reset time was
 # misparsed, so we block for manual resume instead of sleeping for ~a day.
@@ -1333,13 +1334,9 @@ invoke_primary() {
   prompt="$RUN_ROOT/prompts/primary-$turn.txt"
   raw="$RUN_ROOT/raw/primary-$turn.json"
   local session emitted rc model
-  # Consecutive 429-without-success counter. Persisted in state so recovery
-  # after a crash picks up the count; reset to 0 on the first clean turn.
-  # Cap: 5 consecutive rate-limit resets with no successful primary turn → block
-  # for manual resume to prevent an infinite sleep-and-retry spiral.
-  local rate_limit_cap=5 consecutive_429
-  consecutive_429="$(jq -r '.rate_limit_consecutive // 0' "$STATE" 2>/dev/null)"
-  is_valid_int "$consecutive_429" || consecutive_429=0
+  # The consecutive 429-without-success counter now lives entirely in
+  # handle_rate_limit_wait (lib/recovery.sh): persisted in state so recovery
+  # after a crash picks up the count; reset to 0 on the first clean turn below.
   enforce_limits
   archive_old_signal
   session="$(jq -r '.session_id // empty' "$STATE")"
@@ -1351,7 +1348,10 @@ invoke_primary() {
   # a turn-to-turn continue, a rate-limit retry, or recovery of a blocked run —
   # already carries its creation model and must NOT re-pass --model. This keeps
   # resume robust regardless of whether the CLI accepts --model alongside --resume.
-  model="$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
+  # resolve_effective_model maps the knob through state's .model_fallbacks (a
+  # per-model 429 fallback recorded earlier in the run under
+  # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
+  model="$(resolve_effective_model "$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
   while :; do
     rc=0
@@ -1373,18 +1373,22 @@ invoke_primary() {
     if is_rate_limit_response "$raw" &&
       [ -n "$emitted" ] &&
       { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then
-      consecutive_429=$((consecutive_429 + 1))
-      # Guard against an infinite sleep spiral: if the rate limit is not
-      # clearing after $rate_limit_cap consecutive resets with no successful
-      # turn in between, block for manual resume. This catches a misbehaving
-      # session that keeps hitting the limit after each wait completes.
-      [ "$consecutive_429" -lt "$rate_limit_cap" ] ||
-        block_run "rate limit not clearing after $consecutive_429 consecutive resets; resume manually once the limit clears"
+      # Session limit with a parseable reset: count, cap, journal, and sleep it
+      # out (handle_rate_limit_wait, lib/recovery.sh — the extracted, unchanged
+      # production wait path), then retry pinned to the emitted session.
+      handle_rate_limit_wait "$raw"
       session="$emitted"
-      state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
-        --arg session "$session" --argjson n "$consecutive_429" --arg now "$(now_iso)"
-      emit_event rate_limit_wait "$(jq -cn --argjson n "$consecutive_429" '{consecutive:$n}')"
-      wait_for_rate_limit_reset "$raw"
+      continue
+    fi
+    if is_per_model_limit_response "$raw"; then
+      # Per-model usage cap: no reset time exists, so waiting cannot clear it.
+      # Default → block_run (inside the handler) with an actionable reason.
+      # NIGHT_SHIFT_MODEL_FALLBACK=1 → the handler records the fallback in
+      # state's .model_fallbacks, nulls the session, journals model_fallback,
+      # and returns: retry FRESH on the successor model.
+      handle_per_model_limit "$raw" "$model"
+      session=""
+      model="$(resolve_effective_model "$model")"
       continue
     fi
     block_run "primary command failed with status $rc"
@@ -1780,7 +1784,7 @@ invoke_persona_once() {
   # same reason). model_flag word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
   (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
-    claude -p $(model_flag "$PERSONA_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
+    claude -p $(model_flag "$(resolve_effective_model "$PERSONA_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }
 
@@ -2421,7 +2425,7 @@ port_audit_candidate() {
     [ -n "$screen" ] && [ -n "$full" ] || continue
     report="$PROJECT/.night-shift/port-audit/$screen.json"
     if ! "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$PROJECT" --screen "$screen" \
-        --manifest "$full" --model "$PERSONA_MODEL" "${scope_args[@]}" "${offline_args[@]}" \
+        --manifest "$full" --model "$(resolve_effective_model "$PERSONA_MODEL")" "${scope_args[@]}" "${offline_args[@]}" \
         >"$RUN_ROOT/raw/port-audit-$screen.log" 2>&1; then
       log "WARN: port-audit for screen '$screen' failed (advisory only; see raw/port-audit-$screen.log)"
     fi
@@ -2599,7 +2603,7 @@ invoke_observer_once() {
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
   (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" |
-    claude -p $(model_flag "$OBSERVER_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
+    claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || return 1
   extract_claude_structured "$raw" "$out"
 }
 

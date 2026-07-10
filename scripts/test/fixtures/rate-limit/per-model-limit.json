@@ -1,0 +1,1 @@
+{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You've reached your Zephyr 9 limit. Run /usage-credits to continue or switch models with /model.","session_id":"fixed-id"}
