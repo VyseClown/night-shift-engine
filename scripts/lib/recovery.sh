@@ -50,7 +50,7 @@ is_per_model_limit_response() {
 successor_model() {
   case "$1" in
     claude-fable-5|fable*) printf 'opus' ;;
-    opus) printf 'sonnet' ;;
+    opus|opus-*|claude-opus-*) printf 'sonnet' ;;
     *) printf '%s' "$1"; return 1 ;;
   esac
 }

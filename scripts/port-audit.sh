@@ -90,12 +90,13 @@ port_audit_model_flag() {
 # ---- args -------------------------------------------------------------------
 PROJECT="" SCREEN="" MANIFEST_ARG="" SCOPE="" TOKENS="" MODEL="" OFFLINE=""
 LIVE=0 DEVICE="iphone-15" STATE="default" REFERENCE=""
+SCOPE_EXPLICIT=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --project)   PROJECT="${2:-}"; shift 2 ;;
     --screen)    SCREEN="${2:-}"; shift 2 ;;
     --manifest)  MANIFEST_ARG="${2:-}"; shift 2 ;;
-    --scope)     SCOPE="${2:-}"; shift 2 ;;
+    --scope)     SCOPE="${2:-}"; SCOPE_EXPLICIT=1; shift 2 ;;
     --tokens)    TOKENS="${2:-}"; shift 2 ;;
     --model)     MODEL="${2:-}"; shift 2 ;;
     --offline)   OFFLINE="${2:-}"; shift 2 ;;
@@ -128,6 +129,16 @@ jq -e 'type == "object" and (.elements | type == "array")' "$MANIFEST" >/dev/nul
   || die "--manifest is not a valid night-shift-design-manifest/1 JSON: $MANIFEST_ARG"
 
 SCOPE="${SCOPE:-src/features/$SCREEN}"
+# A DEFAULT-derived scope (no explicit --scope) silently killed the whole
+# audit (die -> exit 2, no report at all) whenever a screen name didn't
+# match an existing src/features/<screen> dir — e.g. a screen ported to a
+# differently-named or shared feature dir. Fall back to the whole-src
+# scope in that case and say so; an EXPLICIT --scope that doesn't exist is
+# still an operator error and dies below (in port-audit-static.js).
+if [ "$SCOPE_EXPLICIT" -eq 0 ] && [ ! -d "$PROJECT/$SCOPE" ]; then
+  log "default scope not found ($SCOPE) under --project; falling back to src (whole-src scope)"
+  SCOPE="src"
+fi
 OUT_DIR="$PROJECT/.night-shift/port-audit"
 OUT_FILE="$OUT_DIR/$SCREEN.json"
 mkdir -p "$OUT_DIR" || die "cannot create output dir: $OUT_DIR"

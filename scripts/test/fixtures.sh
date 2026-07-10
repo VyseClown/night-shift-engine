@@ -3278,12 +3278,21 @@ fixture_permodel_detector() {
 fixture_permodel_block_fallback() {
   local root="$1" d="$root/permodel" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit" rc out body
   mkdir -p "$d"
-  # successor_model ladder: fable* -> opus, opus -> sonnet, else unchanged + rc 1.
+  # successor_model ladder: fable* -> opus, opus (bare or full-ID) -> sonnet,
+  # else unchanged + rc 1. The full-ID forms (`claude-opus-4-8`, an
+  # `--model` value the CLI accepts directly) must map identically to the
+  # bare `opus` alias — NIGHT_SHIFT_*_MODEL knobs are documented to accept
+  # full IDs anywhere an alias is uncertain (per-project CLAUDE.md), so the
+  # fallback ladder has to recognize them too.
   [ "$(successor_model claude-fable-5)" = "opus" ] || return 1
   [ "$(successor_model fable-test)" = "opus" ] || return 1
   [ "$(successor_model opus)" = "sonnet" ] || return 1
+  [ "$(successor_model claude-opus-4-8)" = "sonnet" ] || return 1
+  [ "$(successor_model opus-4-8)" = "sonnet" ] || return 1
   rc=0; out="$(successor_model sonnet)" || rc=$?
   [ "$rc" -eq 1 ] && [ "$out" = "sonnet" ] || return 1
+  rc=0; out="$(successor_model weird-model)" || rc=$?
+  [ "$rc" -eq 1 ] && [ "$out" = "weird-model" ] || return 1
   # Default path: block_run fires with the actionable per-model reason, no event.
   rc=0
   (
@@ -5312,6 +5321,23 @@ _fixture_design_extract_figma_run() {
     "jq -e '[.elements[] | select(.role==\"heading\")][0] | (.typography.fontSize == 28 and .typography.fontWeight == 700 and .color == \"#123456\")' '$manifest' >/dev/null"
   fx "button style (background #30437a, radius 8, w 320, text Continue)" bash -c \
     "jq -e '[.elements[] | select(.role==\"button\")][0] | (.background == \"#30437a\" and .radius == 8 and .bounds.w == 320 and .text == \"Continue\")' '$manifest' >/dev/null"
+  # Square-button regression (port-fidelity pre-merge Item 1), a SEPARATE
+  # node-dump (square-button.txt) so it doesn't perturb the element count/
+  # ordering the rest of this fixture and the port-audit-normalize dup-dedupe
+  # fixture (Task 8) bake in from sample-screen.txt: the RECTANGLE child
+  # carries an explicit borderRadius=0 while its GROUP parent carries a
+  # non-zero 6. `resolveRadius(rect) || resolveRadius(node)` treated the
+  # legitimate 0 as falsy and fell through to the parent's 6 — an explicit
+  # null check must keep it at 0.
+  local square_manifest
+  if ! node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$fixture_dir/square-button.txt" --globals "$fixture_dir/_global-vars.txt" \
+    --screen square-button --out "$DESIGN_EXTRACT_FIGMA_OUT_DIR"; then
+    return 1
+  fi
+  square_manifest="$DESIGN_EXTRACT_FIGMA_OUT_DIR/square-button.json"
+  fx "square button keeps its own radius 0, does not inherit the group's radius 6" bash -c \
+    "jq -e '[.elements[] | select(.text == \"Square\")][0].radius == 0' '$square_manifest' >/dev/null"
   fx "icon size 24" bash -c \
     "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
   fx "rollup palette contains #30437a" bash -c \
@@ -5511,15 +5537,21 @@ fixture_manifest_prompt() {
 # text/regex extraction over a committed neutral fixture tree (no chrome, no
 # network, no tsc/npm), so this runs unconditionally on every machine incl.
 # CI. Exercises the CLI wrapper end-to-end against
-# scripts/test/fixtures/component-tree/ (Badge/Row/Chip in src/ui/components,
-# Panel in src/features/sample/components, SampleScreen.tsx importing Badge
-# twice in JSX but from a single import line, and Panel once) and asserts
-# the exact schema/props/usageCount values baked into that fixture tree —
-# usageCount counts importing FILES, not JSX occurrences, which is why
-# Badge.usageCount is 1 (one importing file) despite two <Badge/> uses.
+# scripts/test/fixtures/component-tree/ (Badge/Row/Chip/Toggle in
+# src/ui/components, Panel in src/features/sample/components, SampleScreen.tsx
+# importing Badge twice in JSX but from a single import line, and Panel once)
+# and asserts the exact schema/props/usageCount values baked into that
+# fixture tree — usageCount counts importing FILES, not JSX occurrences,
+# which is why Badge.usageCount is 1 (one importing file) despite two
+# <Badge/> uses.
 # Chip is `export const Chip = memo(function Chip(...))` — regression cover
 # for the HOC-wrapped export shape a live run found invisible to the plain
 # export regexes (which hid a real app's most-reused memo() components).
+# Toggle is `export const Toggle: React.FC<{ onToggle: () => void }> =
+# memo(...)` — regression cover for port-fidelity pre-merge Item 2: an
+# arrow-typed field INSIDE the type annotation broke the annotation matcher
+# (`(?::[^=]+)?` can't cross the `=` inside `=>`), so the whole component
+# vanished from the inventory despite being memo-wrapped exactly like Chip.
 _fixture_component_inventory_run() {
   local fixture_dir out
   fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/component-tree"
@@ -5539,19 +5571,23 @@ _fixture_component_inventory_run() {
   [ -s "$out" ] || { printf 'inventory missing/empty: %s\n' "$out"; return 1; }
 
   fx "schema id" bash -c "jq -e '.schema == \"night-shift-component-inventory/1\"' '$out' >/dev/null"
-  fx "4 components (Badge, Chip, Panel, Row)" bash -c "jq -e '.components | length == 4' '$out' >/dev/null"
+  fx "5 components (Badge, Chip, Panel, Row, Toggle)" bash -c "jq -e '.components | length == 5' '$out' >/dev/null"
   fx "Badge.props == [label, tone]" bash -c \
     "jq -e '([.components[] | select(.name == \"Badge\")][0].props) == [\"label\",\"tone\"]' '$out' >/dev/null"
   fx "Panel.props contains padded" bash -c \
     "jq -e '([.components[] | select(.name == \"Panel\")][0].props) | index(\"padded\") != null' '$out' >/dev/null"
   fx "Chip (memo-wrapped export) detected with props == [label, active]" bash -c \
     "jq -e '([.components[] | select(.name == \"Chip\")][0].props) == [\"label\",\"active\"]' '$out' >/dev/null"
+  fx "Toggle (memo-wrapped, arrow-typed annotation) detected with props == [label, onToggle]" bash -c \
+    "jq -e '([.components[] | select(.name == \"Toggle\")][0].props) == [\"label\",\"onToggle\"]' '$out' >/dev/null"
   fx "Badge.usageCount == 1 (one importing file, not two JSX uses)" bash -c \
     "jq -e '([.components[] | select(.name == \"Badge\")][0].usageCount) == 1' '$out' >/dev/null"
   fx "Row.usageCount == 0 (unused)" bash -c \
     "jq -e '([.components[] | select(.name == \"Row\")][0].usageCount) == 0' '$out' >/dev/null"
   fx "Chip.usageCount == 0 (unused)" bash -c \
     "jq -e '([.components[] | select(.name == \"Chip\")][0].usageCount) == 0' '$out' >/dev/null"
+  fx "Toggle.usageCount == 0 (unused)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Toggle\")][0].usageCount) == 0' '$out' >/dev/null"
   return 0
 }
 
@@ -5560,9 +5596,9 @@ fixture_component_inventory() {
   err="$(_fixture_component_inventory_run 2>&1)"
   status=$?
   if [ "$status" -eq 0 ]; then
-    printf 'ok - component-inventory: extracts 4 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n'
+    printf 'ok - component-inventory: extracts 5 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n'
   else
-    printf 'not ok - component-inventory: extracts 4 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n' >&2
+    printf 'not ok - component-inventory: extracts 5 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
@@ -6017,6 +6053,20 @@ _fixture_port_audit_offline_run() {
     "jq -e '([.entries[] | select(.elementId==\"heading.sample-title\" and .property==\"fontSize\")][0] | .status==\"match\" and .expected==28 and .actual==28)' '$out' >/dev/null"
   fx "offline: match entry's evidence names a real file in the fixture tree" bash -c \
     "jq -r '([.entries[] | select(.status==\"match\")][0].evidence)' '$out' | cut -d: -f1 | xargs -I{} test -f '$repo/{}'"
+
+  # port-fidelity pre-merge Item 3 regression: a screen name with NO matching
+  # src/features/<screen> dir (the fixture tree only has src/features/sample)
+  # used to silently kill the whole audit via the DEFAULT --scope (die -> exit
+  # 2, no report at all). No --scope passed here on purpose: the default
+  # must fall back to whole-src and still produce a report.
+  local orphan_out orphan_status
+  orphan_out="$repo/.night-shift/port-audit/orphan-screen.json"
+  "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen orphan-screen \
+    --manifest "$manifest_dir/sample.json" --offline "$reply" >/dev/null
+  orphan_status=$?
+  fx "offline: default-scope fallback (no matching feature dir) still exits 0" \
+    test "$orphan_status" -eq 0
+  fx "offline: default-scope fallback still produces a report" [ -s "$orphan_out" ]
   return 0
 }
 
@@ -6207,6 +6257,15 @@ _fixture_recovery_guard_project() {
   local proj="$1"
   mkdir -p "$proj"
   git -C "$proj" init -q
+  # CI runners (e.g. ubuntu-latest) carry no global user.name/user.email, so
+  # `git commit` here dies with "Please tell me who you are" (exit 128) —
+  # this helper's caller only checked the FOLLOWING commands' exit codes,
+  # never this one, so the failure surfaced as a mystifying guard-behavior
+  # mismatch rather than a setup error. Set a local per-repo identity, same
+  # idiom as _reuse_gate_seed_repo above, so this is portable across CI/dev
+  # machines regardless of global git config.
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
   printf '.night-shift/\n' >"$proj/.gitignore"
   git -C "$proj" add .gitignore >/dev/null 2>&1
   git -C "$proj" commit -qm init >/dev/null 2>&1 || return 1

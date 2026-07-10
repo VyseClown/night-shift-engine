@@ -265,11 +265,14 @@ function resolveTextStyle(node, globals) {
   };
 }
 
+// Returns null when the node has no borderRadius attr at all (matches
+// resolveFill's/resolveTextStyle's "null means unset" convention above), so
+// callers can tell "no radius data" apart from an explicit radius of 0.
 function resolveRadius(node) {
   const raw = node.attrs.borderRadius;
-  if (raw === undefined) return 0;
+  if (raw === undefined) return null;
   const n = parseFloat(raw);
-  return Number.isNaN(n) ? 0 : n;
+  return Number.isNaN(n) ? null : n;
 }
 
 function findFirstFrame(nodes) {
@@ -359,7 +362,11 @@ function walk(node, globals, ancestorOrigin, out) {
       const color = resolveFill(textChild, globals);
       const text = textChild.attrs.text !== undefined ? textChild.attrs.text : null;
       const background = resolveFill(rect, globals);
-      const radius = resolveRadius(rect) || resolveRadius(node);
+      // Explicit null check, not `||`: a legitimate radius of 0 on the
+      // RECTANGLE child (a square button) is falsy and must NOT fall
+      // through to the GROUP/INSTANCE node's own radius.
+      const rectRadius = resolveRadius(rect);
+      const radius = rectRadius !== null && rectRadius !== undefined ? rectRadius : resolveRadius(node);
       out.push({
         figmaId: node.id,
         role: 'button',

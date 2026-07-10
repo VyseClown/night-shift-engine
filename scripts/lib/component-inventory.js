@@ -299,7 +299,20 @@ function extractProps(content, name, paramsStr) {
 }
 
 const EXPORT_FUNCTION_RE = /export\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(/g;
-const EXPORT_CONST_RE = /export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:function\s*[A-Za-z0-9_]*\s*)?\(/g;
+// Optional `: <type annotation>` before the `=` that starts the initializer.
+// A tempered dot-all-ish pattern: repeat "an arrow token OR any non-'='
+// char", lazily, so it stops at the FIRST bare `=` rather than greedily
+// eating through one embedded in the annotation. Plain `[^=]+` (the earlier
+// shape) treats `=` as a hard stop, so an arrow-typed field inside the
+// annotation — `React.FC<{ onDone: () => void }>` — breaks the match: it
+// stops mid-`=>` and then fails to find `memo(`/`(` right after. Matching
+// `=>` explicitly lets the annotation contain arrow types while the lazy
+// `+?` still yields at the real initializer `=`.
+const CONST_TYPE_ANNOTATION = String.raw`(?::\s*(?:=>|[^=])+?)?`;
+const EXPORT_CONST_RE = new RegExp(
+  String.raw`export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*${CONST_TYPE_ANNOTATION}\s*=\s*(?:function\s*[A-Za-z0-9_]*\s*)?\(`,
+  'g'
+);
 // `export const <Name> = memo(function <anything>(` and friends — a live
 // verification against a real RN app found its MOST-reused components (all
 // `export const X = memo(function X({...}: XProps) {...})`) were invisible to
@@ -314,7 +327,10 @@ const EXPORT_CONST_RE = /export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*
 // destructured-params-fallback prop extraction applies unchanged. A bare
 // identifier wrap (`export const X = memo(Y)`) has no parameter list here
 // and stays undetected — best effort, like the rest of this file.
-const EXPORT_CONST_WRAPPED_RE = /export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:(?:React\s*\.\s*)?(?:memo|forwardRef)\s*\(\s*)+(?:function\s*[A-Za-z0-9_]*\s*)?\(/g;
+const EXPORT_CONST_WRAPPED_RE = new RegExp(
+  String.raw`export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*${CONST_TYPE_ANNOTATION}\s*=\s*(?:(?:React\s*\.\s*)?(?:memo|forwardRef)\s*\(\s*)+(?:function\s*[A-Za-z0-9_]*\s*)?\(`,
+  'g'
+);
 // `export default function Name(` — same paren-terminated shape as
 // EXPORT_FUNCTION_RE, just with the `default` keyword in between.
 const EXPORT_DEFAULT_FUNCTION_RE = /export\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(/g;

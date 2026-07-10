@@ -1,0 +1,5 @@
+[CANVAS] "Page 1" #0:1
+  [FRAME] "SQUARE" #7:1 layout=layout_root fills=fill_bg
+    [GROUP] #7:2 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":24,"y":100},"dimensions":{"width":320,"height":48}} borderRadius=6px
+      [RECTANGLE] #7:3 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":0,"y":0},"dimensions":{"width":320,"height":48}} fills=fill_cta borderRadius=0px
+      [TEXT] #7:4 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":130,"y":13},"dimensions":{"width":60,"height":22}} fills=fill_bg textStyle=style_body text="Square"
