@@ -217,6 +217,12 @@ run_dry_fixtures() {
   fixture_assert "recovery-permodel: detector discrimination" fixture_permodel_detector "$root"
   fixture_assert "recovery-permodel: default block + fallback continue" fixture_permodel_block_fallback "$root"
   fixture_assert "recovery-permodel: extracted session wait path (count, cap, pin, journal)" fixture_handle_rate_limit_wait "$root"
+  fixture_assert "recovery-subagent: invoke_persona_once detects a 429 raw (session + per-model) as 42, not 1" fixture_recovery_invoke_persona_once_detects_rate_limit "$root"
+  fixture_assert "recovery-subagent: invoke_observer_once detects a 429 raw (session + per-model) as 42, not 1" fixture_recovery_invoke_observer_once_detects_rate_limit "$root"
+  fixture_assert "recovery-subagent: persona session-429 waits once and re-runs only the incomplete persona" fixture_recovery_persona_session_wait "$root"
+  fixture_assert "recovery-subagent: persona per-model default blocks with a clear reason" fixture_recovery_persona_permodel_block "$root"
+  fixture_assert "recovery-subagent: persona per-model fallback re-spawns on the successor model" fixture_recovery_persona_permodel_fallback "$root"
+  fixture_assert "recovery-subagent: observer 429 waits without consuming a contract-retry attempt" fixture_recovery_observer_session_wait "$root"
   fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
   fixture_assert "atomic lock: O_EXCL pid gate, no mkdir-write window, reclaims dead/pid-less" fixture_atomic_lock "$root"
   fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
@@ -3360,6 +3366,233 @@ fixture_handle_rate_limit_wait() {
   [ "$rc" -eq 42 ] || return 1
   grep -q "rate limit not clearing after 5 consecutive resets" "$d/blocked-cap.txt" || return 1
   [ ! -f "$d/waited-cap.txt" ] || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# recovery-subagent: a real 429 on a PERSONA or OBSERVER review call used to be
+# misread as "no parseable JSON verdict" — burning both retries and hard-
+# blocking the run — while the SAME 429 on the primary path recovers fine.
+# invoke_persona_once / invoke_observer_once now detect it (return 42, distinct
+# from the ordinary parse-failure 1) and the callers route it to the parent's
+# wait/fallback path instead of the JSON-retry budget.
+# ---------------------------------------------------------------------------
+
+# Drives the REAL invoke_persona_once (not a stubbed seam) with a stubbed
+# `claude` binary, so the detection logic itself — not just the callers that
+# branch on its return code — is exercised against the canned live captures.
+fixture_recovery_invoke_persona_once_detects_rate_limit() {
+  local root="$1" dir="$root/ripo" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit"
+  mkdir -p "$dir"
+  (
+    RUN_ID="ripo-$$"; PERSONA_MODEL="inherit"; SPEC="$dir/s.md"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf 'bundle-body\n' >"$dir/bundle.md"
+    local rc=0
+    claude() { cat "$fdir/session-limit.json"; return 1; }
+    invoke_persona_once "Human Advocate" plan "$dir/bundle.md" "$dir/out.json" "$dir/raw.json" ""
+    rc=$?
+    fx "session-limit raw -> 42" test "$rc" -eq 42
+    claude() { cat "$fdir/per-model-limit.json"; return 1; }
+    invoke_persona_once "Human Advocate" plan "$dir/bundle.md" "$dir/out2.json" "$dir/raw2.json" ""
+    rc=$?
+    fx "per-model raw -> 42" test "$rc" -eq 42
+    # A genuine non-429 failure must still return plain 1 (unchanged behavior;
+    # the fix must not swallow real parse failures into the 42 path).
+    claude() { printf 'garbage, not json'; return 1; }
+    invoke_persona_once "Human Advocate" plan "$dir/bundle.md" "$dir/out3.json" "$dir/raw3.json" ""
+    rc=$?
+    fx "non-429 failure stays 1" test "$rc" -eq 1
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Same detection, for the observer's seam.
+fixture_recovery_invoke_observer_once_detects_rate_limit() {
+  local root="$1" dir="$root/rioo" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit"
+  mkdir -p "$dir"
+  (
+    RUN_ID="rioo-$$"; OBSERVER_MODEL="inherit"
+    printf 'ctx\n' >"$dir/ctx.txt"
+    local rc=0
+    claude() { cat "$fdir/session-limit.json"; return 1; }
+    invoke_observer_once "$dir/ctx.txt" "deadbeef" "$dir/out.json" "$dir/raw.json" ""
+    rc=$?
+    fx "session-limit raw -> 42" test "$rc" -eq 42
+    claude() { cat "$fdir/per-model-limit.json"; return 1; }
+    invoke_observer_once "$dir/ctx.txt" "deadbeef" "$dir/out2.json" "$dir/raw2.json" ""
+    rc=$?
+    fx "per-model raw -> 42" test "$rc" -eq 42
+    claude() { printf 'garbage, not json'; return 1; }
+    invoke_observer_once "$dir/ctx.txt" "deadbeef" "$dir/out3.json" "$dir/raw3.json" ""
+    rc=$?
+    fx "non-429 failure stays 1" test "$rc" -eq 1
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Step 1: batch of 3 personas; the middle one (Human Advocate) hits the
+# session-limit raw on its first spawn, then a valid verdict on re-spawn.
+# Drives the REAL spawn_personas/spawn_persona_worker/handle_persona_rate_limits
+# with invoke_persona_once stubbed at the same seam every other spawn fixture
+# uses (fixture_persona_spawn et al.) — the stub plays the part of the raw-
+# detection invoke_persona_once now does: write the raw + return 42.
+fixture_recovery_persona_session_wait() {
+  local root="$1" dir="$root/rspw"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="rspw"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s}' "$_n" "$_n" >"$STATE"
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >>"$dir/waited.txt"; }
+    invoke_persona_once() {
+      local persona="$1" out="$4" raw="$5" slug n
+      slug="$(persona_slug "$persona")"
+      n="$(cat "$dir/spawncount-$slug" 2>/dev/null)" || n=0
+      n=$((n + 1)); printf '%s' "$n" >"$dir/spawncount-$slug"
+      if [ "$persona" = "Human Advocate" ] && [ "$n" -eq 1 ]; then
+        cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json" "$raw"
+        return 42
+      fi
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$out"
+      printf '{"result":"ok"}' >"$raw"
+    }
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate|TypeScript & Code Quality Expert"
+    fx "wait called exactly once" test "$(grep -c . "$dir/waited.txt" 2>/dev/null)" -eq 1
+    fx "Backend & Data Expert spawned once (not re-invoked)" \
+      test "$(cat "$dir/spawncount-backend-data-expert" 2>/dev/null)" = "1"
+    fx "TypeScript & Code Quality Expert spawned once (not re-invoked)" \
+      test "$(cat "$dir/spawncount-typescript-code-quality-expert" 2>/dev/null)" = "1"
+    fx "Human Advocate spawned twice (429 then a real retry)" \
+      test "$(cat "$dir/spawncount-human-advocate" 2>/dev/null)" = "2"
+    fx "all 3 personas produced a final validated result" \
+      test "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 3
+    for f in "$rd"/*.json; do
+      fx "result $f is schema-valid" json_schema_basic persona-review "$f"
+    done
+    fx "rate_limit_wait journaled" \
+      jq -e 'select(.type=="rate_limit_wait")' "$RUN_ROOT/events.jsonl" >/dev/null
+    fx "no persona_retry 'no parseable JSON' event for the rate-limited persona" \
+      test -z "$(jq -r 'select(.type=="persona_retry" and .payload.persona=="Human Advocate" and (.payload.reason|test("no parseable JSON")))' "$RUN_ROOT/events.jsonl" 2>/dev/null)"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Step 2a: per-model cap on a persona defaults to block_run with the same
+# actionable reason as the primary/Task-10 path.
+fixture_recovery_persona_permodel_block() {
+  local root="$1" dir="$root/rppb" rc=0
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="rppb"; PERSONA_MODEL="fable-test"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s,"session_id":"old"}' "$_n" "$_n" >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$dir/blocked.txt"; exit 42; }
+    invoke_persona_once() {
+      cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/per-model-limit.json" "$5"
+      return 42
+    }
+    unset NIGHT_SHIFT_MODEL_FALLBACK
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    exit 0
+  )
+  rc=$?
+  [ "$rc" -eq 42 ] || return 1
+  grep -q "per-model usage cap hit on model 'fable-test'" "$dir/blocked.txt" || return 1
+  grep -q "reached your Zephyr 9 limit" "$dir/blocked.txt" || return 1
+  return 0
+}
+
+# Step 2b: NIGHT_SHIFT_MODEL_FALLBACK=1 records the fallback and re-spawns on
+# the successor — proven by the STUB's own resolve_effective_model call (the
+# same call the real invoke_persona_once makes to build --model) returning the
+# capped model on the first spawn and the successor on the re-spawn.
+fixture_recovery_persona_permodel_fallback() {
+  local root="$1" dir="$root/rppf"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="rppf"; PERSONA_MODEL="fable-test"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s,"session_id":"old"}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      local out="$4" raw="$5"
+      printf '%s\n' "$(resolve_effective_model "$PERSONA_MODEL")" >>"$dir/model-calls.txt"
+      if [ ! -f "$dir/hit-once" ]; then
+        : >"$dir/hit-once"
+        cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/per-model-limit.json" "$raw"
+        return 42
+      fi
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$out"
+      printf '{}' >"$raw"
+    }
+    NIGHT_SHIFT_MODEL_FALLBACK=1
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    fx "one validated result after the fallback re-spawn" \
+      test "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 1
+    fx "first call used the capped model" test "$(sed -n '1p' "$dir/model-calls.txt")" = "fable-test"
+    fx "re-spawn used the successor" test "$(sed -n '2p' "$dir/model-calls.txt")" = "opus"
+    fx "fallback recorded in state" test "$(jq -r '.model_fallbacks["fable-test"]' "$STATE")" = "opus"
+    fx "model_fallback event journaled" \
+      jq -e 'select(.type=="model_fallback") | .payload.from=="fable-test" and .payload.to=="opus"' \
+        "$RUN_ROOT/events.jsonl" >/dev/null
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Step 3: the observer's serial attempt loop gets the same treatment — a 429
+# is waited out WITHOUT consuming one of the two contract-retry attempts.
+fixture_recovery_observer_session_wait() {
+  local root="$1" dir="$root/rosw"
+  mkdir -p "$dir/raw"
+  (
+    RUN_ROOT="$dir"; OBSERVER=claude; PRIMARY=claude; SPEC="/x/spec.md"
+    STATE="$dir/state.json"; RUN_ID="rosw"
+    printf '{"status":"running"}' >"$STATE"
+    enforce_limits() { :; }
+    enforce_elapsed_limits() { :; }
+    normalize_observer_output() { :; }
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >>"$dir/waited.txt"; }
+    local raw_calls=0 real_attempts=0
+    invoke_observer_once() {
+      raw_calls=$((raw_calls + 1))
+      if [ "$raw_calls" -eq 1 ]; then
+        cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json" "$4"
+        return 42
+      fi
+      real_attempts=$((real_attempts + 1))
+      printf '{"total_cost_usd":1.0,"num_turns":1}\n' >"$4"
+      printf '{"observer":"claude","primary":"claude","task":"/x/spec.md","candidate_commit":"a7a950b","status":"APPROVE","findings":[],"documentation_changes":[]}\n' >"$3"
+    }
+    validated_observer_retry "ctx" "a7a950b" "$dir/out.json" "$dir/raw/obs.jsonl"
+    fx "retry wrapper reports success" test $? -eq 0
+    fx "wait called exactly once" test "$(grep -c . "$dir/waited.txt" 2>/dev/null)" -eq 1
+    fx "exactly one REAL (non-429) attempt consumed the 2-try budget" test "$real_attempts" -eq 1
+    fx "verdict accepted" test "$(jq -r '.status' "$dir/out.json")" = "APPROVE"
+    fx "rate_limit_wait journaled" \
+      jq -e 'select(.type=="rate_limit_wait")' "$dir/events.jsonl" >/dev/null
+    fx "no observer_retry event (the 429 never counted as a contract failure)" \
+      test -z "$(jq -r 'select(.type=="observer_retry")' "$dir/events.jsonl" 2>/dev/null)"
+    exit 0
+  ) >/dev/null || return 1
   return 0
 }
 

@@ -1772,7 +1772,7 @@ EOF
 # extracted from stdout. A discrete seam the fixtures override to test the spawn
 # loop deterministically without a live model.
 invoke_persona_once() {
-  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" retry_note="${6:-}" neutral lens
+  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" retry_note="${6:-}" neutral lens rc=0
   # Per-worker cwd (slug-suffixed): up to NIGHT_SHIFT_PERSONA_CONCURRENCY claude
   # sessions run concurrently, and a shared cwd is an avoidable interference
   # surface (the observer's shared-dir pattern was safe only because it is serial).
@@ -1784,7 +1784,20 @@ invoke_persona_once() {
   # same reason). model_flag word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
   (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
-    claude -p $(model_flag "$(resolve_effective_model "$PERSONA_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || return 1
+    claude -p $(model_flag "$(resolve_effective_model "$PERSONA_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # A 429 (session OR per-model) is a live-recoverable transient — a standard
+    # rate limit that also recovers fine on the primary path — NOT "no parseable
+    # JSON verdict". Distinguishing it here with a distinct return code lets the
+    # caller (spawn_persona_worker) route it to the parent's wait/fallback path
+    # instead of burning one of the worker's two JSON-retry attempts on it (the
+    # incident this fixes: a 429 misread as malformed JSON exhausted both
+    # retries and hard-blocked the run).
+    if is_rate_limit_response "$raw" || is_per_model_limit_response "$raw"; then
+      return 42
+    fi
+    return 1
+  fi
   extract_claude_structured "$raw" "$out"
 }
 
@@ -1852,6 +1865,28 @@ spawn_persona_worker() {
     # the retry before it is recorded.
     raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$tries.json"
     invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" "$retry_note"; iv=$?
+    if [ "$iv" -eq 42 ]; then
+      # Rate-limited (session OR per-model): a live-recoverable transient, not a
+      # malformed reply. This worker must NOT spend one of its own two JSON-retry
+      # attempts on it, and must NOT write .failed-<slug> — only the PARENT may
+      # wait/fall back/journal (workers run backgrounded and parallel; the parent
+      # is the single writer of shared state). Roll the just-written marker back
+      # (an EARLIER genuine attempt in this same call, if any, is preserved so the
+      # batch's cost loop still finds it), rename the raw out of the numbered
+      # sequence so a re-spawn's same-numbered attempt cannot clobber it before
+      # the parent records its cost, and return without looping.
+      tries=$((tries - 1))
+      if [ "$tries" -gt 0 ]; then
+        printf '%s' "$tries" >"$result_dir/.attempts-$slug"
+      else
+        rm -f "$result_dir/.attempts-$slug"
+      fi
+      local rlraw="${raw%.json}.ratelimited.json"
+      mv -f "$raw" "$rlraw" 2>/dev/null || true
+      printf '%s' "$rlraw" >"$result_dir/.ratelimited-$slug"
+      rm -f "$tmp" "$idd" "$norm"
+      return 2
+    fi
     if [ "$iv" -eq 0 ] &&
       jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
       normalize_persona_result "$idd" >"$norm" 2>/dev/null &&
@@ -1918,6 +1953,69 @@ journal_persona_result() {
   fi
 }
 
+# After a persona batch joins, a worker that hit a 429 (session OR per-model)
+# left a .ratelimited-<slug> marker instead of retrying itself — workers run
+# backgrounded and parallel, so only the PARENT may wait/journal/fall back.
+# Loops until the batch has no more markers (a re-spawn can hit the limit again
+# before the reset has truly cleared, or need a second fallback hop).
+#
+# For a session limit, only the FIRST marker found drives ONE
+# handle_rate_limit_wait: two workers hitting the SAME reset window must not
+# sleep it out twice. For a per-model cap, handle_per_model_limit gets the
+# model actually in effect (resolve_effective_model "$PERSONA_MODEL" — personas
+# resolve fresh on every call, unlike the primary's per-turn pinned model) and
+# either block_run's (default) or records the fallback (NIGHT_SHIFT_MODEL_FALLBACK=1),
+# so the re-spawn's own resolve_effective_model call picks up the successor
+# automatically — no model needs to be threaded through here.
+#
+# Re-spawns only personas that are still genuinely pending: no completed result
+# AND no .failed-<slug> marker. A persona that already exhausted its own 2-try
+# JSON-retry budget must not get a bonus attempt just because a sibling in the
+# same batch was rate-limited.
+handle_persona_rate_limits() {
+  local result_dir="$1" persona_stage="$2" bundle="$3"; shift 3
+  local persona slug marker raw first_raw pid
+  local -a pending
+  while :; do
+    first_raw=""
+    for marker in "$result_dir"/.ratelimited-*; do
+      [ -f "$marker" ] || continue
+      [ -n "$first_raw" ] || first_raw="$(cat "$marker" 2>/dev/null)"
+    done
+    [ -n "$first_raw" ] || break
+    if is_rate_limit_response "$first_raw"; then
+      handle_rate_limit_wait "$first_raw"
+    elif is_per_model_limit_response "$first_raw"; then
+      handle_per_model_limit "$first_raw" "$(resolve_effective_model "$PERSONA_MODEL")"
+    fi
+    for marker in "$result_dir"/.ratelimited-*; do
+      [ -f "$marker" ] || continue
+      raw="$(cat "$marker" 2>/dev/null)"
+      if [ -n "$raw" ] && [ -f "$raw" ]; then
+        record_cost "$raw" "$(basename "$raw")"
+      fi
+      rm -f "$marker"
+    done
+    pending=()
+    for persona in "$@"; do
+      slug="$(persona_slug "$persona")"
+      [ -f "$result_dir/$slug.json" ] && continue
+      [ -f "$result_dir/.failed-$slug" ] && continue
+      pending+=("$persona")
+    done
+    [ "${#pending[@]}" -gt 0 ] || break
+    for persona in "${pending[@]}"; do
+      set -m
+      spawn_persona_worker "$persona" "$persona_stage" "$bundle" "$result_dir" &
+      set +m
+      pid=$!
+      PERSONA_WORKER_PIDS="$PERSONA_WORKER_PIDS $pid"
+      wait "$pid" || true
+      PERSONA_WORKER_PIDS=""
+    done
+  done
+}
+
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
   local bundle persona slug raw old_ifs concurrency i j k n a attempts pstatus
@@ -1957,6 +2055,10 @@ spawn_personas() {
       k=$((k + 1))
     done
     PERSONA_WORKER_PIDS=""
+    # Recover any 429s this batch's workers hit BEFORE the cost/journal loop
+    # below reads .attempts-<slug>: a re-spawned persona's fresh worker call
+    # writes its own .attempts-<slug>/result, which that loop must see.
+    handle_persona_rate_limits "$result_dir" "$persona_stage" "$bundle" "${names[@]}"
     # Costs + journal: recorded by the parent from exactly the attempts each
     # worker made this round (.attempts-<slug>), BEFORE any failure becomes
     # block_run — so a blocked round still keeps every paid attempt's cost.
@@ -2583,7 +2685,7 @@ EOF
 }
 
 invoke_observer_once() {
-  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral
+  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral rc=0
   # Context-isolated observer: a fresh Claude session (no --resume) launched from
   # a neutral empty directory. It runs in the default (non-bypass) permission
   # mode, so tool use is not auto-approved and, combined with the neutral cwd, it
@@ -2603,7 +2705,17 @@ invoke_observer_once() {
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
   (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" |
-    claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || return 1
+    claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Same 429 distinction as invoke_persona_once: a live-recoverable transient,
+    # not "the verdict failed the observer-review contract" — the caller
+    # (validated_observer_retry) must wait/fall back and retry WITHOUT spending
+    # one of the observer's two contract-retry attempts on it.
+    if is_rate_limit_response "$raw" || is_per_model_limit_response "$raw"; then
+      return 42
+    fi
+    return 1
+  fi
   extract_claude_structured "$raw" "$out"
 }
 
@@ -2795,10 +2907,24 @@ run_observer() {
 }
 
 validated_observer_retry() {
-  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note=""
+  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note="" iv
   while [ "$attempt" -lt 2 ]; do
     enforce_limits
-    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note" || true
+    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note"; iv=$?
+    if [ "$iv" -eq 42 ]; then
+      # 429 (session OR per-model): the same live-recoverable transient the
+      # primary already survives — not a contract failure. Wait/fall back and
+      # retry the SAME attempt slot WITHOUT incrementing attempt (the observer
+      # gets its full two-try contract-retry budget regardless of how many
+      # times it got rate-limited first).
+      record_cost "$raw.$attempt" "$(basename "$raw")"
+      if is_rate_limit_response "$raw.$attempt"; then
+        handle_rate_limit_wait "$raw.$attempt"
+      elif is_per_model_limit_response "$raw.$attempt"; then
+        handle_per_model_limit "$raw.$attempt" "$(resolve_effective_model "$OBSERVER_MODEL")"
+      fi
+      continue
+    fi
     # Record the cost of THIS attempt immediately after the call returns,
     # regardless of whether the verdict validates. This ensures the cost is
     # never lost when both attempts fail and we fall through to block_run. On
