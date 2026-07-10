@@ -272,6 +272,7 @@ run_dry_fixtures() {
   fixture_design_extract_figma
   fixture_design_extract_cli
   fixture_manifest_prompt
+  fixture_component_inventory
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -5094,6 +5095,61 @@ fixture_manifest_prompt() {
     printf 'ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows, contains escapes\n'
   else
     printf 'not ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows, contains escapes\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/component-inventory.sh + scripts/lib/component-inventory.js
+# (port-fidelity Task 5): opens Phase C (component-reuse gate). Pure
+# text/regex extraction over a committed neutral fixture tree (no chrome, no
+# network, no tsc/npm), so this runs unconditionally on every machine incl.
+# CI. Exercises the CLI wrapper end-to-end against
+# scripts/test/fixtures/component-tree/ (Badge/Row in src/ui/components,
+# Panel in src/features/sample/components, SampleScreen.tsx importing Badge
+# twice in JSX but from a single import line, and Panel once) and asserts
+# the exact schema/props/usageCount values baked into that fixture tree —
+# usageCount counts importing FILES, not JSX occurrences, which is why
+# Badge.usageCount is 1 (one importing file) despite two <Badge/> uses.
+_fixture_component_inventory_run() {
+  local fixture_dir out
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/component-tree"
+  # DELIBERATELY NOT local, same reasoning as _fixture_design_extract_cli_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  COMPONENT_INVENTORY_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-component-inventory.$$"
+  mkdir -p "$COMPONENT_INVENTORY_OUT_DIR" || return 1
+  trap 'rm -rf "${COMPONENT_INVENTORY_OUT_DIR:-}"' EXIT
+
+  out="$COMPONENT_INVENTORY_OUT_DIR/component-inventory.json"
+  if ! "$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$fixture_dir" --out "$out" >/dev/null; then
+    printf 'component-inventory.sh dispatch failed (exit %s)\n' "$?"
+    return 1
+  fi
+  [ -s "$out" ] || { printf 'inventory missing/empty: %s\n' "$out"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-component-inventory/1\"' '$out' >/dev/null"
+  fx "3 components (Badge, Row, Panel)" bash -c "jq -e '.components | length == 3' '$out' >/dev/null"
+  fx "Badge.props == [label, tone]" bash -c \
+    "jq -e '([.components[] | select(.name == \"Badge\")][0].props) == [\"label\",\"tone\"]' '$out' >/dev/null"
+  fx "Panel.props contains padded" bash -c \
+    "jq -e '([.components[] | select(.name == \"Panel\")][0].props) | index(\"padded\") != null' '$out' >/dev/null"
+  fx "Badge.usageCount == 1 (one importing file, not two JSX uses)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Badge\")][0].usageCount) == 1' '$out' >/dev/null"
+  fx "Row.usageCount == 0 (unused)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Row\")][0].usageCount) == 0' '$out' >/dev/null"
+  return 0
+}
+
+fixture_component_inventory() {
+  local err status
+  err="$(_fixture_component_inventory_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - component-inventory: extracts 3 components w/ props + usageCount (files, not JSX occurrences) from a fixture tree\n'
+  else
+    printf 'not ok - component-inventory: extracts 3 components w/ props + usageCount (files, not JSX occurrences) from a fixture tree\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
