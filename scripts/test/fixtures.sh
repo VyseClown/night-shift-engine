@@ -4846,6 +4846,16 @@ _fixture_design_extract_web_run() {
     "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
   fx "li dedupe keeps exactly 2 rows" bash -c \
     "jq -e '[.elements[] | select(.role==\"text\" and (.text|startswith(\"Row\")))] | length == 2' '$manifest' >/dev/null"
+  # oklch() colors don't match the extractor's rgb()/rgba() fast path — this
+  # exercises the 1x1-canvas fallback (the Tailwind-v4 regression: without it
+  # every modern-color-syntax page comes back all-null). Exact bytes are not
+  # asserted (oklch→sRGB rounding may vary); a lowercase 6-digit hex that is
+  # neither pure black (the fallback's sentinel fill) nor white proves the
+  # conversion really ran.
+  fx "oklch color resolves via the canvas fallback (6-digit hex, not null/black/white)" bash -c \
+    "jq -e '[.elements[] | select(.text==\"Oklch sample\")][0].color | (. != null) and test(\"^#[0-9a-f]{6}\$\") and (. != \"#000000\") and (. != \"#ffffff\")' '$manifest' >/dev/null"
+  fx "rollup.spacingScale has no negative values" bash -c \
+    "jq -e '.rollup.spacingScale | all(. >= 0)' '$manifest' >/dev/null"
   return 0
 }
 

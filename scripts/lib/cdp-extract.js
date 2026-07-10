@@ -32,10 +32,34 @@ const SETTLE_MS = 500;
 // actually a valid IIFE — a bare function declaration followed by `()` is a
 // SyntaxError ("Unexpected token ')'"), confirmed live via Runtime.evaluate.
 // Wrapping the source in parens is the minimal fix to make it callable.
+// NOTE: hex() extends the brief's rgb()/rgba()-only version with a 1x1-canvas
+// fallback. Live verification against a real Tailwind v4 app showed every
+// color/background coming back null: modern pages compute colors to
+// oklch(...) / lab(...) / color(srgb ...), which the regex can't parse. The
+// canvas normalizes ANY css color to sRGB bytes; the fast regex path stays
+// first, and fully transparent values still return null on both paths.
 const EXTRACTOR = '(' + String(function extract() {
-  function hex(c) { const m = c && c.match(/rgba?\((\d+), ?(\d+), ?(\d+)(?:, ?([\d.]+))?\)/);
-    if (!m || (m[4] !== undefined && parseFloat(m[4]) === 0)) return null;
-    return '#' + [m[1], m[2], m[3]].map(n => (+n).toString(16).padStart(2, '0')).join(''); }
+  let cv = null, cx = null;
+  function hex(c) {
+    if (!c) return null;
+    const m = c.match(/rgba?\((\d+), ?(\d+), ?(\d+)(?:, ?([\d.]+))?\)/);
+    if (m) {
+      if (m[4] !== undefined && parseFloat(m[4]) === 0) return null;
+      return '#' + [m[1], m[2], m[3]].map(n => (+n).toString(16).padStart(2, '0')).join('');
+    }
+    if (!cx) {
+      cv = document.createElement('canvas'); cv.width = cv.height = 1;
+      cx = cv.getContext('2d', { willReadFrequently: true });
+      if (!cx) return null;
+    }
+    cx.clearRect(0, 0, 1, 1);
+    cx.fillStyle = '#000';
+    try { cx.fillStyle = c; } catch (_e) { return null; }
+    cx.fillRect(0, 0, 1, 1);
+    const d = cx.getImageData(0, 0, 1, 1).data;
+    if (d[3] === 0) return null;
+    return '#' + [d[0], d[1], d[2]].map(n => n.toString(16).padStart(2, '0')).join('');
+  }
   function role(el, cs) { const t = el.tagName.toLowerCase();
     if (/^h[1-6]$/.test(t)) return 'heading';
     if (t === 'button' || (t === 'a' && cs.display !== 'inline')) return 'button';
@@ -192,8 +216,14 @@ function buildRollup(elements) {
     palette: uniqSorted(elements.flatMap((e) => [e.color, e.background])),
     fontFamilies: uniqSorted(elements.map((e) => e.typography && e.typography.fontFamily)),
     fontSizes: uniqSorted(elements.map((e) => e.typography && e.typography.fontSize), true),
+    // Negative values (e.g. gapToPrev when a container overlaps its children
+    // in the y-sorted gap chain, or negative margins) stay raw on the
+    // elements but are excluded here: a spacing SCALE is the set of design
+    // tokens a port should reuse, and negatives are overlap artifacts.
     spacingScale: uniqSorted(
-      elements.flatMap((e) => [e.spacing.marginTop, e.spacing.paddingH, e.spacing.gapToPrev]),
+      elements
+        .flatMap((e) => [e.spacing.marginTop, e.spacing.paddingH, e.spacing.gapToPrev])
+        .filter((v) => v !== null && v >= 0),
       true
     ),
     radii: uniqSorted(elements.map((e) => e.radius), true),
