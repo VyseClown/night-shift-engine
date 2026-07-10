@@ -944,6 +944,59 @@ spec_has_design_contract() {
   [ -n "${1:-}" ] && grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
 }
 
+# Optional `- Design manifest: <path[,path...]>` spec field (port-fidelity Task 4):
+# comma-separated, project-relative path(s) to night-shift-design-manifest/1 JSON(s)
+# produced by scripts/design-extract.sh. Trailing `<!-- ... -->` annotation (the
+# template's convention for these fields) is stripped. Absent field or `none` ->
+# empty. Same dialect as spec_workdir above, minus the mandatory backticks (this
+# field's value is a plain path list, not a single fenced token).
+spec_design_manifest_field() {
+  sed -nE 's/^- Design manifest:[[:space:]]*//p' "$1" 2>/dev/null | head -n 1 |
+    sed -E 's/[[:space:]]*<!--.*-->[[:space:]]*$//; s/[[:space:]]+$//'
+}
+
+# Builds the "Design ground truth" prompt block for the implement stage of a
+# Design-Contract spec: one section per `- Design manifest:` path that resolves to
+# an existing file under $PROJECT, pulled straight from the manifest's own rollup +
+# elements table rather than a hand-typed token list, so the model has no room to
+# eyeball colors/spacing/fonts off a screenshot — "the manifest wins over prose
+# descriptions" is the explicit tie-breaker. Truncates each element table at 40 rows
+# (MANIFEST_PROMPT_ROW_CAP) so one large screen can't blow out the prompt; a listed
+# path that is missing, unreadable, or not valid JSON is silently skipped (never
+# blocks the prompt — a stale/typo'd Design manifest field degrades to no extra
+# context, not a hard failure). No field, or `none` -> empty string, no jq/cat calls.
+MANIFEST_PROMPT_ROW_CAP=40
+manifest_prompt_block() {
+  local spec="$1" raw path full block out old_ifs
+  raw="$(spec_design_manifest_field "$spec")"
+  case "$raw" in ''|none) return 0 ;; esac
+  out=""
+  old_ifs="$IFS"; IFS=','
+  for path in $raw; do
+    IFS="$old_ifs"
+    path="$(printf '%s' "$path" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    full="$PROJECT/$path"
+    if [ -n "$path" ] && [ -f "$full" ]; then
+      block="$(jq -r --argjson cap "$MANIFEST_PROMPT_ROW_CAP" '
+        def s(x): if x == null then "" else (x|tostring) end;
+        def esc(x): (s(x) | gsub("\\|"; "\\|"));
+        "",
+        "## Design ground truth (extracted manifest — authoritative for tokens)",
+        "Screen: \(.screen) (source: \(.source.kind), unit: \(.source.unit))",
+        "Palette: \(.rollup.palette // [] | join(", ")) | Fonts: \(.rollup.fontFamilies // [] | join(", ")) sizes \(.rollup.fontSizes // [] | map(tostring) | join(", ")) | Spacing: \(.rollup.spacingScale // [] | map(tostring) | join(", ")) | Radii: \(.rollup.radii // [] | map(tostring) | join(", ")) | Icons: \(.rollup.iconSizes // [] | map(tostring) | join(", "))",
+        "| element | role | text | font | size/weight | color | bg | bounds | gapToPrev | radius |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+        (.elements[:$cap][]? | "| " + s(.id) + " | " + s(.role) + " | " + esc(.text) + " | " + s(.typography.fontFamily) + " | " + (if .typography == null then "" else s(.typography.fontSize) + "/" + s(.typography.fontWeight) end) + " | " + esc(.color) + " | " + esc(.background) + " | " + "\(s(.bounds.x)),\(s(.bounds.y)) \(s(.bounds.w))x\(s(.bounds.h))" + " | " + s(.spacing.gapToPrev) + " | " + s(.radius) + " |"),
+        "Match these values exactly; the manifest wins over prose descriptions."
+      ' "$full" 2>/dev/null)" && out="$out
+$block"
+    fi
+    IFS=','
+  done
+  IFS="$old_ifs"
+  printf '%s' "$out"
+}
+
 # A long grind inside ONE stage replays ever-growing session history every
 # turn (the cost/rot problem stage-scoped sessions solve at stage boundaries,
 # recurring within a stage). Clears the pinned session every
@@ -1074,6 +1127,7 @@ screen to match its Figma design. Before/while implementing:
    against the Figma image and auto-repairs the residual — get the structure + tokens
    right here; it tightens the pixels.
 "
+        design_build_note="$design_build_note$(manifest_prompt_block "$SPEC")"
       fi ;;
   esac
   # The wrapper runs every validation phase inside the spec's Workdir; the

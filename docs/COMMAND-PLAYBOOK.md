@@ -21,6 +21,7 @@ workspace container (`<workspace>/<app>`).
 | Capture by driving the **real** app (no preview harness) | `--drive maestro` (+ a per-screen flow) | §5 |
 | Build a feature end-to-end (rn / web / node / fullstack) | `scripts/night-shift.sh --project <app> --spec <spec>` | §6 |
 | Convert a Figma design into a web component | Figma MCP → web-track generate → visual review | §7 |
+| Extract a design manifest (web or Figma) | `scripts/design-extract.sh …` | §8 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -146,6 +147,32 @@ No single script; it's an MCP-fed, agent-driven flow:
    downloaded frame image with `odiff` (the same diff the rn path uses), iterating
    until close. (A web capture harness is not yet a single command — render + screenshot
    the route, then `odiff <figma-frame.png> <screenshot.png> <diff.png> --parsable-stdout`.)
+
+## §8 — Extract a design manifest (web or Figma) → `scripts/design-extract.sh …`
+
+A zero-dep CLI that pulls a `night-shift-design-manifest/1` JSON (per-element role,
+text, typography, color, bounds, spacing, radius, plus a rollup palette/fonts/spacing/
+radii/icons) out of either a live web page (real Chrome over CDP) or a committed Figma
+node-dump — the SAME schema either way, so the two are directly diffable. Point a
+spec's `- Design manifest:` field at the written JSON and the implement stage's prompt
+gets an authoritative "Design ground truth" table built straight from it (see
+`manifest_prompt_block` in `scripts/night-shift.sh`) instead of hand-typed tokens.
+
+```bash
+# web mode — drives a live page over CDP (needs a local Chrome):
+scripts/design-extract.sh --mode web --screen dashboard --project <workspace>/<app> \
+  --url http://localhost:3000/dashboard --cookie session=abc123
+
+# figma mode — parses a committed node-dump + globals file (no chrome, no network):
+scripts/design-extract.sh --mode figma --screen dashboard --project <workspace>/<app> \
+  --nodes design/figma/dashboard.txt
+```
+
+Default `--out` is `<project>/design/manifest/`, writing `<screen>.json` (web mode
+also `<screen>-<W>x<H>.png`). `--mode figma` defaults `--globals` to
+`<dirname of --nodes>/_global-vars.txt` when not passed explicitly. Exit 0 on success,
+2 on a usage error (e.g. `--mode web` without `--url`), or whatever the dispatched
+extractor exits with on an extraction failure (1, one-line stderr).
 
 ## Prerequisites & environment
 

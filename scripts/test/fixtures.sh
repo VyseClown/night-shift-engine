@@ -270,6 +270,8 @@ run_dry_fixtures() {
   fixture_cdp_ws
   fixture_design_extract_web
   fixture_design_extract_figma
+  fixture_design_extract_cli
+  fixture_manifest_prompt
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -4919,6 +4921,137 @@ fixture_design_extract_figma() {
     printf 'ok - design-extract-figma: extracts manifest (typography/color/radius/icon/rollup) from a node-dump\n'
   else
     printf 'not ok - design-extract-figma: extracts manifest (typography/color/radius/icon/rollup) from a node-dump\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/design-extract.sh (port-fidelity Task 4): the thin CLI wrapper that
+# validates args and dispatches to the Task 2/3 extractors. Exercises figma mode
+# end-to-end against the committed Task 3 fixtures (pure text parsing — no chrome,
+# no network, so this runs unconditionally on every machine incl. CI), and asserts
+# the usage-error exit code (2) for a bad mode/flag combo (--mode web with no --url).
+_fixture_design_extract_cli_run() {
+  local fixture_dir out web_err web_status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes"
+  # DELIBERATELY NOT local, same reasoning as _fixture_design_extract_figma_run
+  # above: the EXIT trap fires in the surrounding command-substitution subshell
+  # after this function has returned, when a `local` would already be out of scope.
+  DESIGN_EXTRACT_CLI_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-design-extract-cli.$$"
+  mkdir -p "$DESIGN_EXTRACT_CLI_OUT_DIR/proj" || return 1
+  trap 'rm -rf "${DESIGN_EXTRACT_CLI_OUT_DIR:-}"' EXIT
+
+  if ! "$WORKSPACE_ROOT/scripts/design-extract.sh" --mode figma --screen sample-screen \
+    --project "$DESIGN_EXTRACT_CLI_OUT_DIR/proj" --nodes "$fixture_dir/sample-screen.txt" >/dev/null; then
+    printf 'figma-mode dispatch failed (exit %s)\n' "$?"
+    return 1
+  fi
+
+  out="$DESIGN_EXTRACT_CLI_OUT_DIR/proj/design/manifest/sample-screen.json"
+  [ -s "$out" ] || { printf 'manifest missing/empty: %s\n' "$out"; return 1; }
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-design-manifest/1\"' '$out' >/dev/null"
+
+  web_err="$("$WORKSPACE_ROOT/scripts/design-extract.sh" --mode web --screen home \
+    --project "$DESIGN_EXTRACT_CLI_OUT_DIR/proj" 2>&1)"
+  web_status=$?
+  if [ "$web_status" -ne 2 ]; then
+    printf 'expected exit 2 for --mode web without --url, got %s: %s\n' "$web_status" "$web_err"
+    return 1
+  fi
+  return 0
+}
+
+fixture_design_extract_cli() {
+  local err status
+  err="$(_fixture_design_extract_cli_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - design-extract-cli: dispatches figma mode end-to-end, exit 2 on --mode web without --url\n'
+  else
+    printf 'not ok - design-extract-cli: dispatches figma mode end-to-end, exit 2 on --mode web without --url\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# manifest_prompt_block / spec_design_manifest_field (port-fidelity Task 4): the
+# implement-prompt "Design ground truth" table built from an already-extracted
+# night-shift-design-manifest/1 JSON. Pure jq/bash (no chrome, no network), and both
+# functions are defined earlier in night-shift.sh — already in scope here the same
+# way spec_has_design_contract/spec_workdir etc. are, since this file is sourced by
+# the orchestrator AFTER those definitions. Reuses the Task 3 figma fixture
+# (sample-screen.txt + _global-vars.txt) as the manifest source via the checked-in
+# extractor rather than hand-writing a manifest JSON, so drift in the manifest
+# schema breaks this fixture too. Runs unconditionally on every machine (CI incl.).
+_fixture_manifest_prompt_run() {
+  local spec_file spec_nofield_file spec_big_file block empty_block rows
+  local PROJECT
+  # DELIBERATELY NOT local for the dir itself, same reasoning as the other
+  # command-substitution-subshell fixtures above: the EXIT trap fires after this
+  # function returns, when a `local` dir would already be out of scope.
+  MANIFEST_PROMPT_FIXTURE_DIR="$WORKSPACE_ROOT/.night-shift-fixture-manifest-prompt.$$"
+  mkdir -p "$MANIFEST_PROMPT_FIXTURE_DIR/proj/design/manifest" || return 1
+  trap 'rm -rf "${MANIFEST_PROMPT_FIXTURE_DIR:-}"' EXIT
+
+  PROJECT="$MANIFEST_PROMPT_FIXTURE_DIR/proj"
+  node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+    --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+    --screen sample-screen --out "$PROJECT/design/manifest" >/dev/null || return 1
+
+  spec_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec.md"
+  cat >"$spec_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: design/manifest/sample-screen.json            <!-- optional; comma-separated -->
+- Manifest source: figma
+SPECEOF
+
+  spec_nofield_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-nofield.md"
+  cat >"$spec_nofield_file" <<'SPECEOF'
+## Design Contract
+
+- Figma file: whatever
+SPECEOF
+
+  block="$(manifest_prompt_block "$spec_file")"
+  fx "table header present" bash -c \
+    'printf "%s" "$1" | grep -qF "| element | role | text | font | size/weight | color | bg | bounds | gapToPrev | radius |"' _ "$block"
+  fx "Sample Title row present" bash -c 'printf "%s" "$1" | grep -q "Sample Title"' _ "$block"
+
+  empty_block="$(manifest_prompt_block "$spec_nofield_file")"
+  [ -z "$empty_block" ] || { printf 'expected empty block for a spec without a Design manifest field, got: %s\n' "$empty_block"; return 1; }
+
+  # Truncation: synthesize a 45-element manifest (jq, from the same base) and assert
+  # the table caps at MANIFEST_PROMPT_ROW_CAP (40) rows, not 45.
+  jq '.elements = ([range(0;45)] | map({
+        id: "el-\(.)", role: "text", match: {web: null, figma: null}, text: "Row \(.)",
+        typography: {fontFamily: "Poppins", fontSize: 14, fontWeight: 400, lineHeight: 18},
+        color: "#000000", background: null,
+        bounds: {x: 0, y: (. * 10), w: 100, h: 10},
+        spacing: {marginTop: 0, paddingH: 0, gapToPrev: 0}, radius: 0, iconSize: null }))' \
+    "$PROJECT/design/manifest/sample-screen.json" >"$PROJECT/design/manifest/big.json" || return 1
+
+  spec_big_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-big.md"
+  cat >"$spec_big_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: design/manifest/big.json
+SPECEOF
+
+  rows="$(manifest_prompt_block "$spec_big_file" | grep -c '^| el-')"
+  [ "$rows" -eq 40 ] || { printf 'expected the element table capped at 40 rows, got %s\n' "$rows"; return 1; }
+  return 0
+}
+
+fixture_manifest_prompt() {
+  local err status
+  err="$(_fixture_manifest_prompt_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows\n'
+  else
+    printf 'not ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
