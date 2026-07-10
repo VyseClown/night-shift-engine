@@ -53,6 +53,15 @@
 //                                                   declaration if one exists,
 //                                                   else empty.
 //
+// ... and HOC-wrapped const exports (a live run against a real RN app found
+// these hid its most-reused components from the inventory):
+//   export const Name = memo(function Name({...}: Props) { ... })
+//   export const Name = forwardRef((props, ref) => ...)
+//   export const Name = memo(forwardRef(...)), React.memo(...) variants
+// The wrapped inner function's own parameter list is the props source (same
+// Props-type-first, destructured-params-fallback extraction as everywhere
+// else). A bare identifier wrap (`memo(Name)`) stays undetected.
+//
 // Two flags used by Task 6's reuse gate (scripts/night-shift.sh's
 // check_component_reuse), CALLED DIRECTLY on this js — the CLI wrapper
 // (component-inventory.sh) does not forward them, it only builds the full
@@ -215,13 +224,18 @@ function extractBalanced(str, openIndex, open, close) {
 
 // Splits `str` on `delimiters` (a string of single chars) at depth 0 only —
 // commas/semicolons inside nested {}/()/[] don't split. Used for both
-// interface/type member lists and destructured-parameter lists.
+// interface/type member lists and destructured-parameter lists. An `=>`
+// arrow's '>' is NOT a closing angle bracket (a function-typed member like
+// `onChange: (p: P) => void` would otherwise drive the depth negative and
+// stop every later member from splitting — found live on a real app's
+// Props interfaces).
 function splitTopLevel(str, delimiters) {
   const parts = [];
   let depth = 0;
   let start = 0;
   for (let i = 0; i < str.length; i++) {
     const c = str[i];
+    if (c === '>' && str[i - 1] === '=') continue; // `=>` arrow, not a bracket
     if (c === '{' || c === '(' || c === '[' || c === '<') depth++;
     else if (c === '}' || c === ')' || c === ']' || c === '>') depth--;
     else if (depth === 0 && delimiters.includes(c)) {
@@ -233,12 +247,22 @@ function splitTopLevel(str, delimiters) {
   return parts.map((p) => p.trim()).filter(Boolean);
 }
 
+// Removes /* block */ and // line comments. Applied to a Props type body
+// before member splitting: a doc comment between members otherwise glues
+// itself onto the FOLLOWING member ("/** why */\n  hasData: boolean" fails
+// memberKey and the real member silently vanishes — found live on a real
+// app whose Props interfaces are doc-commented per field).
+function stripComments(str) {
+  return str.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+}
+
 // One member of a `type X = { ... }` / `interface X { ... }` body, e.g.
 // `tone?: 'info' | 'warn'` or `padded: boolean` -> the key name before the
-// (optional-marker +) colon. Members with no colon (rare in practice; e.g. a
-// bare `extends` clause fragment) are skipped rather than guessed at.
+// (optional-marker +) colon; also TS method shorthand (`onChange(p): void`),
+// whose key ends at '(' instead. Members with neither (rare in practice;
+// e.g. a bare `extends` clause fragment) are skipped rather than guessed at.
 function memberKey(member) {
-  const m = member.match(/^['"]?([A-Za-z_$][\w$]*)['"]?\s*\??\s*:/);
+  const m = member.match(/^['"]?([A-Za-z_$][\w$]*)['"]?\s*\??\s*[(:]/);
   return m ? m[1] : null;
 }
 
@@ -248,7 +272,7 @@ function propsFromTypeBody(content, name) {
   if (!m) return null;
   const openIndex = m.index + m[0].length - 1;
   const body = extractBalanced(content, openIndex, '{', '}');
-  return splitTopLevel(body, ';,')
+  return splitTopLevel(stripComments(body), ';,')
     .map(memberKey)
     .filter((k) => k !== null);
 }
@@ -276,6 +300,21 @@ function extractProps(content, name, paramsStr) {
 
 const EXPORT_FUNCTION_RE = /export\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(/g;
 const EXPORT_CONST_RE = /export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:function\s*[A-Za-z0-9_]*\s*)?\(/g;
+// `export const <Name> = memo(function <anything>(` and friends — a live
+// verification against a real RN app found its MOST-reused components (all
+// `export const X = memo(function X({...}: XProps) {...})`) were invisible to
+// EXPORT_CONST_RE, whose `=\s*(?:function ...)?\(` requires the paren right
+// after the `=`. This pattern additionally skips one or more HOC wrapper
+// calls — `memo(`, `forwardRef(`, `React.memo(`, and the nested
+// `memo(forwardRef(` — before the same inner shape (optional named/anonymous
+// `function`, then the opening paren of the real parameter list). The match
+// still ends in that inner '(' so the shared parenTerminated extraction reads
+// the wrapped component's own params (`({ label, active }: Props)` or
+// forwardRef's `(props, ref)`), to which the usual XProps-type-first,
+// destructured-params-fallback prop extraction applies unchanged. A bare
+// identifier wrap (`export const X = memo(Y)`) has no parameter list here
+// and stays undetected — best effort, like the rest of this file.
+const EXPORT_CONST_WRAPPED_RE = /export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:(?:React\s*\.\s*)?(?:memo|forwardRef)\s*\(\s*)+(?:function\s*[A-Za-z0-9_]*\s*)?\(/g;
 // `export default function Name(` — same paren-terminated shape as
 // EXPORT_FUNCTION_RE, just with the `default` keyword in between.
 const EXPORT_DEFAULT_FUNCTION_RE = /export\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(/g;
@@ -293,6 +332,7 @@ const EXPORT_DEFAULT_NAME_RE = /export\s+default\s+([A-Z][A-Za-z0-9_]*)\s*;?/g;
 const COMPONENT_PATTERNS = [
   { re: EXPORT_FUNCTION_RE, parenTerminated: true },
   { re: EXPORT_CONST_RE, parenTerminated: true },
+  { re: EXPORT_CONST_WRAPPED_RE, parenTerminated: true },
   { re: EXPORT_DEFAULT_FUNCTION_RE, parenTerminated: true },
   { re: EXPORT_DEFAULT_NAME_RE, parenTerminated: false },
 ];
@@ -308,7 +348,10 @@ function findLooseDeclarationParams(content, name) {
   const funcRe = new RegExp(`\\bfunction\\s+${escaped}\\s*\\(`);
   let m = funcRe.exec(content);
   if (!m) {
-    const constRe = new RegExp(`\\bconst\\s+${escaped}\\s*(?::[^=]+)?=\\s*(?:function\\s*[A-Za-z0-9_]*\\s*)?\\(`);
+    // Same optional HOC-wrapper skip as EXPORT_CONST_WRAPPED_RE, so a bare
+    // `export default Name;` referencing `const Name = memo(function ...)`
+    // still recovers the wrapped component's own parameter list.
+    const constRe = new RegExp(`\\bconst\\s+${escaped}\\s*(?::[^=]+)?=\\s*(?:(?:React\\s*\\.\\s*)?(?:memo|forwardRef)\\s*\\(\\s*)*(?:function\\s*[A-Za-z0-9_]*\\s*)?\\(`);
     m = constRe.exec(content);
   }
   if (!m) return '';

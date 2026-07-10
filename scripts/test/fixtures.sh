@@ -5106,12 +5106,15 @@ fixture_manifest_prompt() {
 # text/regex extraction over a committed neutral fixture tree (no chrome, no
 # network, no tsc/npm), so this runs unconditionally on every machine incl.
 # CI. Exercises the CLI wrapper end-to-end against
-# scripts/test/fixtures/component-tree/ (Badge/Row in src/ui/components,
+# scripts/test/fixtures/component-tree/ (Badge/Row/Chip in src/ui/components,
 # Panel in src/features/sample/components, SampleScreen.tsx importing Badge
 # twice in JSX but from a single import line, and Panel once) and asserts
 # the exact schema/props/usageCount values baked into that fixture tree —
 # usageCount counts importing FILES, not JSX occurrences, which is why
 # Badge.usageCount is 1 (one importing file) despite two <Badge/> uses.
+# Chip is `export const Chip = memo(function Chip(...))` — regression cover
+# for the HOC-wrapped export shape a live run found invisible to the plain
+# export regexes (which hid a real app's most-reused memo() components).
 _fixture_component_inventory_run() {
   local fixture_dir out
   fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/component-tree"
@@ -5131,15 +5134,19 @@ _fixture_component_inventory_run() {
   [ -s "$out" ] || { printf 'inventory missing/empty: %s\n' "$out"; return 1; }
 
   fx "schema id" bash -c "jq -e '.schema == \"night-shift-component-inventory/1\"' '$out' >/dev/null"
-  fx "3 components (Badge, Row, Panel)" bash -c "jq -e '.components | length == 3' '$out' >/dev/null"
+  fx "4 components (Badge, Chip, Panel, Row)" bash -c "jq -e '.components | length == 4' '$out' >/dev/null"
   fx "Badge.props == [label, tone]" bash -c \
     "jq -e '([.components[] | select(.name == \"Badge\")][0].props) == [\"label\",\"tone\"]' '$out' >/dev/null"
   fx "Panel.props contains padded" bash -c \
     "jq -e '([.components[] | select(.name == \"Panel\")][0].props) | index(\"padded\") != null' '$out' >/dev/null"
+  fx "Chip (memo-wrapped export) detected with props == [label, active]" bash -c \
+    "jq -e '([.components[] | select(.name == \"Chip\")][0].props) == [\"label\",\"active\"]' '$out' >/dev/null"
   fx "Badge.usageCount == 1 (one importing file, not two JSX uses)" bash -c \
     "jq -e '([.components[] | select(.name == \"Badge\")][0].usageCount) == 1' '$out' >/dev/null"
   fx "Row.usageCount == 0 (unused)" bash -c \
     "jq -e '([.components[] | select(.name == \"Row\")][0].usageCount) == 0' '$out' >/dev/null"
+  fx "Chip.usageCount == 0 (unused)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Chip\")][0].usageCount) == 0' '$out' >/dev/null"
   return 0
 }
 
@@ -5148,9 +5155,9 @@ fixture_component_inventory() {
   err="$(_fixture_component_inventory_run 2>&1)"
   status=$?
   if [ "$status" -eq 0 ]; then
-    printf 'ok - component-inventory: extracts 3 components w/ props + usageCount (files, not JSX occurrences) from a fixture tree\n'
+    printf 'ok - component-inventory: extracts 4 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n'
   else
-    printf 'not ok - component-inventory: extracts 3 components w/ props + usageCount (files, not JSX occurrences) from a fixture tree\n' >&2
+    printf 'not ok - component-inventory: extracts 4 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
