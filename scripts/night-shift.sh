@@ -86,6 +86,15 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # pipeline and wire contracts are untouched either way.
 CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
 CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
+# Optional post-candidate design-fidelity audit (port-fidelity Task 9, closing
+# Phase B; scripts/port-audit.sh). OFF by default and strictly ADVISORY when
+# on: gated additionally on the spec's Design Contract listing at least one
+# `- Design manifest:` path (no manifest -> nothing to audit, regardless of
+# this knob). NIGHT_SHIFT_PORT_AUDIT_OFFLINE routes the engine-invoked call
+# through port-audit.sh's own `--offline <canned-reply>` — the fixture path,
+# and a human dry-wire knob.
+PORT_AUDIT="${NIGHT_SHIFT_PORT_AUDIT:-0}"
+PORT_AUDIT_OFFLINE="${NIGHT_SHIFT_PORT_AUDIT_OFFLINE:-}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
@@ -1703,6 +1712,9 @@ assemble_review_bundle() {
       # this only surfaces on a re-review round following an observer BLOCK
       # that sent the run back to implementation. Empty on a first pass.
       reuse_violations_section
+      # Same timing note applies: port_audit_candidate runs post-candidate, so
+      # a report only exists here on a re-review round. Empty on a first pass.
+      port_audit_section
     fi
   } >"$out"
 }
@@ -2213,6 +2225,9 @@ EOF
   # above has passed, on the now-validated candidate; see check_component_reuse
   # for why this never blocks.
   check_component_reuse "$candidate"
+  # Soft port-fidelity audit (Task 9): same post-candidate slot, same
+  # never-blocks posture; see port_audit_candidate.
+  port_audit_candidate
   emit_event candidate_validated "$(jq -cn --arg c "$candidate" '{commit:$c}')"
   log "candidate $candidate validated; handing to observer"
   if visual_stage_enabled "$SPEC"; then
@@ -2343,6 +2358,124 @@ reuse_violations_section() {
   printf '%s\n' '--- COMPONENT-REUSE GATE (advisory; engine-computed, NOT authoritative) ---'
   printf 'Added files whose component the plan'"'"'s Component Map did not declare `NEW`.\nWeigh as one more input — a false positive should not block an otherwise-sound\ncandidate, but an unresolved entry across review rounds is a real smell.\n\n'
   jq -c '.violations[]' "$f" 2>/dev/null | sed 's/^/    /'
+}
+
+# Screen list for the spec's `- Design manifest:` field (port-fidelity Task 9):
+# one `<screen>\t<resolved-manifest-path>` line per comma-separated path that
+# resolves inside the project via manifest_path_resolve — the SAME containment
+# gate manifest_prompt_block uses, so a port-audit call never gets fed a path
+# that gate would have rejected. Screen name = the manifest file's basename
+# minus .json (a manifest path cannot contain a tab or newline: it is one
+# comma-separated segment of a single spec line, so the TSV framing is safe).
+# An escaping/unresolvable path is skipped with a LOUD warning (same treatment
+# as manifest_prompt_block); a plain not-found path is skipped silently (a
+# stale field degrades to "this screen is not audited", not a hard failure).
+# No field, `none`, or no valid path -> empty output.
+port_audit_screens_for_spec() {
+  local spec="$1" raw path full old_ifs rc
+  raw="$(spec_design_manifest_field "$spec")"
+  case "$raw" in ''|none) return 0 ;; esac
+  old_ifs="$IFS"; IFS=','
+  for path in $raw; do
+    IFS="$old_ifs"
+    path="$(printf '%s' "$path" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    if [ -n "$path" ]; then
+      full="$(manifest_path_resolve "$path")"; rc=$?
+      if [ "$rc" -eq 0 ]; then
+        printf '%s\t%s\n' "$(basename "$path" .json)" "$full"
+      elif [ "$rc" -eq 1 ]; then
+        log "WARN: port-audit skipped — Design manifest path escapes or does not resolve inside the project: $path"
+      fi
+    fi
+    IFS=','
+  done
+  IFS="$old_ifs"
+}
+
+# Post-candidate, non-gating design-fidelity audit (port-fidelity Task 9,
+# closing Phase B). Gate: NIGHT_SHIFT_PORT_AUDIT=1 AND the spec's Design
+# Contract lists at least one `- Design manifest:` path that resolves inside
+# the project (port_audit_screens_for_spec above) — absent either, this is a
+# silent no-op. Runs scripts/port-audit.sh once per screen (screen = manifest
+# basename), on the PERSONA_MODEL knob (breadth-tier judgment, same as the
+# persona bench; port-audit.sh treats "inherit" as no --model flag), scoped to
+# the spec's resolved Workdir when one is set (--scope is project-relative on
+# both sides). NIGHT_SHIFT_PORT_AUDIT_OFFLINE routes the call through the
+# CLI's own --offline canned-reply path (zero cost — the fixture suite and a
+# human dry-wire both use it). Same soft posture as check_component_reuse/
+# codex_review_candidate: every failure mode is a WARN + skip, NEVER
+# block_run, NEVER fails the candidate — but a report on disk is attached and
+# journaled regardless of the CLI's exit status (exit 3 still writes a report
+# with summary.error; that IS the evidence that auditing did not happen).
+# Journal: one `port_audit` event per report, {screen, pct} with pct null on
+# an error report. The report (attached via port_audit_section below) is
+# supplementary evidence for the review personas/observer to weigh, not a gate.
+port_audit_candidate() {
+  local screen full report payload scope_args=() offline_args=()
+  [ "$PORT_AUDIT" = "1" ] || return 0
+  [ -n "$(spec_design_manifest_field "$SPEC")" ] || return 0
+  [ -z "$WORKDIR" ] || scope_args=(--scope "$WORKDIR")
+  [ -z "$PORT_AUDIT_OFFLINE" ] || offline_args=(--offline "$PORT_AUDIT_OFFLINE")
+  mkdir -p "$RUN_ROOT/raw" 2>/dev/null || true
+  while IFS="$(printf '\t')" read -r screen full; do
+    [ -n "$screen" ] && [ -n "$full" ] || continue
+    report="$PROJECT/.night-shift/port-audit/$screen.json"
+    if ! "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$PROJECT" --screen "$screen" \
+        --manifest "$full" --model "$PERSONA_MODEL" "${scope_args[@]}" "${offline_args[@]}" \
+        >"$RUN_ROOT/raw/port-audit-$screen.log" 2>&1; then
+      log "WARN: port-audit for screen '$screen' failed (advisory only; see raw/port-audit-$screen.log)"
+    fi
+    if [ -s "$report" ]; then
+      integrity_put "$report"
+      payload="$(jq -c --arg screen "$screen" '
+          {screen: $screen,
+           pct: (if (.summary.error? // null) != null then null else (.summary.pct // null) end)}
+        ' "$report" 2>/dev/null)"
+      [ -n "$payload" ] || payload="$(jq -cn --arg screen "$screen" '{screen:$screen, pct:null}')"
+      emit_event port_audit "$payload"
+    else
+      log "WARN: port-audit for screen '$screen' produced no report (advisory only, skipped)"
+    fi
+  done <<SCREENS
+$(port_audit_screens_for_spec "$SPEC")
+SCREENS
+  return 0
+}
+
+# Supplementary reviewer surface for the port-fidelity audit above — same
+# non-authoritative framing and dual attachment (implementation-review persona
+# bundle via assemble_review_bundle, observer context via run_observer) as
+# reuse_violations_section, per docs/review-personas.md's Design Fidelity
+# Reviewer implementation checklist ("port-audit report's off/missing entries
+# are addressed or explicitly waived"). Restricted to the CURRENT spec's own
+# screens (port_audit_screens_for_spec), not a blanket glob of
+# .night-shift/port-audit/ — that directory is $PROJECT-scoped and persists
+# across every night-shift run on the project, so an unscoped glob would leak
+# a stale report from an unrelated earlier task/spec into this run's review.
+# Deliberately NOT gated on $PORT_AUDIT: an existing report for this spec's
+# own screens is evidence worth surfacing even if the knob was flipped off
+# between rounds (mirrors reuse_violations_section keying on the file, not the
+# knob). Empty when the spec has no `- Design manifest:` field or no report
+# has been written yet (the common first-round case: port_audit_candidate runs
+# post-candidate, after implementation-review has already judged the working
+# tree once — so this surfaces on re-review rounds and to the observer).
+port_audit_section() {
+  local screen full f printed=0
+  while IFS="$(printf '\t')" read -r screen full; do
+    [ -n "$screen" ] || continue
+    f="$PROJECT/.night-shift/port-audit/$screen.json"
+    [ -s "$f" ] || continue
+    integrity_guard "$f" "port-audit-$screen" "the port-audit report for screen '$screen'"
+    if [ "$printed" -eq 0 ]; then
+      printf '%s\n' '--- PORT-FIDELITY AUDIT (advisory; engine-computed, NOT authoritative) ---'
+      printf 'Per-screen manifest-vs-implementation conformance (scripts/port-audit.sh).\nWeigh as one more input — never gating. Any `off`/`missing` entries should be\naddressed or explicitly waived in the Design Contract'"'"'s Approved deviations.\n\n'
+      printed=1
+    fi
+    jq -c '.' "$f" 2>/dev/null | sed 's/^/    /'
+  done <<SCREENS
+$(port_audit_screens_for_spec "$SPEC")
+SCREENS
+  return 0
 }
 
 # Seam for fixtures: is the Codex CLI available? (command -v inline would make
@@ -2632,6 +2765,7 @@ run_observer() {
     observer_wrapper_evidence "$candidate"
     codex_review_section "$candidate"
     reuse_violations_section
+    port_audit_section
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30

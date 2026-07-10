@@ -231,6 +231,8 @@ contract. Keep the two distinct.
   touch-targets / states match, and are approved deviations honored?
 - **If no screenshots exist** (no simulator): perform static checks only and
   state that pixel validation is deferred — do not block on missing pixels.
+- When a port-audit report exists, its `off`/`missing` entries are addressed or
+  explicitly waived in Approved deviations.
 
 ### Security Reviewer
 

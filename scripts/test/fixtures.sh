@@ -277,6 +277,7 @@ run_dry_fixtures() {
   fixture_port_audit_static
   fixture_port_audit_normalize
   fixture_port_audit_offline
+  fixture_port_audit_wiring
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -5576,6 +5577,159 @@ fixture_port_audit_offline() {
     printf 'ok - port-audit-offline: full offline run (Task 3 manifest + Task 7 material) -- report exists, match >= 1, evidence names a real file\n'
   else
     printf 'not ok - port-audit-offline: full offline run (Task 3 manifest + Task 7 material) -- report exists, match >= 1, evidence names a real file\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# Seeds one self-contained port-audit-wiring case dir under $1: the Task 7
+# rn-screen fixture tree as a git repo, a Task 3 figma-mode manifest INSIDE
+# the project (manifest_path_resolve demands project containment), run-state
+# dirs, and a Design-Contract spec whose `- Design manifest:` names it.
+_port_audit_wiring_seed() {
+  local dir="$1"
+  mkdir -p "$dir/repo/design/manifest" || return 1
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen/." "$dir/repo/" || return 1
+  node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+    --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+    --screen sample --out "$dir/repo/design/manifest" >/dev/null || return 1
+  git -C "$dir/repo" init -q || return 1
+  git -C "$dir/repo" config user.email t@t && git -C "$dir/repo" config user.name t || return 1
+  git -C "$dir/repo" add -A && git -C "$dir/repo" commit -qm base >/dev/null || return 1
+  mkdir -p "$dir/rs/control" "$dir/rs/validated" "$dir/rs/raw" || return 1
+  cat >"$dir/spec.md" <<'SPEC'
+# Sample port
+
+## Design Contract
+
+- Design manifest: design/manifest/sample.json
+- Manifest source: figma
+SPEC
+}
+
+_fixture_port_audit_wiring_run() {
+  local root="$FIXTURE_ROOT/port-audit-wiring" reply
+  mkdir -p "$root"
+  reply="$root/reply.json"
+  printf '{"entries":[{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"}]}\n' >"$reply"
+
+  # Structural wiring: the audit runs in verify_candidate's post-candidate
+  # soft slot (right after check_component_reuse), and the report section is
+  # attached to BOTH reviewer surfaces (implementation persona bundle +
+  # observer context) — the codex_review/reuse_violations attachment pattern.
+  ( body="$(awk '/^verify_candidate\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "verify_candidate calls port_audit_candidate" \
+      bash -c 'printf "%s" "$1" | grep -q port_audit_candidate' _ "$body"
+    reuse_line="$(printf '%s' "$body" | grep -n 'check_component_reuse' | head -1 | cut -d: -f1)"
+    audit_line="$(printf '%s' "$body" | grep -n 'port_audit_candidate' | head -1 | cut -d: -f1)"
+    fx "port audit runs AFTER the reuse gate (same soft slot)" \
+      test -n "$reuse_line" -a -n "$audit_line" -a "$audit_line" -gt "$reuse_line"
+    obs="$(awk '/^run_observer\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "run_observer context includes port_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q port_audit_section' _ "$obs"
+    bun="$(awk '/^assemble_review_bundle\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "implementation review bundle includes port_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q port_audit_section' _ "$bun"
+    exit 0
+  ) || return 1
+
+  # Gate case: NIGHT_SHIFT_PORT_AUDIT unset/0 -> nothing runs, nothing is
+  # journaled, even with a manifest-bearing spec and the offline reply staged.
+  # Ditto knob ON but a spec with no `- Design manifest:` field.
+  ( dir="$root/off"; _port_audit_wiring_seed "$dir" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="pawire-off"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+    WORKDIR=""
+    PORT_AUDIT=0 PORT_AUDIT_OFFLINE="$reply"
+    port_audit_candidate || exit 1
+    fx_not "knob OFF: no report written" [ -e "$PROJECT/.night-shift/port-audit/sample.json" ] || exit 1
+    fx_not "knob OFF: no port_audit event journaled" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q port_audit '$RUN_ROOT/events.jsonl'" || exit 1
+    fx "knob OFF: port_audit_section is empty (no report)" \
+      test -z "$(port_audit_section)" || exit 1
+    PORT_AUDIT=1
+    printf '# plain spec, no manifest field\n## Design Contract\n' >"$dir/spec-nofield.md"
+    SPEC="$dir/spec-nofield.md"
+    port_audit_candidate || exit 1
+    fx_not "no manifest field: no report even with the knob ON" \
+      [ -e "$PROJECT/.night-shift/port-audit/sample.json" ] || exit 1
+    fx_not "no manifest field: nothing journaled" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q port_audit '$RUN_ROOT/events.jsonl'" || exit 1
+    exit 0
+  ) || return 1
+
+  # Happy path: knob ON + NIGHT_SHIFT_PORT_AUDIT_OFFLINE -> the engine runs
+  # port-audit.sh over the spec's manifest screens through the CLI's own
+  # --offline path (zero cost), the report lands in the run dir, a port_audit
+  # event carries {screen, pct}, and the section/persona bundle surface it
+  # indented and labeled non-authoritative.
+  ( dir="$root/on"; _port_audit_wiring_seed "$dir" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="pawire-on"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+    WORKDIR=""
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    screens="$(port_audit_screens_for_spec "$SPEC")"
+    fx "screen list: one TSV line, screen = manifest basename, path resolved in-project" \
+      bash -c 'printf "%s\n" "$1" | grep -q "^sample	.*/design/manifest/sample\.json$"' _ "$screens"
+    PORT_AUDIT=1 PORT_AUDIT_OFFLINE="$reply"
+    port_audit_candidate || exit 1
+    report="$PROJECT/.night-shift/port-audit/sample.json"
+    fx "report generated in the project run dir" [ -s "$report" ] || exit 1
+    fx "report carries the port-audit schema id" \
+      bash -c "jq -e '.schema == \"night-shift-port-audit/1\"' '$report' >/dev/null" || exit 1
+    fx "port_audit event journaled with screen + numeric pct" \
+      bash -c "jq -e 'select(.type==\"port_audit\") | .payload.screen==\"sample\" and (.payload.pct|type)==\"number\"' '$RUN_ROOT/events.jsonl' >/dev/null" || exit 1
+    sec="$(port_audit_section)"
+    fx "section prints the advisory marker" \
+      bash -c 'printf "%s" "$1" | grep -q "PORT-FIDELITY AUDIT"' _ "$sec"
+    fx "section labeled non-authoritative" \
+      bash -c 'printf "%s" "$1" | grep -q "NOT authoritative"' _ "$sec"
+    fx "section indents the report (no section forgery)" \
+      bash -c 'printf "%s" "$1" | grep -q "^    {"' _ "$sec"
+    assemble_review_bundle implementation "$dir/bundle.md" || exit 1
+    fx "implementation persona bundle references the audit" \
+      grep -q 'PORT-FIDELITY AUDIT' "$dir/bundle.md" || exit 1
+    fx "persona bundle carries the report body (screen name)" \
+      grep -q '"screen":"sample"' "$dir/bundle.md" || exit 1
+    exit 0
+  ) || return 1
+
+  # Agent-pass failure (exit 3): a garbage offline reply exhausts the CLI's
+  # retry budget, but the error report it still writes is attached and
+  # journaled with pct:null — and port_audit_candidate itself returns 0
+  # (advisory only, never blocks the candidate).
+  ( dir="$root/err"; _port_audit_wiring_seed "$dir" || exit 1
+    printf '{"nope":true}\n' >"$dir/garbage.json"
+    RUN_ROOT="$dir/rs"; RUN_ID="pawire-err"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+    WORKDIR=""
+    PORT_AUDIT=1 PORT_AUDIT_OFFLINE="$dir/garbage.json"
+    port_audit_candidate || exit 1
+    report="$PROJECT/.night-shift/port-audit/sample.json"
+    fx "error report still written (exit 3 path)" [ -s "$report" ] || exit 1
+    fx "error report carries summary.error" \
+      bash -c "jq -e '.summary.error | length > 0' '$report' >/dev/null" || exit 1
+    fx "port_audit event journaled with pct null" \
+      bash -c "jq -e 'select(.type==\"port_audit\") | .payload.screen==\"sample\" and .payload.pct==null' '$RUN_ROOT/events.jsonl' >/dev/null" || exit 1
+    sec="$(port_audit_section)"
+    fx "error report still surfaces in the section (evidence of the failure)" \
+      bash -c 'printf "%s" "$1" | grep -q "PORT-FIDELITY AUDIT"' _ "$sec"
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_port_audit_wiring() {
+  local err status
+  err="$(_fixture_port_audit_wiring_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-wiring: gated on knob+manifest field, offline report journaled {screen,pct} + attached to persona bundle/observer, error report pct null, never blocks\n'
+  else
+    printf 'not ok - port-audit-wiring: gated on knob+manifest field, offline report journaled {screen,pct} + attached to persona bundle/observer, error report pct null, never blocks\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
