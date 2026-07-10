@@ -274,6 +274,7 @@ run_dry_fixtures() {
   fixture_manifest_prompt
   fixture_component_inventory
   fixture_reuse_gate
+  fixture_port_audit_static
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -5333,6 +5334,62 @@ fixture_reuse_gate() {
     printf 'ok - reuse-gate: undeclared new component flagged / declared NEW passes / no-contract skips\n'
   else
     printf 'not ok - reuse-gate: undeclared new component flagged / declared NEW passes / no-contract skips\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/lib/port-audit-static.js (port-fidelity Task 7): opens Phase B
+# (port-audit) — a deterministic, zero-dep material extractor that Task 8's
+# agent pass wraps. Pure text/regex extraction over a committed neutral
+# fixture tree (no chrome, no network, no tsc/npm), so this runs
+# unconditionally on every machine incl. CI, same as the Task 3/5 fixtures
+# above. Exercises the CLI directly against
+# scripts/test/fixtures/rn-screen/ (src/ui/tokens.ts declaring colors/spacing/
+# type `as const` blocks; src/features/sample/SampleScreen.tsx using
+# colors.ink/spacing.lg/type.h1 as token refs plus one literal borderRadius
+# and one literal color) and asserts the exact schema/flattened-tokens/
+# resolved-usage values baked into that fixture tree.
+_fixture_port_audit_static_run() {
+  local fixture_dir out status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen"
+  # DELIBERATELY NOT local, same reasoning as _fixture_component_inventory_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  PORT_AUDIT_STATIC_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-port-audit-static.$$"
+  mkdir -p "$PORT_AUDIT_STATIC_OUT_DIR" || return 1
+  trap 'rm -rf "${PORT_AUDIT_STATIC_OUT_DIR:-}"' EXIT
+
+  out="$PORT_AUDIT_STATIC_OUT_DIR/material.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/port-audit-static.js" \
+    --project "$fixture_dir" --scope src/features/sample --tokens src/ui/tokens.ts >"$out" 2>"$out.err"; then
+    status=$?
+    printf 'port-audit-static.js dispatch failed (exit %s): %s\n' "$status" "$(cat "$out.err")"
+    return 1
+  fi
+  [ -s "$out" ] || { printf 'material missing/empty: %s\n' "$out"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-port-audit-material/1\"' '$out' >/dev/null"
+  fx "tokens flattened one level (colors.ink)" bash -c \
+    "jq -e '.tokens[\"colors.ink\"] == \"#123456\"' '$out' >/dev/null"
+  fx "tokens flattened one level (spacing.lg, numeric)" bash -c \
+    "jq -e '.tokens[\"spacing.lg\"] == 24' '$out' >/dev/null"
+  fx "fontSize usage resolves the type.h1 token ref to 28" bash -c \
+    "jq -e '([.usages[] | select(.property == \"fontSize\")][0].resolved) == 28' '$out' >/dev/null"
+  fx "literal color usage captured with correct file + plausible line" bash -c \
+    "jq -e '([.usages[] | select(.property == \"color\")][0] | .file == \"src/features/sample/SampleScreen.tsx\" and .resolved == \"#999999\" and .line > 0)' '$out' >/dev/null"
+  return 0
+}
+
+fixture_port_audit_static() {
+  local err status
+  err="$(_fixture_port_audit_static_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-static: flattens tokens one level, resolves group.key refs, captures literals w/ file:line\n'
+  else
+    printf 'not ok - port-audit-static: flattens tokens one level, resolves group.key refs, captures literals w/ file:line\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
