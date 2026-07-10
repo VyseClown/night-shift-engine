@@ -8,6 +8,16 @@
 > safely, emit a `BLOCKED` next-action with the question in `reason` and stop, so
 > the human can resolve it in the morning. The human validates everything then.
 
+> **Recovery is wrapper-owned, not yours.** A Claude session-limit 429 waits for
+> the reported reset and resumes this same session; a per-model usage cap blocks
+> for a knob change by default, or (`NIGHT_SHIFT_MODEL_FALLBACK=1`) steps the
+> capped role down to a cheaper model and continues — persona and observer
+> sub-agent calls get identical treatment, independently of the primary. None of
+> this needs any action from you. Separately: a bare relaunch over a prior run
+> that stopped `blocked` (not rate-limited) with uncommitted work still in the
+> project tree refuses to start fresh — it requires `--resume` instead. If you
+> are reading this file, that guard already let this run start legitimately.
+
 ---
 
 ## Before You Start

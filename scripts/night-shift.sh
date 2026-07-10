@@ -29,12 +29,13 @@ MAX_TASK_SECONDS="${NIGHT_SHIFT_MAX_TASK_SECONDS:-10800}"
 # healthy run (which produces a valid signal almost every turn) never trips it.
 MAX_MALFORMED_SIGNALS="${NIGHT_SHIFT_MAX_MALFORMED_SIGNALS:-5}"
 RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
-# The CLI version whose live 429 session-limit response shape was last verified
-# against is_rate_limit_response (lib/recovery.sh). A real 429 cannot be
-# provoked on demand, so the canary is a version tripwire: a differing
-# installed CLI logs a warning (never blocks) reminding to re-verify the
-# capture. Bump this after re-verifying against a real 429 on a newer CLI.
-RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.198"
+# The CLI version whose live 429 response shapes (session limit AND per-model
+# usage cap) were last verified against is_rate_limit_response /
+# is_per_model_limit_response (lib/recovery.sh). A real 429 cannot be provoked
+# on demand, so the canary is a version tripwire: a differing installed CLI
+# logs a warning (never blocks) reminding to re-verify the capture. Bump this
+# after re-verifying against a real 429 on a newer CLI.
+RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.202"
 # Sanity ceiling on a rate-limit wait. A genuine session limit resets within a
 # few hours; a wait longer than this almost certainly means the reset time was
 # misparsed, so we block for manual resume instead of sleeping for ~a day.
@@ -86,6 +87,15 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # pipeline and wire contracts are untouched either way.
 CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
 CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
+# Optional post-candidate design-fidelity audit (port-fidelity Task 9, closing
+# Phase B; scripts/port-audit.sh). OFF by default and strictly ADVISORY when
+# on: gated additionally on the spec's Design Contract listing at least one
+# `- Design manifest:` path (no manifest -> nothing to audit, regardless of
+# this knob). NIGHT_SHIFT_PORT_AUDIT_OFFLINE routes the engine-invoked call
+# through port-audit.sh's own `--offline <canned-reply>` — the fixture path,
+# and a human dry-wire knob.
+PORT_AUDIT="${NIGHT_SHIFT_PORT_AUDIT:-0}"
+PORT_AUDIT_OFFLINE="${NIGHT_SHIFT_PORT_AUDIT_OFFLINE:-}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
@@ -844,6 +854,18 @@ recover_run() {
       :
     elif [ "$RESUME" -eq 1 ] && resumable_blocked_state "$STATE"; then
       resume_block=1
+    elif [ "$RESUME" -eq 0 ] && [ "$status" = "blocked" ] &&
+      [ -n "$(git -C "$PROJECT" status --porcelain 2>/dev/null)" ]; then
+      # A bare relaunch (no --resume) over a logic-blocked run — NOT the
+      # rate-limit-recoverable case above, which already claimed this branch —
+      # whose project tree is still dirty: the prior run's work is real and
+      # uncommitted, and a fresh run would treat that dirt as baseline noise
+      # (structurally unable to commit it as the new run's own work). Applies
+      # to every non-rate-limit block reason alike (signal interruption,
+      # a failed primary command, a logic block) — the tree state is what
+      # matters, not why it stopped. Die loudly instead of silently starting
+      # a fresh run that strands the intact work.
+      die "an interrupted run left uncommitted work in the tree; re-run with --resume to continue it, or commit/stash the work first (see .night-shift/control/plan.md)"
     else
       return 1
     fi
@@ -942,6 +964,143 @@ model_flag() {
 # even when capture tooling is absent). Empty/missing path -> false.
 spec_has_design_contract() {
   [ -n "${1:-}" ] && grep -Eq '^## Design Contract([ \t]|$)' "$1" 2>/dev/null
+}
+
+# Optional `- Design manifest: <path[,path...]>` spec field (port-fidelity Task 4):
+# comma-separated, project-relative path(s) to night-shift-design-manifest/1 JSON(s)
+# produced by scripts/design-extract.sh. Trailing `<!-- ... -->` annotation (the
+# template's convention for these fields) is stripped. Absent field or `none` ->
+# empty. Same dialect as spec_workdir above, minus the mandatory backticks (this
+# field's value is a plain path list, not a single fenced token).
+spec_design_manifest_field() {
+  sed -nE 's/^- Design manifest:[[:space:]]*//p' "$1" 2>/dev/null | head -n 1 |
+    sed -E 's/[[:space:]]*<!--.*-->[[:space:]]*$//; s/[[:space:]]+$//'
+}
+
+# Containment gate for ONE `- Design manifest:` path: prints the resolved
+# PHYSICAL path on stdout and returns 0 only when the path is project-relative,
+# exists, and resolves inside $PROJECT. Mirrors set_spec_workdir's hardening
+# (scripts/lib/preflight.sh): absolute paths and `..` traversal are rejected
+# lexically, then the physical location (cd + pwd -P, which resolves directory
+# symlinks) must stay under the physically-resolved project — and because a
+# manifest is a FILE, a symlinked manifest itself is also followed (bounded
+# readlink chain, re-canonicalizing the directory at each hop) so a committed
+# link pointing at a sibling repo cannot route outside-project content into the
+# implement prompt. The engine runs unattended with bypassPermissions against
+# isolation-sensitive targets; prompt inputs get the same escape rules as
+# validation Workdirs. Returns: 0 = safe (path printed), 1 = escape/unresolvable
+# (caller warns loudly), 2 = plain not-found (caller skips silently — a stale
+# field degrades to no extra context, exactly as before).
+manifest_path_resolve() {
+  local path="$1" full projreal dir link hops
+  case "$path" in /*) return 1 ;; esac
+  case "/$path/" in *"/../"*) return 1 ;; esac
+  full="$PROJECT/$path"
+  [ -f "$full" ] || return 2
+  projreal="$(cd "$PROJECT" 2>/dev/null && pwd -P)" || return 1
+  dir="$(cd "$(dirname "$full")" 2>/dev/null && pwd -P)" || return 1
+  full="$dir/$(basename "$full")"
+  hops=0
+  while [ -L "$full" ]; do
+    [ "$hops" -lt 8 ] || return 1
+    link="$(readlink "$full")" || return 1
+    case "$link" in /*) ;; *) link="$(dirname "$full")/$link" ;; esac
+    dir="$(cd "$(dirname "$link")" 2>/dev/null && pwd -P)" || return 1
+    full="$dir/$(basename "$link")"
+    hops=$((hops + 1))
+  done
+  [ -f "$full" ] || return 2
+  case "$full" in "$projreal"/*) ;; *) return 1 ;; esac
+  printf '%s' "$full"
+}
+
+# Builds the "Design ground truth" prompt block for the implement stage of a
+# Design-Contract spec: one section per `- Design manifest:` path that resolves to
+# an existing file under $PROJECT, pulled straight from the manifest's own rollup +
+# elements table rather than a hand-typed token list, so the model has no room to
+# eyeball colors/spacing/fonts off a screenshot — "the manifest wins over prose
+# descriptions" is the explicit tie-breaker. Truncates each element table at 40 rows
+# (MANIFEST_PROMPT_ROW_CAP) so one large screen can't blow out the prompt. Every
+# path goes through manifest_path_resolve above: an escaping/unresolvable path is
+# skipped with a LOUD warning (log writes to stderr, so the command-substituted
+# block stays clean — a warn never blocks the prompt); a plain not-found or
+# not-valid-JSON path is skipped silently (a stale/typo'd field degrades to no
+# extra context, not a hard failure). No field, or `none` -> empty string, no
+# jq/cat calls.
+MANIFEST_PROMPT_ROW_CAP=40
+manifest_prompt_block() {
+  local spec="$1" raw path full block out old_ifs rc
+  raw="$(spec_design_manifest_field "$spec")"
+  case "$raw" in ''|none) return 0 ;; esac
+  out=""
+  old_ifs="$IFS"; IFS=','
+  for path in $raw; do
+    IFS="$old_ifs"
+    path="$(printf '%s' "$path" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    full=""
+    if [ -n "$path" ]; then
+      full="$(manifest_path_resolve "$path")"; rc=$?
+      if [ "$rc" -eq 1 ]; then
+        log "WARN: Design manifest path skipped — escapes or does not resolve inside the project: $path"
+        full=""
+      elif [ "$rc" -ne 0 ]; then
+        full=""
+      fi
+    fi
+    if [ -n "$full" ]; then
+      block="$(jq -r --argjson cap "$MANIFEST_PROMPT_ROW_CAP" '
+        def s(x): if x == null then "" else (x|tostring) end;
+        def esc(x): (s(x) | gsub("\\|"; "\\|"));
+        "",
+        "## Design ground truth (extracted manifest — authoritative for tokens)",
+        "Screen: \(.screen) (source: \(.source.kind), unit: \(.source.unit))",
+        "Palette: \(.rollup.palette // [] | join(", ")) | Fonts: \(.rollup.fontFamilies // [] | join(", ")) sizes \(.rollup.fontSizes // [] | map(tostring) | join(", ")) | Spacing: \(.rollup.spacingScale // [] | map(tostring) | join(", ")) | Radii: \(.rollup.radii // [] | map(tostring) | join(", ")) | Icons: \(.rollup.iconSizes // [] | map(tostring) | join(", "))",
+        "| element | role | text | font | size/weight | color | bg | bounds | gapToPrev | radius |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+        (.elements[:$cap][]? | "| " + s(.id) + " | " + s(.role) + " | " + esc(.text) + " | " + s(.typography.fontFamily) + " | " + (if .typography == null then "" else s(.typography.fontSize) + "/" + s(.typography.fontWeight) end) + " | " + esc(.color) + " | " + esc(.background) + " | " + "\(s(.bounds.x)),\(s(.bounds.y)) \(s(.bounds.w))x\(s(.bounds.h))" + " | " + s(.spacing.gapToPrev) + " | " + s(.radius) + " |"),
+        "Match these values exactly; the manifest wins over prose descriptions."
+      ' "$full" 2>/dev/null)" && out="$out
+$block"
+    fi
+    IFS=','
+  done
+  IFS="$old_ifs"
+  printf '%s' "$out"
+}
+
+COMPONENT_INVENTORY_ROW_CAP=40
+
+# Generates + inlines the target project's component inventory into the planning
+# prompt for a Design-Contract spec (port-fidelity Task 6, opening on Task 5's
+# extractor). Writes into $RUN_ROOT/component-inventory.json — which IS
+# $PROJECT/.night-shift/component-inventory.json, since initialize_run sets
+# RUN_ROOT to exactly that directory — so check_component_reuse (below) later
+# reads the SAME snapshot the plan was written against. Guarded end to end: no
+# Design Contract -> empty, no generation attempted. Any generation failure
+# (missing script, non-zero exit, unreadable/invalid JSON) logs one WARN and
+# returns empty — inventory generation is best-effort context and must NEVER
+# block planning.
+component_inventory_prompt_block() {
+  local spec="$1" inv err rc out
+  spec_has_design_contract "$spec" || return 0
+  inv="$RUN_ROOT/component-inventory.json"
+  err="$("$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$PROJECT" --out "$inv" 2>&1 1>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "WARN: component-inventory generation failed (exit $rc); planning proceeds without it: $(printf '%s' "$err" | tail -n1)"
+    return 0
+  fi
+  [ -s "$inv" ] || return 0
+  jq empty "$inv" >/dev/null 2>&1 || return 0
+  out="$(jq -r --argjson cap "$COMPONENT_INVENTORY_ROW_CAP" '
+    "",
+    "## Existing component inventory (.night-shift/component-inventory.json — reuse before building new)",
+    "| name | file | props | usageCount |",
+    "|---|---|---|---|",
+    (.components[:$cap][]? | "| " + .name + " | " + .file + " | " + (.props | join(", ")) + " | " + (.usageCount | tostring) + " |")
+  ' "$inv" 2>/dev/null)" || return 0
+  [ -n "$out" ] || return 0
+  printf '%s\n\nRequirement: .night-shift/control/plan.md MUST include a `## Component Map`\nsection mapping every design piece from the Design Contract to exactly one of:\n  reuse <Name>\n  variant <Name> — <change>\n  NEW <Name> — <justification>\nUse the inventory above as the source of truth for what already exists — after\nimplementation, any added component the plan does not declare `NEW <Name>` for\nis flagged (a soft, advisory gate; see .night-shift/validated/reuse-violations.json).\n' "$out"
 }
 
 # A long grind inside ONE stage replays ever-growing session history every
@@ -1053,6 +1212,13 @@ Fix exactly that and rewrite the WHOLE file this turn in the required shape belo
   fi
   design_build_note=""
   case "$stage" in
+    planning)
+      if spec_has_design_contract "$SPEC"; then
+        design_build_note="
+Design-fidelity plan (this spec has a \`## Design Contract\`). Your plan must map every
+piece of the design to a reuse decision before implementation starts.
+$(component_inventory_prompt_block "$SPEC")"
+      fi ;;
     implementation|implementation_review)
       if spec_has_design_contract "$SPEC"; then
         design_build_note="
@@ -1074,6 +1240,7 @@ screen to match its Figma design. Before/while implementing:
    against the Figma image and auto-repairs the residual — get the structure + tokens
    right here; it tightens the pixels.
 "
+        design_build_note="$design_build_note$(manifest_prompt_block "$SPEC")"
       fi ;;
   esac
   # The wrapper runs every validation phase inside the spec's Workdir; the
@@ -1179,13 +1346,9 @@ invoke_primary() {
   prompt="$RUN_ROOT/prompts/primary-$turn.txt"
   raw="$RUN_ROOT/raw/primary-$turn.json"
   local session emitted rc model
-  # Consecutive 429-without-success counter. Persisted in state so recovery
-  # after a crash picks up the count; reset to 0 on the first clean turn.
-  # Cap: 5 consecutive rate-limit resets with no successful primary turn → block
-  # for manual resume to prevent an infinite sleep-and-retry spiral.
-  local rate_limit_cap=5 consecutive_429
-  consecutive_429="$(jq -r '.rate_limit_consecutive // 0' "$STATE" 2>/dev/null)"
-  is_valid_int "$consecutive_429" || consecutive_429=0
+  # The consecutive 429-without-success counter now lives entirely in
+  # handle_rate_limit_wait (lib/recovery.sh): persisted in state so recovery
+  # after a crash picks up the count; reset to 0 on the first clean turn below.
   enforce_limits
   archive_old_signal
   session="$(jq -r '.session_id // empty' "$STATE")"
@@ -1197,7 +1360,10 @@ invoke_primary() {
   # a turn-to-turn continue, a rate-limit retry, or recovery of a blocked run —
   # already carries its creation model and must NOT re-pass --model. This keeps
   # resume robust regardless of whether the CLI accepts --model alongside --resume.
-  model="$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
+  # resolve_effective_model maps the knob through state's .model_fallbacks (a
+  # per-model 429 fallback recorded earlier in the run under
+  # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
+  model="$(resolve_effective_model "$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
   while :; do
     rc=0
@@ -1219,18 +1385,22 @@ invoke_primary() {
     if is_rate_limit_response "$raw" &&
       [ -n "$emitted" ] &&
       { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then
-      consecutive_429=$((consecutive_429 + 1))
-      # Guard against an infinite sleep spiral: if the rate limit is not
-      # clearing after $rate_limit_cap consecutive resets with no successful
-      # turn in between, block for manual resume. This catches a misbehaving
-      # session that keeps hitting the limit after each wait completes.
-      [ "$consecutive_429" -lt "$rate_limit_cap" ] ||
-        block_run "rate limit not clearing after $consecutive_429 consecutive resets; resume manually once the limit clears"
+      # Session limit with a parseable reset: count, cap, journal, and sleep it
+      # out (handle_rate_limit_wait, lib/recovery.sh — the extracted, unchanged
+      # production wait path), then retry pinned to the emitted session.
+      handle_rate_limit_wait "$raw"
       session="$emitted"
-      state_set '.session_id=$session | .rate_limit_consecutive=$n | .updated_at=$now' \
-        --arg session "$session" --argjson n "$consecutive_429" --arg now "$(now_iso)"
-      emit_event rate_limit_wait "$(jq -cn --argjson n "$consecutive_429" '{consecutive:$n}')"
-      wait_for_rate_limit_reset "$raw"
+      continue
+    fi
+    if is_per_model_limit_response "$raw"; then
+      # Per-model usage cap: no reset time exists, so waiting cannot clear it.
+      # Default → block_run (inside the handler) with an actionable reason.
+      # NIGHT_SHIFT_MODEL_FALLBACK=1 → the handler records the fallback in
+      # state's .model_fallbacks, nulls the session, journals model_fallback,
+      # and returns: retry FRESH on the successor model.
+      handle_per_model_limit "$raw" "$model"
+      session=""
+      model="$(resolve_effective_model "$model")"
       continue
     fi
     block_run "primary command failed with status $rc"
@@ -1552,6 +1722,15 @@ assemble_review_bundle() {
         cat "$RUN_ROOT/validated/baseline.json"
         printf '\n```\n'
       fi
+      # A reuse-violations.json can only exist from an EARLIER candidate in
+      # this task (check_component_reuse runs post-candidate, after the FIRST
+      # implementation-review round has already judged the working tree) — so
+      # this only surfaces on a re-review round following an observer BLOCK
+      # that sent the run back to implementation. Empty on a first pass.
+      reuse_violations_section
+      # Same timing note applies: port_audit_candidate runs post-candidate, so
+      # a report only exists here on a re-review round. Empty on a first pass.
+      port_audit_section
     fi
   } >"$out"
 }
@@ -1605,7 +1784,7 @@ EOF
 # extracted from stdout. A discrete seam the fixtures override to test the spawn
 # loop deterministically without a live model.
 invoke_persona_once() {
-  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" retry_note="${6:-}" neutral lens
+  local persona="$1" stage="$2" bundle="$3" out="$4" raw="$5" retry_note="${6:-}" neutral lens rc=0
   # Per-worker cwd (slug-suffixed): up to NIGHT_SHIFT_PERSONA_CONCURRENCY claude
   # sessions run concurrently, and a shared cwd is an avoidable interference
   # surface (the observer's shared-dir pattern was safe only because it is serial).
@@ -1617,7 +1796,20 @@ invoke_persona_once() {
   # same reason). model_flag word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
   (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
-    claude -p $(model_flag "$PERSONA_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
+    claude -p $(model_flag "$(resolve_effective_model "$PERSONA_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # A 429 (session OR per-model) is a live-recoverable transient — a standard
+    # rate limit that also recovers fine on the primary path — NOT "no parseable
+    # JSON verdict". Distinguishing it here with a distinct return code lets the
+    # caller (spawn_persona_worker) route it to the parent's wait/fallback path
+    # instead of burning one of the worker's two JSON-retry attempts on it (the
+    # incident this fixes: a 429 misread as malformed JSON exhausted both
+    # retries and hard-blocked the run).
+    if is_rate_limit_response "$raw" || is_per_model_limit_response "$raw"; then
+      return 42
+    fi
+    return 1
+  fi
   extract_claude_structured "$raw" "$out"
 }
 
@@ -1685,6 +1877,28 @@ spawn_persona_worker() {
     # the retry before it is recorded.
     raw="$RUN_ROOT/raw/persona-$persona_stage-$slug.$tries.json"
     invoke_persona_once "$persona" "$persona_stage" "$bundle" "$tmp" "$raw" "$retry_note"; iv=$?
+    if [ "$iv" -eq 42 ]; then
+      # Rate-limited (session OR per-model): a live-recoverable transient, not a
+      # malformed reply. This worker must NOT spend one of its own two JSON-retry
+      # attempts on it, and must NOT write .failed-<slug> — only the PARENT may
+      # wait/fall back/journal (workers run backgrounded and parallel; the parent
+      # is the single writer of shared state). Roll the just-written marker back
+      # (an EARLIER genuine attempt in this same call, if any, is preserved so the
+      # batch's cost loop still finds it), rename the raw out of the numbered
+      # sequence so a re-spawn's same-numbered attempt cannot clobber it before
+      # the parent records its cost, and return without looping.
+      tries=$((tries - 1))
+      if [ "$tries" -gt 0 ]; then
+        printf '%s' "$tries" >"$result_dir/.attempts-$slug"
+      else
+        rm -f "$result_dir/.attempts-$slug"
+      fi
+      local rlraw="${raw%.json}.ratelimited.json"
+      mv -f "$raw" "$rlraw" 2>/dev/null || true
+      printf '%s' "$rlraw" >"$result_dir/.ratelimited-$slug"
+      rm -f "$tmp" "$idd" "$norm"
+      return 2
+    fi
     if [ "$iv" -eq 0 ] &&
       jq --arg p "$persona" --arg s "$persona_stage" '.persona=$p | .stage=$s' "$tmp" >"$idd" 2>/dev/null &&
       normalize_persona_result "$idd" >"$norm" 2>/dev/null &&
@@ -1751,6 +1965,69 @@ journal_persona_result() {
   fi
 }
 
+# After a persona batch joins, a worker that hit a 429 (session OR per-model)
+# left a .ratelimited-<slug> marker instead of retrying itself — workers run
+# backgrounded and parallel, so only the PARENT may wait/journal/fall back.
+# Loops until the batch has no more markers (a re-spawn can hit the limit again
+# before the reset has truly cleared, or need a second fallback hop).
+#
+# For a session limit, only the FIRST marker found drives ONE
+# handle_rate_limit_wait: two workers hitting the SAME reset window must not
+# sleep it out twice. For a per-model cap, handle_per_model_limit gets the
+# model actually in effect (resolve_effective_model "$PERSONA_MODEL" — personas
+# resolve fresh on every call, unlike the primary's per-turn pinned model) and
+# either block_run's (default) or records the fallback (NIGHT_SHIFT_MODEL_FALLBACK=1),
+# so the re-spawn's own resolve_effective_model call picks up the successor
+# automatically — no model needs to be threaded through here.
+#
+# Re-spawns only personas that are still genuinely pending: no completed result
+# AND no .failed-<slug> marker. A persona that already exhausted its own 2-try
+# JSON-retry budget must not get a bonus attempt just because a sibling in the
+# same batch was rate-limited.
+handle_persona_rate_limits() {
+  local result_dir="$1" persona_stage="$2" bundle="$3"; shift 3
+  local persona slug marker raw first_raw pid
+  local -a pending
+  while :; do
+    first_raw=""
+    for marker in "$result_dir"/.ratelimited-*; do
+      [ -f "$marker" ] || continue
+      [ -n "$first_raw" ] || first_raw="$(cat "$marker" 2>/dev/null)"
+    done
+    [ -n "$first_raw" ] || break
+    if is_rate_limit_response "$first_raw"; then
+      handle_rate_limit_wait "$first_raw" subagent
+    elif is_per_model_limit_response "$first_raw"; then
+      handle_per_model_limit "$first_raw" "$(resolve_effective_model "$PERSONA_MODEL")" subagent
+    fi
+    for marker in "$result_dir"/.ratelimited-*; do
+      [ -f "$marker" ] || continue
+      raw="$(cat "$marker" 2>/dev/null)"
+      if [ -n "$raw" ] && [ -f "$raw" ]; then
+        record_cost "$raw" "$(basename "$raw")"
+      fi
+      rm -f "$marker"
+    done
+    pending=()
+    for persona in "$@"; do
+      slug="$(persona_slug "$persona")"
+      [ -f "$result_dir/$slug.json" ] && continue
+      [ -f "$result_dir/.failed-$slug" ] && continue
+      pending+=("$persona")
+    done
+    [ "${#pending[@]}" -gt 0 ] || break
+    for persona in "${pending[@]}"; do
+      set -m
+      spawn_persona_worker "$persona" "$persona_stage" "$bundle" "$result_dir" &
+      set +m
+      pid=$!
+      PERSONA_WORKER_PIDS="$PERSONA_WORKER_PIDS $pid"
+      wait "$pid" || true
+      PERSONA_WORKER_PIDS=""
+    done
+  done
+}
+
 spawn_personas() {
   local result_dir="$1" persona_stage="$2" expected_set="$3"
   local bundle persona slug raw old_ifs concurrency i j k n a attempts pstatus
@@ -1790,6 +2067,10 @@ spawn_personas() {
       k=$((k + 1))
     done
     PERSONA_WORKER_PIDS=""
+    # Recover any 429s this batch's workers hit BEFORE the cost/journal loop
+    # below reads .attempts-<slug>: a re-spawned persona's fresh worker call
+    # writes its own .attempts-<slug>/result, which that loop must see.
+    handle_persona_rate_limits "$result_dir" "$persona_stage" "$bundle" "${names[@]}"
     # Costs + journal: recorded by the parent from exactly the attempts each
     # worker made this round (.attempts-<slug>), BEFORE any failure becomes
     # block_run — so a blocked round still keeps every paid attempt's cost.
@@ -2058,6 +2339,13 @@ EOF
   ' --arg candidate "$candidate" --arg now "$(now_iso)"
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
+  # Soft reuse gate (port-fidelity Task 6): runs only AFTER every hard check
+  # above has passed, on the now-validated candidate; see check_component_reuse
+  # for why this never blocks.
+  check_component_reuse "$candidate"
+  # Soft port-fidelity audit (Task 9): same post-candidate slot, same
+  # never-blocks posture; see port_audit_candidate.
+  port_audit_candidate
   emit_event candidate_validated "$(jq -cn --arg c "$candidate" '{commit:$c}')"
   log "candidate $candidate validated; handing to observer"
   if visual_stage_enabled "$SPEC"; then
@@ -2065,6 +2353,247 @@ EOF
   else
     set_stage observer_review
   fi
+}
+
+# --dirs precedence for the reuse gate's own added-file classification: same
+# env override / defaults as scripts/lib/component-inventory.js's
+# resolveComponentDirs, so a project's non-default component dirs get the same
+# treatment on both sides of Task 5/6 without a second config surface.
+reuse_gate_component_dirs() {
+  printf '%s' "${NIGHT_SHIFT_COMPONENT_DIRS:-src/ui/components,src/components,src/features/*/components}"
+}
+
+# True when an added file is a plausible component: any *.tsx file (a Design-
+# Contract screen is commonly assembled outside the configured component dirs),
+# OR a file under one of the resolved component-dir glob patterns regardless of
+# extension. Bash `case` patterns are globs natively, so a pattern like
+# `src/features/*/components` needs no regex translation — `case "$file" in
+# $pattern/*)` matches it directly.
+reuse_gate_path_matches() {
+  local file="$1" dirs old_ifs pattern
+  case "$file" in *.tsx) return 0 ;; esac
+  dirs="$(reuse_gate_component_dirs)"
+  old_ifs="$IFS"; IFS=','
+  for pattern in $dirs; do
+    IFS="$old_ifs"
+    pattern="$(printf '%s' "$pattern" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    # shellcheck disable=SC2254 # deliberately UNquoted: $pattern's own '*'
+    # (e.g. src/features/*/components) must keep its glob meaning here — a
+    # quoted "$pattern" would flatten that '*' to a literal asterisk and never
+    # match a real path segment.
+    case "$file" in $pattern/*) return 0 ;; esac
+    IFS=','
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+# Soft component-reuse gate (port-fidelity Task 6, closing Phase C). Diffs
+# base..candidate for ADDED files that look like components and flags any
+# exported name the plan's `## Component Map` does not declare `NEW <Name>`
+# for — a design piece the plan called `reuse`/`variant` but the implementation
+# actually built from scratch, or one the plan never accounted for at all.
+#
+# Skips silently (return 0, writes nothing, emits nothing) when the spec has
+# no `## Design Contract` or the plan has no `## Component Map` section — this
+# gate only applies to design-directed builds that made the reuse commitment
+# Task 6 requires at planning time.
+#
+# NEVER calls block_run: an undeclared component is a signal for the review
+# personas/observer to weigh (surfaced via reuse_violations_section into both
+# the implementation-review persona bundle and the observer's evidence,
+# mirroring how codex_review_section attaches the advisory Codex review), not
+# a wrapper-enforced hard stop — the plan's Component Map is the primary's own
+# prose, and a false positive here (e.g. a component the reviewer agrees was
+# genuinely necessary) must not wedge an otherwise-good run.
+check_component_reuse() {
+  local candidate="$1" plan violations_file map_section added
+  local file names name declared closest violations count
+  plan="$RUN_ROOT/control/plan.md"
+  spec_has_design_contract "$SPEC" || return 0
+  [ -s "$plan" ] || return 0
+  grep -Eq '^## Component Map([[:space:]]|$)' "$plan" || return 0
+
+  violations_file="$RUN_ROOT/validated/reuse-violations.json"
+  rm -f "$violations_file"
+
+  # The Component Map section's own body only — from its heading to the next
+  # `## ` heading or EOF — so a `NEW Foo` mention elsewhere in the plan (prose
+  # discussing a REJECTED alternative, say) can't accidentally satisfy the gate.
+  map_section="$(awk '
+    /^## Component Map([ \t]|$)/ { grabbing=1; next }
+    grabbing && /^## / { grabbing=0 }
+    grabbing { print }
+  ' "$plan")"
+
+  added="$(git -C "$PROJECT" diff --diff-filter=A --name-only "$BASE_COMMIT..$candidate" 2>/dev/null)"
+  [ -n "$added" ] || return 0
+
+  violations="[]"
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    reuse_gate_path_matches "$file" || continue
+    [ -f "$PROJECT/$file" ] || continue
+    names="$(node "$WORKSPACE_ROOT/scripts/lib/component-inventory.js" --single-file "$PROJECT/$file" 2>/dev/null)" || continue
+    [ -n "$names" ] || continue
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      declared=0
+      printf '%s\n' "$map_section" | grep -Eq "NEW[[:space:]]+${name}([^A-Za-z0-9_]|\$)" && declared=1
+      [ "$declared" -eq 1 ] && continue
+      closest="$(node "$WORKSPACE_ROOT/scripts/lib/component-inventory.js" \
+        --closest "$name" --inventory "$RUN_ROOT/component-inventory.json" 2>/dev/null)"
+      violations="$(printf '%s' "$violations" | jq -c --arg f "$file" --arg c "$name" --arg closest "$closest" \
+        '. + [{file:$f, component:$c, declared:false, closestExisting:$closest}]')"
+    done <<NAMES
+$names
+NAMES
+  done <<ADDED
+$added
+ADDED
+
+  count="$(printf '%s' "$violations" | jq 'length')"
+  [ "$count" -gt 0 ] || return 0
+
+  jq -n --argjson v "$violations" '{schema:"night-shift-reuse-violations/1", violations:$v}' >"$violations_file"
+  integrity_put "$violations_file"
+  emit_event reuse_violation "$(jq -cn --argjson n "$count" '{count:$n}')"
+  log "reuse gate: $count undeclared new component(s) — advisory, see .night-shift/validated/reuse-violations.json"
+  return 0
+}
+
+# Supplementary reviewer surface for the reuse gate above — same shape and same
+# non-authoritative framing as codex_review_section, attached to BOTH the
+# implementation-review persona bundle (assemble_review_bundle) and the
+# observer's context (run_observer), per docs/review-personas.md's Design
+# Fidelity Reviewer implementation checklist ("no reuse-violations.json entries
+# remain unresolved"). Empty when no violations file exists (the common case:
+# no Design Contract, no Component Map, or a clean candidate).
+reuse_violations_section() {
+  local f="$RUN_ROOT/validated/reuse-violations.json"
+  [ -s "$f" ] || return 0
+  integrity_guard "$f" reuse-violations "the reuse-violations report"
+  printf '%s\n' '--- COMPONENT-REUSE GATE (advisory; engine-computed, NOT authoritative) ---'
+  printf 'Added files whose component the plan'"'"'s Component Map did not declare `NEW`.\nWeigh as one more input — a false positive should not block an otherwise-sound\ncandidate, but an unresolved entry across review rounds is a real smell.\n\n'
+  jq -c '.violations[]' "$f" 2>/dev/null | sed 's/^/    /'
+}
+
+# Screen list for the spec's `- Design manifest:` field (port-fidelity Task 9):
+# one `<screen>\t<resolved-manifest-path>` line per comma-separated path that
+# resolves inside the project via manifest_path_resolve — the SAME containment
+# gate manifest_prompt_block uses, so a port-audit call never gets fed a path
+# that gate would have rejected. Screen name = the manifest file's basename
+# minus .json (a manifest path cannot contain a tab or newline: it is one
+# comma-separated segment of a single spec line, so the TSV framing is safe).
+# An escaping/unresolvable path is skipped with a LOUD warning (same treatment
+# as manifest_prompt_block); a plain not-found path is skipped silently (a
+# stale field degrades to "this screen is not audited", not a hard failure).
+# No field, `none`, or no valid path -> empty output.
+port_audit_screens_for_spec() {
+  local spec="$1" raw path full old_ifs rc
+  raw="$(spec_design_manifest_field "$spec")"
+  case "$raw" in ''|none) return 0 ;; esac
+  old_ifs="$IFS"; IFS=','
+  for path in $raw; do
+    IFS="$old_ifs"
+    path="$(printf '%s' "$path" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    if [ -n "$path" ]; then
+      full="$(manifest_path_resolve "$path")"; rc=$?
+      if [ "$rc" -eq 0 ]; then
+        printf '%s\t%s\n' "$(basename "$path" .json)" "$full"
+      elif [ "$rc" -eq 1 ]; then
+        log "WARN: port-audit skipped — Design manifest path escapes or does not resolve inside the project: $path"
+      fi
+    fi
+    IFS=','
+  done
+  IFS="$old_ifs"
+}
+
+# Post-candidate, non-gating design-fidelity audit (port-fidelity Task 9,
+# closing Phase B). Gate: NIGHT_SHIFT_PORT_AUDIT=1 AND the spec's Design
+# Contract lists at least one `- Design manifest:` path that resolves inside
+# the project (port_audit_screens_for_spec above) — absent either, this is a
+# silent no-op. Runs scripts/port-audit.sh once per screen (screen = manifest
+# basename), on the PERSONA_MODEL knob (breadth-tier judgment, same as the
+# persona bench; port-audit.sh treats "inherit" as no --model flag), scoped to
+# the spec's resolved Workdir when one is set (--scope is project-relative on
+# both sides). NIGHT_SHIFT_PORT_AUDIT_OFFLINE routes the call through the
+# CLI's own --offline canned-reply path (zero cost — the fixture suite and a
+# human dry-wire both use it). Same soft posture as check_component_reuse/
+# codex_review_candidate: every failure mode is a WARN + skip, NEVER
+# block_run, NEVER fails the candidate — but a report on disk is attached and
+# journaled regardless of the CLI's exit status (exit 3 still writes a report
+# with summary.error; that IS the evidence that auditing did not happen).
+# Journal: one `port_audit` event per report, {screen, pct} with pct null on
+# an error report. The report (attached via port_audit_section below) is
+# supplementary evidence for the review personas/observer to weigh, not a gate.
+port_audit_candidate() {
+  local screen full report payload scope_args=() offline_args=()
+  [ "$PORT_AUDIT" = "1" ] || return 0
+  [ -n "$(spec_design_manifest_field "$SPEC")" ] || return 0
+  [ -z "$WORKDIR" ] || scope_args=(--scope "$WORKDIR")
+  [ -z "$PORT_AUDIT_OFFLINE" ] || offline_args=(--offline "$PORT_AUDIT_OFFLINE")
+  mkdir -p "$RUN_ROOT/raw" 2>/dev/null || true
+  while IFS="$(printf '\t')" read -r screen full; do
+    [ -n "$screen" ] && [ -n "$full" ] || continue
+    report="$PROJECT/.night-shift/port-audit/$screen.json"
+    if ! "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$PROJECT" --screen "$screen" \
+        --manifest "$full" --model "$(resolve_effective_model "$PERSONA_MODEL")" "${scope_args[@]}" "${offline_args[@]}" \
+        >"$RUN_ROOT/raw/port-audit-$screen.log" 2>&1; then
+      log "WARN: port-audit for screen '$screen' failed (advisory only; see raw/port-audit-$screen.log)"
+    fi
+    if [ -s "$report" ]; then
+      integrity_put "$report"
+      payload="$(jq -c --arg screen "$screen" '
+          {screen: $screen,
+           pct: (if (.summary.error? // null) != null then null else (.summary.pct // null) end)}
+        ' "$report" 2>/dev/null)"
+      [ -n "$payload" ] || payload="$(jq -cn --arg screen "$screen" '{screen:$screen, pct:null}')"
+      emit_event port_audit "$payload"
+    else
+      log "WARN: port-audit for screen '$screen' produced no report (advisory only, skipped)"
+    fi
+  done <<SCREENS
+$(port_audit_screens_for_spec "$SPEC")
+SCREENS
+  return 0
+}
+
+# Supplementary reviewer surface for the port-fidelity audit above — same
+# non-authoritative framing and dual attachment (implementation-review persona
+# bundle via assemble_review_bundle, observer context via run_observer) as
+# reuse_violations_section, per docs/review-personas.md's Design Fidelity
+# Reviewer implementation checklist ("port-audit report's off/missing entries
+# are addressed or explicitly waived"). Restricted to the CURRENT spec's own
+# screens (port_audit_screens_for_spec), not a blanket glob of
+# .night-shift/port-audit/ — that directory is $PROJECT-scoped and persists
+# across every night-shift run on the project, so an unscoped glob would leak
+# a stale report from an unrelated earlier task/spec into this run's review.
+# Deliberately NOT gated on $PORT_AUDIT: an existing report for this spec's
+# own screens is evidence worth surfacing even if the knob was flipped off
+# between rounds (mirrors reuse_violations_section keying on the file, not the
+# knob). Empty when the spec has no `- Design manifest:` field or no report
+# has been written yet (the common first-round case: port_audit_candidate runs
+# post-candidate, after implementation-review has already judged the working
+# tree once — so this surfaces on re-review rounds and to the observer).
+port_audit_section() {
+  local screen full f printed=0
+  while IFS="$(printf '\t')" read -r screen full; do
+    [ -n "$screen" ] || continue
+    f="$PROJECT/.night-shift/port-audit/$screen.json"
+    [ -s "$f" ] || continue
+    integrity_guard "$f" "port-audit-$screen" "the port-audit report for screen '$screen'"
+    if [ "$printed" -eq 0 ]; then
+      printf '%s\n' '--- PORT-FIDELITY AUDIT (advisory; engine-computed, NOT authoritative) ---'
+      printf 'Per-screen manifest-vs-implementation conformance (scripts/port-audit.sh).\nWeigh as one more input — never gating. Any `off`/`missing` entries should be\naddressed or explicitly waived in the Design Contract'"'"'s Approved deviations.\n\n'
+      printed=1
+    fi
+    jq -c '.' "$f" 2>/dev/null | sed 's/^/    /'
+  done <<SCREENS
+$(port_audit_screens_for_spec "$SPEC")
+SCREENS
+  return 0
 }
 
 # Seam for fixtures: is the Codex CLI available? (command -v inline would make
@@ -2168,7 +2697,7 @@ EOF
 }
 
 invoke_observer_once() {
-  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral
+  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral rc=0
   # Context-isolated observer: a fresh Claude session (no --resume) launched from
   # a neutral empty directory. It runs in the default (non-bypass) permission
   # mode, so tool use is not auto-approved and, combined with the neutral cwd, it
@@ -2188,7 +2717,17 @@ invoke_observer_once() {
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
   (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" |
-    claude -p $(model_flag "$OBSERVER_MODEL") --output-format json) >"$raw" 2>"${raw}.err" || return 1
+    claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Same 429 distinction as invoke_persona_once: a live-recoverable transient,
+    # not "the verdict failed the observer-review contract" — the caller
+    # (validated_observer_retry) must wait/fall back and retry WITHOUT spending
+    # one of the observer's two contract-retry attempts on it.
+    if is_rate_limit_response "$raw" || is_per_model_limit_response "$raw"; then
+      return 42
+    fi
+    return 1
+  fi
   extract_claude_structured "$raw" "$out"
 }
 
@@ -2353,6 +2892,8 @@ run_observer() {
     done
     observer_wrapper_evidence "$candidate"
     codex_review_section "$candidate"
+    reuse_violations_section
+    port_audit_section
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30
@@ -2378,10 +2919,24 @@ run_observer() {
 }
 
 validated_observer_retry() {
-  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note=""
+  local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note="" iv
   while [ "$attempt" -lt 2 ]; do
     enforce_limits
-    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note" || true
+    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note"; iv=$?
+    if [ "$iv" -eq 42 ]; then
+      # 429 (session OR per-model): the same live-recoverable transient the
+      # primary already survives — not a contract failure. Wait/fall back and
+      # retry the SAME attempt slot WITHOUT incrementing attempt (the observer
+      # gets its full two-try contract-retry budget regardless of how many
+      # times it got rate-limited first).
+      record_cost "$raw.$attempt" "$(basename "$raw")"
+      if is_rate_limit_response "$raw.$attempt"; then
+        handle_rate_limit_wait "$raw.$attempt" subagent
+      elif is_per_model_limit_response "$raw.$attempt"; then
+        handle_per_model_limit "$raw.$attempt" "$(resolve_effective_model "$OBSERVER_MODEL")" subagent
+      fi
+      continue
+    fi
     # Record the cost of THIS attempt immediately after the call returns,
     # regardless of whether the verdict validates. This ensures the cost is
     # never lost when both attempts fail and we fall through to block_run. On

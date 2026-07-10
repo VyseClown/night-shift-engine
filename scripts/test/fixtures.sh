@@ -214,6 +214,15 @@ run_dry_fixtures() {
   fixture_assert "rate-limit resume rebases elapsed budgets" fixture_rate_limit_rebase "$root"
   fixture_assert "preserved rate-limit block is recoverable" fixture_rate_limit_recovery "$root"
   fixture_assert "runaway rate-limit wait hits the cap" fixture_rate_limit_cap "$root"
+  fixture_assert "recovery-permodel: detector discrimination" fixture_permodel_detector "$root"
+  fixture_assert "recovery-permodel: default block + fallback continue" fixture_permodel_block_fallback "$root"
+  fixture_assert "recovery-permodel: extracted session wait path (count, cap, pin, journal)" fixture_handle_rate_limit_wait "$root"
+  fixture_assert "recovery-subagent: invoke_persona_once detects a 429 raw (session + per-model) as 42, not 1" fixture_recovery_invoke_persona_once_detects_rate_limit "$root"
+  fixture_assert "recovery-subagent: invoke_observer_once detects a 429 raw (session + per-model) as 42, not 1" fixture_recovery_invoke_observer_once_detects_rate_limit "$root"
+  fixture_assert "recovery-subagent: persona session-429 waits once and re-runs only the incomplete persona" fixture_recovery_persona_session_wait "$root"
+  fixture_assert "recovery-subagent: persona per-model default blocks with a clear reason" fixture_recovery_persona_permodel_block "$root"
+  fixture_assert "recovery-subagent: persona per-model fallback re-spawns on the successor model" fixture_recovery_persona_permodel_fallback "$root"
+  fixture_assert "recovery-subagent: observer 429 waits without consuming a contract-retry attempt" fixture_recovery_observer_session_wait "$root"
   fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
   fixture_assert "atomic lock: O_EXCL pid gate, no mkdir-write window, reclaims dead/pid-less" fixture_atomic_lock "$root"
   fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
@@ -267,6 +276,20 @@ run_dry_fixtures() {
   fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
   fixture_assert "repair_recapture_screen: restart-then-wait-then-capture order; first-pass never invokes repair-only fns" fixture_recapture_wrapper "$root"
   fixture_assert "__visual_wait_bundle_ready: large bundle ready, tiny error page not ready" fixture_wait_bundle_ready "$root"
+  fixture_cdp_ws
+  fixture_design_extract_web
+  fixture_design_extract_figma
+  fixture_design_extract_cli
+  fixture_manifest_prompt
+  fixture_component_inventory
+  fixture_reuse_gate
+  fixture_port_audit_static
+  fixture_port_audit_normalize
+  fixture_port_audit_offline
+  fixture_port_audit_wiring
+  fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
+  fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
+  fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -1510,7 +1533,7 @@ fixture_event_stream() {
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
-    stage_transition codex_review; do
+    stage_transition codex_review model_fallback reuse_violation port_audit; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -3219,6 +3242,393 @@ fixture_rate_limit_cap() {
 }
 
 # ---------------------------------------------------------------------------
+# recovery-permodel fixtures (port-fidelity Task 10): the per-model 429 shape
+# ("You've reached your <Model> limit…", NO reset timestamp) vs the session
+# limit ("…resets 4:00pm (America/Sao_Paulo)"). Canned captures live at
+# scripts/test/fixtures/rate-limit/ — neutral fake model name, real field
+# shape (is_error:true, api_error_status:429).
+# ---------------------------------------------------------------------------
+
+# Detector discrimination on the canned files: session file -> session detector
+# only; per-model file -> per-model detector only; a 500-class error -> neither
+# (falls through to block_run exactly as before this feature).
+fixture_permodel_detector() {
+  local root="$1" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit" err="$root/permodel-500.json"
+  printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500,"result":"Internal server error","session_id":"fixed-id"}' >"$err"
+  (
+    fx "session file: session detector true" is_rate_limit_response "$fdir/session-limit.json"
+    fx_not "session file: per-model detector false" is_per_model_limit_response "$fdir/session-limit.json"
+    fx "per-model file: per-model detector true" is_per_model_limit_response "$fdir/per-model-limit.json"
+    fx_not "per-model file: session detector false" is_rate_limit_response "$fdir/per-model-limit.json"
+    fx_not "500 file: session detector false" is_rate_limit_response "$err"
+    fx_not "500 file: per-model detector false" is_per_model_limit_response "$err"
+    exit 0
+  ) || return 1
+  # The canary was re-verified against these live captures on CLI 2.1.202.
+  [ "$RATE_LIMIT_CONTRACT_CLI_VERSION" = "2.1.202" ] || return 1
+  return 0
+}
+
+# Branch behavior of handle_per_model_limit, driven directly with recording
+# shims (block_run records + exits like the real one dies; emit_event records).
+# Default -> block with the "per-model usage cap" reason; with
+# NIGHT_SHIFT_MODEL_FALLBACK=1 -> model_fallback journaled, .model_fallbacks
+# updated, session nulled, NO block — and resolve_effective_model then returns
+# the successor. Plus the successor_model ladder and the call-site wiring.
+fixture_permodel_block_fallback() {
+  local root="$1" d="$root/permodel" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit" rc out body
+  mkdir -p "$d"
+  # successor_model ladder: fable* -> opus, opus (bare or full-ID) -> sonnet,
+  # else unchanged + rc 1. The full-ID forms (`claude-opus-4-8`, an
+  # `--model` value the CLI accepts directly) must map identically to the
+  # bare `opus` alias — NIGHT_SHIFT_*_MODEL knobs are documented to accept
+  # full IDs anywhere an alias is uncertain (per-project CLAUDE.md), so the
+  # fallback ladder has to recognize them too.
+  [ "$(successor_model claude-fable-5)" = "opus" ] || return 1
+  [ "$(successor_model fable-test)" = "opus" ] || return 1
+  [ "$(successor_model opus)" = "sonnet" ] || return 1
+  [ "$(successor_model claude-opus-4-8)" = "sonnet" ] || return 1
+  [ "$(successor_model opus-4-8)" = "sonnet" ] || return 1
+  rc=0; out="$(successor_model sonnet)" || rc=$?
+  [ "$rc" -eq 1 ] && [ "$out" = "sonnet" ] || return 1
+  rc=0; out="$(successor_model weird-model)" || rc=$?
+  [ "$rc" -eq 1 ] && [ "$out" = "weird-model" ] || return 1
+  # Default path: block_run fires with the actionable per-model reason, no event.
+  rc=0
+  (
+    STATE="$d/state-block.json"; RUN_ROOT="$d"; RUN_ID="pm-block-$$"
+    printf '%s\n' '{"status":"running","stage":"implementation","session_id":"old-sid"}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events-block.txt"; }
+    unset NIGHT_SHIFT_MODEL_FALLBACK
+    handle_per_model_limit "$fdir/per-model-limit.json" "fable-test" 2>/dev/null
+    exit 0
+  ) || rc=$?
+  [ "$rc" -eq 42 ] || return 1
+  grep -q "per-model usage cap hit on model 'fable-test'" "$d/blocked.txt" || return 1
+  grep -q "reached your Zephyr 9 limit" "$d/blocked.txt" || return 1
+  grep -q "NIGHT_SHIFT_\*_MODEL knob" "$d/blocked.txt" || return 1
+  grep -q "re-run with --resume" "$d/blocked.txt" || return 1
+  [ ! -f "$d/events-block.txt" ] || return 1
+  # Fallback path: NIGHT_SHIFT_MODEL_FALLBACK=1 records, nulls, journals, returns.
+  (
+    STATE="$d/state-fb.json"; RUN_ROOT="$d"; RUN_ID="pm-fb-$$"
+    printf '%s\n' '{"status":"running","stage":"implementation","session_id":"old-sid"}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked-fb.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events-fb.txt"; }
+    NIGHT_SHIFT_MODEL_FALLBACK=1 handle_per_model_limit "$fdir/per-model-limit.json" "fable-test" 2>/dev/null || exit 1
+    fx "no block on the fallback path" test ! -f "$d/blocked-fb.txt"
+    fx "fallback recorded in state" test "$(jq -r '.model_fallbacks["fable-test"]' "$STATE")" = "opus"
+    fx "session nulled (next turn starts fresh on the successor)" test "$(jq -r '.session_id' "$STATE")" = "null"
+    fx "model_fallback event journaled" grep -q '^model_fallback|' "$d/events-fb.txt"
+    fx "event payload carries from/to" \
+      jq -e '.from=="fable-test" and .to=="opus"' <<<"$(sed -n 's/^model_fallback|//p' "$d/events-fb.txt")"
+    fx "resolve_effective_model returns the successor afterward" \
+      test "$(resolve_effective_model fable-test)" = "opus"
+    fx "resolve_effective_model identity for unmapped models" \
+      test "$(resolve_effective_model sonnet)" = "sonnet"
+    exit 0
+  ) >/dev/null || return 1
+  # Wiring: the primary loop consults both handlers, the per-model branch sits
+  # AFTER the session-limit branch, and every model consumer routes through
+  # resolve_effective_model. declare -f, not grep -q pipes (pipefail flake).
+  body="$(declare -f invoke_primary)"
+  case "$body" in *handle_rate_limit_wait*) ;; *) return 1 ;; esac
+  case "${body#*is_rate_limit_response}" in *is_per_model_limit_response*) ;; *) return 1 ;; esac
+  local fn
+  for fn in invoke_primary invoke_persona_once invoke_observer_once port_audit_candidate; do
+    case "$(declare -f "$fn")" in *resolve_effective_model*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# handle_rate_limit_wait is the session-limit loop body extracted verbatim from
+# invoke_primary: it must increment + persist the consecutive counter, pin the
+# raw's session, journal rate_limit_wait, and hand off to
+# wait_for_rate_limit_reset — and block at the 5-cap (same predicate
+# fixture_rate_limit_consecutive guards) instead of sleeping forever.
+fixture_handle_rate_limit_wait() {
+  local root="$1" d="$root/hrlw" rc
+  mkdir -p "$d"
+  (
+    STATE="$d/state.json"; RUN_ROOT="$d"; RUN_ID="hw-$$"
+    printf '%s\n' '{"status":"running","stage":"planning","rate_limit_consecutive":1}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >"$d/waited.txt"; }
+    handle_rate_limit_wait "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json" || exit 1
+    fx "counter incremented + persisted" test "$(jq -r '.rate_limit_consecutive' "$STATE")" = "2"
+    fx "session pinned from the raw" test "$(jq -r '.session_id' "$STATE")" = "fixed-id"
+    fx "rate_limit_wait journaled with the count" \
+      jq -e '.consecutive==2' <<<"$(sed -n 's/^rate_limit_wait|//p' "$d/events.txt")"
+    fx "wait handed the raw file" grep -q 'session-limit.json' "$d/waited.txt"
+    exit 0
+  ) >/dev/null || return 1
+  # At the cap (4 prior consecutive -> 5th) it must block, not wait.
+  rc=0
+  (
+    STATE="$d/state-cap.json"; RUN_ROOT="$d"; RUN_ID="hw-cap-$$"
+    printf '%s\n' '{"status":"running","stage":"planning","rate_limit_consecutive":4}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked-cap.txt"; exit 42; }
+    emit_event() { :; }
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >"$d/waited-cap.txt"; }
+    handle_rate_limit_wait "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json"
+    exit 0
+  ) >/dev/null || rc=$?
+  [ "$rc" -eq 42 ] || return 1
+  grep -q "rate limit not clearing after 5 consecutive resets" "$d/blocked-cap.txt" || return 1
+  [ ! -f "$d/waited-cap.txt" ] || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# recovery-subagent: a real 429 on a PERSONA or OBSERVER review call used to be
+# misread as "no parseable JSON verdict" — burning both retries and hard-
+# blocking the run — while the SAME 429 on the primary path recovers fine.
+# invoke_persona_once / invoke_observer_once now detect it (return 42, distinct
+# from the ordinary parse-failure 1) and the callers route it to the parent's
+# wait/fallback path instead of the JSON-retry budget.
+# ---------------------------------------------------------------------------
+
+# Drives the REAL invoke_persona_once (not a stubbed seam) with a stubbed
+# `claude` binary, so the detection logic itself — not just the callers that
+# branch on its return code — is exercised against the canned live captures.
+fixture_recovery_invoke_persona_once_detects_rate_limit() {
+  local root="$1" dir="$root/ripo" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit"
+  mkdir -p "$dir"
+  (
+    RUN_ID="ripo-$$"; PERSONA_MODEL="inherit"; SPEC="$dir/s.md"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf 'bundle-body\n' >"$dir/bundle.md"
+    local rc=0
+    claude() { cat "$fdir/session-limit.json"; return 1; }
+    invoke_persona_once "Human Advocate" plan "$dir/bundle.md" "$dir/out.json" "$dir/raw.json" ""
+    rc=$?
+    fx "session-limit raw -> 42" test "$rc" -eq 42
+    claude() { cat "$fdir/per-model-limit.json"; return 1; }
+    invoke_persona_once "Human Advocate" plan "$dir/bundle.md" "$dir/out2.json" "$dir/raw2.json" ""
+    rc=$?
+    fx "per-model raw -> 42" test "$rc" -eq 42
+    # A genuine non-429 failure must still return plain 1 (unchanged behavior;
+    # the fix must not swallow real parse failures into the 42 path).
+    claude() { printf 'garbage, not json'; return 1; }
+    invoke_persona_once "Human Advocate" plan "$dir/bundle.md" "$dir/out3.json" "$dir/raw3.json" ""
+    rc=$?
+    fx "non-429 failure stays 1" test "$rc" -eq 1
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Same detection, for the observer's seam.
+fixture_recovery_invoke_observer_once_detects_rate_limit() {
+  local root="$1" dir="$root/rioo" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit"
+  mkdir -p "$dir"
+  (
+    RUN_ID="rioo-$$"; OBSERVER_MODEL="inherit"
+    printf 'ctx\n' >"$dir/ctx.txt"
+    local rc=0
+    claude() { cat "$fdir/session-limit.json"; return 1; }
+    invoke_observer_once "$dir/ctx.txt" "deadbeef" "$dir/out.json" "$dir/raw.json" ""
+    rc=$?
+    fx "session-limit raw -> 42" test "$rc" -eq 42
+    claude() { cat "$fdir/per-model-limit.json"; return 1; }
+    invoke_observer_once "$dir/ctx.txt" "deadbeef" "$dir/out2.json" "$dir/raw2.json" ""
+    rc=$?
+    fx "per-model raw -> 42" test "$rc" -eq 42
+    claude() { printf 'garbage, not json'; return 1; }
+    invoke_observer_once "$dir/ctx.txt" "deadbeef" "$dir/out3.json" "$dir/raw3.json" ""
+    rc=$?
+    fx "non-429 failure stays 1" test "$rc" -eq 1
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Step 1: batch of 3 personas; the middle one (Human Advocate) hits the
+# session-limit raw on its first spawn, then a valid verdict on re-spawn.
+# Drives the REAL spawn_personas/spawn_persona_worker/handle_persona_rate_limits
+# with invoke_persona_once stubbed at the same seam every other spawn fixture
+# uses (fixture_persona_spawn et al.) — the stub plays the part of the raw-
+# detection invoke_persona_once now does: write the raw + return 42.
+fixture_recovery_persona_session_wait() {
+  local root="$1" dir="$root/rspw"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="rspw"; PERSONA_MODEL="inherit"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    # session_id seeded to the PRIMARY's pinned session: handle_rate_limit_wait
+    # is called here in subagent mode (the raw belongs to the rate-limited
+    # persona, not the primary) and must NOT overwrite it — a persona-BLOCK
+    # routes back to implementation within the same session scope, so an
+    # overwritten .session_id would resume the primary inside a reviewer's
+    # session (the bug this fixture's assertion below guards against).
+    printf '{"stage_started_at":%s,"task_started_at":%s,"session_id":"PRIMARY-SESSION"}' "$_n" "$_n" >"$STATE"
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >>"$dir/waited.txt"; }
+    invoke_persona_once() {
+      local persona="$1" out="$4" raw="$5" slug n
+      slug="$(persona_slug "$persona")"
+      n="$(cat "$dir/spawncount-$slug" 2>/dev/null)" || n=0
+      n=$((n + 1)); printf '%s' "$n" >"$dir/spawncount-$slug"
+      if [ "$persona" = "Human Advocate" ] && [ "$n" -eq 1 ]; then
+        cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json" "$raw"
+        return 42
+      fi
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$out"
+      printf '{"result":"ok"}' >"$raw"
+    }
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Backend & Data Expert|Human Advocate|TypeScript & Code Quality Expert"
+    fx "wait called exactly once" test "$(grep -c . "$dir/waited.txt" 2>/dev/null)" -eq 1
+    fx "Backend & Data Expert spawned once (not re-invoked)" \
+      test "$(cat "$dir/spawncount-backend-data-expert" 2>/dev/null)" = "1"
+    fx "TypeScript & Code Quality Expert spawned once (not re-invoked)" \
+      test "$(cat "$dir/spawncount-typescript-code-quality-expert" 2>/dev/null)" = "1"
+    fx "Human Advocate spawned twice (429 then a real retry)" \
+      test "$(cat "$dir/spawncount-human-advocate" 2>/dev/null)" = "2"
+    fx "all 3 personas produced a final validated result" \
+      test "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 3
+    for f in "$rd"/*.json; do
+      fx "result $f is schema-valid" json_schema_basic persona-review "$f"
+    done
+    fx "rate_limit_wait journaled" \
+      jq -e 'select(.type=="rate_limit_wait")' "$RUN_ROOT/events.jsonl" >/dev/null
+    fx "no persona_retry 'no parseable JSON' event for the rate-limited persona" \
+      test -z "$(jq -r 'select(.type=="persona_retry" and .payload.persona=="Human Advocate" and (.payload.reason|test("no parseable JSON")))' "$RUN_ROOT/events.jsonl" 2>/dev/null)"
+    fx "primary's pinned session_id is UNCHANGED by the persona-path 429 wait" \
+      test "$(jq -r '.session_id' "$STATE")" = "PRIMARY-SESSION"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Step 2a: per-model cap on a persona defaults to block_run with the same
+# actionable reason as the primary/Task-10 path.
+fixture_recovery_persona_permodel_block() {
+  local root="$1" dir="$root/rppb" rc=0
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="rppb"; PERSONA_MODEL="fable-test"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s,"session_id":"old"}' "$_n" "$_n" >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$dir/blocked.txt"; exit 42; }
+    invoke_persona_once() {
+      cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/per-model-limit.json" "$5"
+      return 42
+    }
+    unset NIGHT_SHIFT_MODEL_FALLBACK
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    exit 0
+  )
+  rc=$?
+  [ "$rc" -eq 42 ] || return 1
+  grep -q "per-model usage cap hit on model 'fable-test'" "$dir/blocked.txt" || return 1
+  grep -q "reached your Zephyr 9 limit" "$dir/blocked.txt" || return 1
+  return 0
+}
+
+# Step 2b: NIGHT_SHIFT_MODEL_FALLBACK=1 records the fallback and re-spawns on
+# the successor — proven by the STUB's own resolve_effective_model call (the
+# same call the real invoke_persona_once makes to build --model) returning the
+# capped model on the first spawn and the successor on the re-spawn.
+fixture_recovery_persona_permodel_fallback() {
+  local root="$1" dir="$root/rppf"
+  mkdir -p "$dir"
+  ( log() { :; }
+    RUN_ROOT="$dir/run"; SPEC="$dir/s.md"; PROJECT="$dir/proj"
+    BASE_COMMIT="HEAD"; RUN_ID="rppf"; PERSONA_MODEL="fable-test"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/validated" "$PROJECT"
+    printf '## Review\n- Track: node\n- Review Profile: logic\n' >"$SPEC"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    STATE="$RUN_ROOT/state.json"; _n="$(now_epoch)"
+    printf '{"stage_started_at":%s,"task_started_at":%s,"session_id":"old"}' "$_n" "$_n" >"$STATE"
+    invoke_persona_once() {
+      local out="$4" raw="$5"
+      printf '%s\n' "$(resolve_effective_model "$PERSONA_MODEL")" >>"$dir/model-calls.txt"
+      if [ ! -f "$dir/hit-once" ]; then
+        : >"$dir/hit-once"
+        cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/per-model-limit.json" "$raw"
+        return 42
+      fi
+      printf '{"status":"APPROVE","findings":[],"documentation_changes":[],"commit":null}' >"$out"
+      printf '{}' >"$raw"
+    }
+    NIGHT_SHIFT_MODEL_FALLBACK=1
+    rd="$RUN_ROOT/validated/personas/s/plan/round-1"; mkdir -p "$rd"
+    spawn_personas "$rd" plan "Human Advocate"
+    fx "one validated result after the fallback re-spawn" \
+      test "$(find "$rd" -name '*.json' | wc -l | tr -d ' ')" -eq 1
+    fx "first call used the capped model" test "$(sed -n '1p' "$dir/model-calls.txt")" = "fable-test"
+    fx "re-spawn used the successor" test "$(sed -n '2p' "$dir/model-calls.txt")" = "opus"
+    fx "fallback recorded in state" test "$(jq -r '.model_fallbacks["fable-test"]' "$STATE")" = "opus"
+    fx "model_fallback event journaled" \
+      jq -e 'select(.type=="model_fallback") | .payload.from=="fable-test" and .payload.to=="opus"' \
+        "$RUN_ROOT/events.jsonl" >/dev/null
+    # handle_per_model_limit is called here in subagent mode: .model_fallbacks
+    # must still be recorded (every model consumer needs the mapping) but the
+    # PRIMARY's pinned .session_id must NOT be force-refreshed — only a
+    # primary-mode call nulls it.
+    fx "primary's pinned session_id is UNCHANGED by the persona-path fallback" \
+      test "$(jq -r '.session_id' "$STATE")" = "old"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Step 3: the observer's serial attempt loop gets the same treatment — a 429
+# is waited out WITHOUT consuming one of the two contract-retry attempts.
+fixture_recovery_observer_session_wait() {
+  local root="$1" dir="$root/rosw"
+  mkdir -p "$dir/raw"
+  (
+    RUN_ROOT="$dir"; OBSERVER=claude; PRIMARY=claude; SPEC="/x/spec.md"
+    STATE="$dir/state.json"; RUN_ID="rosw"
+    # session_id seeded to the PRIMARY's pinned session: handle_rate_limit_wait
+    # is called here in subagent mode (the raw belongs to the observer, not the
+    # primary) and must NOT overwrite it (same contamination risk as the
+    # persona path above).
+    printf '{"status":"running","session_id":"PRIMARY-SESSION"}' >"$STATE"
+    enforce_limits() { :; }
+    enforce_elapsed_limits() { :; }
+    normalize_observer_output() { :; }
+    wait_for_rate_limit_reset() { printf '%s\n' "$1" >>"$dir/waited.txt"; }
+    local raw_calls=0 real_attempts=0
+    invoke_observer_once() {
+      raw_calls=$((raw_calls + 1))
+      if [ "$raw_calls" -eq 1 ]; then
+        cp "$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit/session-limit.json" "$4"
+        return 42
+      fi
+      real_attempts=$((real_attempts + 1))
+      printf '{"total_cost_usd":1.0,"num_turns":1}\n' >"$4"
+      printf '{"observer":"claude","primary":"claude","task":"/x/spec.md","candidate_commit":"a7a950b","status":"APPROVE","findings":[],"documentation_changes":[]}\n' >"$3"
+    }
+    validated_observer_retry "ctx" "a7a950b" "$dir/out.json" "$dir/raw/obs.jsonl"
+    fx "retry wrapper reports success" test $? -eq 0
+    fx "wait called exactly once" test "$(grep -c . "$dir/waited.txt" 2>/dev/null)" -eq 1
+    fx "exactly one REAL (non-429) attempt consumed the 2-try budget" test "$real_attempts" -eq 1
+    fx "verdict accepted" test "$(jq -r '.status' "$dir/out.json")" = "APPROVE"
+    fx "rate_limit_wait journaled" \
+      jq -e 'select(.type=="rate_limit_wait")' "$dir/events.jsonl" >/dev/null
+    fx "no observer_retry event (the 429 never counted as a contract failure)" \
+      test -z "$(jq -r 'select(.type=="observer_retry")' "$dir/events.jsonl" 2>/dev/null)"
+    fx "primary's pinned session_id is UNCHANGED by the observer-path 429 wait" \
+      test "$(jq -r '.session_id' "$STATE")" = "PRIMARY-SESSION"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # F1 fixture: run-lock stale-vs-live decision
 # ---------------------------------------------------------------------------
 fixture_run_lock() {
@@ -4748,6 +5158,1189 @@ STUB
     export BR_SIZE=512;     __visual_wait_bundle_ready && exit 1   # tiny error page -> not ready
     exit 0
   ) || return 1
+  return 0
+}
+
+# scripts/lib/cdp-ws.js (port-fidelity Task 1): a zero-dep CDP websocket client
+# that Task 2's design extractor will drive real headless Chrome through. This
+# fixture actually launches Chrome, so it self-skips when no chrome binary is
+# available — the deterministic/offline suite must stay green on machines
+# without Chrome (CI) without silently losing coverage on machines that do
+# have it (dev). Its label differs by branch ("skipped" vs. the real
+# launch+evaluate assertion), so unlike every other fixture above it does not
+# go through fixture_assert's fixed-description dispatch — it prints its own
+# ok/not-ok line, same convention fixture_assert itself uses.
+fixture_cdp_ws() {
+  local bin="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  if [ ! -x "$bin" ]; then
+    printf 'ok - cdp-ws: skipped (no chrome)\n'
+    return
+  fi
+  # Chrome cold-start on a busy CI runner can exceed the default 15s launch
+  # timeout (observed flaking on ubuntu-latest: pass one run, timeout the
+  # next). Give CI headroom and retry once before declaring failure — the
+  # selftest is deterministic once Chrome is warm.
+  local out attempt
+  for attempt in 1 2; do
+    if out="$(CHROME_BIN="$bin" NIGHT_SHIFT_CDP_LAUNCH_TIMEOUT_MS=60000 \
+        node "$WORKSPACE_ROOT/scripts/lib/cdp-ws.js" --selftest 2>&1)"; then
+      printf 'ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n'
+      return
+    fi
+  done
+  printf 'not ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n' >&2
+  printf '%s\n' "$out" >&2
+  FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+}
+
+# scripts/lib/cdp-extract.js (port-fidelity Task 2): the web-mode design
+# extractor built on cdp-ws.js. This fixture serves the committed neutral
+# fixture page over a real local HTTP server, drives the extractor CLI
+# against it through real headless Chrome, and asserts the resulting
+# manifest against known values baked into that fixture page (the "test
+# oracle"). Chrome- and python3-guarded the same way as fixture_cdp_ws above,
+# so a chromeless/python3-less machine (CI) still gets a green, deterministic
+# suite instead of a false failure. Everything (the http.server background
+# process, its port, and the CLI's --out scratch dir) lives inside a command-
+# substitution subshell so its own `trap ... EXIT` cleans up on every path
+# (pass, fail, or a stray hang) without disturbing run_dry_fixtures' own EXIT
+# trap on $FIXTURE_ROOT.
+_fixture_design_extract_web_run() {
+  local bin="$1"
+  local fixture_dir port up i manifest png
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/design-page"
+  # DELIBERATELY NOT local: the EXIT trap fires in the surrounding command-
+  # substitution subshell AFTER this function has returned, when its locals
+  # are already out of scope — a `local` here means the trap sees unbound
+  # variables (set -u aborts it) and the http server + scratch dir leak
+  # (observed live before this fix). Non-local is still contained: the
+  # caller always invokes this inside $(...), so nothing escapes to the
+  # real shell.
+  DESIGN_EXTRACT_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-design-extract.$$"
+  DESIGN_EXTRACT_HTTPD_PID=""
+  mkdir -p "$DESIGN_EXTRACT_OUT_DIR" || return 1
+  trap 'kill "${DESIGN_EXTRACT_HTTPD_PID:-}" 2>/dev/null; rm -rf "${DESIGN_EXTRACT_OUT_DIR:-}"' EXIT
+
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
+
+  python3 -m http.server "$port" --bind 127.0.0.1 --directory "$fixture_dir" >/dev/null 2>&1 &
+  DESIGN_EXTRACT_HTTPD_PID=$!
+
+  up=0
+  for i in $(seq 1 30); do
+    if curl -s -o /dev/null "http://127.0.0.1:$port/"; then
+      up=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [ "$up" -ne 1 ]; then
+    printf 'fixture http server never came up on port %s\n' "$port"
+    return 1
+  fi
+
+  # Same CI cold-start headroom as fixture_cdp_ws (Chrome launch can exceed
+  # the 15s default on a busy runner).
+  if ! CHROME_BIN="$bin" NIGHT_SHIFT_CDP_LAUNCH_TIMEOUT_MS=60000 \
+    node "$WORKSPACE_ROOT/scripts/lib/cdp-extract.js" \
+    --url "http://127.0.0.1:$port/" --screen home --out "$DESIGN_EXTRACT_OUT_DIR"; then
+    return 1
+  fi
+
+  manifest="$DESIGN_EXTRACT_OUT_DIR/home.json"
+  png="$DESIGN_EXTRACT_OUT_DIR/home-430x932.png"
+  [ -s "$manifest" ] || { printf 'manifest missing/empty: %s\n' "$manifest"; return 1; }
+  [ -s "$png" ] || { printf 'screenshot missing/empty: %s\n' "$png"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-design-manifest/1\"' '$manifest' >/dev/null"
+  fx "heading typography (fontSize 28, fontWeight 700, color #123456)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"heading\")][0] | (.typography.fontSize == 28 and .typography.fontWeight == 700 and .color == \"#123456\")' '$manifest' >/dev/null"
+  fx "button style (background #30437a, radius 8, w 320)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"button\")][0] | ((.background|ascii_downcase) == \"#30437a\" and .radius == 8 and .bounds.w == 320)' '$manifest' >/dev/null"
+  fx "icon size 24" bash -c \
+    "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
+  fx "li dedupe keeps exactly 2 rows" bash -c \
+    "jq -e '[.elements[] | select(.role==\"text\" and (.text|startswith(\"Row\")))] | length == 2' '$manifest' >/dev/null"
+  # oklch() colors don't match the extractor's rgb()/rgba() fast path — this
+  # exercises the 1x1-canvas fallback (the Tailwind-v4 regression: without it
+  # every modern-color-syntax page comes back all-null). Exact bytes are not
+  # asserted (oklch→sRGB rounding may vary); a lowercase 6-digit hex that is
+  # neither pure black (the fallback's sentinel fill) nor white proves the
+  # conversion really ran.
+  fx "oklch color resolves via the canvas fallback (6-digit hex, not null/black/white)" bash -c \
+    "jq -e '[.elements[] | select(.text==\"Oklch sample\")][0].color | (. != null) and test(\"^#[0-9a-f]{6}\$\") and (. != \"#000000\") and (. != \"#ffffff\")' '$manifest' >/dev/null"
+  fx "rollup.spacingScale has no negative values" bash -c \
+    "jq -e '.rollup.spacingScale | all(. >= 0)' '$manifest' >/dev/null"
+  return 0
+}
+
+fixture_design_extract_web() {
+  local bin="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  if [ ! -x "$bin" ]; then
+    printf 'ok - design-extract-web: skipped (no chrome)\n'
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'ok - design-extract-web: skipped (no python3)\n'
+    return
+  fi
+
+  local err status
+  err="$(_fixture_design_extract_web_run "$bin" 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - design-extract-web: extracts manifest (typography/color/radius/icon/list-dedupe) from a live page\n'
+  else
+    printf 'not ok - design-extract-web: extracts manifest (typography/color/radius/icon/list-dedupe) from a live page\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/lib/figma-manifest.js (port-fidelity Task 3): the figma-mode
+# design extractor. Unlike cdp-ws.js/cdp-extract.js above, this is pure text
+# parsing of a committed node-dump + globals file (no MCP server, no chrome,
+# no simulator) into the SAME night-shift-design-manifest/1 schema the web
+# extractor produces (source.kind "figma", unit "pt") — so this fixture is
+# fully deterministic/offline and runs UNCONDITIONALLY on every machine (CI
+# included), unlike the two chrome-gated fixtures immediately above it.
+# Known values baked into the committed fixture files are the test oracle.
+_fixture_design_extract_figma_run() {
+  local fixture_dir manifest
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes"
+  # DELIBERATELY NOT local, same reasoning as _fixture_design_extract_web_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  DESIGN_EXTRACT_FIGMA_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-design-extract-figma.$$"
+  mkdir -p "$DESIGN_EXTRACT_FIGMA_OUT_DIR" || return 1
+  trap 'rm -rf "${DESIGN_EXTRACT_FIGMA_OUT_DIR:-}"' EXIT
+
+  if ! node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$fixture_dir/sample-screen.txt" --globals "$fixture_dir/_global-vars.txt" \
+    --screen sample-screen --out "$DESIGN_EXTRACT_FIGMA_OUT_DIR"; then
+    return 1
+  fi
+
+  manifest="$DESIGN_EXTRACT_FIGMA_OUT_DIR/sample-screen.json"
+  [ -s "$manifest" ] || { printf 'manifest missing/empty: %s\n' "$manifest"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-design-manifest/1\"' '$manifest' >/dev/null"
+  fx "source.unit is pt" bash -c "jq -e '.source.unit == \"pt\"' '$manifest' >/dev/null"
+  fx "heading typography (fontSize 28, fontWeight 700, color #123456)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"heading\")][0] | (.typography.fontSize == 28 and .typography.fontWeight == 700 and .color == \"#123456\")' '$manifest' >/dev/null"
+  fx "button style (background #30437a, radius 8, w 320, text Continue)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"button\")][0] | (.background == \"#30437a\" and .radius == 8 and .bounds.w == 320 and .text == \"Continue\")' '$manifest' >/dev/null"
+  # Square-button regression (port-fidelity pre-merge Item 1), a SEPARATE
+  # node-dump (square-button.txt) so it doesn't perturb the element count/
+  # ordering the rest of this fixture and the port-audit-normalize dup-dedupe
+  # fixture (Task 8) bake in from sample-screen.txt: the RECTANGLE child
+  # carries an explicit borderRadius=0 while its GROUP parent carries a
+  # non-zero 6. `resolveRadius(rect) || resolveRadius(node)` treated the
+  # legitimate 0 as falsy and fell through to the parent's 6 — an explicit
+  # null check must keep it at 0.
+  local square_manifest
+  if ! node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$fixture_dir/square-button.txt" --globals "$fixture_dir/_global-vars.txt" \
+    --screen square-button --out "$DESIGN_EXTRACT_FIGMA_OUT_DIR"; then
+    return 1
+  fi
+  square_manifest="$DESIGN_EXTRACT_FIGMA_OUT_DIR/square-button.json"
+  fx "square button keeps its own radius 0, does not inherit the group's radius 6" bash -c \
+    "jq -e '[.elements[] | select(.text == \"Square\")][0].radius == 0' '$square_manifest' >/dev/null"
+  fx "icon size 24" bash -c \
+    "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
+  fx "rollup palette contains #30437a" bash -c \
+    "jq -e '.rollup.palette | index(\"#30437a\") != null' '$manifest' >/dev/null"
+  # Negative-gap rollup filter: an absolutely-positioned TEXT node ("Overlap
+  # Label") overlaps the button's vertical extent, producing a negative
+  # gapToPrev (-8) on that element (kept raw — negatives are real overlap
+  # facts about the layout). spacingScale is a design-token SCALE, so it must
+  # filter negatives out — the identical rule cdp-extract.js applies (Task 2)
+  # must also apply here (Task 3), or web-mode and figma-mode manifests
+  # diverge on the same rollup semantic.
+  fx "overlapping text element keeps its raw negative gapToPrev (-8)" bash -c \
+    "jq -e '[.elements[] | select(.text == \"Overlap Label\")][0].spacing.gapToPrev == -8' '$manifest' >/dev/null"
+  fx "rollup.spacingScale has no negative values (overlap artifacts excluded)" bash -c \
+    "jq -e '.rollup.spacingScale | all(. >= 0)' '$manifest' >/dev/null"
+  return 0
+}
+
+fixture_design_extract_figma() {
+  local err status
+  err="$(_fixture_design_extract_figma_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - design-extract-figma: extracts manifest (typography/color/radius/icon/rollup) from a node-dump\n'
+  else
+    printf 'not ok - design-extract-figma: extracts manifest (typography/color/radius/icon/rollup) from a node-dump\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/design-extract.sh (port-fidelity Task 4): the thin CLI wrapper that
+# validates args and dispatches to the Task 2/3 extractors. Exercises figma mode
+# end-to-end against the committed Task 3 fixtures (pure text parsing — no chrome,
+# no network, so this runs unconditionally on every machine incl. CI), and asserts
+# the usage-error exit code (2) for a bad mode/flag combo (--mode web with no --url).
+_fixture_design_extract_cli_run() {
+  local fixture_dir out web_err web_status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes"
+  # DELIBERATELY NOT local, same reasoning as _fixture_design_extract_figma_run
+  # above: the EXIT trap fires in the surrounding command-substitution subshell
+  # after this function has returned, when a `local` would already be out of scope.
+  DESIGN_EXTRACT_CLI_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-design-extract-cli.$$"
+  mkdir -p "$DESIGN_EXTRACT_CLI_OUT_DIR/proj" || return 1
+  trap 'rm -rf "${DESIGN_EXTRACT_CLI_OUT_DIR:-}"' EXIT
+
+  if ! "$WORKSPACE_ROOT/scripts/design-extract.sh" --mode figma --screen sample-screen \
+    --project "$DESIGN_EXTRACT_CLI_OUT_DIR/proj" --nodes "$fixture_dir/sample-screen.txt" >/dev/null; then
+    printf 'figma-mode dispatch failed (exit %s)\n' "$?"
+    return 1
+  fi
+
+  out="$DESIGN_EXTRACT_CLI_OUT_DIR/proj/design/manifest/sample-screen.json"
+  [ -s "$out" ] || { printf 'manifest missing/empty: %s\n' "$out"; return 1; }
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-design-manifest/1\"' '$out' >/dev/null"
+
+  web_err="$("$WORKSPACE_ROOT/scripts/design-extract.sh" --mode web --screen home \
+    --project "$DESIGN_EXTRACT_CLI_OUT_DIR/proj" 2>&1)"
+  web_status=$?
+  if [ "$web_status" -ne 2 ]; then
+    printf 'expected exit 2 for --mode web without --url, got %s: %s\n' "$web_status" "$web_err"
+    return 1
+  fi
+  return 0
+}
+
+fixture_design_extract_cli() {
+  local err status
+  err="$(_fixture_design_extract_cli_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - design-extract-cli: dispatches figma mode end-to-end, exit 2 on --mode web without --url\n'
+  else
+    printf 'not ok - design-extract-cli: dispatches figma mode end-to-end, exit 2 on --mode web without --url\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# manifest_prompt_block / spec_design_manifest_field (port-fidelity Task 4): the
+# implement-prompt "Design ground truth" table built from an already-extracted
+# night-shift-design-manifest/1 JSON. Pure jq/bash (no chrome, no network), and both
+# functions are defined earlier in night-shift.sh — already in scope here the same
+# way spec_has_design_contract/spec_workdir etc. are, since this file is sourced by
+# the orchestrator AFTER those definitions. Reuses the Task 3 figma fixture
+# (sample-screen.txt + _global-vars.txt) as the manifest source via the checked-in
+# extractor rather than hand-writing a manifest JSON, so drift in the manifest
+# schema breaks this fixture too. Runs unconditionally on every machine (CI incl.).
+_fixture_manifest_prompt_run() {
+  local spec_file spec_nofield_file spec_big_file block empty_block rows
+  local spec_escape_file spec_link_file
+  local PROJECT
+  # DELIBERATELY NOT local for the dir itself, same reasoning as the other
+  # command-substitution-subshell fixtures above: the EXIT trap fires after this
+  # function returns, when a `local` dir would already be out of scope.
+  MANIFEST_PROMPT_FIXTURE_DIR="$WORKSPACE_ROOT/.night-shift-fixture-manifest-prompt.$$"
+  mkdir -p "$MANIFEST_PROMPT_FIXTURE_DIR/proj/design/manifest" || return 1
+  trap 'rm -rf "${MANIFEST_PROMPT_FIXTURE_DIR:-}"' EXIT
+
+  PROJECT="$MANIFEST_PROMPT_FIXTURE_DIR/proj"
+  node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+    --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+    --screen sample-screen --out "$PROJECT/design/manifest" >/dev/null || return 1
+
+  spec_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec.md"
+  cat >"$spec_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: design/manifest/sample-screen.json            <!-- optional; comma-separated -->
+- Manifest source: figma
+SPECEOF
+
+  spec_nofield_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-nofield.md"
+  cat >"$spec_nofield_file" <<'SPECEOF'
+## Design Contract
+
+- Figma file: whatever
+SPECEOF
+
+  block="$(manifest_prompt_block "$spec_file")"
+  fx "table header present" bash -c \
+    'printf "%s" "$1" | grep -qF "| element | role | text | font | size/weight | color | bg | bounds | gapToPrev | radius |"' _ "$block"
+  fx "Sample Title row present" bash -c 'printf "%s" "$1" | grep -q "Sample Title"' _ "$block"
+
+  empty_block="$(manifest_prompt_block "$spec_nofield_file")"
+  [ -z "$empty_block" ] || { printf 'expected empty block for a spec without a Design manifest field, got: %s\n' "$empty_block"; return 1; }
+
+  # Truncation: synthesize a 45-element manifest (jq, from the same base) and assert
+  # the table caps at MANIFEST_PROMPT_ROW_CAP (40) rows, not 45.
+  jq '.elements = ([range(0;45)] | map({
+        id: "el-\(.)", role: "text", match: {web: null, figma: null}, text: "Row \(.)",
+        typography: {fontFamily: "Poppins", fontSize: 14, fontWeight: 400, lineHeight: 18},
+        color: "#000000", background: null,
+        bounds: {x: 0, y: (. * 10), w: 100, h: 10},
+        spacing: {marginTop: 0, paddingH: 0, gapToPrev: 0}, radius: 0, iconSize: null }))' \
+    "$PROJECT/design/manifest/sample-screen.json" >"$PROJECT/design/manifest/big.json" || return 1
+
+  spec_big_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-big.md"
+  cat >"$spec_big_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: design/manifest/big.json
+SPECEOF
+
+  rows="$(manifest_prompt_block "$spec_big_file" | grep -c '^| el-')"
+  [ "$rows" -eq 40 ] || { printf 'expected the element table capped at 40 rows, got %s\n' "$rows"; return 1; }
+
+  # Containment (manifest_path_resolve): the engine runs unattended with
+  # bypassPermissions against isolation-sensitive targets, so a `- Design
+  # manifest:` path must never read a file OUTSIDE the project into the
+  # implement prompt — same escape rules as set_spec_workdir's Workdir field.
+  # (a) `../` traversal to a real file above the project: block empty + a loud
+  #     one-line WARN on stderr (skip, never a hard failure).
+  cp "$PROJECT/design/manifest/sample-screen.json" "$MANIFEST_PROMPT_FIXTURE_DIR/outside.json"
+  spec_escape_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-escape.md"
+  cat >"$spec_escape_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: ../outside.json
+SPECEOF
+  block="$(manifest_prompt_block "$spec_escape_file" 2>"$MANIFEST_PROMPT_FIXTURE_DIR/escape.err")"
+  [ -z "$block" ] || { printf 'expected empty block for a ../-escaping manifest path, got: %s\n' "$block"; return 1; }
+  fx "escaping ../ path warned loudly" \
+    grep -q 'WARN: Design manifest path skipped' "$MANIFEST_PROMPT_FIXTURE_DIR/escape.err"
+  # (b) a symlink UNDER the project pointing outside it (the case a bare
+  #     `[ -f $PROJECT/$path ]` would happily pass): also skipped with the WARN.
+  ln -s "$MANIFEST_PROMPT_FIXTURE_DIR/outside.json" "$PROJECT/design/manifest/evil-link.json"
+  spec_link_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-link.md"
+  cat >"$spec_link_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: design/manifest/evil-link.json
+SPECEOF
+  block="$(manifest_prompt_block "$spec_link_file" 2>"$MANIFEST_PROMPT_FIXTURE_DIR/link.err")"
+  [ -z "$block" ] || { printf 'expected empty block for a symlink escaping the project, got: %s\n' "$block"; return 1; }
+  fx "outside-pointing symlink warned loudly" \
+    grep -q 'WARN: Design manifest path skipped' "$MANIFEST_PROMPT_FIXTURE_DIR/link.err"
+  return 0
+}
+
+fixture_manifest_prompt() {
+  local err status
+  err="$(_fixture_manifest_prompt_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows, contains escapes\n'
+  else
+    printf 'not ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows, contains escapes\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/component-inventory.sh + scripts/lib/component-inventory.js
+# (port-fidelity Task 5): opens Phase C (component-reuse gate). Pure
+# text/regex extraction over a committed neutral fixture tree (no chrome, no
+# network, no tsc/npm), so this runs unconditionally on every machine incl.
+# CI. Exercises the CLI wrapper end-to-end against
+# scripts/test/fixtures/component-tree/ (Badge/Row/Chip/Toggle in
+# src/ui/components, Panel in src/features/sample/components, SampleScreen.tsx
+# importing Badge twice in JSX but from a single import line, and Panel once)
+# and asserts the exact schema/props/usageCount values baked into that
+# fixture tree — usageCount counts importing FILES, not JSX occurrences,
+# which is why Badge.usageCount is 1 (one importing file) despite two
+# <Badge/> uses.
+# Chip is `export const Chip = memo(function Chip(...))` — regression cover
+# for the HOC-wrapped export shape a live run found invisible to the plain
+# export regexes (which hid a real app's most-reused memo() components).
+# Toggle is `export const Toggle: React.FC<{ onToggle: () => void }> =
+# memo(...)` — regression cover for port-fidelity pre-merge Item 2: an
+# arrow-typed field INSIDE the type annotation broke the annotation matcher
+# (`(?::[^=]+)?` can't cross the `=` inside `=>`), so the whole component
+# vanished from the inventory despite being memo-wrapped exactly like Chip.
+_fixture_component_inventory_run() {
+  local fixture_dir out
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/component-tree"
+  # DELIBERATELY NOT local, same reasoning as _fixture_design_extract_cli_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  COMPONENT_INVENTORY_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-component-inventory.$$"
+  mkdir -p "$COMPONENT_INVENTORY_OUT_DIR" || return 1
+  trap 'rm -rf "${COMPONENT_INVENTORY_OUT_DIR:-}"' EXIT
+
+  out="$COMPONENT_INVENTORY_OUT_DIR/component-inventory.json"
+  if ! "$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$fixture_dir" --out "$out" >/dev/null; then
+    printf 'component-inventory.sh dispatch failed (exit %s)\n' "$?"
+    return 1
+  fi
+  [ -s "$out" ] || { printf 'inventory missing/empty: %s\n' "$out"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-component-inventory/1\"' '$out' >/dev/null"
+  fx "5 components (Badge, Chip, Panel, Row, Toggle)" bash -c "jq -e '.components | length == 5' '$out' >/dev/null"
+  fx "Badge.props == [label, tone]" bash -c \
+    "jq -e '([.components[] | select(.name == \"Badge\")][0].props) == [\"label\",\"tone\"]' '$out' >/dev/null"
+  fx "Panel.props contains padded" bash -c \
+    "jq -e '([.components[] | select(.name == \"Panel\")][0].props) | index(\"padded\") != null' '$out' >/dev/null"
+  fx "Chip (memo-wrapped export) detected with props == [label, active]" bash -c \
+    "jq -e '([.components[] | select(.name == \"Chip\")][0].props) == [\"label\",\"active\"]' '$out' >/dev/null"
+  fx "Toggle (memo-wrapped, arrow-typed annotation) detected with props == [label, onToggle]" bash -c \
+    "jq -e '([.components[] | select(.name == \"Toggle\")][0].props) == [\"label\",\"onToggle\"]' '$out' >/dev/null"
+  fx "Badge.usageCount == 1 (one importing file, not two JSX uses)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Badge\")][0].usageCount) == 1' '$out' >/dev/null"
+  fx "Row.usageCount == 0 (unused)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Row\")][0].usageCount) == 0' '$out' >/dev/null"
+  fx "Chip.usageCount == 0 (unused)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Chip\")][0].usageCount) == 0' '$out' >/dev/null"
+  fx "Toggle.usageCount == 0 (unused)" bash -c \
+    "jq -e '([.components[] | select(.name == \"Toggle\")][0].usageCount) == 0' '$out' >/dev/null"
+  return 0
+}
+
+fixture_component_inventory() {
+  local err status
+  err="$(_fixture_component_inventory_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - component-inventory: extracts 5 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n'
+  else
+    printf 'not ok - component-inventory: extracts 5 components incl. memo-wrapped, w/ props + usageCount (files, not JSX occurrences)\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/night-shift.sh's check_component_reuse (port-fidelity Task 6,
+# closing Phase C). Seeds a fresh temp git repo per case from the SAME Task 5
+# fixture component tree (Badge/Row in src/ui/components, Panel in
+# src/features/sample/components), commits it as base, adds a brand-new
+# src/ui/components/Fancy.tsx on top as the "candidate" commit, and calls
+# check_component_reuse directly (no full night-shift run — the function only
+# needs PROJECT/BASE_COMMIT/SPEC/RUN_ROOT, all cheaply fixture-built here).
+_reuse_gate_seed_repo() {
+  local repo="$1"
+  mkdir -p "$repo"
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/component-tree/." "$repo/"
+  git init -q "$repo"
+  git -C "$repo" config user.email t@t
+  git -C "$repo" config user.name t
+  git -C "$repo" add -A && git -C "$repo" commit -qm base >/dev/null
+  git -C "$repo" rev-parse HEAD
+}
+
+# Adds src/ui/components/Fancy.tsx (a plain, undeclared-by-default component)
+# on top of the given repo's current HEAD and returns the new commit SHA.
+_reuse_gate_add_fancy() {
+  local repo="$1"
+  mkdir -p "$repo/src/ui/components"
+  cat >"$repo/src/ui/components/Fancy.tsx" <<'EOF'
+type FancyProps = { title: string };
+export function Fancy({ title }: FancyProps) { return null; }
+EOF
+  git -C "$repo" add -A && git -C "$repo" commit -qm 'add Fancy' >/dev/null
+  git -C "$repo" rev-parse HEAD
+}
+
+_fixture_reuse_gate_run() {
+  local root="$FIXTURE_ROOT/reuse-gate" repo base candidate
+  mkdir -p "$root"
+
+  # Case 1: candidate adds Fancy.tsx, the plan's Component Map declares only
+  # the PRE-EXISTING components (never mentions Fancy) -> flagged, count==1,
+  # a non-empty closestExisting suggestion from the inventory.
+  ( dir="$root/undeclared"; mkdir -p "$dir"
+    repo="$dir/repo"
+    base="$(_reuse_gate_seed_repo "$repo")" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-undeclared"; PROJECT="$repo"; BASE_COMMIT="$base"
+    SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '## Design Contract\n\n- Design manifest: none\n' >"$SPEC"
+    printf '# Plan\n\n## Component Map\n\n- Header: reuse Panel\n- Chip: reuse Badge\n' >"$RUN_ROOT/control/plan.md"
+    "$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$repo" \
+      --out "$RUN_ROOT/component-inventory.json" >/dev/null || exit 1
+    candidate="$(_reuse_gate_add_fancy "$repo")" || exit 1
+    check_component_reuse "$candidate"
+    fx "undeclared: violations file written" \
+      [ -s "$RUN_ROOT/validated/reuse-violations.json" ]
+    fx "undeclared: schema id" bash -c \
+      "jq -e '.schema == \"night-shift-reuse-violations/1\"' '$RUN_ROOT/validated/reuse-violations.json' >/dev/null"
+    fx "undeclared: exactly 1 violation for Fancy" bash -c \
+      "jq -e '(.violations | length) == 1 and (.violations[0].component == \"Fancy\") and (.violations[0].declared == false)' '$RUN_ROOT/validated/reuse-violations.json' >/dev/null"
+    fx "undeclared: closestExisting is non-empty" bash -c \
+      "jq -e '(.violations[0].closestExisting | length) > 0' '$RUN_ROOT/validated/reuse-violations.json' >/dev/null"
+    fx "undeclared: reuse_violation event journaled with count 1" \
+      grep -q '"type":"reuse_violation".*"count":1' "$RUN_ROOT/events.jsonl"
+    section="$(reuse_violations_section)"
+    fx "undeclared: reuse_violations_section prints the advisory marker" \
+      bash -c 'printf "%s" "$1" | grep -q "COMPONENT-REUSE GATE"' _ "$section"
+    fx "undeclared: reuse_violations_section names the flagged component" \
+      bash -c 'printf "%s" "$1" | grep -q Fancy' _ "$section"
+    exit 0
+  ) || return 1
+
+  # Case 2: same added component, but the plan's Component Map DOES declare
+  # `NEW Fancy — <justification>` -> no violation, no file.
+  ( dir="$root/declared"; mkdir -p "$dir"
+    repo="$dir/repo"
+    base="$(_reuse_gate_seed_repo "$repo")" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-declared"; PROJECT="$repo"; BASE_COMMIT="$base"
+    SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '## Design Contract\n\n- Design manifest: none\n' >"$SPEC"
+    printf '# Plan\n\n## Component Map\n\n- Header: reuse Panel\n- Fancy badge: NEW Fancy — needed because no existing component supports the animated pill shape\n' \
+      >"$RUN_ROOT/control/plan.md"
+    "$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$repo" \
+      --out "$RUN_ROOT/component-inventory.json" >/dev/null || exit 1
+    candidate="$(_reuse_gate_add_fancy "$repo")" || exit 1
+    check_component_reuse "$candidate"
+    fx "declared NEW: no violations file" \
+      [ ! -e "$RUN_ROOT/validated/reuse-violations.json" ]
+    fx_not "declared NEW: no reuse_violation event" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q reuse_violation '$RUN_ROOT/events.jsonl'"
+    exit 0
+  ) || return 1
+
+  # Case 3: the spec has NO `## Design Contract` at all -> skip silently, no
+  # file, no event, regardless of what the plan says.
+  ( dir="$root/no-contract"; mkdir -p "$dir"
+    repo="$dir/repo"
+    base="$(_reuse_gate_seed_repo "$repo")" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-nocontract"; PROJECT="$repo"; BASE_COMMIT="$base"
+    SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '# Just a plain spec\n\nNo design contract here.\n' >"$SPEC"
+    printf '# Plan\n\n## Component Map\n\n- Header: reuse Panel\n' >"$RUN_ROOT/control/plan.md"
+    candidate="$(_reuse_gate_add_fancy "$repo")" || exit 1
+    check_component_reuse "$candidate"
+    fx "no design contract: no violations file" \
+      [ ! -e "$RUN_ROOT/validated/reuse-violations.json" ]
+    fx_not "no design contract: no reuse_violation event" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q reuse_violation '$RUN_ROOT/events.jsonl'"
+    fx "no design contract: reuse_violations_section is empty (no file)" \
+      test -z "$(reuse_violations_section)"
+    exit 0
+  ) || return 1
+
+  # reuse_gate_component_dirs / reuse_gate_path_matches: the added-file
+  # classifier check_component_reuse uses to decide which added paths are
+  # "plausible components" — direct unit coverage of the glob/env-precedence
+  # logic, independent of the git-repo cases above.
+  ( unset NIGHT_SHIFT_COMPONENT_DIRS
+    fx "component dirs: built-in default list" \
+      test "$(reuse_gate_component_dirs)" = "src/ui/components,src/components,src/features/*/components"
+    fx "path match: any *.tsx matches regardless of directory" \
+      reuse_gate_path_matches "src/screens/Home.tsx"
+    fx "path match: default component dir, non-tsx extension" \
+      reuse_gate_path_matches "src/ui/components/Foo.ts"
+    fx "path match: wildcard dir segment (src/features/*/components)" \
+      reuse_gate_path_matches "src/features/auth/components/Foo.ts"
+    fx_not "path match: unrelated non-tsx path does not match" \
+      reuse_gate_path_matches "src/utils/helpers.ts"
+    NIGHT_SHIFT_COMPONENT_DIRS="lib/widgets"
+    fx "path match: NIGHT_SHIFT_COMPONENT_DIRS override honored" \
+      reuse_gate_path_matches "lib/widgets/Foo.ts"
+    fx_not "path match: override replaces (not adds to) the defaults" \
+      reuse_gate_path_matches "src/ui/components/Foo.ts"
+    exit 0
+  ) || return 1
+
+  # component_inventory_prompt_block: the planning-prompt addition (Step 1).
+  # Runs against the Task 5 fixture tree directly (read-only; --out points
+  # outside it, so nothing is written into the tracked fixture).
+  ( dir="$root/inv-prompt"; mkdir -p "$dir"
+    PROJECT="$WORKSPACE_ROOT/scripts/test/fixtures/component-tree"
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-invprompt"
+    mkdir -p "$RUN_ROOT"
+    spec_dc="$dir/spec-dc.md"
+    printf '## Design Contract\n\n- Design manifest: none\n' >"$spec_dc"
+    spec_plain="$dir/spec-plain.md"
+    printf '# Just a plain spec\n' >"$spec_plain"
+    block="$(component_inventory_prompt_block "$spec_dc")"
+    fx "inventory prompt: inventory JSON generated at RUN_ROOT" \
+      [ -s "$RUN_ROOT/component-inventory.json" ]
+    fx "inventory prompt: mentions the inventory heading" \
+      bash -c 'printf "%s" "$1" | grep -q "Existing component inventory"' _ "$block"
+    fx "inventory prompt: lists Badge from the fixture tree" \
+      bash -c 'printf "%s" "$1" | grep -q Badge' _ "$block"
+    fx "inventory prompt: requires a Component Map section" \
+      bash -c 'printf "%s" "$1" | grep -q "Component Map"' _ "$block"
+    fx "inventory prompt: empty for a spec without a Design Contract" \
+      test -z "$(component_inventory_prompt_block "$spec_plain")"
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_reuse_gate() {
+  local err status
+  err="$(_fixture_reuse_gate_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - reuse-gate: undeclared new component flagged / declared NEW passes / no-contract skips\n'
+  else
+    printf 'not ok - reuse-gate: undeclared new component flagged / declared NEW passes / no-contract skips\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/lib/port-audit-static.js (port-fidelity Task 7): opens Phase B
+# (port-audit) — a deterministic, zero-dep material extractor that Task 8's
+# agent pass wraps. Pure text/regex extraction over a committed neutral
+# fixture tree (no chrome, no network, no tsc/npm), so this runs
+# unconditionally on every machine incl. CI, same as the Task 3/5 fixtures
+# above. Exercises the CLI directly against
+# scripts/test/fixtures/rn-screen/ (src/ui/tokens.ts declaring colors/spacing/
+# type `as const` blocks; src/features/sample/SampleScreen.tsx using
+# colors.ink/spacing.lg/type.h1 as token refs plus one literal borderRadius
+# and one literal color) and asserts the exact schema/flattened-tokens/
+# resolved-usage values baked into that fixture tree.
+_fixture_port_audit_static_run() {
+  local fixture_dir out status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen"
+  # DELIBERATELY NOT local, same reasoning as _fixture_component_inventory_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  PORT_AUDIT_STATIC_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-port-audit-static.$$"
+  mkdir -p "$PORT_AUDIT_STATIC_OUT_DIR" || return 1
+  trap 'rm -rf "${PORT_AUDIT_STATIC_OUT_DIR:-}"' EXIT
+
+  out="$PORT_AUDIT_STATIC_OUT_DIR/material.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/port-audit-static.js" \
+    --project "$fixture_dir" --scope src/features/sample --tokens src/ui/tokens.ts >"$out" 2>"$out.err"; then
+    status=$?
+    printf 'port-audit-static.js dispatch failed (exit %s): %s\n' "$status" "$(cat "$out.err")"
+    return 1
+  fi
+  [ -s "$out" ] || { printf 'material missing/empty: %s\n' "$out"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-port-audit-material/1\"' '$out' >/dev/null"
+  fx "tokens flattened one level (colors.ink)" bash -c \
+    "jq -e '.tokens[\"colors.ink\"] == \"#123456\"' '$out' >/dev/null"
+  fx "tokens flattened one level (spacing.lg, numeric)" bash -c \
+    "jq -e '.tokens[\"spacing.lg\"] == 24' '$out' >/dev/null"
+  fx "fontSize usage resolves the type.h1 token ref to 28" bash -c \
+    "jq -e '([.usages[] | select(.property == \"fontSize\")][0].resolved) == 28' '$out' >/dev/null"
+  fx "literal color usage captured with correct file + plausible line" bash -c \
+    "jq -e '([.usages[] | select(.property == \"color\")][0] | .file == \"src/features/sample/SampleScreen.tsx\" and .resolved == \"#999999\" and .line > 0)' '$out' >/dev/null"
+  fx "nested token group flattens recursively (typography.size.md == 16)" bash -c \
+    "jq -e '.tokens[\"typography.size.md\"] == 16' '$out' >/dev/null"
+  fx "3-deep dotted usage ref resolves through the flattened table (typography.size.md -> 16)" bash -c \
+    "jq -e '([.usages[] | select(.raw == \"typography.size.md\")][0].resolved) == 16' '$out' >/dev/null"
+  return 0
+}
+
+fixture_port_audit_static() {
+  local err status
+  err="$(_fixture_port_audit_static_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-static: flattens tokens recursively to scalar leaves, resolves dotted refs (any depth), captures literals w/ file:line\n'
+  else
+    printf 'not ok - port-audit-static: flattens tokens recursively to scalar leaves, resolves dotted refs (any depth), captures literals w/ file:line\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/port-audit.sh + scripts/lib/port-audit-normalize.sh (port-fidelity
+# Task 8, closing Phase B): the agent pass + report. --offline skips the paid
+# `claude -p` call entirely and feeds a canned reply through the SAME
+# normalize+assemble path a live run uses, so both fixtures below are fully
+# deterministic/offline and run UNCONDITIONALLY (no chrome/simulator/claude
+# CLI needed), same as the Task 3/5/7 fixtures above.
+#
+# port-audit-normalize exercises the RECOMPUTE discipline directly: a tiny
+# synthetic project (one manifest element, one source file) where a canned
+# "good" reply claims status:"match" with expected/actual numbers that differ
+# by 5 -- proving the wrapper ignores the agent's own arithmetic entirely and
+# recomputes status/delta itself from the manifest + material lookups (here:
+# off, delta 5) -- plus the canned-garbage-reply failure path (report with
+# summary.error, exit 3, entries:[]).
+_fixture_port_audit_normalize_run() {
+  local root="$FIXTURE_ROOT/port-audit-normalize" dir repo manifest good garbage out status
+
+  # Case 1: a false "match" claim over numbers 5 apart is corrected to "off".
+  ( dir="$root/off-recompute"; mkdir -p "$dir/repo/src/ui" "$dir/repo/src/features/off"
+    repo="$dir/repo"
+    printf 'export const type = { h1: 28 } as const;\n' >"$repo/src/ui/tokens.ts"
+    cat >"$repo/src/features/off/OffScreen.tsx" <<'EOF'
+import { StyleSheet } from 'react-native';
+
+const styles = StyleSheet.create({
+  title: {
+    fontSize: 33,
+  },
+});
+EOF
+    manifest="$dir/manifest.json"
+    jq -n '{
+      schema: "night-shift-design-manifest/1", screen: "off",
+      source: {kind: "web", ref: "n/a", extractedAt: "2026-01-01T00:00:00.000Z", viewport: {width:1,height:1}, unit:"px"},
+      elements: [{
+        id: "heading.x", role: "heading", match: {web: null, figma: null}, text: "X",
+        typography: {fontFamily: "Sys", fontSize: 28, fontWeight: 400, lineHeight: 32, letterSpacing: 0},
+        color: "#123456", background: null, bounds: {x:0,y:0,w:10,h:10},
+        spacing: {marginTop:0, paddingH:0, gapToPrev:0}, radius: 0, iconSize: null
+      }],
+      rollup: {palette:["#123456"], fontFamilies:["Sys"], fontSizes:[28], spacingScale:[0], radii:[0], iconSizes:[]}
+    }' >"$manifest"
+    good="$dir/good-reply.json"
+    printf '{"entries":[{"elementId":"heading.x","property":"fontSize","evidence":"src/features/off/OffScreen.tsx:5","status":"match","expected":28,"actual":33}]}\n' >"$good"
+
+    out="$repo/.night-shift/port-audit/off.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen off --manifest "$manifest" \
+      --scope src/features/off --offline "$good" >/dev/null
+    status=$?
+    fx "off-recompute: exit 0" test "$status" -eq 0
+    fx "off-recompute: report written" [ -s "$out" ]
+    fx "off-recompute: agent's false match claim corrected to off, delta 5" bash -c \
+      "jq -e '([.entries[] | select(.elementId==\"heading.x\" and .property==\"fontSize\")][0] | .status==\"off\" and .delta==5 and .expected==28 and .actual==33)' '$out' >/dev/null"
+    fx "off-recompute: summary counts the correction as off, not match" bash -c \
+      "jq -e '.summary.off >= 1 and .summary.match == 0' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
+  # Case 2: a garbage reply (no entries anywhere) fails both attempts ->
+  # entries:[] + summary.error, exit 3 -- never blocks, always writes a report.
+  ( dir="$root/garbage"; mkdir -p "$dir/repo/src/ui" "$dir/repo/src/features/off"
+    repo="$dir/repo"
+    printf 'export const type = { h1: 28 } as const;\n' >"$repo/src/ui/tokens.ts"
+    printf "const styles = { title: { fontSize: 28 } };\n" >"$repo/src/features/off/OffScreen.tsx"
+    manifest="$dir/manifest.json"
+    jq -n '{schema:"night-shift-design-manifest/1", screen:"off", source:{kind:"web"}, elements:[], rollup:{}}' >"$manifest"
+    garbage="$dir/garbage-reply.json"
+    printf '{"nonsense": "yes"}\n' >"$garbage"
+
+    out="$repo/.night-shift/port-audit/off.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen off --manifest "$manifest" \
+      --scope src/features/off --offline "$garbage" >/dev/null 2>&1
+    status=$?
+    fx "garbage: exit 3" test "$status" -eq 3
+    fx "garbage: report still written (never blocks)" [ -s "$out" ]
+    fx "garbage: entries empty + summary.error set" bash -c \
+      "jq -e '(.entries|length)==0 and (.summary.error|type)==\"string\"' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
+  # Case 3: duplicate (elementId, property) pairs in the reply are deduped
+  # KEEP-FIRST -- a sloppy/adversarial agent reporting the same pair twice
+  # must not inflate the summary counts/pct, and the entries array itself
+  # must carry no duplicates. Same Task 3 manifest + Task 7 tree as the
+  # offline block; the reply reports heading.sample-title/fontSize TWICE
+  # (both would match) -> exactly ONE entry for the pair, match counted once,
+  # every summary count asserted exactly (1 match + the 11 checklist-derived
+  # missing entries, nothing else — 11 includes the 3 properties of the
+  # "Overlap Label" element added to the node fixture for the negative-gap
+  # rollup cover in design-extract-figma).
+  ( dir="$root/dup-dedupe"; mkdir -p "$dir"
+    repo="$dir/repo"
+    mkdir -p "$repo"
+    cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen/." "$repo/"
+    mkdir -p "$dir/design/manifest"
+    node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+      --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+      --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+      --screen sample --out "$dir/design/manifest" >/dev/null || exit 1
+    good="$dir/dup-reply.json"
+    printf '{"entries":[{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"},{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"}]}\n' >"$good"
+
+    out="$repo/.night-shift/port-audit/sample.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen sample \
+      --manifest "$dir/design/manifest/sample.json" --scope src/features/sample --offline "$good" >/dev/null
+    status=$?
+    fx "dup-dedupe: exit 0" test "$status" -eq 0
+    fx "dup-dedupe: exactly ONE entry for the twice-reported pair" bash -c \
+      "jq -e '([.entries[] | select(.elementId==\"heading.sample-title\" and .property==\"fontSize\")] | length) == 1' '$out' >/dev/null"
+    fx "dup-dedupe: summary counts the pair once (match=1, off=0, missing=11, extra=0, unknown=0)" bash -c \
+      "jq -e '.summary == {match:1, off:0, missing:11, extra:0, unknown:0, pct:8}' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
+  # Case 4: a NEGATIVE figma spacing expectation (gapToPrev of an absolute-
+  # positioned/overlapping node -- an overlap artifact of the y-sorted gap
+  # chain, not design truth) must classify as "unknown", never off or match,
+  # so it cannot poison pct in either direction. Manifest: one figma-mode
+  # container whose gapToPrev is -625 (marginTop maps onto gapToPrev for
+  # figma sources); source: a real marginTop usage; reply maps the pair.
+  ( dir="$root/figma-neg-spacing"; mkdir -p "$dir/repo/src/ui" "$dir/repo/src/features/neg"
+    repo="$dir/repo"
+    printf 'export const spacing = { md: 12 } as const;\n' >"$repo/src/ui/tokens.ts"
+    cat >"$repo/src/features/neg/NegScreen.tsx" <<'EOF'
+import { StyleSheet } from 'react-native';
+
+const styles = StyleSheet.create({
+  container: {
+    marginTop: 10,
+  },
+});
+EOF
+    manifest="$dir/manifest.json"
+    jq -n '{
+      schema: "night-shift-design-manifest/1", screen: "neg",
+      source: {kind: "figma", ref: "9:9", extractedAt: "2026-01-01T00:00:00.000Z", viewport: {width:430,height:932}, unit:"pt"},
+      elements: [{
+        id: "container.1", role: "container", match: {web: null, figma: "9:9"}, text: null,
+        typography: null, color: null, background: null, bounds: {x:0,y:0,w:100,h:100},
+        spacing: {marginTop: 0, paddingH: 0, gapToPrev: -625}, radius: 0, iconSize: null
+      }],
+      rollup: {palette:[], fontFamilies:[], fontSizes:[], spacingScale:[], radii:[0], iconSizes:[]}
+    }' >"$manifest"
+    good="$dir/reply.json"
+    printf '{"entries":[{"elementId":"container.1","property":"marginTop","evidence":"src/features/neg/NegScreen.tsx:5"}]}\n' >"$good"
+
+    out="$repo/.night-shift/port-audit/neg.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen neg --manifest "$manifest" \
+      --scope src/features/neg --offline "$good" >/dev/null
+    status=$?
+    fx "figma-neg-spacing: exit 0" test "$status" -eq 0
+    fx "figma-neg-spacing: entry is unknown with expected -625 kept visible" bash -c \
+      "jq -e '([.entries[] | select(.elementId==\"container.1\" and .property==\"marginTop\")][0] | .status==\"unknown\" and .expected==-625 and .actual==10 and .delta==null)' '$out' >/dev/null"
+    fx "figma-neg-spacing: excluded from off (off=0, unknown=1, match=0)" bash -c \
+      "jq -e '.summary.off == 0 and .summary.unknown == 1 and .summary.match == 0' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_port_audit_normalize() {
+  local err status
+  err="$(_fixture_port_audit_normalize_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-normalize: recomputes status/delta from expected vs actual (never trusts agent arithmetic); garbage reply -> summary.error, exit 3\n'
+  else
+    printf 'not ok - port-audit-normalize: recomputes status/delta from expected vs actual (never trusts agent arithmetic); garbage reply -> summary.error, exit 3\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# port-audit-offline: the full offline pipeline -- Task 3's figma fixture
+# node-dump (generates a real night-shift-design-manifest/1 with
+# heading.sample-title/icon.1/button.continue) + Task 7's rn-screen fixture
+# tree (real port-audit-static.js material extraction, not hand-authored) +
+# a canned reply mapping just the heading -> a real report exists, at least
+# one match, and the match entry's evidence is a real file:line in the
+# fixture tree.
+_fixture_port_audit_offline_run() {
+  local dir repo manifest_dir reply out status
+  dir="$FIXTURE_ROOT/port-audit-offline"
+  mkdir -p "$dir"
+  repo="$dir/repo"
+  mkdir -p "$repo"
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen/." "$repo/"
+
+  manifest_dir="$dir/design/manifest"
+  mkdir -p "$manifest_dir"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+      --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+      --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+      --screen sample --out "$manifest_dir" >/dev/null; then
+    printf 'figma-manifest.js dispatch failed\n'
+    return 1
+  fi
+
+  reply="$dir/reply.json"
+  printf '{"entries":[{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"}]}\n' >"$reply"
+
+  out="$repo/.night-shift/port-audit/sample.json"
+  "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen sample \
+    --manifest "$manifest_dir/sample.json" --scope src/features/sample --offline "$reply" >/dev/null
+  status=$?
+  fx "offline: exit 0" test "$status" -eq 0
+  fx "offline: report exists" [ -s "$out" ]
+  fx "offline: schema id" bash -c "jq -e '.schema == \"night-shift-port-audit/1\"' '$out' >/dev/null"
+  fx "offline: at least one match" bash -c "jq -e '.summary.match >= 1' '$out' >/dev/null"
+  fx "offline: the heading fontSize entry matches (28==28)" bash -c \
+    "jq -e '([.entries[] | select(.elementId==\"heading.sample-title\" and .property==\"fontSize\")][0] | .status==\"match\" and .expected==28 and .actual==28)' '$out' >/dev/null"
+  fx "offline: match entry's evidence names a real file in the fixture tree" bash -c \
+    "jq -r '([.entries[] | select(.status==\"match\")][0].evidence)' '$out' | cut -d: -f1 | xargs -I{} test -f '$repo/{}'"
+
+  # port-fidelity pre-merge Item 3 regression: a screen name with NO matching
+  # src/features/<screen> dir (the fixture tree only has src/features/sample)
+  # used to silently kill the whole audit via the DEFAULT --scope (die -> exit
+  # 2, no report at all). No --scope passed here on purpose: the default
+  # must fall back to whole-src and still produce a report.
+  local orphan_out orphan_status
+  orphan_out="$repo/.night-shift/port-audit/orphan-screen.json"
+  "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen orphan-screen \
+    --manifest "$manifest_dir/sample.json" --offline "$reply" >/dev/null
+  orphan_status=$?
+  fx "offline: default-scope fallback (no matching feature dir) still exits 0" \
+    test "$orphan_status" -eq 0
+  fx "offline: default-scope fallback still produces a report" [ -s "$orphan_out" ]
+  return 0
+}
+
+fixture_port_audit_offline() {
+  local err status
+  err="$(_fixture_port_audit_offline_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-offline: full offline run (Task 3 manifest + Task 7 material) -- report exists, match >= 1, evidence names a real file\n'
+  else
+    printf 'not ok - port-audit-offline: full offline run (Task 3 manifest + Task 7 material) -- report exists, match >= 1, evidence names a real file\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# Seeds one self-contained port-audit-wiring case dir under $1: the Task 7
+# rn-screen fixture tree as a git repo, a Task 3 figma-mode manifest INSIDE
+# the project (manifest_path_resolve demands project containment), run-state
+# dirs, and a Design-Contract spec whose `- Design manifest:` names it.
+_port_audit_wiring_seed() {
+  local dir="$1"
+  mkdir -p "$dir/repo/design/manifest" || return 1
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen/." "$dir/repo/" || return 1
+  node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+    --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+    --screen sample --out "$dir/repo/design/manifest" >/dev/null || return 1
+  git -C "$dir/repo" init -q || return 1
+  git -C "$dir/repo" config user.email t@t && git -C "$dir/repo" config user.name t || return 1
+  git -C "$dir/repo" add -A && git -C "$dir/repo" commit -qm base >/dev/null || return 1
+  mkdir -p "$dir/rs/control" "$dir/rs/validated" "$dir/rs/raw" || return 1
+  cat >"$dir/spec.md" <<'SPEC'
+# Sample port
+
+## Design Contract
+
+- Design manifest: design/manifest/sample.json
+- Manifest source: figma
+SPEC
+}
+
+_fixture_port_audit_wiring_run() {
+  local root="$FIXTURE_ROOT/port-audit-wiring" reply
+  mkdir -p "$root"
+  reply="$root/reply.json"
+  printf '{"entries":[{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"}]}\n' >"$reply"
+
+  # Structural wiring: the audit runs in verify_candidate's post-candidate
+  # soft slot (right after check_component_reuse), and the report section is
+  # attached to BOTH reviewer surfaces (implementation persona bundle +
+  # observer context) — the codex_review/reuse_violations attachment pattern.
+  ( body="$(awk '/^verify_candidate\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "verify_candidate calls port_audit_candidate" \
+      bash -c 'printf "%s" "$1" | grep -q port_audit_candidate' _ "$body"
+    reuse_line="$(printf '%s' "$body" | grep -n 'check_component_reuse' | head -1 | cut -d: -f1)"
+    audit_line="$(printf '%s' "$body" | grep -n 'port_audit_candidate' | head -1 | cut -d: -f1)"
+    fx "port audit runs AFTER the reuse gate (same soft slot)" \
+      test -n "$reuse_line" -a -n "$audit_line" -a "$audit_line" -gt "$reuse_line"
+    obs="$(awk '/^run_observer\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "run_observer context includes port_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q port_audit_section' _ "$obs"
+    bun="$(awk '/^assemble_review_bundle\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "implementation review bundle includes port_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q port_audit_section' _ "$bun"
+    exit 0
+  ) || return 1
+
+  # Gate case: NIGHT_SHIFT_PORT_AUDIT unset/0 -> nothing runs, nothing is
+  # journaled, even with a manifest-bearing spec and the offline reply staged.
+  # Ditto knob ON but a spec with no `- Design manifest:` field.
+  ( dir="$root/off"; _port_audit_wiring_seed "$dir" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="pawire-off"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+    WORKDIR=""
+    PORT_AUDIT=0 PORT_AUDIT_OFFLINE="$reply"
+    port_audit_candidate || exit 1
+    fx_not "knob OFF: no report written" [ -e "$PROJECT/.night-shift/port-audit/sample.json" ] || exit 1
+    fx_not "knob OFF: no port_audit event journaled" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q port_audit '$RUN_ROOT/events.jsonl'" || exit 1
+    fx "knob OFF: port_audit_section is empty (no report)" \
+      test -z "$(port_audit_section)" || exit 1
+    PORT_AUDIT=1
+    printf '# plain spec, no manifest field\n## Design Contract\n' >"$dir/spec-nofield.md"
+    SPEC="$dir/spec-nofield.md"
+    port_audit_candidate || exit 1
+    fx_not "no manifest field: no report even with the knob ON" \
+      [ -e "$PROJECT/.night-shift/port-audit/sample.json" ] || exit 1
+    fx_not "no manifest field: nothing journaled" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q port_audit '$RUN_ROOT/events.jsonl'" || exit 1
+    exit 0
+  ) || return 1
+
+  # Happy path: knob ON + NIGHT_SHIFT_PORT_AUDIT_OFFLINE -> the engine runs
+  # port-audit.sh over the spec's manifest screens through the CLI's own
+  # --offline path (zero cost), the report lands in the run dir, a port_audit
+  # event carries {screen, pct}, and the section/persona bundle surface it
+  # indented and labeled non-authoritative.
+  ( dir="$root/on"; _port_audit_wiring_seed "$dir" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="pawire-on"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+    WORKDIR=""
+    BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+    screens="$(port_audit_screens_for_spec "$SPEC")"
+    fx "screen list: one TSV line, screen = manifest basename, path resolved in-project" \
+      bash -c 'printf "%s\n" "$1" | grep -q "^sample	.*/design/manifest/sample\.json$"' _ "$screens"
+    PORT_AUDIT=1 PORT_AUDIT_OFFLINE="$reply"
+    port_audit_candidate || exit 1
+    report="$PROJECT/.night-shift/port-audit/sample.json"
+    fx "report generated in the project run dir" [ -s "$report" ] || exit 1
+    fx "report carries the port-audit schema id" \
+      bash -c "jq -e '.schema == \"night-shift-port-audit/1\"' '$report' >/dev/null" || exit 1
+    fx "port_audit event journaled with screen + numeric pct" \
+      bash -c "jq -e 'select(.type==\"port_audit\") | .payload.screen==\"sample\" and (.payload.pct|type)==\"number\"' '$RUN_ROOT/events.jsonl' >/dev/null" || exit 1
+    sec="$(port_audit_section)"
+    fx "section prints the advisory marker" \
+      bash -c 'printf "%s" "$1" | grep -q "PORT-FIDELITY AUDIT"' _ "$sec"
+    fx "section labeled non-authoritative" \
+      bash -c 'printf "%s" "$1" | grep -q "NOT authoritative"' _ "$sec"
+    fx "section indents the report (no section forgery)" \
+      bash -c 'printf "%s" "$1" | grep -q "^    {"' _ "$sec"
+    assemble_review_bundle implementation "$dir/bundle.md" || exit 1
+    fx "implementation persona bundle references the audit" \
+      grep -q 'PORT-FIDELITY AUDIT' "$dir/bundle.md" || exit 1
+    fx "persona bundle carries the report body (screen name)" \
+      grep -q '"screen":"sample"' "$dir/bundle.md" || exit 1
+    exit 0
+  ) || return 1
+
+  # Agent-pass failure (exit 3): a garbage offline reply exhausts the CLI's
+  # retry budget, but the error report it still writes is attached and
+  # journaled with pct:null — and port_audit_candidate itself returns 0
+  # (advisory only, never blocks the candidate).
+  ( dir="$root/err"; _port_audit_wiring_seed "$dir" || exit 1
+    printf '{"nope":true}\n' >"$dir/garbage.json"
+    RUN_ROOT="$dir/rs"; RUN_ID="pawire-err"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+    WORKDIR=""
+    PORT_AUDIT=1 PORT_AUDIT_OFFLINE="$dir/garbage.json"
+    port_audit_candidate || exit 1
+    report="$PROJECT/.night-shift/port-audit/sample.json"
+    fx "error report still written (exit 3 path)" [ -s "$report" ] || exit 1
+    fx "error report carries summary.error" \
+      bash -c "jq -e '.summary.error | length > 0' '$report' >/dev/null" || exit 1
+    fx "port_audit event journaled with pct null" \
+      bash -c "jq -e 'select(.type==\"port_audit\") | .payload.screen==\"sample\" and .payload.pct==null' '$RUN_ROOT/events.jsonl' >/dev/null" || exit 1
+    sec="$(port_audit_section)"
+    fx "error report still surfaces in the section (evidence of the failure)" \
+      bash -c 'printf "%s" "$1" | grep -q "PORT-FIDELITY AUDIT"' _ "$sec"
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_port_audit_wiring() {
+  local err status
+  err="$(_fixture_port_audit_wiring_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-wiring: gated on knob+manifest field, offline report journaled {screen,pct} + attached to persona bundle/observer, error report pct null, never blocks\n'
+  else
+    printf 'not ok - port-audit-wiring: gated on knob+manifest field, offline report journaled {screen,pct} + attached to persona bundle/observer, error report pct null, never blocks\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# recovery-guard fixtures (port-fidelity Task 12): a bare relaunch (no
+# --resume) over a prior BLOCKED, non-rate-limit run whose project tree is
+# still dirty must die with a directive instead of silently starting a fresh
+# run that would strand the interrupted run's intact, uncommitted work as
+# baseline-dirty (the incident this task fixes). Drives the REAL recover_run
+# directly against a fabricated project dir + state.json, same idiom as the
+# recovery-permodel/recovery-subagent fixtures above (subshell-scoped globals,
+# recording shims for the seams recover_run reaches only on the recovered
+# path — cleanup/log/wait/emit_event never fire on the die path, so the first
+# two fixtures need no shims for them at all).
+# ---------------------------------------------------------------------------
+
+# Shared setup: a real tiny git repo (recover_run's new guard shells out to
+# `git -C "$PROJECT" status --porcelain`) that ignores .night-shift/ — as every
+# real night-shift target must — so only fixture-added dirt outside .night-shift/
+# makes the tree "dirty", never the run dir itself.
+_fixture_recovery_guard_project() {
+  local proj="$1"
+  mkdir -p "$proj"
+  git -C "$proj" init -q
+  # CI runners (e.g. ubuntu-latest) carry no global user.name/user.email, so
+  # `git commit` here dies with "Please tell me who you are" (exit 128) —
+  # this helper's caller only checked the FOLLOWING commands' exit codes,
+  # never this one, so the failure surfaced as a mystifying guard-behavior
+  # mismatch rather than a setup error. Set a local per-repo identity, same
+  # idiom as _reuse_gate_seed_repo above, so this is portable across CI/dev
+  # machines regardless of global git config.
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '.night-shift/\n' >"$proj/.gitignore"
+  git -C "$proj" add .gitignore >/dev/null 2>&1
+  git -C "$proj" commit -qm init >/dev/null 2>&1 || return 1
+  mkdir -p "$proj/.night-shift"
+}
+
+fixture_recovery_guard_blocked_dirty() {
+  local root="$1" proj="$root/rgbd-proj" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  # Dirty for a reason OTHER than a rate-limit block — the incident's actual
+  # shape ("run interrupted by signal") — proves the guard fires on ANY
+  # non-rate-limit block reason, not just one specific phrasing.
+  printf 'stranded work\n' >"$proj/dirty.txt"
+  printf '%s\n' '{"status":"blocked","block_reason":"run interrupted by signal","primary_turns":0,"primary":"claude"}' \
+    >"$proj/.night-shift/state.json"
+  out="$( ( PROJECT="$proj"; PRIMARY="claude"; RESUME=0; recover_run ) 2>&1 )"
+  rc=$?
+  fx "recover_run dies (exit 1) on blocked+dirty bare relaunch" test "$rc" -eq 1
+  fx "directive names --resume" bash -c 'printf "%s" "$1" | grep -q -- "--resume"' _ "$out"
+  fx "directive names commit/stash as the alternative" bash -c 'printf "%s" "$1" | grep -q "commit/stash"' _ "$out"
+  return 0
+}
+
+fixture_recovery_guard_blocked_clean() {
+  local root="$1" proj="$root/rgbc-proj" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  # Same blocked, non-rate-limit state — but a clean tree. The guard must NOT
+  # fire: recover_run falls through to its unchanged fresh-start signal
+  # (return 1), same as before this task, and the caller proceeds to normal
+  # task selection.
+  printf '%s\n' '{"status":"blocked","block_reason":"run interrupted by signal","primary_turns":0,"primary":"claude"}' \
+    >"$proj/.night-shift/state.json"
+  out="$( ( PROJECT="$proj"; PRIMARY="claude"; RESUME=0; recover_run ) 2>&1 )"
+  rc=$?
+  fx "recover_run returns 1 (fresh-start fallthrough), not a die" test "$rc" -eq 1
+  fx "no directive text (guard did not fire)" bash -c '! printf "%s" "$1" | grep -q -- "--resume"' _ "$out"
+  return 0
+}
+
+fixture_recovery_guard_ratelimit_dirty() {
+  local root="$1" proj="$root/rgrl-proj" dir="$root/rgrl-work" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  # Dirty tree, exactly like the die case above — the ONLY difference is the
+  # block is rate-limit-recoverable, which must outrank the new guard (it is
+  # checked first in recover_run, unchanged placement/ordering).
+  printf 'stranded work\n' >"$proj/dirty.txt"
+  mkdir -p "$dir" "$proj/.night-shift/raw"
+  printf '{}\n' >"$proj/.night-shift/baseline.json"
+  printf '%s\n' '{"status":"blocked","session_id":"fixed-id","block_reason":"primary command failed with status 1","primary_turns":0,"primary":"claude","run_id":"rgrl","task":"spec.md","observer":"claude","base_commit":"deadbeef","base_branch":"main","baseline_status":"'"$proj"'/.night-shift/baseline.json","stage":"planning"}' \
+    >"$proj/.night-shift/state.json"
+  printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 5:40am (America/Sao_Paulo)","session_id":"fixed-id"}' \
+    >"$proj/.night-shift/raw/primary-1.json"
+  out="$( (
+    PROJECT="$proj"; PRIMARY="claude"; RESUME=0
+    log() { :; }
+    emit_event() { :; }
+    cleanup_validation_worktree() { return 0; }
+    set_spec_workdir() { SPEC="$1"; return 0; }
+    wait_for_rate_limit_reset() { printf 'waited:%s\n' "$1" >"$dir/waited.txt"; }
+    recover_run
+    printf 'rc=%s\n' "$?"
+  ) 2>&1 )"
+  rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
+  fx "recover_run completes the auto-recovery path (rc 0), guard never evaluated" test "$rc" = "0"
+  fx "the rate-limit wait path was actually taken (not the guard's die)" test -f "$dir/waited.txt"
   return 0
 }
 

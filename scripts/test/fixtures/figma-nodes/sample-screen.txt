@@ -1,0 +1,8 @@
+[CANVAS] "Page 1" #0:1
+  [FRAME] "SAMPLE" #9:1 layout=layout_root fills=fill_bg
+    [TEXT] #9:2 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":24,"y":88},"dimensions":{"width":220,"height":32}} fills=fill_ink textStyle=style_h1 text="Sample Title"
+    [GROUP] #9:3 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":24,"y":300},"dimensions":{"width":320,"height":48}} borderRadius=8px
+      [RECTANGLE] #9:4 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":0,"y":0},"dimensions":{"width":320,"height":48}} fills=fill_cta borderRadius=8px
+      [TEXT] #9:5 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":130,"y":13},"dimensions":{"width":60,"height":22}} fills=fill_bg textStyle=style_body text="Continue"
+    [IMAGE-SVG] "icon" #9:6 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":24,"y":140},"dimensions":{"width":24,"height":24}}
+    [TEXT] #9:7 layout={"mode":"none","sizing":{},"locationRelativeToParent":{"x":24,"y":340},"dimensions":{"width":140,"height":20}} fills=fill_ink textStyle=style_body text="Overlap Label"

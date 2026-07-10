@@ -17,6 +17,13 @@ spec.
 - [x] feature: Web app logic audit (`specs/web-audit.md`)
 - [x] bug: Web app P1 correctness fixes (`specs/web-p1-fixes.md`)
 - [x] feature: Web app call-site resilience (HUMAN-001 follow-up) (`specs/web-resilience.md`)
+- [x] feature: Financa mobile foundation — tab shell, tokens, API client, domain math (`specs/financa-mobile-foundation.md`)
+- [x] feature: Financa mobile login screen & auth gate (`specs/financa-mobile-auth-login.md`)
+- [x] feature: Financa mobile home dashboard (`specs/financa-mobile-dashboard.md`)
+- [x] feature: Financa mobile transactions tab (`specs/financa-mobile-transactions.md`)
+- [x] feature: Financa mobile stats tab — expense tracker donut (`specs/financa-mobile-expense-tracker.md`)
+- [x] feature: Financa mobile categories, category detail & add expense (`specs/financa-mobile-categories-add-expense.md`)
+- [x] feature: Financa mobile calendar view & search (`specs/financa-mobile-calendar-search.md`)
 
 ## Engine self-improvement backlog
 

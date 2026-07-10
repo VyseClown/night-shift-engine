@@ -21,6 +21,8 @@ workspace container (`<workspace>/<app>`).
 | Capture by driving the **real** app (no preview harness) | `--drive maestro` (+ a per-screen flow) | §5 |
 | Build a feature end-to-end (rn / web / node / fullstack) | `scripts/night-shift.sh --project <app> --spec <spec>` | §6 |
 | Convert a Figma design into a web component | Figma MCP → web-track generate → visual review | §7 |
+| Extract a design manifest (web or Figma) | `scripts/design-extract.sh …` | §8 |
+| Audit how faithfully a port implements its design manifest | `scripts/port-audit.sh --project <app> --screen <s> --manifest <m>` | §9 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -146,6 +148,67 @@ No single script; it's an MCP-fed, agent-driven flow:
    downloaded frame image with `odiff` (the same diff the rn path uses), iterating
    until close. (A web capture harness is not yet a single command — render + screenshot
    the route, then `odiff <figma-frame.png> <screenshot.png> <diff.png> --parsable-stdout`.)
+
+## §8 — Extract a design manifest (web or Figma) → `scripts/design-extract.sh …`
+
+A zero-dep CLI that pulls a `night-shift-design-manifest/1` JSON (per-element role,
+text, typography, color, bounds, spacing, radius, plus a rollup palette/fonts/spacing/
+radii/icons) out of either a live web page (real Chrome over CDP) or a committed Figma
+node-dump — the SAME schema either way, so the two are directly diffable. Point a
+spec's `- Design manifest:` field at the written JSON and the implement stage's prompt
+gets an authoritative "Design ground truth" table built straight from it (see
+`manifest_prompt_block` in `scripts/night-shift.sh`) instead of hand-typed tokens.
+
+```bash
+# web mode — drives a live page over CDP (needs a local Chrome):
+scripts/design-extract.sh --mode web --screen dashboard --project <workspace>/<app> \
+  --url http://localhost:3000/dashboard --cookie session=abc123
+
+# figma mode — parses a committed node-dump + globals file (no chrome, no network):
+scripts/design-extract.sh --mode figma --screen dashboard --project <workspace>/<app> \
+  --nodes design/figma/dashboard.txt
+```
+
+Default `--out` is `<project>/design/manifest/`, writing `<screen>.json` (web mode
+also `<screen>-<W>x<H>.png`). `--mode figma` defaults `--globals` to
+`<dirname of --nodes>/_global-vars.txt` when not passed explicitly. Exit 0 on success,
+2 on a usage error (e.g. `--mode web` without `--url`), or whatever the dispatched
+extractor exits with on an extraction failure (1, one-line stderr).
+
+## §9 — Audit port fidelity against a design manifest → `scripts/port-audit.sh …`
+
+A zero-dep CLI that scores how faithfully an already-ported screen implements a
+`night-shift-design-manifest/1` JSON (§8's output): a deterministic static extractor
+(`scripts/lib/port-audit-static.js`) pulls tokens + resolved style-property usages out
+of the scoped source, ONE bounded `claude -p` agent pass maps manifest elements to the
+source lines that implement them, and a deterministic wrapper
+(`scripts/lib/port-audit-normalize.sh`) computes every expected/actual/status/delta
+value itself — the agent's reply is never trusted for arithmetic, only for the
+element→evidence mapping.
+
+```bash
+scripts/port-audit.sh --project <app> --screen <name> --manifest <path> \
+  [--scope src/features/<dir>] [--model sonnet] [--offline <canned-reply.json>]
+```
+
+Writes `<project>/.night-shift/port-audit/<screen>.json` — entries tagged `match` /
+`off` / `missing` / `extra` / `unknown`, plus a `summary.pct` match rate. Exit 0 on
+success, 2 on a usage/argument error (nothing written), 3 when the agent pass fails
+twice (report still written with `entries:[]` + `summary.error`, so a caller always
+has *a* report to read). `--offline <reply.json>` skips the paid call entirely for a
+fully deterministic dry run.
+
+**Engine wiring (opt-in, non-gating):** set `NIGHT_SHIFT_PORT_AUDIT=1` and give the
+spec a Design Contract `- Design manifest:` field, and `night-shift.sh` runs this CLI
+once per manifest (screen = the manifest's basename) right after the candidate is
+validated, on the `NIGHT_SHIFT_PERSONA_MODEL` knob. Every report on disk (regardless
+of exit status) is attached — indented, advisory, never authoritative — to the Design
+Fidelity Reviewer's implementation-review bundle and the observer's evidence, and a
+`port_audit` event (`{screen, pct}`, `pct:null` on `summary.error`) is journaled.
+Missing tooling, a failed agent pass, or an unresolvable manifest path all skip
+cleanly with a `WARN` log — this never blocks a candidate or fails a run.
+`NIGHT_SHIFT_PORT_AUDIT_OFFLINE=<canned-reply-path>` routes the engine-invoked call
+through `--offline` (fixture/dry-wire use).
 
 ## Prerequisites & environment
 

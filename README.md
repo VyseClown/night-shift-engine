@@ -83,6 +83,14 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <workspace>/<proj>
 > `--permission-mode bypassPermissions`, and the spec's validation commands are
 > executed verbatim via `bash -lc`. Only run specs you authored or fully reviewed.
 
+A bare relaunch (no `--resume`) over a prior run that stopped `blocked` for a
+reason other than a rate limit, with uncommitted work still in the project
+tree, refuses to start fresh — a new run could never legitimately claim that
+work as its own commit. It dies naming `--resume` and the alternative
+(commit/stash first) instead of silently stranding the work as baseline noise.
+A rate-limit block still auto-recovers regardless of tree state, and a clean
+tree proceeds to normal task selection exactly as before.
+
 `NIGHT_SHIFT_ACCEPT_COSTS=YES` is a safety gate so live model calls are never made
 by accident (not a billing switch). On a Claude Pro/Max login runs consume plan
 **usage limits**; with `ANTHROPIC_API_KEY` set they are **billed per token**.
@@ -93,6 +101,17 @@ budgets (`NIGHT_SHIFT_MAX_STAGE_TURNS` / `…_TASK_TURNS` / `…_STAGE_SECONDS` 
 (`NIGHT_SHIFT_MAX_MALFORMED_SIGNALS`, default 5) that fails fast instead of
 grinding the whole turn budget on junk. Hitting any limit blocks the run for
 manual review rather than continuing.
+
+A Claude session-limit 429 waits until the reported reset plus a safety
+buffer, then resumes the same pinned session (up to 5 consecutive resets
+before blocking for manual review). A per-model usage cap is a distinct 429
+shape (no reset time) and blocks by default with a knob-and-model suggestion;
+`NIGHT_SHIFT_MODEL_FALLBACK=1` instead auto-steps the capped role down the
+scarcity ladder (`fable → opus → sonnet`) and continues on the successor.
+Persona and observer sub-agent calls hit the same two shapes independently of
+the primary: a session-limit 429 mid-batch waits once and re-spawns only the
+still-incomplete workers, and a per-model cap follows the identical
+block/fallback rule.
 
 ## Model tiering (cost)
 
