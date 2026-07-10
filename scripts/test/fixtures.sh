@@ -5176,14 +5176,21 @@ fixture_cdp_ws() {
     printf 'ok - cdp-ws: skipped (no chrome)\n'
     return
   fi
-  local out
-  if out="$(CHROME_BIN="$bin" node "$WORKSPACE_ROOT/scripts/lib/cdp-ws.js" --selftest 2>&1)"; then
-    printf 'ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n'
-  else
-    printf 'not ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n' >&2
-    printf '%s\n' "$out" >&2
-    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
-  fi
+  # Chrome cold-start on a busy CI runner can exceed the default 15s launch
+  # timeout (observed flaking on ubuntu-latest: pass one run, timeout the
+  # next). Give CI headroom and retry once before declaring failure — the
+  # selftest is deterministic once Chrome is warm.
+  local out attempt
+  for attempt in 1 2; do
+    if out="$(CHROME_BIN="$bin" NIGHT_SHIFT_CDP_LAUNCH_TIMEOUT_MS=60000 \
+        node "$WORKSPACE_ROOT/scripts/lib/cdp-ws.js" --selftest 2>&1)"; then
+      printf 'ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n'
+      return
+    fi
+  done
+  printf 'not ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n' >&2
+  printf '%s\n' "$out" >&2
+  FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
 }
 
 # scripts/lib/cdp-extract.js (port-fidelity Task 2): the web-mode design
@@ -5232,7 +5239,10 @@ _fixture_design_extract_web_run() {
     return 1
   fi
 
-  if ! CHROME_BIN="$bin" node "$WORKSPACE_ROOT/scripts/lib/cdp-extract.js" \
+  # Same CI cold-start headroom as fixture_cdp_ws (Chrome launch can exceed
+  # the 15s default on a busy runner).
+  if ! CHROME_BIN="$bin" NIGHT_SHIFT_CDP_LAUNCH_TIMEOUT_MS=60000 \
+    node "$WORKSPACE_ROOT/scripts/lib/cdp-extract.js" \
     --url "http://127.0.0.1:$port/" --screen home --out "$DESIGN_EXTRACT_OUT_DIR"; then
     return 1
   fi

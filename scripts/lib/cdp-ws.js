@@ -22,8 +22,15 @@ const DEFAULT_CHROME_BIN =
 // debugging port, then parses the actual port off the
 // "DevTools listening on ws://127.0.0.1:<port>/" line Chrome prints to
 // stderr (remote-debugging-port=0 means "pick a free port", so this line is
-// the only source of truth for what it picked). Rejects after 15s if that
-// line never appears, or immediately if the process errors/exits first.
+// the only source of truth for what it picked). Rejects after the launch
+// timeout (default 15s; NIGHT_SHIFT_CDP_LAUNCH_TIMEOUT_MS overrides — CI
+// runners cold-start Chrome slower than a dev machine) if that line never
+// appears, or immediately if the process errors/exits first.
+const LAUNCH_TIMEOUT_MS = (() => {
+  const v = Number(process.env.NIGHT_SHIFT_CDP_LAUNCH_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 15000;
+})();
+
 function launchChrome({ chromeBin, userDataDir } = {}) {
   const bin = chromeBin || DEFAULT_CHROME_BIN;
   const dir = userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-ws-'));
@@ -38,9 +45,9 @@ function launchChrome({ chromeBin, userDataDir } = {}) {
     let buffer = '';
 
     const timer = setTimeout(() => {
-      finish(() => reject(new Error('launchChrome: timed out after 15s waiting for the DevTools listening line')));
+      finish(() => reject(new Error(`launchChrome: timed out after ${LAUNCH_TIMEOUT_MS}ms waiting for the DevTools listening line`)));
       try { proc.kill(); } catch (_err) { /* already dead */ }
-    }, 15000);
+    }, LAUNCH_TIMEOUT_MS);
 
     function finish(fn) {
       if (settled) return;
