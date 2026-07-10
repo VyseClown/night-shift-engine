@@ -216,7 +216,8 @@ contract. Keep the two distinct.
 
 **Plan-stage checklist:**
 - Does every Figma frame/state map to an acceptance criterion and a
-  reuse-or-new component decision?
+  reuse-or-new component decision — is the Component Map present and
+  consistent with `.night-shift/component-inventory.json`?
 - Are all required states present (loading / empty / error / offline / disabled /
   accessibility)?
 - Are tokens, assets, and fonts identified?
@@ -224,7 +225,7 @@ contract. Keep the two distinct.
 
 **Implementation-stage checklist:**
 - Does the implementation reuse design-system components and tokens rather than
-  re-creating them?
+  re-creating them, and do no `reuse-violations.json` entries remain unresolved?
 - **If** implementation screenshots and reference images are present: are visual
   differences within the Comparison tolerance, do spacing / type / color /
   touch-targets / states match, and are approved deviations honored?

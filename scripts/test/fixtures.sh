@@ -273,6 +273,7 @@ run_dry_fixtures() {
   fixture_design_extract_cli
   fixture_manifest_prompt
   fixture_component_inventory
+  fixture_reuse_gate
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -5150,6 +5151,181 @@ fixture_component_inventory() {
     printf 'ok - component-inventory: extracts 3 components w/ props + usageCount (files, not JSX occurrences) from a fixture tree\n'
   else
     printf 'not ok - component-inventory: extracts 3 components w/ props + usageCount (files, not JSX occurrences) from a fixture tree\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/night-shift.sh's check_component_reuse (port-fidelity Task 6,
+# closing Phase C). Seeds a fresh temp git repo per case from the SAME Task 5
+# fixture component tree (Badge/Row in src/ui/components, Panel in
+# src/features/sample/components), commits it as base, adds a brand-new
+# src/ui/components/Fancy.tsx on top as the "candidate" commit, and calls
+# check_component_reuse directly (no full night-shift run — the function only
+# needs PROJECT/BASE_COMMIT/SPEC/RUN_ROOT, all cheaply fixture-built here).
+_reuse_gate_seed_repo() {
+  local repo="$1"
+  mkdir -p "$repo"
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/component-tree/." "$repo/"
+  git init -q "$repo"
+  git -C "$repo" config user.email t@t
+  git -C "$repo" config user.name t
+  git -C "$repo" add -A && git -C "$repo" commit -qm base >/dev/null
+  git -C "$repo" rev-parse HEAD
+}
+
+# Adds src/ui/components/Fancy.tsx (a plain, undeclared-by-default component)
+# on top of the given repo's current HEAD and returns the new commit SHA.
+_reuse_gate_add_fancy() {
+  local repo="$1"
+  mkdir -p "$repo/src/ui/components"
+  cat >"$repo/src/ui/components/Fancy.tsx" <<'EOF'
+type FancyProps = { title: string };
+export function Fancy({ title }: FancyProps) { return null; }
+EOF
+  git -C "$repo" add -A && git -C "$repo" commit -qm 'add Fancy' >/dev/null
+  git -C "$repo" rev-parse HEAD
+}
+
+_fixture_reuse_gate_run() {
+  local root="$FIXTURE_ROOT/reuse-gate" repo base candidate
+  mkdir -p "$root"
+
+  # Case 1: candidate adds Fancy.tsx, the plan's Component Map declares only
+  # the PRE-EXISTING components (never mentions Fancy) -> flagged, count==1,
+  # a non-empty closestExisting suggestion from the inventory.
+  ( dir="$root/undeclared"; mkdir -p "$dir"
+    repo="$dir/repo"
+    base="$(_reuse_gate_seed_repo "$repo")" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-undeclared"; PROJECT="$repo"; BASE_COMMIT="$base"
+    SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '## Design Contract\n\n- Design manifest: none\n' >"$SPEC"
+    printf '# Plan\n\n## Component Map\n\n- Header: reuse Panel\n- Chip: reuse Badge\n' >"$RUN_ROOT/control/plan.md"
+    "$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$repo" \
+      --out "$RUN_ROOT/component-inventory.json" >/dev/null || exit 1
+    candidate="$(_reuse_gate_add_fancy "$repo")" || exit 1
+    check_component_reuse "$candidate"
+    fx "undeclared: violations file written" \
+      [ -s "$RUN_ROOT/validated/reuse-violations.json" ]
+    fx "undeclared: schema id" bash -c \
+      "jq -e '.schema == \"night-shift-reuse-violations/1\"' '$RUN_ROOT/validated/reuse-violations.json' >/dev/null"
+    fx "undeclared: exactly 1 violation for Fancy" bash -c \
+      "jq -e '(.violations | length) == 1 and (.violations[0].component == \"Fancy\") and (.violations[0].declared == false)' '$RUN_ROOT/validated/reuse-violations.json' >/dev/null"
+    fx "undeclared: closestExisting is non-empty" bash -c \
+      "jq -e '(.violations[0].closestExisting | length) > 0' '$RUN_ROOT/validated/reuse-violations.json' >/dev/null"
+    fx "undeclared: reuse_violation event journaled with count 1" \
+      grep -q '"type":"reuse_violation".*"count":1' "$RUN_ROOT/events.jsonl"
+    section="$(reuse_violations_section)"
+    fx "undeclared: reuse_violations_section prints the advisory marker" \
+      bash -c 'printf "%s" "$1" | grep -q "COMPONENT-REUSE GATE"' _ "$section"
+    fx "undeclared: reuse_violations_section names the flagged component" \
+      bash -c 'printf "%s" "$1" | grep -q Fancy' _ "$section"
+    exit 0
+  ) || return 1
+
+  # Case 2: same added component, but the plan's Component Map DOES declare
+  # `NEW Fancy — <justification>` -> no violation, no file.
+  ( dir="$root/declared"; mkdir -p "$dir"
+    repo="$dir/repo"
+    base="$(_reuse_gate_seed_repo "$repo")" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-declared"; PROJECT="$repo"; BASE_COMMIT="$base"
+    SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '## Design Contract\n\n- Design manifest: none\n' >"$SPEC"
+    printf '# Plan\n\n## Component Map\n\n- Header: reuse Panel\n- Fancy badge: NEW Fancy — needed because no existing component supports the animated pill shape\n' \
+      >"$RUN_ROOT/control/plan.md"
+    "$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$repo" \
+      --out "$RUN_ROOT/component-inventory.json" >/dev/null || exit 1
+    candidate="$(_reuse_gate_add_fancy "$repo")" || exit 1
+    check_component_reuse "$candidate"
+    fx "declared NEW: no violations file" \
+      [ ! -e "$RUN_ROOT/validated/reuse-violations.json" ]
+    fx_not "declared NEW: no reuse_violation event" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q reuse_violation '$RUN_ROOT/events.jsonl'"
+    exit 0
+  ) || return 1
+
+  # Case 3: the spec has NO `## Design Contract` at all -> skip silently, no
+  # file, no event, regardless of what the plan says.
+  ( dir="$root/no-contract"; mkdir -p "$dir"
+    repo="$dir/repo"
+    base="$(_reuse_gate_seed_repo "$repo")" || exit 1
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-nocontract"; PROJECT="$repo"; BASE_COMMIT="$base"
+    SPEC="$dir/spec.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '# Just a plain spec\n\nNo design contract here.\n' >"$SPEC"
+    printf '# Plan\n\n## Component Map\n\n- Header: reuse Panel\n' >"$RUN_ROOT/control/plan.md"
+    candidate="$(_reuse_gate_add_fancy "$repo")" || exit 1
+    check_component_reuse "$candidate"
+    fx "no design contract: no violations file" \
+      [ ! -e "$RUN_ROOT/validated/reuse-violations.json" ]
+    fx_not "no design contract: no reuse_violation event" \
+      bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q reuse_violation '$RUN_ROOT/events.jsonl'"
+    fx "no design contract: reuse_violations_section is empty (no file)" \
+      test -z "$(reuse_violations_section)"
+    exit 0
+  ) || return 1
+
+  # reuse_gate_component_dirs / reuse_gate_path_matches: the added-file
+  # classifier check_component_reuse uses to decide which added paths are
+  # "plausible components" — direct unit coverage of the glob/env-precedence
+  # logic, independent of the git-repo cases above.
+  ( unset NIGHT_SHIFT_COMPONENT_DIRS
+    fx "component dirs: built-in default list" \
+      test "$(reuse_gate_component_dirs)" = "src/ui/components,src/components,src/features/*/components"
+    fx "path match: any *.tsx matches regardless of directory" \
+      reuse_gate_path_matches "src/screens/Home.tsx"
+    fx "path match: default component dir, non-tsx extension" \
+      reuse_gate_path_matches "src/ui/components/Foo.ts"
+    fx "path match: wildcard dir segment (src/features/*/components)" \
+      reuse_gate_path_matches "src/features/auth/components/Foo.ts"
+    fx_not "path match: unrelated non-tsx path does not match" \
+      reuse_gate_path_matches "src/utils/helpers.ts"
+    NIGHT_SHIFT_COMPONENT_DIRS="lib/widgets"
+    fx "path match: NIGHT_SHIFT_COMPONENT_DIRS override honored" \
+      reuse_gate_path_matches "lib/widgets/Foo.ts"
+    fx_not "path match: override replaces (not adds to) the defaults" \
+      reuse_gate_path_matches "src/ui/components/Foo.ts"
+    exit 0
+  ) || return 1
+
+  # component_inventory_prompt_block: the planning-prompt addition (Step 1).
+  # Runs against the Task 5 fixture tree directly (read-only; --out points
+  # outside it, so nothing is written into the tracked fixture).
+  ( dir="$root/inv-prompt"; mkdir -p "$dir"
+    PROJECT="$WORKSPACE_ROOT/scripts/test/fixtures/component-tree"
+    RUN_ROOT="$dir/rs"; RUN_ID="reusegate-invprompt"
+    mkdir -p "$RUN_ROOT"
+    spec_dc="$dir/spec-dc.md"
+    printf '## Design Contract\n\n- Design manifest: none\n' >"$spec_dc"
+    spec_plain="$dir/spec-plain.md"
+    printf '# Just a plain spec\n' >"$spec_plain"
+    block="$(component_inventory_prompt_block "$spec_dc")"
+    fx "inventory prompt: inventory JSON generated at RUN_ROOT" \
+      [ -s "$RUN_ROOT/component-inventory.json" ]
+    fx "inventory prompt: mentions the inventory heading" \
+      bash -c 'printf "%s" "$1" | grep -q "Existing component inventory"' _ "$block"
+    fx "inventory prompt: lists Badge from the fixture tree" \
+      bash -c 'printf "%s" "$1" | grep -q Badge' _ "$block"
+    fx "inventory prompt: requires a Component Map section" \
+      bash -c 'printf "%s" "$1" | grep -q "Component Map"' _ "$block"
+    fx "inventory prompt: empty for a spec without a Design Contract" \
+      test -z "$(component_inventory_prompt_block "$spec_plain")"
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_reuse_gate() {
+  local err status
+  err="$(_fixture_reuse_gate_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - reuse-gate: undeclared new component flagged / declared NEW passes / no-contract skips\n'
+  else
+    printf 'not ok - reuse-gate: undeclared new component flagged / declared NEW passes / no-contract skips\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi

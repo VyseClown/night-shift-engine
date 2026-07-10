@@ -40,14 +40,32 @@
 // under <project>/src whose import line(s) contain the component name as a
 // whole word, minus the component's own defining file.
 //
-// Reserved for Task 6 (not implemented here — Task 6 wires these against
-// this same inventory JSON):
-//   --single-file <file>   emit just the exported component names of one
-//                           file, one per line (skips the directory walk
-//                           and usage-count pass entirely).
-//   --closest <name>       given the inventory, print the inventory
-//                           component name with the smallest case-insensitive
-//                           Levenshtein distance to <name>.
+// Component detection also covers default exports (a Task 5 review found the
+// plain export-function/export-const regexes drop these, which would let a
+// default-exported component slip past Task 6's reuse gate undetected):
+//   export default function Name(...) { ... }   -- same paren-terminated
+//                                                   extraction as a named
+//                                                   export-function.
+//   export default Name;                        -- bare identifier; props are
+//                                                   recovered (best effort)
+//                                                   from a same-file `function
+//                                                   Name(` / `const Name = (`
+//                                                   declaration if one exists,
+//                                                   else empty.
+//
+// Two flags used by Task 6's reuse gate (scripts/night-shift.sh's
+// check_component_reuse), CALLED DIRECTLY on this js — the CLI wrapper
+// (component-inventory.sh) does not forward them, it only builds the full
+// inventory:
+//   --single-file <file>     print the exported component names of one file,
+//                             one per line (skips the directory walk and
+//                             usage-count pass entirely; no --project needed).
+//   --closest <name> --inventory <file>
+//                             read the night-shift-component-inventory/1 JSON
+//                             at <file> and print the component name with the
+//                             smallest case-insensitive Levenshtein distance
+//                             to <name> (empty stdout if the inventory has no
+//                             components).
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -71,14 +89,20 @@ function parseArgs(argv) {
       case '--project': args.project = argv[++i]; break;
       case '--dirs': args.dirs = argv[++i]; break;
       case '--out': args.out = argv[++i]; break;
-      // Reserved for Task 6 — accepted here only so a shared parseArgs can
-      // grow into them without a breaking CLI change; not acted on yet.
       case '--single-file': args.singleFile = argv[++i]; break;
       case '--closest': args.closest = argv[++i]; break;
+      case '--inventory': args.inventory = argv[++i]; break;
       default: throw new Error(`unrecognized argument: ${a}`);
     }
   }
-  if (!args.project) throw new Error('--project is required');
+  // --project is only required for the full directory-walk build; --single-file
+  // and --closest each operate on an explicit file argument instead.
+  if (!args.project && args.singleFile === undefined && args.closest === undefined) {
+    throw new Error('--project is required');
+  }
+  if (args.closest !== undefined && !args.inventory) {
+    throw new Error('--closest requires --inventory <file>');
+  }
   return args;
 }
 
@@ -252,23 +276,61 @@ function extractProps(content, name, paramsStr) {
 
 const EXPORT_FUNCTION_RE = /export\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(/g;
 const EXPORT_CONST_RE = /export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:function\s*[A-Za-z0-9_]*\s*)?\(/g;
+// `export default function Name(` — same paren-terminated shape as
+// EXPORT_FUNCTION_RE, just with the `default` keyword in between.
+const EXPORT_DEFAULT_FUNCTION_RE = /export\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(/g;
+// `export default Name;` (or `export default Name` at EOF) — a bare
+// identifier reference, not a declaration; the next token after `default`
+// being lowercase (`function`, `class`, `{`, ...) never matches the
+// capitalized-identifier class, so this never collides with the pattern above.
+const EXPORT_DEFAULT_NAME_RE = /export\s+default\s+([A-Z][A-Za-z0-9_]*)\s*;?/g;
+
+// Patterns tried in order; `parenTerminated` says whether the match itself
+// ends in the component's opening '(' (so `re.lastIndex - 1` is that paren's
+// index, from which extractBalanced reads the full, possibly multi-line,
+// possibly nested parameter list) or whether it is a bare identifier that
+// needs a separate lookup (findLooseDeclarationParams) to find any params.
+const COMPONENT_PATTERNS = [
+  { re: EXPORT_FUNCTION_RE, parenTerminated: true },
+  { re: EXPORT_CONST_RE, parenTerminated: true },
+  { re: EXPORT_DEFAULT_FUNCTION_RE, parenTerminated: true },
+  { re: EXPORT_DEFAULT_NAME_RE, parenTerminated: false },
+];
+
+// Best-effort parameter lookup for a bare `export default Name;` reference:
+// finds a same-file `function Name(` or `const Name = (...)` declaration
+// (NOT required to itself be exported) and returns its raw parameter-list
+// text, or '' if no such declaration is found (component is still recorded,
+// just with no recoverable props — same "best effort" spirit as the rest of
+// this file).
+function findLooseDeclarationParams(content, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const funcRe = new RegExp(`\\bfunction\\s+${escaped}\\s*\\(`);
+  let m = funcRe.exec(content);
+  if (!m) {
+    const constRe = new RegExp(`\\bconst\\s+${escaped}\\s*(?::[^=]+)?=\\s*(?:function\\s*[A-Za-z0-9_]*\\s*)?\\(`);
+    m = constRe.exec(content);
+  }
+  if (!m) return '';
+  const openIndex = m.index + m[0].length - 1;
+  return extractBalanced(content, openIndex, '(', ')');
+}
 
 // One component per exported capitalized function/const per file (per the
-// task brief). Both regexes end in a literal '(' so `re.lastIndex - 1` is
-// always that opening paren's index, from which extractBalanced reads the
-// full (possibly multi-line, possibly nested) parameter list.
+// task brief), including default exports (see COMPONENT_PATTERNS above).
 function extractComponentsFromFile(content) {
   const found = [];
   const seenNames = new Set();
-  for (const re of [EXPORT_FUNCTION_RE, EXPORT_CONST_RE]) {
+  for (const { re, parenTerminated } of COMPONENT_PATTERNS) {
     re.lastIndex = 0;
     let m;
     while ((m = re.exec(content))) {
       const name = m[1];
       if (seenNames.has(name)) continue; // don't double-count re-declarations
       seenNames.add(name);
-      const openParenIndex = re.lastIndex - 1;
-      const paramsStr = extractBalanced(content, openParenIndex, '(', ')');
+      const paramsStr = parenTerminated
+        ? extractBalanced(content, re.lastIndex - 1, '(', ')')
+        : findLooseDeclarationParams(content, name);
       found.push({ name, props: extractProps(content, name, paramsStr) });
     }
   }
@@ -349,6 +411,53 @@ function run(args) {
   return out;
 }
 
+// --single-file: one exported component name per line (no directory walk, no
+// usage-count pass — just this file's own extraction).
+function componentNamesInFile(filePath) {
+  const content = fs.readFileSync(path.resolve(filePath), 'utf8');
+  return extractComponentsFromFile(content).map((c) => c.name);
+}
+
+// --closest: classic Wagner–Fischer edit distance, case-insensitive (a
+// full-width DP table — inventories are small enough that this need not be
+// space-optimized for readability's sake, but a rolling single row keeps it
+// linear in memory since a component name can legitimately run long).
+function levenshteinDistance(a, b) {
+  a = String(a).toLowerCase();
+  b = String(b).toLowerCase();
+  const m = a.length, n = b.length;
+  const row = new Array(n + 1);
+  for (let j = 0; j <= n; j++) row[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let prevDiag = row[0];
+    row[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = row[j];
+      row[j] = a[i - 1] === b[j - 1] ? prevDiag : 1 + Math.min(prevDiag, row[j], row[j - 1]);
+      prevDiag = tmp;
+    }
+  }
+  return row[n];
+}
+
+// The inventory component name with the smallest case-insensitive Levenshtein
+// distance to `name`; '' when `components` is empty. Ties keep the first
+// (lowest name.file sort order, since buildInventory sorts its output before
+// writing) rather than the arbitrary last — deterministic across runs.
+function closestComponentName(name, components) {
+  if (!Array.isArray(components) || components.length === 0) return '';
+  let best = components[0].name;
+  let bestDist = levenshteinDistance(name, best);
+  for (const c of components.slice(1)) {
+    const d = levenshteinDistance(name, c.name);
+    if (d < bestDist) {
+      bestDist = d;
+      best = c.name;
+    }
+  }
+  return best;
+}
+
 function main() {
   let args;
   try {
@@ -358,6 +467,16 @@ function main() {
     return;
   }
   try {
+    if (args.singleFile !== undefined) {
+      for (const name of componentNamesInFile(args.singleFile)) console.log(name);
+      return;
+    }
+    if (args.closest !== undefined) {
+      const raw = JSON.parse(fs.readFileSync(path.resolve(args.inventory), 'utf8'));
+      const best = closestComponentName(args.closest, raw.components);
+      if (best) console.log(best);
+      return;
+    }
     const out = run(args);
     console.log(out);
   } catch (err) {
@@ -379,5 +498,8 @@ module.exports = {
   extractComponentsFromFile,
   computeUsageCount,
   buildInventory,
+  componentNamesInFile,
+  levenshteinDistance,
+  closestComponentName,
   DEFAULT_DIRS,
 };

@@ -1046,6 +1046,41 @@ $block"
   printf '%s' "$out"
 }
 
+COMPONENT_INVENTORY_ROW_CAP=40
+
+# Generates + inlines the target project's component inventory into the planning
+# prompt for a Design-Contract spec (port-fidelity Task 6, opening on Task 5's
+# extractor). Writes into $RUN_ROOT/component-inventory.json — which IS
+# $PROJECT/.night-shift/component-inventory.json, since initialize_run sets
+# RUN_ROOT to exactly that directory — so check_component_reuse (below) later
+# reads the SAME snapshot the plan was written against. Guarded end to end: no
+# Design Contract -> empty, no generation attempted. Any generation failure
+# (missing script, non-zero exit, unreadable/invalid JSON) logs one WARN and
+# returns empty — inventory generation is best-effort context and must NEVER
+# block planning.
+component_inventory_prompt_block() {
+  local spec="$1" inv err rc out
+  spec_has_design_contract "$spec" || return 0
+  inv="$RUN_ROOT/component-inventory.json"
+  err="$("$WORKSPACE_ROOT/scripts/component-inventory.sh" --project "$PROJECT" --out "$inv" 2>&1 1>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "WARN: component-inventory generation failed (exit $rc); planning proceeds without it: $(printf '%s' "$err" | tail -n1)"
+    return 0
+  fi
+  [ -s "$inv" ] || return 0
+  jq empty "$inv" >/dev/null 2>&1 || return 0
+  out="$(jq -r --argjson cap "$COMPONENT_INVENTORY_ROW_CAP" '
+    "",
+    "## Existing component inventory (.night-shift/component-inventory.json — reuse before building new)",
+    "| name | file | props | usageCount |",
+    "|---|---|---|---|",
+    (.components[:$cap][]? | "| " + .name + " | " + .file + " | " + (.props | join(", ")) + " | " + (.usageCount | tostring) + " |")
+  ' "$inv" 2>/dev/null)" || return 0
+  [ -n "$out" ] || return 0
+  printf '%s\n\nRequirement: .night-shift/control/plan.md MUST include a `## Component Map`\nsection mapping every design piece from the Design Contract to exactly one of:\n  reuse <Name>\n  variant <Name> — <change>\n  NEW <Name> — <justification>\nUse the inventory above as the source of truth for what already exists — after\nimplementation, any added component the plan does not declare `NEW <Name>` for\nis flagged (a soft, advisory gate; see .night-shift/validated/reuse-violations.json).\n' "$out"
+}
+
 # A long grind inside ONE stage replays ever-growing session history every
 # turn (the cost/rot problem stage-scoped sessions solve at stage boundaries,
 # recurring within a stage). Clears the pinned session every
@@ -1155,6 +1190,13 @@ Fix exactly that and rewrite the WHOLE file this turn in the required shape belo
   fi
   design_build_note=""
   case "$stage" in
+    planning)
+      if spec_has_design_contract "$SPEC"; then
+        design_build_note="
+Design-fidelity plan (this spec has a \`## Design Contract\`). Your plan must map every
+piece of the design to a reuse decision before implementation starts.
+$(component_inventory_prompt_block "$SPEC")"
+      fi ;;
     implementation|implementation_review)
       if spec_has_design_contract "$SPEC"; then
         design_build_note="
@@ -1655,6 +1697,12 @@ assemble_review_bundle() {
         cat "$RUN_ROOT/validated/baseline.json"
         printf '\n```\n'
       fi
+      # A reuse-violations.json can only exist from an EARLIER candidate in
+      # this task (check_component_reuse runs post-candidate, after the FIRST
+      # implementation-review round has already judged the working tree) — so
+      # this only surfaces on a re-review round following an observer BLOCK
+      # that sent the run back to implementation. Empty on a first pass.
+      reuse_violations_section
     fi
   } >"$out"
 }
@@ -2161,6 +2209,10 @@ EOF
   ' --arg candidate "$candidate" --arg now "$(now_iso)"
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
+  # Soft reuse gate (port-fidelity Task 6): runs only AFTER every hard check
+  # above has passed, on the now-validated candidate; see check_component_reuse
+  # for why this never blocks.
+  check_component_reuse "$candidate"
   emit_event candidate_validated "$(jq -cn --arg c "$candidate" '{commit:$c}')"
   log "candidate $candidate validated; handing to observer"
   if visual_stage_enabled "$SPEC"; then
@@ -2168,6 +2220,129 @@ EOF
   else
     set_stage observer_review
   fi
+}
+
+# --dirs precedence for the reuse gate's own added-file classification: same
+# env override / defaults as scripts/lib/component-inventory.js's
+# resolveComponentDirs, so a project's non-default component dirs get the same
+# treatment on both sides of Task 5/6 without a second config surface.
+reuse_gate_component_dirs() {
+  printf '%s' "${NIGHT_SHIFT_COMPONENT_DIRS:-src/ui/components,src/components,src/features/*/components}"
+}
+
+# True when an added file is a plausible component: any *.tsx file (a Design-
+# Contract screen is commonly assembled outside the configured component dirs),
+# OR a file under one of the resolved component-dir glob patterns regardless of
+# extension. Bash `case` patterns are globs natively, so a pattern like
+# `src/features/*/components` needs no regex translation — `case "$file" in
+# $pattern/*)` matches it directly.
+reuse_gate_path_matches() {
+  local file="$1" dirs old_ifs pattern
+  case "$file" in *.tsx) return 0 ;; esac
+  dirs="$(reuse_gate_component_dirs)"
+  old_ifs="$IFS"; IFS=','
+  for pattern in $dirs; do
+    IFS="$old_ifs"
+    pattern="$(printf '%s' "$pattern" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    # shellcheck disable=SC2254 # deliberately UNquoted: $pattern's own '*'
+    # (e.g. src/features/*/components) must keep its glob meaning here — a
+    # quoted "$pattern" would flatten that '*' to a literal asterisk and never
+    # match a real path segment.
+    case "$file" in $pattern/*) return 0 ;; esac
+    IFS=','
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+# Soft component-reuse gate (port-fidelity Task 6, closing Phase C). Diffs
+# base..candidate for ADDED files that look like components and flags any
+# exported name the plan's `## Component Map` does not declare `NEW <Name>`
+# for — a design piece the plan called `reuse`/`variant` but the implementation
+# actually built from scratch, or one the plan never accounted for at all.
+#
+# Skips silently (return 0, writes nothing, emits nothing) when the spec has
+# no `## Design Contract` or the plan has no `## Component Map` section — this
+# gate only applies to design-directed builds that made the reuse commitment
+# Task 6 requires at planning time.
+#
+# NEVER calls block_run: an undeclared component is a signal for the review
+# personas/observer to weigh (surfaced via reuse_violations_section into both
+# the implementation-review persona bundle and the observer's evidence,
+# mirroring how codex_review_section attaches the advisory Codex review), not
+# a wrapper-enforced hard stop — the plan's Component Map is the primary's own
+# prose, and a false positive here (e.g. a component the reviewer agrees was
+# genuinely necessary) must not wedge an otherwise-good run.
+check_component_reuse() {
+  local candidate="$1" plan violations_file map_section added
+  local file names name declared closest violations count
+  plan="$RUN_ROOT/control/plan.md"
+  spec_has_design_contract "$SPEC" || return 0
+  [ -s "$plan" ] || return 0
+  grep -Eq '^## Component Map([[:space:]]|$)' "$plan" || return 0
+
+  violations_file="$RUN_ROOT/validated/reuse-violations.json"
+  rm -f "$violations_file"
+
+  # The Component Map section's own body only — from its heading to the next
+  # `## ` heading or EOF — so a `NEW Foo` mention elsewhere in the plan (prose
+  # discussing a REJECTED alternative, say) can't accidentally satisfy the gate.
+  map_section="$(awk '
+    /^## Component Map([ \t]|$)/ { grabbing=1; next }
+    grabbing && /^## / { grabbing=0 }
+    grabbing { print }
+  ' "$plan")"
+
+  added="$(git -C "$PROJECT" diff --diff-filter=A --name-only "$BASE_COMMIT..$candidate" 2>/dev/null)"
+  [ -n "$added" ] || return 0
+
+  violations="[]"
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    reuse_gate_path_matches "$file" || continue
+    [ -f "$PROJECT/$file" ] || continue
+    names="$(node "$WORKSPACE_ROOT/scripts/lib/component-inventory.js" --single-file "$PROJECT/$file" 2>/dev/null)" || continue
+    [ -n "$names" ] || continue
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      declared=0
+      printf '%s\n' "$map_section" | grep -Eq "NEW[[:space:]]+${name}([^A-Za-z0-9_]|\$)" && declared=1
+      [ "$declared" -eq 1 ] && continue
+      closest="$(node "$WORKSPACE_ROOT/scripts/lib/component-inventory.js" \
+        --closest "$name" --inventory "$RUN_ROOT/component-inventory.json" 2>/dev/null)"
+      violations="$(printf '%s' "$violations" | jq -c --arg f "$file" --arg c "$name" --arg closest "$closest" \
+        '. + [{file:$f, component:$c, declared:false, closestExisting:$closest}]')"
+    done <<NAMES
+$names
+NAMES
+  done <<ADDED
+$added
+ADDED
+
+  count="$(printf '%s' "$violations" | jq 'length')"
+  [ "$count" -gt 0 ] || return 0
+
+  jq -n --argjson v "$violations" '{schema:"night-shift-reuse-violations/1", violations:$v}' >"$violations_file"
+  integrity_put "$violations_file"
+  emit_event reuse_violation "$(jq -cn --argjson n "$count" '{count:$n}')"
+  log "reuse gate: $count undeclared new component(s) — advisory, see .night-shift/validated/reuse-violations.json"
+  return 0
+}
+
+# Supplementary reviewer surface for the reuse gate above — same shape and same
+# non-authoritative framing as codex_review_section, attached to BOTH the
+# implementation-review persona bundle (assemble_review_bundle) and the
+# observer's context (run_observer), per docs/review-personas.md's Design
+# Fidelity Reviewer implementation checklist ("no reuse-violations.json entries
+# remain unresolved"). Empty when no violations file exists (the common case:
+# no Design Contract, no Component Map, or a clean candidate).
+reuse_violations_section() {
+  local f="$RUN_ROOT/validated/reuse-violations.json"
+  [ -s "$f" ] || return 0
+  integrity_guard "$f" reuse-violations "the reuse-violations report"
+  printf '%s\n' '--- COMPONENT-REUSE GATE (advisory; engine-computed, NOT authoritative) ---'
+  printf 'Added files whose component the plan'"'"'s Component Map did not declare `NEW`.\nWeigh as one more input — a false positive should not block an otherwise-sound\ncandidate, but an unresolved entry across review rounds is a real smell.\n\n'
+  jq -c '.violations[]' "$f" 2>/dev/null | sed 's/^/    /'
 }
 
 # Seam for fixtures: is the Codex CLI available? (command -v inline would make
@@ -2456,6 +2631,7 @@ run_observer() {
     done
     observer_wrapper_evidence "$candidate"
     codex_review_section "$candidate"
+    reuse_violations_section
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30
