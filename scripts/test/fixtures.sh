@@ -275,6 +275,8 @@ run_dry_fixtures() {
   fixture_component_inventory
   fixture_reuse_gate
   fixture_port_audit_static
+  fixture_port_audit_normalize
+  fixture_port_audit_offline
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -5390,6 +5392,158 @@ fixture_port_audit_static() {
     printf 'ok - port-audit-static: flattens tokens one level, resolves group.key refs, captures literals w/ file:line\n'
   else
     printf 'not ok - port-audit-static: flattens tokens one level, resolves group.key refs, captures literals w/ file:line\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/port-audit.sh + scripts/lib/port-audit-normalize.sh (port-fidelity
+# Task 8, closing Phase B): the agent pass + report. --offline skips the paid
+# `claude -p` call entirely and feeds a canned reply through the SAME
+# normalize+assemble path a live run uses, so both fixtures below are fully
+# deterministic/offline and run UNCONDITIONALLY (no chrome/simulator/claude
+# CLI needed), same as the Task 3/5/7 fixtures above.
+#
+# port-audit-normalize exercises the RECOMPUTE discipline directly: a tiny
+# synthetic project (one manifest element, one source file) where a canned
+# "good" reply claims status:"match" with expected/actual numbers that differ
+# by 5 -- proving the wrapper ignores the agent's own arithmetic entirely and
+# recomputes status/delta itself from the manifest + material lookups (here:
+# off, delta 5) -- plus the canned-garbage-reply failure path (report with
+# summary.error, exit 3, entries:[]).
+_fixture_port_audit_normalize_run() {
+  local root="$FIXTURE_ROOT/port-audit-normalize" dir repo manifest good garbage out status
+
+  # Case 1: a false "match" claim over numbers 5 apart is corrected to "off".
+  ( dir="$root/off-recompute"; mkdir -p "$dir/repo/src/ui" "$dir/repo/src/features/off"
+    repo="$dir/repo"
+    printf 'export const type = { h1: 28 } as const;\n' >"$repo/src/ui/tokens.ts"
+    cat >"$repo/src/features/off/OffScreen.tsx" <<'EOF'
+import { StyleSheet } from 'react-native';
+
+const styles = StyleSheet.create({
+  title: {
+    fontSize: 33,
+  },
+});
+EOF
+    manifest="$dir/manifest.json"
+    jq -n '{
+      schema: "night-shift-design-manifest/1", screen: "off",
+      source: {kind: "web", ref: "n/a", extractedAt: "2026-01-01T00:00:00.000Z", viewport: {width:1,height:1}, unit:"px"},
+      elements: [{
+        id: "heading.x", role: "heading", match: {web: null, figma: null}, text: "X",
+        typography: {fontFamily: "Sys", fontSize: 28, fontWeight: 400, lineHeight: 32, letterSpacing: 0},
+        color: "#123456", background: null, bounds: {x:0,y:0,w:10,h:10},
+        spacing: {marginTop:0, paddingH:0, gapToPrev:0}, radius: 0, iconSize: null
+      }],
+      rollup: {palette:["#123456"], fontFamilies:["Sys"], fontSizes:[28], spacingScale:[0], radii:[0], iconSizes:[]}
+    }' >"$manifest"
+    good="$dir/good-reply.json"
+    printf '{"entries":[{"elementId":"heading.x","property":"fontSize","evidence":"src/features/off/OffScreen.tsx:5","status":"match","expected":28,"actual":33}]}\n' >"$good"
+
+    out="$repo/.night-shift/port-audit/off.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen off --manifest "$manifest" \
+      --scope src/features/off --offline "$good" >/dev/null
+    status=$?
+    fx "off-recompute: exit 0" test "$status" -eq 0
+    fx "off-recompute: report written" [ -s "$out" ]
+    fx "off-recompute: agent's false match claim corrected to off, delta 5" bash -c \
+      "jq -e '([.entries[] | select(.elementId==\"heading.x\" and .property==\"fontSize\")][0] | .status==\"off\" and .delta==5 and .expected==28 and .actual==33)' '$out' >/dev/null"
+    fx "off-recompute: summary counts the correction as off, not match" bash -c \
+      "jq -e '.summary.off >= 1 and .summary.match == 0' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
+  # Case 2: a garbage reply (no entries anywhere) fails both attempts ->
+  # entries:[] + summary.error, exit 3 -- never blocks, always writes a report.
+  ( dir="$root/garbage"; mkdir -p "$dir/repo/src/ui" "$dir/repo/src/features/off"
+    repo="$dir/repo"
+    printf 'export const type = { h1: 28 } as const;\n' >"$repo/src/ui/tokens.ts"
+    printf "const styles = { title: { fontSize: 28 } };\n" >"$repo/src/features/off/OffScreen.tsx"
+    manifest="$dir/manifest.json"
+    jq -n '{schema:"night-shift-design-manifest/1", screen:"off", source:{kind:"web"}, elements:[], rollup:{}}' >"$manifest"
+    garbage="$dir/garbage-reply.json"
+    printf '{"nonsense": "yes"}\n' >"$garbage"
+
+    out="$repo/.night-shift/port-audit/off.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen off --manifest "$manifest" \
+      --scope src/features/off --offline "$garbage" >/dev/null 2>&1
+    status=$?
+    fx "garbage: exit 3" test "$status" -eq 3
+    fx "garbage: report still written (never blocks)" [ -s "$out" ]
+    fx "garbage: entries empty + summary.error set" bash -c \
+      "jq -e '(.entries|length)==0 and (.summary.error|type)==\"string\"' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_port_audit_normalize() {
+  local err status
+  err="$(_fixture_port_audit_normalize_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-normalize: recomputes status/delta from expected vs actual (never trusts agent arithmetic); garbage reply -> summary.error, exit 3\n'
+  else
+    printf 'not ok - port-audit-normalize: recomputes status/delta from expected vs actual (never trusts agent arithmetic); garbage reply -> summary.error, exit 3\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# port-audit-offline: the full offline pipeline -- Task 3's figma fixture
+# node-dump (generates a real night-shift-design-manifest/1 with
+# heading.sample-title/icon.1/button.continue) + Task 7's rn-screen fixture
+# tree (real port-audit-static.js material extraction, not hand-authored) +
+# a canned reply mapping just the heading -> a real report exists, at least
+# one match, and the match entry's evidence is a real file:line in the
+# fixture tree.
+_fixture_port_audit_offline_run() {
+  local dir repo manifest_dir reply out status
+  dir="$FIXTURE_ROOT/port-audit-offline"
+  mkdir -p "$dir"
+  repo="$dir/repo"
+  mkdir -p "$repo"
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/rn-screen/." "$repo/"
+
+  manifest_dir="$dir/design/manifest"
+  mkdir -p "$manifest_dir"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+      --nodes "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/sample-screen.txt" \
+      --globals "$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes/_global-vars.txt" \
+      --screen sample --out "$manifest_dir" >/dev/null; then
+    printf 'figma-manifest.js dispatch failed\n'
+    return 1
+  fi
+
+  reply="$dir/reply.json"
+  printf '{"entries":[{"elementId":"heading.sample-title","property":"fontSize","evidence":"src/features/sample/SampleScreen.tsx:19"}]}\n' >"$reply"
+
+  out="$repo/.night-shift/port-audit/sample.json"
+  "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen sample \
+    --manifest "$manifest_dir/sample.json" --scope src/features/sample --offline "$reply" >/dev/null
+  status=$?
+  fx "offline: exit 0" test "$status" -eq 0
+  fx "offline: report exists" [ -s "$out" ]
+  fx "offline: schema id" bash -c "jq -e '.schema == \"night-shift-port-audit/1\"' '$out' >/dev/null"
+  fx "offline: at least one match" bash -c "jq -e '.summary.match >= 1' '$out' >/dev/null"
+  fx "offline: the heading fontSize entry matches (28==28)" bash -c \
+    "jq -e '([.entries[] | select(.elementId==\"heading.sample-title\" and .property==\"fontSize\")][0] | .status==\"match\" and .expected==28 and .actual==28)' '$out' >/dev/null"
+  fx "offline: match entry's evidence names a real file in the fixture tree" bash -c \
+    "jq -r '([.entries[] | select(.status==\"match\")][0].evidence)' '$out' | cut -d: -f1 | xargs -I{} test -f '$repo/{}'"
+  return 0
+}
+
+fixture_port_audit_offline() {
+  local err status
+  err="$(_fixture_port_audit_offline_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - port-audit-offline: full offline run (Task 3 manifest + Task 7 material) -- report exists, match >= 1, evidence names a real file\n'
+  else
+    printf 'not ok - port-audit-offline: full offline run (Task 3 manifest + Task 7 material) -- report exists, match >= 1, evidence names a real file\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
