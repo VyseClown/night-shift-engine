@@ -267,6 +267,7 @@ run_dry_fixtures() {
   fixture_assert "visual-review --repair starts Metro before the initial capture loop" fixture_repair_metro_call_order "$root"
   fixture_assert "repair_recapture_screen: restart-then-wait-then-capture order; first-pass never invokes repair-only fns" fixture_recapture_wrapper "$root"
   fixture_assert "__visual_wait_bundle_ready: large bundle ready, tiny error page not ready" fixture_wait_bundle_ready "$root"
+  fixture_cdp_ws
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -4749,5 +4750,30 @@ STUB
     exit 0
   ) || return 1
   return 0
+}
+
+# scripts/lib/cdp-ws.js (port-fidelity Task 1): a zero-dep CDP websocket client
+# that Task 2's design extractor will drive real headless Chrome through. This
+# fixture actually launches Chrome, so it self-skips when no chrome binary is
+# available — the deterministic/offline suite must stay green on machines
+# without Chrome (CI) without silently losing coverage on machines that do
+# have it (dev). Its label differs by branch ("skipped" vs. the real
+# launch+evaluate assertion), so unlike every other fixture above it does not
+# go through fixture_assert's fixed-description dispatch — it prints its own
+# ok/not-ok line, same convention fixture_assert itself uses.
+fixture_cdp_ws() {
+  local bin="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  if [ ! -x "$bin" ]; then
+    printf 'ok - cdp-ws: skipped (no chrome)\n'
+    return
+  fi
+  local out
+  if out="$(CHROME_BIN="$bin" node "$WORKSPACE_ROOT/scripts/lib/cdp-ws.js" --selftest 2>&1)"; then
+    printf 'ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n'
+  else
+    printf 'not ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n' >&2
+    printf '%s\n' "$out" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
 }
 
