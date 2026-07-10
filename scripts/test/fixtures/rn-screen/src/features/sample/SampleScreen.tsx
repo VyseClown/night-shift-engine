@@ -1,5 +1,5 @@
 import { StyleSheet, Text, View } from 'react-native';
-import { colors, spacing, type } from '../../ui/tokens';
+import { colors, spacing, type, typography } from '../../ui/tokens';
 
 export function SampleScreen() {
   return (
@@ -18,5 +18,8 @@ const styles = StyleSheet.create({
   title: {
     fontSize: type.h1,
     color: '#999999',
+  },
+  subtitle: {
+    fontSize: typography.size.md,
   },
 });

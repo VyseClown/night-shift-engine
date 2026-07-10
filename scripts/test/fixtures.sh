@@ -5382,6 +5382,10 @@ _fixture_port_audit_static_run() {
     "jq -e '([.usages[] | select(.property == \"fontSize\")][0].resolved) == 28' '$out' >/dev/null"
   fx "literal color usage captured with correct file + plausible line" bash -c \
     "jq -e '([.usages[] | select(.property == \"color\")][0] | .file == \"src/features/sample/SampleScreen.tsx\" and .resolved == \"#999999\" and .line > 0)' '$out' >/dev/null"
+  fx "nested token group flattens recursively (typography.size.md == 16)" bash -c \
+    "jq -e '.tokens[\"typography.size.md\"] == 16' '$out' >/dev/null"
+  fx "3-deep dotted usage ref resolves through the flattened table (typography.size.md -> 16)" bash -c \
+    "jq -e '([.usages[] | select(.raw == \"typography.size.md\")][0].resolved) == 16' '$out' >/dev/null"
   return 0
 }
 
@@ -5390,9 +5394,9 @@ fixture_port_audit_static() {
   err="$(_fixture_port_audit_static_run 2>&1)"
   status=$?
   if [ "$status" -eq 0 ]; then
-    printf 'ok - port-audit-static: flattens tokens one level, resolves group.key refs, captures literals w/ file:line\n'
+    printf 'ok - port-audit-static: flattens tokens recursively to scalar leaves, resolves dotted refs (any depth), captures literals w/ file:line\n'
   else
-    printf 'not ok - port-audit-static: flattens tokens one level, resolves group.key refs, captures literals w/ file:line\n' >&2
+    printf 'not ok - port-audit-static: flattens tokens recursively to scalar leaves, resolves dotted refs (any depth), captures literals w/ file:line\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
@@ -5507,6 +5511,50 @@ EOF
       "jq -e '([.entries[] | select(.elementId==\"heading.sample-title\" and .property==\"fontSize\")] | length) == 1' '$out' >/dev/null"
     fx "dup-dedupe: summary counts the pair once (match=1, off=0, missing=8, extra=0, unknown=0)" bash -c \
       "jq -e '.summary == {match:1, off:0, missing:8, extra:0, unknown:0, pct:11}' '$out' >/dev/null"
+    exit 0
+  ) || return 1
+
+  # Case 4: a NEGATIVE figma spacing expectation (gapToPrev of an absolute-
+  # positioned/overlapping node -- an overlap artifact of the y-sorted gap
+  # chain, not design truth) must classify as "unknown", never off or match,
+  # so it cannot poison pct in either direction. Manifest: one figma-mode
+  # container whose gapToPrev is -625 (marginTop maps onto gapToPrev for
+  # figma sources); source: a real marginTop usage; reply maps the pair.
+  ( dir="$root/figma-neg-spacing"; mkdir -p "$dir/repo/src/ui" "$dir/repo/src/features/neg"
+    repo="$dir/repo"
+    printf 'export const spacing = { md: 12 } as const;\n' >"$repo/src/ui/tokens.ts"
+    cat >"$repo/src/features/neg/NegScreen.tsx" <<'EOF'
+import { StyleSheet } from 'react-native';
+
+const styles = StyleSheet.create({
+  container: {
+    marginTop: 10,
+  },
+});
+EOF
+    manifest="$dir/manifest.json"
+    jq -n '{
+      schema: "night-shift-design-manifest/1", screen: "neg",
+      source: {kind: "figma", ref: "9:9", extractedAt: "2026-01-01T00:00:00.000Z", viewport: {width:430,height:932}, unit:"pt"},
+      elements: [{
+        id: "container.1", role: "container", match: {web: null, figma: "9:9"}, text: null,
+        typography: null, color: null, background: null, bounds: {x:0,y:0,w:100,h:100},
+        spacing: {marginTop: 0, paddingH: 0, gapToPrev: -625}, radius: 0, iconSize: null
+      }],
+      rollup: {palette:[], fontFamilies:[], fontSizes:[], spacingScale:[], radii:[0], iconSizes:[]}
+    }' >"$manifest"
+    good="$dir/reply.json"
+    printf '{"entries":[{"elementId":"container.1","property":"marginTop","evidence":"src/features/neg/NegScreen.tsx:5"}]}\n' >"$good"
+
+    out="$repo/.night-shift/port-audit/neg.json"
+    "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$repo" --screen neg --manifest "$manifest" \
+      --scope src/features/neg --offline "$good" >/dev/null
+    status=$?
+    fx "figma-neg-spacing: exit 0" test "$status" -eq 0
+    fx "figma-neg-spacing: entry is unknown with expected -625 kept visible" bash -c \
+      "jq -e '([.entries[] | select(.elementId==\"container.1\" and .property==\"marginTop\")][0] | .status==\"unknown\" and .expected==-625 and .actual==10 and .delta==null)' '$out' >/dev/null"
+    fx "figma-neg-spacing: excluded from off (off=0, unknown=1, match=0)" bash -c \
+      "jq -e '.summary.off == 0 and .summary.unknown == 1 and .summary.match == 0' '$out' >/dev/null"
     exit 0
   ) || return 1
 

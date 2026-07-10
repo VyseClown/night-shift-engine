@@ -23,7 +23,9 @@
 // Exit 0 on success, 1 with a one-line stderr reason otherwise.
 //
 // Token parsing: `export const <name> = { ... } as const` blocks, flattened
-// one level (`colors.ink` from `export const colors = { ink: ... }`). A real
+// RECURSIVELY to scalar leaves with dot-joined keys (`colors.ink` from
+// `export const colors = { ink: ... }`; `typography.size.xs` from a nested
+// `typography: { size: { xs: 12 } }` group — real RN apps nest). A real
 // app's tokens.ts (unlike this fixture) may spread the object literal over
 // many lines, drop the trailing semicolon (ASI), use either quote style for
 // string values, or carry `//`/`/* */` comments between entries — all
@@ -194,14 +196,38 @@ function parseFlatEntries(body) {
   return entries;
 }
 
+// Recursive flatten of a token object body to its SCALAR LEAVES, dot-joining
+// nested keys (`typography: { size: { xs: 12 } }` -> `typography.size.xs`:
+// 12). Real RN apps nest their token groups (the live gate's target:
+// `typography.size.xs`), and a one-level flatten left those usages resolving
+// to their raw ref text — a systematic false-"off" against every numeric
+// expectation. Flat groups flatten exactly as before (a scalar value at
+// depth 1 takes the same parse path parseFlatEntries used).
+function flattenEntries(body, prefix, out) {
+  const cleaned = stripComments(body);
+  for (const part of splitTopLevel(cleaned, ',')) {
+    const m = part.match(/^['"]?([A-Za-z_$][\w$]*)['"]?\s*:\s*([\s\S]+)$/);
+    if (!m) continue;
+    const key = prefix ? `${prefix}.${m[1]}` : m[1];
+    const raw = m[2].trim();
+    if (raw.startsWith('{')) {
+      flattenEntries(extractBalanced(raw, 0, '{', '}'), key, out);
+    } else {
+      out.push([key, parseScalarValue(raw)]);
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Token parsing: `export const <name> = { ... } as const` blocks.
 // ---------------------------------------------------------------------------
 
 // Tolerant of: multi-line object bodies, comments inside the body (stripped
-// by parseFlatEntries), a missing trailing semicolon (ASI — the "as const"
+// by flattenEntries), a missing trailing semicolon (ASI — the "as const"
 // check only looks at the text immediately after the closing brace, not at
-// what follows it), and either quote style for string values.
+// what follows it), and either quote style for string values. Nested object
+// values flatten recursively to their scalar leaves (see flattenEntries).
 function parseTokenGroups(content) {
   const tokens = {};
   const re = /export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*\{/g;
@@ -213,8 +239,8 @@ function parseTokenGroups(content) {
     const afterIndex = openIndex + body.length + 2; // past the closing '}'
     const rest = content.slice(afterIndex);
     if (!/^\s*as\s+const\s*;?/.test(rest)) continue; // not a token block
-    for (const [key, value] of parseFlatEntries(body)) {
-      tokens[`${name}.${key}`] = value;
+    for (const [key, value] of flattenEntries(body, name, [])) {
+      tokens[key] = value;
     }
     re.lastIndex = afterIndex;
   }
@@ -227,15 +253,15 @@ function parseTokenGroups(content) {
 
 const KV_LINE_RE = /^\s*['"]?([A-Za-z_$][\w$]*)['"]?\s*:\s*(.+?),?\s*$/;
 
-// `group.key` (e.g. `type.h1`) resolves through the token table; a quoted
-// string or bare number literal resolves to itself; anything else (an
-// expression this line scan doesn't understand) is returned unresolved —
-// the raw text stands in for both fields.
+// A dotted token ref of ANY depth (`type.h1`, `typography.size.xs`) resolves
+// through the (recursively flattened) token table; a quoted string or bare
+// number literal resolves to itself; anything else (an expression this line
+// scan doesn't understand, or a dotted path absent from the table) is
+// returned unresolved — the raw text stands in for both fields.
 function resolveValue(raw, tokens) {
-  const tokenRef = raw.match(/^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)$/);
-  if (tokenRef) {
-    const key = `${tokenRef[1]}.${tokenRef[2]}`;
-    if (Object.prototype.hasOwnProperty.call(tokens, key)) return tokens[key];
+  const tokenRef = raw.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)$/);
+  if (tokenRef && Object.prototype.hasOwnProperty.call(tokens, tokenRef[1])) {
+    return tokens[tokenRef[1]];
   }
   return parseScalarValue(raw);
 }
@@ -314,6 +340,7 @@ module.exports = {
   splitTopLevel,
   parseScalarValue,
   parseFlatEntries,
+  flattenEntries,
   parseTokenGroups,
   isTrackedProperty,
   resolveValue,

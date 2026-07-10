@@ -175,6 +175,17 @@ port_audit_assemble() {
           { elementId: $id, property: $prop, expected: $exp, actual: null, status: "unknown", delta: null, evidence: $ev }
         elif $exp == null then
           { elementId: $id, property: $prop, expected: null, actual: $u.resolved, status: "extra", delta: null, evidence: $ev }
+        elif (($m.source.kind // "") == "figma"
+              and ($prop | test("^(gap$|margin|padding)"))
+              and (($exp | tonum) != null) and (($exp | tonum) < 0)) then
+          # A NEGATIVE figma spacing expectation (the gapToPrev of an
+          # absolute-positioned/overlapping node, e.g. -625 on the live
+          # gate login screen) is an overlap ARTIFACT of the y-sorted gap
+          # chain, not design truth: never let it decide off OR match.
+          # Status "unknown" keeps the pair visible (expected/actual/evidence
+          # intact) without poisoning pct in either direction. Web manifests
+          # are unaffected — their spacing comes from the real CSS box model.
+          { elementId: $id, property: $prop, expected: $exp, actual: $u.resolved, status: "unknown", delta: null, evidence: $ev }
         else
           (compare($exp; $u.resolved)) as $c |
           { elementId: $id, property: $prop, expected: $exp, actual: $u.resolved, status: $c.status, delta: $c.delta, evidence: $ev }
