@@ -268,6 +268,7 @@ run_dry_fixtures() {
   fixture_assert "repair_recapture_screen: restart-then-wait-then-capture order; first-pass never invokes repair-only fns" fixture_recapture_wrapper "$root"
   fixture_assert "__visual_wait_bundle_ready: large bundle ready, tiny error page not ready" fixture_wait_bundle_ready "$root"
   fixture_cdp_ws
+  fixture_design_extract_web
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -4773,6 +4774,97 @@ fixture_cdp_ws() {
   else
     printf 'not ok - cdp-ws: launches chrome, evaluates 1+1 over CDP\n' >&2
     printf '%s\n' "$out" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/lib/cdp-extract.js (port-fidelity Task 2): the web-mode design
+# extractor built on cdp-ws.js. This fixture serves the committed neutral
+# fixture page over a real local HTTP server, drives the extractor CLI
+# against it through real headless Chrome, and asserts the resulting
+# manifest against known values baked into that fixture page (the "test
+# oracle"). Chrome- and python3-guarded the same way as fixture_cdp_ws above,
+# so a chromeless/python3-less machine (CI) still gets a green, deterministic
+# suite instead of a false failure. Everything (the http.server background
+# process, its port, and the CLI's --out scratch dir) lives inside a command-
+# substitution subshell so its own `trap ... EXIT` cleans up on every path
+# (pass, fail, or a stray hang) without disturbing run_dry_fixtures' own EXIT
+# trap on $FIXTURE_ROOT.
+_fixture_design_extract_web_run() {
+  local bin="$1"
+  local fixture_dir port up i manifest png
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/design-page"
+  # DELIBERATELY NOT local: the EXIT trap fires in the surrounding command-
+  # substitution subshell AFTER this function has returned, when its locals
+  # are already out of scope — a `local` here means the trap sees unbound
+  # variables (set -u aborts it) and the http server + scratch dir leak
+  # (observed live before this fix). Non-local is still contained: the
+  # caller always invokes this inside $(...), so nothing escapes to the
+  # real shell.
+  DESIGN_EXTRACT_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-design-extract.$$"
+  DESIGN_EXTRACT_HTTPD_PID=""
+  mkdir -p "$DESIGN_EXTRACT_OUT_DIR" || return 1
+  trap 'kill "${DESIGN_EXTRACT_HTTPD_PID:-}" 2>/dev/null; rm -rf "${DESIGN_EXTRACT_OUT_DIR:-}"' EXIT
+
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
+
+  python3 -m http.server "$port" --bind 127.0.0.1 --directory "$fixture_dir" >/dev/null 2>&1 &
+  DESIGN_EXTRACT_HTTPD_PID=$!
+
+  up=0
+  for i in $(seq 1 30); do
+    if curl -s -o /dev/null "http://127.0.0.1:$port/"; then
+      up=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [ "$up" -ne 1 ]; then
+    printf 'fixture http server never came up on port %s\n' "$port"
+    return 1
+  fi
+
+  if ! CHROME_BIN="$bin" node "$WORKSPACE_ROOT/scripts/lib/cdp-extract.js" \
+    --url "http://127.0.0.1:$port/" --screen home --out "$DESIGN_EXTRACT_OUT_DIR"; then
+    return 1
+  fi
+
+  manifest="$DESIGN_EXTRACT_OUT_DIR/home.json"
+  png="$DESIGN_EXTRACT_OUT_DIR/home-430x932.png"
+  [ -s "$manifest" ] || { printf 'manifest missing/empty: %s\n' "$manifest"; return 1; }
+  [ -s "$png" ] || { printf 'screenshot missing/empty: %s\n' "$png"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-design-manifest/1\"' '$manifest' >/dev/null"
+  fx "heading typography (fontSize 28, fontWeight 700, color #123456)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"heading\")][0] | (.typography.fontSize == 28 and .typography.fontWeight == 700 and .color == \"#123456\")' '$manifest' >/dev/null"
+  fx "button style (background #30437a, radius 8, w 320)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"button\")][0] | ((.background|ascii_downcase) == \"#30437a\" and .radius == 8 and .bounds.w == 320)' '$manifest' >/dev/null"
+  fx "icon size 24" bash -c \
+    "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
+  fx "li dedupe keeps exactly 2 rows" bash -c \
+    "jq -e '[.elements[] | select(.role==\"text\" and (.text|startswith(\"Row\")))] | length == 2' '$manifest' >/dev/null"
+  return 0
+}
+
+fixture_design_extract_web() {
+  local bin="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  if [ ! -x "$bin" ]; then
+    printf 'ok - design-extract-web: skipped (no chrome)\n'
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'ok - design-extract-web: skipped (no python3)\n'
+    return
+  fi
+
+  local err status
+  err="$(_fixture_design_extract_web_run "$bin" 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - design-extract-web: extracts manifest (typography/color/radius/icon/list-dedupe) from a live page\n'
+  else
+    printf 'not ok - design-extract-web: extracts manifest (typography/color/radius/icon/list-dedupe) from a live page\n' >&2
+    printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
 }
