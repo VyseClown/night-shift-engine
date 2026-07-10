@@ -269,6 +269,7 @@ run_dry_fixtures() {
   fixture_assert "__visual_wait_bundle_ready: large bundle ready, tiny error page not ready" fixture_wait_bundle_ready "$root"
   fixture_cdp_ws
   fixture_design_extract_web
+  fixture_design_extract_figma
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -4864,6 +4865,60 @@ fixture_design_extract_web() {
     printf 'ok - design-extract-web: extracts manifest (typography/color/radius/icon/list-dedupe) from a live page\n'
   else
     printf 'not ok - design-extract-web: extracts manifest (typography/color/radius/icon/list-dedupe) from a live page\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/lib/figma-manifest.js (port-fidelity Task 3): the figma-mode
+# design extractor. Unlike cdp-ws.js/cdp-extract.js above, this is pure text
+# parsing of a committed node-dump + globals file (no MCP server, no chrome,
+# no simulator) into the SAME night-shift-design-manifest/1 schema the web
+# extractor produces (source.kind "figma", unit "pt") — so this fixture is
+# fully deterministic/offline and runs UNCONDITIONALLY on every machine (CI
+# included), unlike the two chrome-gated fixtures immediately above it.
+# Known values baked into the committed fixture files are the test oracle.
+_fixture_design_extract_figma_run() {
+  local fixture_dir manifest
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/figma-nodes"
+  # DELIBERATELY NOT local, same reasoning as _fixture_design_extract_web_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  DESIGN_EXTRACT_FIGMA_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-design-extract-figma.$$"
+  mkdir -p "$DESIGN_EXTRACT_FIGMA_OUT_DIR" || return 1
+  trap 'rm -rf "${DESIGN_EXTRACT_FIGMA_OUT_DIR:-}"' EXIT
+
+  if ! node "$WORKSPACE_ROOT/scripts/lib/figma-manifest.js" \
+    --nodes "$fixture_dir/sample-screen.txt" --globals "$fixture_dir/_global-vars.txt" \
+    --screen sample-screen --out "$DESIGN_EXTRACT_FIGMA_OUT_DIR"; then
+    return 1
+  fi
+
+  manifest="$DESIGN_EXTRACT_FIGMA_OUT_DIR/sample-screen.json"
+  [ -s "$manifest" ] || { printf 'manifest missing/empty: %s\n' "$manifest"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-design-manifest/1\"' '$manifest' >/dev/null"
+  fx "source.unit is pt" bash -c "jq -e '.source.unit == \"pt\"' '$manifest' >/dev/null"
+  fx "heading typography (fontSize 28, fontWeight 700, color #123456)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"heading\")][0] | (.typography.fontSize == 28 and .typography.fontWeight == 700 and .color == \"#123456\")' '$manifest' >/dev/null"
+  fx "button style (background #30437a, radius 8, w 320, text Continue)" bash -c \
+    "jq -e '[.elements[] | select(.role==\"button\")][0] | ((.background|ascii_downcase) == \"#30437a\" and .radius == 8 and .bounds.w == 320 and .text == \"Continue\")' '$manifest' >/dev/null"
+  fx "icon size 24" bash -c \
+    "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
+  fx "rollup palette contains #30437a" bash -c \
+    "jq -e '(.rollup.palette | map(ascii_downcase) | index(\"#30437a\")) != null' '$manifest' >/dev/null"
+  return 0
+}
+
+fixture_design_extract_figma() {
+  local err status
+  err="$(_fixture_design_extract_figma_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - design-extract-figma: extracts manifest (typography/color/radius/icon/rollup) from a node-dump\n'
+  else
+    printf 'not ok - design-extract-figma: extracts manifest (typography/color/radius/icon/rollup) from a node-dump\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi

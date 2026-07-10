@@ -1,0 +1,24 @@
+layout_root:
+  mode: none
+  sizing: {}
+  dimensions:
+    width: 430
+    height: 932
+fill_bg:
+  - '#F0F2FA'
+fill_ink:
+  - '#123456'
+fill_cta:
+  - '#30437A'
+style_h1:
+  fontFamily: Poppins
+  fontStyle: Bold
+  fontWeight: 700
+  fontSize: 28
+  lineHeight: 36px
+style_body:
+  fontFamily: Poppins
+  fontStyle: Regular
+  fontWeight: 400
+  fontSize: 16
+  lineHeight: 22px
