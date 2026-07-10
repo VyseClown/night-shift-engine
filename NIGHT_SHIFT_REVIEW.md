@@ -215,3 +215,77 @@ output is transient and must not be copied here.
   ]
 }
 ```
+
+## Run 20260707T152422Z-21406 - 2026-07-07T20:47:56Z
+
+- Task: `/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-transactions.md`
+- Base: `0c0c699b5fb692ff970c1da1710e8fb9d3322065`
+- Candidate: `1782b0b39756af108d6357511a64660f7a90199f`
+
+```json
+{
+  "observer": "claude",
+  "primary": "claude",
+  "task": "/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-transactions.md",
+  "candidate_commit": "1782b0b39756af108d6357511a64660f7a90199f",
+  "status": "APPROVE",
+  "findings": [],
+  "documentation_changes": [
+    "Optional (non-blocking, already surfaced by the Design Fidelity Reviewer): append the three implementation-time deviations — card gradients flattened to colors.white, colors.monthInactive #5F5F5F replacing source #B1B1B1, and the Earned card text rendered colors.inkFigure instead of the source near-white — to the spec's Design Contract 'Approved deviations' list so the contract document matches CLAUDE.md and the plan."
+  ]
+}
+```
+
+## Run 20260707T152422Z-21406 - 2026-07-08T00:54:39Z
+
+- Task: `/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-expense-tracker.md`
+- Base: `1782b0b39756af108d6357511a64660f7a90199f`
+- Candidate: `fa3ac420f18669ba117c2fe51732bcfc0e55b17a`
+
+```json
+{
+  "observer": "claude",
+  "primary": "claude",
+  "task": "/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-expense-tracker.md",
+  "candidate_commit": "fa3ac420f18669ba117c2fe51732bcfc0e55b17a",
+  "status": "APPROVE",
+  "findings": [],
+  "documentation_changes": []
+}
+```
+
+## Run 20260707T152422Z-21406 - 2026-07-08T02:13:22Z
+
+- Task: `/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-categories-add-expense.md`
+- Base: `fa3ac420f18669ba117c2fe51732bcfc0e55b17a`
+- Candidate: `10a24ab638a7e3c799e621cbb010c4b3e5162e7a`
+
+```json
+{
+  "observer": "claude",
+  "primary": "claude",
+  "task": "/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-categories-add-expense.md",
+  "candidate_commit": "10a24ab638a7e3c799e621cbb010c4b3e5162e7a",
+  "status": "APPROVE",
+  "findings": [],
+  "documentation_changes": []
+}
+```
+
+## Run 20260707T152422Z-21406 - 2026-07-08T03:40:02Z
+
+- Task: `/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-calendar-search.md`
+- Base: `10a24ab638a7e3c799e621cbb010c4b3e5162e7a`
+- Candidate: `1c01e92469589a374be6636a0b851d36e4046a7c`
+
+```json
+{
+  "observer": "claude",
+  "primary": "claude",
+  "task": "/Users/alessandrogentil/work/personal/night-shift-engine/specs/financa-mobile-calendar-search.md",
+  "candidate_commit": "1c01e92469589a374be6636a0b851d36e4046a7c",
+  "status": "APPROVE",
+  "findings": [],
+  "documentation_changes": []
+}
+```
