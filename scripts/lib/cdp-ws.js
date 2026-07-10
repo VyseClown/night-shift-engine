@@ -80,6 +80,12 @@ function httpGetJson(port, urlPath) {
       });
     });
     req.on('error', reject);
+    // Idle timeout: covers both "connection never established" and
+    // "connected but Chrome never answers" — either way the request socket
+    // sits silent, so 15s of inactivity is the signal to give up.
+    req.setTimeout(15000, () => {
+      req.destroy(new Error('httpGetJson: timed out after 15s waiting for a response'));
+    });
   });
 }
 
@@ -154,8 +160,31 @@ function parseFrame(buf) {
 //   on(event, fn)                                          (dispatch by .method)
 //   close()
 function connect(port) {
-  return httpGetJson(port, '/json/version').then((info) => {
-    return new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let activeSocket = null;
+    let activeReq = null;
+
+    // Overall connect() timeout: covers the /json/version fetch AND the ws
+    // upgrade handshake. If Chrome accepts the TCP connection but never
+    // completes the upgrade (or never answers at all), this is what unblocks
+    // the caller instead of hanging forever.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      if (activeSocket) { try { activeSocket.destroy(); } catch (_err) { /* already gone */ } }
+      else if (activeReq) { try { activeReq.destroy(); } catch (_err) { /* already gone */ } }
+      reject(new Error('connect: timed out after 15s waiting for the CDP websocket handshake'));
+    }, 15000);
+
+    function settle(fn) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    }
+
+    httpGetJson(port, '/json/version').then((info) => {
       const wsUrl = new URL(info.webSocketDebuggerUrl);
       const key = crypto.randomBytes(16).toString('base64');
 
@@ -170,11 +199,12 @@ function connect(port) {
           'Sec-WebSocket-Key': key,
         },
       });
+      activeReq = req;
 
-      req.on('error', reject);
+      req.on('error', (err) => settle(() => reject(err)));
       req.on('response', (res) => {
         // A non-101 response means no 'upgrade' event will fire.
-        reject(new Error(`connect: expected HTTP 101, got ${res.statusCode}`));
+        settle(() => reject(new Error(`connect: expected HTTP 101, got ${res.statusCode}`)));
       });
       // The request is never actually written to the socket until end() is
       // called — without this the handshake hangs forever waiting on an
@@ -182,6 +212,7 @@ function connect(port) {
       req.end();
 
       req.on('upgrade', (res, socket, head) => {
+        activeSocket = socket;
         socket.setNoDelay(true);
 
         const listeners = new Map(); // event name -> [fn, ...]
@@ -282,13 +313,18 @@ function connect(port) {
           try { socket.end(); } catch (_err) { /* already gone */ }
         }
 
-        resolve({ send, on, close });
+        settle(() => resolve({ send, on, close }));
       });
-    });
+    }, (err) => settle(() => reject(err)));
   });
 }
 
 module.exports = { launchChrome, connect };
+
+// Tracks the in-flight selftest's Chrome process so the wall-clock cap below
+// can still kill it if something inside selftest() hangs past the per-call
+// timeouts (e.g. a cdp.send() whose response never arrives).
+let selftestChromeProc = null;
 
 // --selftest: launches real headless Chrome, evaluates 1+1 over CDP, and
 // exits 0/1. Chrome-presence gating lives in the bash fixture that invokes
@@ -300,6 +336,7 @@ async function selftest() {
   try {
     const launched = await launchChrome({});
     proc = launched.proc;
+    selftestChromeProc = proc;
     const cdp = await connect(launched.port);
     try {
       const created = await cdp.send('Target.createTarget', { url: 'about:blank' });
@@ -323,9 +360,20 @@ async function selftest() {
     return 1;
   } finally {
     if (proc) { try { proc.kill(); } catch (_err) { /* already dead */ } }
+    selftestChromeProc = null;
   }
 }
 
 if (require.main === module && process.argv.includes('--selftest')) {
+  // Backstop only: connect()/httpGetJson() already time out well under this,
+  // so this only fires if something else inside selftest() hangs (e.g. a
+  // cdp.send() awaiting a response that never comes). unref() so it never
+  // keeps the process alive past a normal, on-time exit.
+  const t = setTimeout(() => {
+    console.error('selftest timeout');
+    if (selftestChromeProc) { try { selftestChromeProc.kill(); } catch (_err) { /* already dead */ } }
+    process.exit(1);
+  }, 30000);
+  t.unref?.();
   selftest().then((code) => process.exit(code));
 }
