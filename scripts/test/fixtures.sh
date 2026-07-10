@@ -4903,11 +4903,11 @@ _fixture_design_extract_figma_run() {
   fx "heading typography (fontSize 28, fontWeight 700, color #123456)" bash -c \
     "jq -e '[.elements[] | select(.role==\"heading\")][0] | (.typography.fontSize == 28 and .typography.fontWeight == 700 and .color == \"#123456\")' '$manifest' >/dev/null"
   fx "button style (background #30437a, radius 8, w 320, text Continue)" bash -c \
-    "jq -e '[.elements[] | select(.role==\"button\")][0] | ((.background|ascii_downcase) == \"#30437a\" and .radius == 8 and .bounds.w == 320 and .text == \"Continue\")' '$manifest' >/dev/null"
+    "jq -e '[.elements[] | select(.role==\"button\")][0] | (.background == \"#30437a\" and .radius == 8 and .bounds.w == 320 and .text == \"Continue\")' '$manifest' >/dev/null"
   fx "icon size 24" bash -c \
     "jq -e '[.elements[] | select(.role==\"icon\")][0].iconSize == 24' '$manifest' >/dev/null"
   fx "rollup palette contains #30437a" bash -c \
-    "jq -e '(.rollup.palette | map(ascii_downcase) | index(\"#30437a\")) != null' '$manifest' >/dev/null"
+    "jq -e '.rollup.palette | index(\"#30437a\") != null' '$manifest' >/dev/null"
   return 0
 }
 

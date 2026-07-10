@@ -243,7 +243,11 @@ function resolveFill(node, globals) {
   if (raw === undefined) return null;
   const arr = globals[raw];
   if (!Array.isArray(arr) || !arr.length) return null;
-  return arr[0];
+  // Figma dumps carry uppercase hex (#30437A); the web extractor
+  // (cdp-extract.js) emits lowercase — normalize here so figma- and web-mode
+  // manifests (element color/background and, downstream, the rollup palette)
+  // compare byte-equal without a case-folding pass in Task 4's comparator.
+  return typeof arr[0] === 'string' ? arr[0].toLowerCase() : arr[0];
 }
 
 function resolveTextStyle(node, globals) {
