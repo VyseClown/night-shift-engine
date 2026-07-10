@@ -955,19 +955,59 @@ spec_design_manifest_field() {
     sed -E 's/[[:space:]]*<!--.*-->[[:space:]]*$//; s/[[:space:]]+$//'
 }
 
+# Containment gate for ONE `- Design manifest:` path: prints the resolved
+# PHYSICAL path on stdout and returns 0 only when the path is project-relative,
+# exists, and resolves inside $PROJECT. Mirrors set_spec_workdir's hardening
+# (scripts/lib/preflight.sh): absolute paths and `..` traversal are rejected
+# lexically, then the physical location (cd + pwd -P, which resolves directory
+# symlinks) must stay under the physically-resolved project — and because a
+# manifest is a FILE, a symlinked manifest itself is also followed (bounded
+# readlink chain, re-canonicalizing the directory at each hop) so a committed
+# link pointing at a sibling repo cannot route outside-project content into the
+# implement prompt. The engine runs unattended with bypassPermissions against
+# isolation-sensitive targets; prompt inputs get the same escape rules as
+# validation Workdirs. Returns: 0 = safe (path printed), 1 = escape/unresolvable
+# (caller warns loudly), 2 = plain not-found (caller skips silently — a stale
+# field degrades to no extra context, exactly as before).
+manifest_path_resolve() {
+  local path="$1" full projreal dir link hops
+  case "$path" in /*) return 1 ;; esac
+  case "/$path/" in *"/../"*) return 1 ;; esac
+  full="$PROJECT/$path"
+  [ -f "$full" ] || return 2
+  projreal="$(cd "$PROJECT" 2>/dev/null && pwd -P)" || return 1
+  dir="$(cd "$(dirname "$full")" 2>/dev/null && pwd -P)" || return 1
+  full="$dir/$(basename "$full")"
+  hops=0
+  while [ -L "$full" ]; do
+    [ "$hops" -lt 8 ] || return 1
+    link="$(readlink "$full")" || return 1
+    case "$link" in /*) ;; *) link="$(dirname "$full")/$link" ;; esac
+    dir="$(cd "$(dirname "$link")" 2>/dev/null && pwd -P)" || return 1
+    full="$dir/$(basename "$link")"
+    hops=$((hops + 1))
+  done
+  [ -f "$full" ] || return 2
+  case "$full" in "$projreal"/*) ;; *) return 1 ;; esac
+  printf '%s' "$full"
+}
+
 # Builds the "Design ground truth" prompt block for the implement stage of a
 # Design-Contract spec: one section per `- Design manifest:` path that resolves to
 # an existing file under $PROJECT, pulled straight from the manifest's own rollup +
 # elements table rather than a hand-typed token list, so the model has no room to
 # eyeball colors/spacing/fonts off a screenshot — "the manifest wins over prose
 # descriptions" is the explicit tie-breaker. Truncates each element table at 40 rows
-# (MANIFEST_PROMPT_ROW_CAP) so one large screen can't blow out the prompt; a listed
-# path that is missing, unreadable, or not valid JSON is silently skipped (never
-# blocks the prompt — a stale/typo'd Design manifest field degrades to no extra
-# context, not a hard failure). No field, or `none` -> empty string, no jq/cat calls.
+# (MANIFEST_PROMPT_ROW_CAP) so one large screen can't blow out the prompt. Every
+# path goes through manifest_path_resolve above: an escaping/unresolvable path is
+# skipped with a LOUD warning (log writes to stderr, so the command-substituted
+# block stays clean — a warn never blocks the prompt); a plain not-found or
+# not-valid-JSON path is skipped silently (a stale/typo'd field degrades to no
+# extra context, not a hard failure). No field, or `none` -> empty string, no
+# jq/cat calls.
 MANIFEST_PROMPT_ROW_CAP=40
 manifest_prompt_block() {
-  local spec="$1" raw path full block out old_ifs
+  local spec="$1" raw path full block out old_ifs rc
   raw="$(spec_design_manifest_field "$spec")"
   case "$raw" in ''|none) return 0 ;; esac
   out=""
@@ -975,8 +1015,17 @@ manifest_prompt_block() {
   for path in $raw; do
     IFS="$old_ifs"
     path="$(printf '%s' "$path" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-    full="$PROJECT/$path"
-    if [ -n "$path" ] && [ -f "$full" ]; then
+    full=""
+    if [ -n "$path" ]; then
+      full="$(manifest_path_resolve "$path")"; rc=$?
+      if [ "$rc" -eq 1 ]; then
+        log "WARN: Design manifest path skipped — escapes or does not resolve inside the project: $path"
+        full=""
+      elif [ "$rc" -ne 0 ]; then
+        full=""
+      fi
+    fi
+    if [ -n "$full" ]; then
       block="$(jq -r --argjson cap "$MANIFEST_PROMPT_ROW_CAP" '
         def s(x): if x == null then "" else (x|tostring) end;
         def esc(x): (s(x) | gsub("\\|"; "\\|"));

@@ -4985,6 +4985,7 @@ fixture_design_extract_cli() {
 # schema breaks this fixture too. Runs unconditionally on every machine (CI incl.).
 _fixture_manifest_prompt_run() {
   local spec_file spec_nofield_file spec_big_file block empty_block rows
+  local spec_escape_file spec_link_file
   local PROJECT
   # DELIBERATELY NOT local for the dir itself, same reasoning as the other
   # command-substitution-subshell fixtures above: the EXIT trap fires after this
@@ -5041,6 +5042,37 @@ SPECEOF
 
   rows="$(manifest_prompt_block "$spec_big_file" | grep -c '^| el-')"
   [ "$rows" -eq 40 ] || { printf 'expected the element table capped at 40 rows, got %s\n' "$rows"; return 1; }
+
+  # Containment (manifest_path_resolve): the engine runs unattended with
+  # bypassPermissions against isolation-sensitive targets, so a `- Design
+  # manifest:` path must never read a file OUTSIDE the project into the
+  # implement prompt — same escape rules as set_spec_workdir's Workdir field.
+  # (a) `../` traversal to a real file above the project: block empty + a loud
+  #     one-line WARN on stderr (skip, never a hard failure).
+  cp "$PROJECT/design/manifest/sample-screen.json" "$MANIFEST_PROMPT_FIXTURE_DIR/outside.json"
+  spec_escape_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-escape.md"
+  cat >"$spec_escape_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: ../outside.json
+SPECEOF
+  block="$(manifest_prompt_block "$spec_escape_file" 2>"$MANIFEST_PROMPT_FIXTURE_DIR/escape.err")"
+  [ -z "$block" ] || { printf 'expected empty block for a ../-escaping manifest path, got: %s\n' "$block"; return 1; }
+  fx "escaping ../ path warned loudly" \
+    grep -q 'WARN: Design manifest path skipped' "$MANIFEST_PROMPT_FIXTURE_DIR/escape.err"
+  # (b) a symlink UNDER the project pointing outside it (the case a bare
+  #     `[ -f $PROJECT/$path ]` would happily pass): also skipped with the WARN.
+  ln -s "$MANIFEST_PROMPT_FIXTURE_DIR/outside.json" "$PROJECT/design/manifest/evil-link.json"
+  spec_link_file="$MANIFEST_PROMPT_FIXTURE_DIR/spec-link.md"
+  cat >"$spec_link_file" <<'SPECEOF'
+## Design Contract
+
+- Design manifest: design/manifest/evil-link.json
+SPECEOF
+  block="$(manifest_prompt_block "$spec_link_file" 2>"$MANIFEST_PROMPT_FIXTURE_DIR/link.err")"
+  [ -z "$block" ] || { printf 'expected empty block for a symlink escaping the project, got: %s\n' "$block"; return 1; }
+  fx "outside-pointing symlink warned loudly" \
+    grep -q 'WARN: Design manifest path skipped' "$MANIFEST_PROMPT_FIXTURE_DIR/link.err"
   return 0
 }
 
@@ -5049,9 +5081,9 @@ fixture_manifest_prompt() {
   err="$(_fixture_manifest_prompt_run 2>&1)"
   status=$?
   if [ "$status" -eq 0 ]; then
-    printf 'ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows\n'
+    printf 'ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows, contains escapes\n'
   else
-    printf 'not ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows\n' >&2
+    printf 'not ok - manifest-prompt: builds the Design ground truth table, empty w/o the field, caps at 40 rows, contains escapes\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
