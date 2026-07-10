@@ -287,6 +287,9 @@ run_dry_fixtures() {
   fixture_port_audit_normalize
   fixture_port_audit_offline
   fixture_port_audit_wiring
+  fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
+  fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
+  fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -6148,5 +6151,94 @@ fixture_port_audit_wiring() {
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
+}
+
+# ---------------------------------------------------------------------------
+# recovery-guard fixtures (port-fidelity Task 12): a bare relaunch (no
+# --resume) over a prior BLOCKED, non-rate-limit run whose project tree is
+# still dirty must die with a directive instead of silently starting a fresh
+# run that would strand the interrupted run's intact, uncommitted work as
+# baseline-dirty (the incident this task fixes). Drives the REAL recover_run
+# directly against a fabricated project dir + state.json, same idiom as the
+# recovery-permodel/recovery-subagent fixtures above (subshell-scoped globals,
+# recording shims for the seams recover_run reaches only on the recovered
+# path — cleanup/log/wait/emit_event never fire on the die path, so the first
+# two fixtures need no shims for them at all).
+# ---------------------------------------------------------------------------
+
+# Shared setup: a real tiny git repo (recover_run's new guard shells out to
+# `git -C "$PROJECT" status --porcelain`) that ignores .night-shift/ — as every
+# real night-shift target must — so only fixture-added dirt outside .night-shift/
+# makes the tree "dirty", never the run dir itself.
+_fixture_recovery_guard_project() {
+  local proj="$1"
+  mkdir -p "$proj"
+  git -C "$proj" init -q
+  printf '.night-shift/\n' >"$proj/.gitignore"
+  git -C "$proj" add .gitignore >/dev/null 2>&1
+  git -C "$proj" commit -qm init >/dev/null 2>&1 || return 1
+  mkdir -p "$proj/.night-shift"
+}
+
+fixture_recovery_guard_blocked_dirty() {
+  local root="$1" proj="$root/rgbd-proj" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  # Dirty for a reason OTHER than a rate-limit block — the incident's actual
+  # shape ("run interrupted by signal") — proves the guard fires on ANY
+  # non-rate-limit block reason, not just one specific phrasing.
+  printf 'stranded work\n' >"$proj/dirty.txt"
+  printf '%s\n' '{"status":"blocked","block_reason":"run interrupted by signal","primary_turns":0,"primary":"claude"}' \
+    >"$proj/.night-shift/state.json"
+  out="$( ( PROJECT="$proj"; PRIMARY="claude"; RESUME=0; recover_run ) 2>&1 )"
+  rc=$?
+  fx "recover_run dies (exit 1) on blocked+dirty bare relaunch" test "$rc" -eq 1
+  fx "directive names --resume" bash -c 'printf "%s" "$1" | grep -q -- "--resume"' _ "$out"
+  fx "directive names commit/stash as the alternative" bash -c 'printf "%s" "$1" | grep -q "commit/stash"' _ "$out"
+  return 0
+}
+
+fixture_recovery_guard_blocked_clean() {
+  local root="$1" proj="$root/rgbc-proj" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  # Same blocked, non-rate-limit state — but a clean tree. The guard must NOT
+  # fire: recover_run falls through to its unchanged fresh-start signal
+  # (return 1), same as before this task, and the caller proceeds to normal
+  # task selection.
+  printf '%s\n' '{"status":"blocked","block_reason":"run interrupted by signal","primary_turns":0,"primary":"claude"}' \
+    >"$proj/.night-shift/state.json"
+  out="$( ( PROJECT="$proj"; PRIMARY="claude"; RESUME=0; recover_run ) 2>&1 )"
+  rc=$?
+  fx "recover_run returns 1 (fresh-start fallthrough), not a die" test "$rc" -eq 1
+  fx "no directive text (guard did not fire)" bash -c '! printf "%s" "$1" | grep -q -- "--resume"' _ "$out"
+  return 0
+}
+
+fixture_recovery_guard_ratelimit_dirty() {
+  local root="$1" proj="$root/rgrl-proj" dir="$root/rgrl-work" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  # Dirty tree, exactly like the die case above — the ONLY difference is the
+  # block is rate-limit-recoverable, which must outrank the new guard (it is
+  # checked first in recover_run, unchanged placement/ordering).
+  printf 'stranded work\n' >"$proj/dirty.txt"
+  mkdir -p "$dir" "$proj/.night-shift/raw"
+  printf '{}\n' >"$proj/.night-shift/baseline.json"
+  printf '%s\n' '{"status":"blocked","session_id":"fixed-id","block_reason":"primary command failed with status 1","primary_turns":0,"primary":"claude","run_id":"rgrl","task":"spec.md","observer":"claude","base_commit":"deadbeef","base_branch":"main","baseline_status":"'"$proj"'/.night-shift/baseline.json","stage":"planning"}' \
+    >"$proj/.night-shift/state.json"
+  printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 5:40am (America/Sao_Paulo)","session_id":"fixed-id"}' \
+    >"$proj/.night-shift/raw/primary-1.json"
+  out="$( (
+    PROJECT="$proj"; PRIMARY="claude"; RESUME=0
+    log() { :; }
+    emit_event() { :; }
+    cleanup_validation_worktree() { return 0; }
+    set_spec_workdir() { SPEC="$1"; return 0; }
+    wait_for_rate_limit_reset() { printf 'waited:%s\n' "$1" >"$dir/waited.txt"; }
+    recover_run
+    printf 'rc=%s\n' "$?"
+  ) 2>&1 )"
+  rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
+  fx "recover_run completes the auto-recovery path (rc 0), guard never evaluated" test "$rc" = "0"
+  fx "the rate-limit wait path was actually taken (not the guard's die)" test -f "$dir/waited.txt"
+  return 0
 }
 

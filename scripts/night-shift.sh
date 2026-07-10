@@ -854,6 +854,18 @@ recover_run() {
       :
     elif [ "$RESUME" -eq 1 ] && resumable_blocked_state "$STATE"; then
       resume_block=1
+    elif [ "$RESUME" -eq 0 ] && [ "$status" = "blocked" ] &&
+      [ -n "$(git -C "$PROJECT" status --porcelain 2>/dev/null)" ]; then
+      # A bare relaunch (no --resume) over a logic-blocked run — NOT the
+      # rate-limit-recoverable case above, which already claimed this branch —
+      # whose project tree is still dirty: the prior run's work is real and
+      # uncommitted, and a fresh run would treat that dirt as baseline noise
+      # (structurally unable to commit it as the new run's own work). Applies
+      # to every non-rate-limit block reason alike (signal interruption,
+      # a failed primary command, a logic block) — the tree state is what
+      # matters, not why it stopped. Die loudly instead of silently starting
+      # a fresh run that strands the intact work.
+      die "an interrupted run left uncommitted work in the tree; re-run with --resume to continue it, or commit/stash the work first (see .night-shift/control/plan.md)"
     else
       return 1
     fi
