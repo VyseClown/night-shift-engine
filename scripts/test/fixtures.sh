@@ -304,6 +304,7 @@ run_dry_fixtures() {
   fixture_assert "run feedback: writes one section + event, second run appends" fixture_run_feedback_writes_and_appends "$root"
   fixture_assert "run feedback: session failure warns and never blocks (advisory)" fixture_run_feedback_session_failure_is_advisory "$root"
   fixture_assert "run feedback: NIGHT_SHIFT_RUN_FEEDBACK=0 skips the session and never writes feedback.md; default runs it" fixture_run_feedback_knob "$root"
+  fixture_assert "compact_success preserves feedback.md and archives residual sweep findings" fixture_compact_success_preserves_feedback_and_sweep "$root"
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
@@ -1564,7 +1565,8 @@ fixture_event_stream() {
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
-    stage_transition codex_review model_fallback reuse_violation port_audit smoke; do
+    stage_transition codex_review model_fallback reuse_violation port_audit smoke \
+    sweep sweep_fix sweep_fix_reverted run_feedback test_audit; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -7157,6 +7159,61 @@ fixture_run_feedback_knob() {
   return 0
 }
 
+# compact_success (final-review C1): feedback.md (write_run_feedback) and the
+# branch sweep's residual artifacts used to be destroyed by compact_success's
+# delete-everything-but-archive loop, which ran over the SAME dir as RUN_ROOT
+# in production ($project/.night-shift IS run_dir) — so a successful run wiped
+# the persistent cross-run feedback log and any unresolved sweep findings in
+# the very moment they'd matter most. Unlike the standalone compact fixtures
+# elsewhere in this file, RUN_ROOT here is deliberately set to
+# "$proj/.night-shift" (not an unrelated sibling dir) to reproduce that real
+# invariant — feedback.md's absolute path and run_dir are the same directory.
+fixture_compact_success_preserves_feedback_and_sweep() {
+  local root="$1" dir="$root/compact-persist" proj feedback
+  mkdir -p "$dir/proj/.night-shift"
+  (
+    proj="$dir/proj"
+    RUN_ROOT="$proj/.night-shift"
+    RUN_ID="compact-persist-$$"
+    STATE="$RUN_ROOT/state.json"
+    SPEC="$dir/spec.md"
+    IMPLEMENT_MODEL="inherit"
+    printf -- '- Track: node\n' >"$SPEC"
+    jq -n '{review_round:1}' >"$STATE"
+    printf '{"ts":"2026-07-12T00:00:00Z","run":"compact-persist","stage":"implement","type":"stage_start","payload":null}\n' \
+      >"$RUN_ROOT/events.jsonl"
+    feedback="$proj/.night-shift/feedback.md"
+    claude() {
+      cat >/dev/null
+      printf '{"result":"- keep me\\n- and me"}\n'
+    }
+    write_run_feedback "$proj"
+    fx "feedback.md written before compaction" test -f "$feedback"
+
+    mkdir -p "$RUN_ROOT/sweep"
+    printf '## a residual finding\n' >"$RUN_ROOT/sweep/findings.md"
+    printf 'SWEEP_FINDINGS\n' >"$RUN_ROOT/sweep/verdict.txt"
+    printf 'diff content\n' >"$RUN_ROOT/sweep/package.diff"
+
+    ( log() { :; }; compact_success "$RUN_ROOT" "$RUN_ID" ) || exit 1
+
+    fx "feedback.md survives compaction" test -f "$feedback"
+    fx "feedback.md keeps its content" grep -q "keep me" "$feedback"
+    fx "feedback.md is NOT duplicated into the archive (stays only at its persistent path)" \
+      test ! -e "$RUN_ROOT/archive/$RUN_ID/feedback.md"
+    fx "sweep dir archived alongside validated/" \
+      test -f "$RUN_ROOT/archive/$RUN_ID/sweep/findings.md"
+    fx "archived sweep findings keep their content" \
+      grep -q "a residual finding" "$RUN_ROOT/archive/$RUN_ID/sweep/findings.md"
+    fx "archived sweep dir also has verdict.txt + package.diff" \
+      bash -c 'test -f "$1/verdict.txt" && test -f "$1/package.diff"' _ "$RUN_ROOT/archive/$RUN_ID/sweep"
+    fx "live sweep dir removed from run_dir after compaction" \
+      test ! -d "$RUN_ROOT/sweep"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Doc-freshness candidate mapper (scripts/lib/doc-freshness.sh; agentic-gaps
 # Task 5). Not yet wired into night-shift.sh's implement-stage prompt (a
@@ -7187,6 +7244,7 @@ _fixture_doc_freshness_project() {
 
 fixture_doc_freshness_basic() {
   local root="$1" proj="$root/dfb-proj" base out
+  # shellcheck source=scripts/lib/doc-freshness.sh
   . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
   base="$(_fixture_doc_freshness_project "$proj")" || return 1
   printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
@@ -7213,6 +7271,7 @@ fixture_doc_freshness_basic() {
 # truncated:true, regardless of which ties get dropped.
 fixture_doc_freshness_cap() {
   local root="$1" proj="$root/dfc-proj" base out i
+  # shellcheck source=scripts/lib/doc-freshness.sh
   . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
   mkdir -p "$proj/src/mod" "$proj/docs"
   git -C "$proj" init -q
@@ -7240,6 +7299,7 @@ fixture_doc_freshness_cap() {
 
 fixture_doc_freshness_empty_diff() {
   local root="$1" proj="$root/dfe-proj" head out
+  # shellcheck source=scripts/lib/doc-freshness.sh
   . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
   head="$(_fixture_doc_freshness_project "$proj")" || return 1
   out="$proj/out.json"
@@ -7256,6 +7316,7 @@ fixture_doc_freshness_empty_diff() {
 # not just the dir-proximity tier the other fixtures exercise.
 fixture_doc_freshness_symbol() {
   local root="$1" proj="$root/dfs-proj" base out
+  # shellcheck source=scripts/lib/doc-freshness.sh
   . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
   mkdir -p "$proj/lib" "$proj/docs"
   git -C "$proj" init -q
@@ -7699,6 +7760,52 @@ STUB
       bash -c "jq -e '(.judged | length) == 2' '$out' >/dev/null" || exit 1
     fx "absolute-path judged[].file: output re-normalizes file to project-relative" \
       bash -c "jq -e '[.judged[].file] | all(. == \"tests/vacuous.test.js\")' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  # (e) [final-review I1] --src pruning + size cap: --src is commonly wired to
+  # the project root, so a node_modules dir living under it must NEVER reach
+  # the paid prompt, and a src tree bigger than the 200KB budget must be
+  # truncated (not silently dumped in full) with the truncation noted in the
+  # prompt text. The stub `claude` captures its own stdin (the exact prompt
+  # sent) to a file for inspection — the only way to see the prompt, since
+  # test-audit.sh's own PROMPT_FILE lives in a mktemp dir cleaned up on exit.
+  ( dir="$root/src-prune-cap"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/tests/src/node_modules/evil"
+    printf 'const SENTINEL_NODE_MODULES_CONTENT_SHOULD_NOT_APPEAR = 1;\n' \
+      >"$dir/tests/src/node_modules/evil/junk.js"
+    # Two ~150KB files (sorted before sample.js): big1.js alone fits the 200KB
+    # cap, big2.js would push the running total over it and must be skipped,
+    # and sample.js (encountered after truncation kicks in) must be skipped too.
+    head -c 153600 /dev/zero | tr '\0' 'a' >"$dir/tests/src/big1.js"
+    head -c 153600 /dev/zero | tr '\0' 'b' >"$dir/tests/src/big2.js"
+    mkdir -p "$dir/bin"
+    prompt_capture="$dir/prompt-capture.txt"
+    cat >"$dir/bin/claude" <<STUB
+#!/usr/bin/env bash
+cat >"$prompt_capture"
+printf '%s\n' '{"result":"judgment:\n\`\`\`json\n{\"judged\":[],\"additional\":[]}\n\`\`\`"}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    fx "src-prune-cap: run completed (some exit status; report was still written)" [ -s "$out" ] || exit 1
+    fx "src-prune-cap: prompt was captured" [ -s "$prompt_capture" ] || exit 1
+    fx "node_modules content never reaches the prompt" \
+      bash -c '! grep -q SENTINEL_NODE_MODULES_CONTENT_SHOULD_NOT_APPEAR "$1"' _ "$prompt_capture" || exit 1
+    fx "node_modules path itself never reaches the prompt" \
+      bash -c '! grep -q "node_modules/evil/junk.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "big1.js (fits under the cap) is included" \
+      bash -c 'grep -q "### .*big1.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "big2.js (would exceed the cap) is skipped" \
+      bash -c '! grep -q "### .*big2.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "sample.js (encountered after truncation) is skipped" \
+      bash -c '! grep -q "### .*sample.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "truncation is noted in the prompt text" \
+      bash -c 'grep -q "source dump truncated" "$1"' _ "$prompt_capture" || exit 1
     exit 0
   ) || return 1
 

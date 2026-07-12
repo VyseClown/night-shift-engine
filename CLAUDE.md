@@ -148,6 +148,15 @@ directory; run engine/workflow git inside the engine directory.
   CLI / failure / timeout skip cleanly and are journaled (`codex_review`
   events). The verdict pipeline stays Claude-only either way — leave this off
   unless you deliberately want a second vendor's perspective.
+- **Run feedback (default ON):** at every run's completion (before the branch
+  sweep block below, and regardless of `NIGHT_SHIFT_BRANCH_SWEEP`), a short
+  fresh session distills the run's journal into 5-15 bullets for the human who
+  authors specs — spec ambiguities, stages that looped, validation friction —
+  appended to `<project>/.night-shift/feedback.md` (a persistent, cross-run
+  file; never touched by `compact_success`). Gated on `NIGHT_SHIFT_RUN_FEEDBACK`
+  (default `1`; set `=0` to skip the session's cost entirely). Advisory only —
+  a session failure or unparseable reply WARNs and never blocks or delays
+  completion.
 - **Branch sweep, in-run (opt-in, default OFF):** `NIGHT_SHIFT_BRANCH_SWEEP=1`
   or `=advisory` adds one whole-branch strong-model review at run completion —
   the full merge-base diff, read by `NIGHT_SHIFT_SWEEP_MODEL` (default = the

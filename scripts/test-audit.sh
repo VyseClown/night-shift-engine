@@ -181,14 +181,21 @@ fi
 # test-audit-static.js's own resolver above and simply omitted from the
 # prompt dump below — the static findings it produced still name real
 # file:line pairs regardless).
+# TEST_AUDIT_PRUNE_DIRS mirrors test-audit-static.js's IGNORE_DIR_NAMES
+# (node_modules, .git, .night-shift, dist, build, .next, .expo) as find(1)
+# `-prune` clauses — without this, a directory walk rooted at the project
+# root (the wired --src/--tests default) descends into node_modules and cats
+# its entire contents into the paid prompt.
+TEST_AUDIT_PRUNE_DIRS=(-name node_modules -o -name .git -o -name .night-shift -o -name dist -o -name build -o -name .next -o -name .expo)
+
 resolve_test_files_for_prompt() {
   local entry
   for entry in "$@"; do
     if [ -d "$entry" ]; then
-      find "$entry" -type f \( \
+      find "$entry" \( "${TEST_AUDIT_PRUNE_DIRS[@]}" \) -prune -o -type f \( \
         -iname '*.test.js' -o -iname '*.test.ts' -o -iname '*.test.jsx' -o -iname '*.test.tsx' \
         -o -iname '*.spec.js' -o -iname '*.spec.ts' -o -iname '*.spec.jsx' -o -iname '*.spec.tsx' \
-        \) 2>/dev/null
+        \) -print 2>/dev/null
     elif [ -f "$entry" ]; then
       printf '%s\n' "$entry"
     else
@@ -376,12 +383,30 @@ else
     done < <(resolve_test_files_for_prompt "${RESOLVED_TESTS[@]}")
     if [ -n "$SRC" ]; then
       printf '\n## Source under test (--src %s)\n' "$SRC"
-      find "$SRC" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.jsx' -o -name '*.tsx' \) 2>/dev/null | sort |
-        while IFS= read -r sf; do
-          printf '\n### %s\n```\n' "$sf"
-          cat "$sf" 2>/dev/null
-          printf '\n```\n'
-        done
+      # Capped at TEST_AUDIT_SRC_BUDGET_BYTES (200KB): --src is commonly wired
+      # to the project root, so an uncapped dump of a large tree would blow up
+      # the paid prompt. Files are added in sorted order until the cap would
+      # be exceeded; the rest are skipped and the truncation is noted below
+      # rather than silently dropped.
+      TEST_AUDIT_SRC_BUDGET_BYTES=$((200 * 1024))
+      src_bytes_written=0
+      src_truncated=0
+      while IFS= read -r sf; do
+        [ -n "$sf" ] || continue
+        [ "$src_truncated" -eq 0 ] || continue
+        sf_size="$(wc -c <"$sf" 2>/dev/null || printf '0')"
+        if [ $((src_bytes_written + sf_size)) -gt "$TEST_AUDIT_SRC_BUDGET_BYTES" ]; then
+          src_truncated=1
+          continue
+        fi
+        printf '\n### %s\n```\n' "$sf"
+        cat "$sf" 2>/dev/null
+        printf '\n```\n'
+        src_bytes_written=$((src_bytes_written + sf_size))
+      done < <(find "$SRC" \( "${TEST_AUDIT_PRUNE_DIRS[@]}" \) -prune -o -type f \
+        \( -name '*.js' -o -name '*.ts' -o -name '*.jsx' -o -name '*.tsx' \) -print 2>/dev/null | sort)
+      [ "$src_truncated" -eq 0 ] || printf '\n(source dump truncated at %s bytes; remaining files omitted)\n' \
+        "$TEST_AUDIT_SRC_BUDGET_BYTES"
     fi
     printf '\nYour job has two parts.\n\n(a) For EACH static finding above (identified by file:line:rule), judge\nwhether it is a genuine false-confidence problem ("confirm") or a false\npositive from the mechanical scan ("refute"), with a one-line reason. Your\n`judged` array MUST contain exactly one entry for EVERY static finding\nabove — one confirm or refute each, none omitted. Copy each finding'"'"'s\nfile, line, and rule VERBATIM from the static-findings JSON (those exact\nstrings — NOT the paths in the ### headers).\n\n(b) Separately, hunt for judgment-tier smells the static scan cannot see:\na mock asserted against itself rather than the real behavior; a\ntautological round-trip (encode then decode the same value, asserting only\nthat they match, with no independent expectation); a guard/branch clearly\npresent in the source under test with no negative-case test covering it; a\n`.skip`/`xit` test that reads as stale rather than deliberately deferred.\nOnly report something you have real evidence for at a specific file:line —\ndo not guess, and do not repeat a static finding as an "additional" one.\n\n'
     printf 'Reply with ONLY a single fenced json code block containing exactly one\nJSON object: {"judged":[{"file":"<path>","line":<n>,"rule":"<static rule\nname>","verdict":"confirm"|"refute","reason":"<one line>"}, ...],\n"additional":[{"file":"<path>","line":<n>,"rule":"<short-kebab-case\nname>","summary":"<one line>"}, ...]}. Omit additional entries you have\nnothing to report for — do not pad that array. `judged` is never empty: it\nmirrors the static findings one-for-one.\n'

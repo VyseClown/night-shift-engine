@@ -161,8 +161,10 @@ branch gets one whole-branch strong-model review — catching cross-task
 interactions and accumulated minor findings the per-task reviews can't see —
 plus a capped fix cycle under `=1`, before you call the shift done. Every run
 also appends spec/process feedback (ambiguities, loops, validation friction)
-to `<project>/.night-shift/feedback.md` regardless of this knob — read it
-first when picking up the next spec.
+to `<project>/.night-shift/feedback.md` regardless of `NIGHT_SHIFT_BRANCH_SWEEP`
+— gated only on its own knob, `NIGHT_SHIFT_RUN_FEEDBACK` (default `1`; set `=0`
+to skip the cost of that session entirely) — read it first when picking up the
+next spec.
 
 ---
 

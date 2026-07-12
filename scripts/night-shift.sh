@@ -750,6 +750,13 @@ compact_success() {
     [ ! -f "$run_dir/events.jsonl" ] || cp "$run_dir/events.jsonl" "$archive/events.jsonl" || copy_ok=0
     # ...and so is the human log, run.log (the timestamped mirror of every log line).
     [ ! -f "$run_dir/run.log" ] || cp "$run_dir/run.log" "$archive/run.log" || copy_ok=0
+    # The branch sweep's residual findings/verdict/package matter exactly when
+    # a run completes with unresolved sweep findings (BRANCH_SWEEP=advisory, or
+    # the fix cycle exhausted its rounds) — archive the whole sweep/ dir
+    # (findings.md, verdict.txt, package.diff, package.meta.json, any
+    # fix-session-N.json) alongside validated/ rather than letting it evaporate
+    # with the rest of run_dir below.
+    [ ! -d "$run_dir/sweep" ] || cp -R "$run_dir/sweep" "$archive/sweep" || copy_ok=0
   fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
@@ -775,7 +782,15 @@ compact_success() {
   fi
   for entry in "$run_dir"/* "$run_dir"/.[!.]* "$run_dir"/..?*; do
     [ -e "$entry" ] || continue
-    [ "$entry" = "$run_dir/archive" ] || rm -rf "$entry"
+    # feedback.md (write_run_feedback) is a PERSISTENT cross-run file living
+    # directly under RUN_ROOT ($project/.night-shift/feedback.md) — unlike
+    # everything else compacted here it is not per-run evidence, it is the
+    # human-facing feedback log that accumulates across every run against
+    # this project, so it must survive compaction untouched.
+    case "$entry" in
+      "$run_dir/archive"|"$run_dir/feedback.md") continue ;;
+    esac
+    rm -rf "$entry"
   done
 }
 
@@ -3419,6 +3434,12 @@ EOF
   [ -n "$next_spec" ] || { complete_run; return; }
   validate_spec "$next_spec" || block_run "next TODO spec is incomplete"
   SPEC="$next_spec"
+  # Clear stale smoke evidence from the completed task BEFORE this task's own
+  # baseline/final smoke runs (if it declares a Smoke field) write fresh files.
+  # Without this, a follow-up task with no Smoke field at all would silently
+  # inherit and re-present the PREVIOUS task's smoke-baseline.json/
+  # smoke-final.json as if they belonged to it.
+  rm -f "$RUN_ROOT/validated/smoke-final.json" "$RUN_ROOT/validated/smoke-baseline.json"
   BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
   BASE_BRANCH="$(git -C "$PROJECT" branch --show-current)"
   BASE_STATUS="$RUN_ROOT/baseline-status-$(basename "$SPEC" .md).txt"
@@ -3495,6 +3516,13 @@ main_run() {
   require_command claude
   case "$RATE_LIMIT_BUFFER_SECONDS" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS must be a non-negative integer" ;;
+  esac
+  # SMOKE_TIMEOUT feeds a `timeout` invocation inside run_smoke_phase, deep
+  # into a build; a non-integer override used to surface only as a mid-phase
+  # arithmetic/usage error there. Validate loudly at startup instead, same
+  # posture as RATE_LIMIT_BUFFER_SECONDS above.
+  case "$SMOKE_TIMEOUT" in
+    ''|*[!0-9]*) die "NIGHT_SHIFT_SMOKE_TIMEOUT must be a non-negative integer" ;;
   esac
 
   # Acquire a per-project lock BEFORE touching state.json; two concurrent runs
