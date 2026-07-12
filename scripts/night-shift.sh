@@ -19,6 +19,7 @@ LIST_OPTIONAL_PERSONAS=0
 LIST_CONFIG=0
 PREFLIGHT=0
 RESUME=0
+SWEEP_ONLY=0
 MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
 MAX_STAGE_SECONDS="${NIGHT_SHIFT_MAX_STAGE_SECONDS:-3600}"
 MAX_TASK_TURNS="${NIGHT_SHIFT_MAX_TASK_TURNS:-36}"
@@ -85,8 +86,24 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # completes, looking for what per-task reviews cannot see (cross-task
 # interactions, accumulated minor findings, hygiene). OFF by default; the
 # sweep model defaults to the observer's (same "strong final gate" tier).
+# Any non-"0" value turns the sweep session on; NIGHT_SHIFT_BRANCH_SWEEP=advisory
+# specifically additionally skips the fix cycle below (verdict + findings
+# only, no auto-fix) — any other truthy value (e.g. "1") runs it.
 BRANCH_SWEEP="${NIGHT_SHIFT_BRANCH_SWEEP:-0}"
 SWEEP_MODEL="${NIGHT_SHIFT_SWEEP_MODEL:-$OBSERVER_MODEL}"
+# Sweep fix cycle (scripts/lib/sweep.sh sweep_fix_cycle): capped at one round
+# by default — a residual SWEEP_FINDINGS after the cap is logged and left for
+# a human, never looped indefinitely. NIGHT_SHIFT_BRANCH_SWEEP=advisory (as
+# opposed to =1) skips the fix cycle entirely — verdict only, no auto-fix.
+SWEEP_MAX_FIX="${NIGHT_SHIFT_SWEEP_MAX_FIX:-1}"
+# Sanity ceiling on the sweep's OWN rate-limit retry wait (sweep_run in
+# scripts/lib/sweep.sh) — deliberately much smaller than
+# RATE_LIMIT_MAX_WAIT_SECONDS above: the sweep is an advisory review at the
+# tail of an already-successful run (or a standalone --sweep-only call), so a
+# reset more than this many seconds away skips the retry and records
+# SWEEP_ERROR instead of holding the process open for a review nobody gates
+# completion on.
+SWEEP_MAX_WAIT="${NIGHT_SHIFT_SWEEP_MAX_WAIT:-900}"
 # Optional external second perspective via the Codex CLI (gpt-5.5). OFF by
 # default and strictly ADVISORY when on: one bounded `codex exec` review per
 # candidate, handed to the observer as supplementary (non-gating) evidence.
@@ -190,6 +207,7 @@ Usage:
   scripts/night-shift.sh --list-config              # NIGHT_SHIFT_* knobs + defaults, no run
   scripts/night-shift.sh --preflight --project PATH --spec PATH  # JSON readiness, no run
   scripts/night-shift.sh --project PATH [--spec PATH] --resume    # resume a preserved blocked run
+  scripts/night-shift.sh --sweep-only --project PATH  # one-shot branch sweep, no run/queue; exit 0 SWEEP_PASS, 2 residual findings
 
 Claude runs the entire flow: stage-scoped primary sessions implement (a fresh
 session per stage scope — plan, implement, observe — handing off through files
@@ -243,6 +261,7 @@ while [ "$#" -gt 0 ]; do
     --list-config) LIST_CONFIG=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
     --resume) RESUME=1; shift ;;
+    --sweep-only) SWEEP_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -3026,9 +3045,15 @@ complete_run() {
   # task. sweep_build_package refusing (main/master tip, empty branch) is a
   # clean skip, not a failure; its stderr names the reason for the log line.
   if [ "$BRANCH_SWEEP" != "0" ]; then
-    sweep_build_package "$PROJECT" "$RUN_ROOT/sweep" >/dev/null 2>"$RUN_ROOT/sweep-skip.log" &&
-      sweep_run "$PROJECT" "$RUN_ROOT/sweep" ||
+    if sweep_build_package "$PROJECT" "$RUN_ROOT/sweep" >/dev/null 2>"$RUN_ROOT/sweep-skip.log" &&
+      sweep_run "$PROJECT" "$RUN_ROOT/sweep"; then
+      # advisory: verdict + findings only, no auto-fix. Any other value
+      # (default "1") runs the capped fix cycle (Task 2, agentic-gaps
+      # tranche) — never gates completion either way.
+      [ "$BRANCH_SWEEP" = "advisory" ] || sweep_fix_cycle "$PROJECT" "$RUN_ROOT/sweep"
+    else
       log "branch sweep skipped: $(tail -1 "$RUN_ROOT/sweep-skip.log" 2>/dev/null)"
+    fi
   fi
   # The journal is anchored on every append (events.sh); verify it here — the
   # last trust point before it becomes the archived record of the run.
@@ -3236,4 +3261,28 @@ if [ "$FIXTURE_TEST" -eq 1 ]; then
   exit 0
 fi
 [ "$DRY_RUN" -eq 0 ] || die "--dry-run is valid only with --fixture-test"
+# shellcheck disable=SC2031
+# ^ False positive, tree-wide runs only: when fixtures.sh is also a shellcheck
+#   input (CI passes every scripts/**/*.sh together), its test-scaffolding
+#   subshell `PROJECT=` assignments (SC2030/SC2031 are file-wide-suppressed
+#   THERE for exactly this) taint every later top-level `$PROJECT` use in this
+#   file. The fixture path `exit 0`s above before this block can ever run, so
+#   no subshell modification is live here.
+if [ "$SWEEP_ONLY" -eq 1 ]; then
+  require_command git
+  [ -n "$PROJECT" ] || die "--sweep-only requires --project"
+  git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "project is not a Git repository: $PROJECT"
+  # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
+  # queued specs, so it never touches --spec/NEXT_TASK task selection. The
+  # fix cycle's re-validation is a no-op here unless --spec names a spec with
+  # a "Final validation commands" section (SPEC stays "" otherwise, matching
+  # sweep_fix_cycle's own `[ -z "${SPEC:-}" ]` guard).
+  out="${TMPDIR:-/tmp}/night-shift-sweep-$$"
+  sweep_build_package "$PROJECT" "$out" >/dev/null || die "nothing to sweep"
+  sweep_run "$PROJECT" "$out"
+  [ "$BRANCH_SWEEP" = "advisory" ] || sweep_fix_cycle "$PROJECT" "$out"
+  printf 'sweep artifacts: %s\n' "$out"
+  [ "$(cat "$out/verdict.txt")" = "SWEEP_PASS" ] && exit 0 || exit 2
+fi
 main_run

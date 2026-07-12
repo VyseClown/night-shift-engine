@@ -290,6 +290,13 @@ run_dry_fixtures() {
   fixture_sweep_package
   fixture_sweep_verdict
   fixture_assert "branch sweep: session run writes verdict + journals a sweep event" fixture_sweep_run "$root"
+  fixture_assert "branch sweep: rate-limit retry bounded by NIGHT_SHIFT_SWEEP_MAX_WAIT" fixture_sweep_rate_limit_bound "$root"
+  fixture_assert "branch sweep: package + SWEEP_ERROR verdict anchor into the integrity dir" fixture_sweep_integrity "$root"
+  fixture_assert "branch sweep: SWEEP_ERROR skips the fix cycle untouched" fixture_sweep_error_skips_fix "$root"
+  fixture_assert "branch sweep: fix cycle reverts on failed re-validation" fixture_sweep_fix_revert "$root"
+  fixture_assert "branch sweep: fix cycle capped at NIGHT_SHIFT_SWEEP_MAX_FIX then residual" fixture_sweep_fix_cap "$root"
+  fixture_sweep_only_args
+  fixture_assert "branch sweep: --sweep-only exits 0 on SWEEP_PASS / 2 on residual findings" fixture_sweep_only_run "$root"
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
@@ -6348,7 +6355,8 @@ fixture_recovery_guard_ratelimit_dirty() {
 }
 
 # ---------------------------------------------------------------------------
-# Branch sweep (scripts/lib/sweep.sh; agentic-gaps Task 1, advisory core).
+# Branch sweep (scripts/lib/sweep.sh; agentic-gaps Task 1 advisory core +
+# Task 2 fix cycle / --sweep-only / rate-limit bound / integrity anchoring).
 # ---------------------------------------------------------------------------
 
 # sweep: package builder is deterministic and refuses main/master tips
@@ -6378,6 +6386,19 @@ fixture_sweep_verdict() {
     test "$(printf 'SWEEP_FINDINGS: 3\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
   fixture_assert "verdict: garbage -> FINDINGS (fail-closed)" \
     test "$(printf 'no verdict here\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
+  # Hardening (Task 1 reviewer finding): the verdict is the LAST non-empty
+  # line, anchored — not an anywhere-in-text grep. A finding sentence that
+  # merely NAMES "SWEEP_PASS" in passing, with a genuine SWEEP_FINDINGS verdict
+  # on the actual last line, must parse as FINDINGS.
+  fixture_assert "verdict: last-line anchor ignores a mid-text SWEEP_PASS mention" \
+    test "$(printf 'this note mentions SWEEP_PASS but is not the verdict line\nSWEEP_FINDINGS: 4\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
+  # ...and symmetrically, a genuine trailing SWEEP_PASS still parses as PASS
+  # even when an earlier line merely mentions SWEEP_FINDINGS in passing.
+  fixture_assert "verdict: last-line anchor honors a genuine trailing SWEEP_PASS despite an earlier SWEEP_FINDINGS mention" \
+    test "$(printf 'an earlier note mentions SWEEP_FINDINGS: 1 in passing\nSWEEP_PASS\n' | sweep_parse_verdict)" = "SWEEP_PASS"
+  # Trailing blank lines after the real verdict must not blank it out.
+  fixture_assert "verdict: trailing blank lines after PASS are skipped" \
+    test "$(printf 'SWEEP_PASS\n\n\n' | sweep_parse_verdict)" = "SWEEP_PASS"
   local prompt; prompt="$(sweep_prompt "/tmp/sweep-out")"
   fixture_assert "sweep prompt: names both contract words + the package path" \
     bash -c 'case "$1" in
@@ -6405,13 +6426,18 @@ fixture_sweep_run() {
     # STUBBED FUNCTION (not the real external binary) that never reads stdin can
     # SIGPIPE the writer — a test-only artifact of the pipe/heredoc/function
     # combination, invisible in production where claude always reads the prompt.
-    claude() { cat >/dev/null; printf '{"result":"looks fine\nSWEEP_PASS"}\n'; }
+    # NOTE the escaped \\n: it must land in the JSON as the two characters
+    # backslash-n (a raw newline inside a JSON string is invalid — jq would
+    # reject the whole reply, sweep_run would cp the raw JSON as findings.md,
+    # and the last line would read `SWEEP_PASS"}`, which the anchored
+    # last-line parser rightly refuses).
+    claude() { cat >/dev/null; printf '{"result":"looks fine\\nSWEEP_PASS"}\n'; }
     sweep_run "$proj" "$out"
     fx "sweep_run (PASS): verdict.txt is SWEEP_PASS" \
       bash -c 'test "$(cat "$1")" = "SWEEP_PASS"' _ "$out/verdict.txt"
 
     out="$dir/out-findings"; mkdir -p "$out"
-    claude() { cat >/dev/null; printf '{"result":"issues found\nSWEEP_FINDINGS: 2"}\n'; }
+    claude() { cat >/dev/null; printf '{"result":"issues found\\nSWEEP_FINDINGS: 2"}\n'; }
     sweep_run "$proj" "$out"
     fx "sweep_run (FINDINGS): verdict.txt is SWEEP_FINDINGS" \
       bash -c 'test "$(cat "$1")" = "SWEEP_FINDINGS"' _ "$out/verdict.txt"
@@ -6420,10 +6446,239 @@ fixture_sweep_run() {
     RUN_ROOT="$dir/run"; RUN_ID="sweeprun-$$"
     mkdir -p "$RUN_ROOT"
     out="$dir/out-journal"; mkdir -p "$out"
-    claude() { cat >/dev/null; printf '{"result":"fine\nSWEEP_PASS"}\n'; }
+    claude() { cat >/dev/null; printf '{"result":"fine\\nSWEEP_PASS"}\n'; }
     sweep_run "$proj" "$out"
     fx "sweep event journaled to events.jsonl" \
       bash -c 'grep -q "\"type\":\"sweep\"" "$1"' _ "$RUN_ROOT/events.jsonl"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Shared setup for the Task 2 fix-cycle fixtures below: a committed repo (via
+# _fixture_recovery_guard_project) already checked out on a feature branch
+# with one real commit over the default branch, so sweep_build_package's own
+# guards (feature branch, commits-over-base) are satisfied without each
+# fixture repeating the git plumbing.
+_fixture_sweep_branch_project() {
+  local proj="$1"
+  _fixture_recovery_guard_project "$proj" || return 1
+  (cd "$proj" && git checkout -q -b feat/x &&
+    printf 'a\n' >f.txt && git add f.txt && git commit -qm one) || return 1
+}
+
+# sweep: rate-limit retry is bounded by NIGHT_SHIFT_SWEEP_MAX_WAIT (reviewer
+# finding #3, Task 1 -> Task 2). Stubs is_rate_limit_response/
+# rate_limit_reset_epoch (same seam as fixture_recovery_guard_ratelimit_dirty,
+# which stubs wait_for_rate_limit_reset directly) so the reset math is
+# deterministic and no real sleep ever happens. A reset further out than
+# SWEEP_MAX_WAIT must skip the retry (handle_rate_limit_wait never called,
+# verdict SWEEP_ERROR); a reset within the cap must retry normally.
+fixture_sweep_rate_limit_bound() {
+  local root="$1" dir="$root/sweep-rl-bound" proj out
+  proj="$dir/proj"
+  mkdir -p "$proj"
+  (
+    SWEEP_MODEL="inherit"
+    is_rate_limit_response() { return 0; }
+    # The wait stub records into a FIXED file (not one derived from its $1):
+    # the raw path it receives points inside $out, so a per-arg marker would
+    # be fiddly to predict; a fixed path is unambiguous either way.
+    handle_rate_limit_wait() { printf 'called\n' >"$dir/rl-waited"; }
+
+    out="$dir/out-far"; mkdir -p "$out"
+    # A reset comfortably beyond SWEEP_MAX_WAIT (+ the buffer already folded
+    # into sweep_run's own wait_seconds math).
+    rate_limit_reset_epoch() { printf '%s\n' "$(($(now_epoch) + SWEEP_MAX_WAIT + 3600))"; }
+    claude() { cat >/dev/null; printf '{}\n'; return 1; }
+    sweep_run "$proj" "$out"
+    fx "far reset: retry skipped, verdict is SWEEP_ERROR" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    fx "far reset: handle_rate_limit_wait never invoked" \
+      bash -c '[ ! -f "$1" ]' _ "$dir/rl-waited"
+
+    out="$dir/out-near"; mkdir -p "$out"
+    # A reset comfortably within SWEEP_MAX_WAIT.
+    rate_limit_reset_epoch() { printf '%s\n' "$(($(now_epoch) + 30))"; }
+    # File-based invocation counter: the stub runs inside sweep_run's
+    # (cd "$project" && ...) subshell, so a plain shell variable would reset
+    # to its parent value on every call and the "second call succeeds" branch
+    # would be unreachable.
+    : >"$dir/rl-calls"
+    claude() {
+      cat >/dev/null
+      printf 'x\n' >>"$dir/rl-calls"
+      if [ "$(wc -l <"$dir/rl-calls")" -le 1 ]; then printf '{}\n'; return 1; fi
+      printf '{"result":"fine\\nSWEEP_PASS"}\n'
+    }
+    sweep_run "$proj" "$out"
+    fx "near reset: handle_rate_limit_wait invoked (retry attempted)" \
+      bash -c '[ -f "$1" ]' _ "$dir/rl-waited"
+    fx "near reset: retry succeeded, verdict is SWEEP_PASS" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep: integrity anchoring (reviewer finding #4, Task 1 -> Task 2).
+# sweep_build_package must anchor package.diff/package.meta.json when RUN_ROOT
+# is set, and sweep_run must anchor a SWEEP_ERROR verdict.txt the same way the
+# PASS/FINDINGS path already anchors findings.md/verdict.txt.
+fixture_sweep_integrity() {
+  local root="$1" dir="$root/sweep-integrity" proj out anchor
+  proj="$dir/proj"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    RUN_ROOT="$dir/run"; RUN_ID="sweepintegrity-$$"
+    mkdir -p "$RUN_ROOT"
+    out="$RUN_ROOT/sweep"
+    sweep_build_package "$proj" "$out" >/dev/null || exit 1
+    anchor="$(integrity_dir)"
+    fx "package.diff anchored into the integrity dir" test -f "$anchor/sweep/package.diff"
+    fx "package.meta.json anchored into the integrity dir" test -f "$anchor/sweep/package.meta.json"
+    claude() { cat >/dev/null; exit 1; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run session failure yields SWEEP_ERROR" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    fx "SWEEP_ERROR verdict.txt anchored into the integrity dir" test -f "$anchor/sweep/verdict.txt"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep: SWEEP_ERROR (advisory session failure) must skip the fix cycle
+# entirely — nothing coherent to fix (reviewer finding #2, Task 1 -> Task 2).
+# The guard is the existing literal-string verdict check at the top of
+# sweep_fix_cycle; this fixture proves SWEEP_ERROR takes the same early-return
+# path as SWEEP_PASS, never invoking claude or touching the project.
+fixture_sweep_error_skips_fix() {
+  local root="$1" dir="$root/sweep-error-skip" proj out calls
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$proj" "$out"
+  calls="$dir/claude-calls"
+  (
+    printf 'SWEEP_ERROR\n' >"$out/verdict.txt"
+    printf 'branch sweep session failed\n' >"$out/findings.md"
+    : >"$calls"
+    claude() { cat >/dev/null; printf 'x\n' >>"$calls"; printf '{"result":"should never run"}\n'; }
+    SWEEP_MAX_FIX=1
+    sweep_fix_cycle "$proj" "$out"
+    fx "sweep_fix_cycle returns 0 on SWEEP_ERROR" test "$?" -eq 0
+    fx "SWEEP_ERROR: fix cycle never invokes claude" bash -c '[ ! -s "$1" ]' _ "$calls"
+    fx "SWEEP_ERROR: verdict.txt left untouched" test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: a stubbed "fix" session commits a bad change; a `false`
+# final-validation command then fails re-validation; sweep_fix_cycle must
+# deterministically reset --hard to the recorded pre-fix tip rather than trust
+# the agent to have undone its own commit, journal sweep_fix_reverted, and
+# leave the verdict at the residual SWEEP_FINDINGS (nothing was actually
+# fixed).
+fixture_sweep_fix_revert() {
+  local root="$1" dir="$root/sweep-fix-revert" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"
+    SWEEP_MAX_FIX=1
+    IMPLEMENT_MODEL="inherit"
+    SPEC="$dir/spec.md"
+    printf -- '- Final validation commands:\n  1. `false`\n' >"$SPEC"
+    RUN_ROOT="$dir/run"; RUN_ID="sweepfixrevert-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    # The stub commits a change (as an implement session would) then replies —
+    # draining stdin first (see fixture_sweep_run's SIGPIPE note above).
+    claude() { cat >/dev/null; git -C "$proj" commit --allow-empty -qm sweepfix >/dev/null; printf '{"result":"done"}\n'; }
+    sweep_fix_cycle "$proj" "$out"
+    fx "fix revert: tip restored to the pre-fix commit" \
+      test "$(git -C "$proj" rev-parse HEAD)" = "$tip_before"
+    fx "fix revert: sweep_fix_reverted event emitted" \
+      grep -q '"type":"sweep_fix_reverted"' "$RUN_ROOT/events.jsonl"
+    fx "fix revert: verdict stays SWEEP_FINDINGS (residual)" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_FINDINGS"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: capped at NIGHT_SHIFT_SWEEP_MAX_FIX (default 1) fix round,
+# then residual findings — never loops indefinitely against a session that
+# keeps reporting findings. Counts claude invocations via a counter file: one
+# initial sweep_run (the caller's, before the fix cycle) + one fix session +
+# one re-sweep, all inside sweep_fix_cycle's single allowed cycle.
+fixture_sweep_fix_cap() {
+  local root="$1" dir="$root/sweep-fix-cap" proj out calls
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  calls="$dir/claude-calls"
+  (
+    : >"$calls"
+    PROJECT="$proj"
+    SWEEP_MODEL="inherit"
+    IMPLEMENT_MODEL="inherit"
+    SWEEP_MAX_FIX=1
+    claude() { cat >/dev/null; printf 'x\n' >>"$calls"; printf '{"result":"still broken\\nSWEEP_FINDINGS: 1"}\n'; }
+    sweep_run "$proj" "$out"
+    sweep_fix_cycle "$proj" "$out"
+    fx "fix cap: sweep_fix_cycle returns 0 (advisory, never blocks)" test "$?" -eq 0
+    fx "fix cap: exactly one fix cycle ran (initial sweep + fix + re-sweep = 3 calls)" \
+      test "$(wc -l <"$calls")" -eq 3
+    fx "fix cap: residual findings after the cap" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_FINDINGS"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# --sweep-only: arg parsing. Requires --project; dies (rejects) without it,
+# before ever touching git or spawning a sweep session.
+fixture_sweep_only_args() {
+  fixture_reject "--sweep-only without --project dies" \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only
+}
+
+# --sweep-only: end-to-end CLI exit codes. A real subprocess invocation (the
+# arg-parsing/dispatch code under test lives at the top level of
+# night-shift.sh, outside any function this suite can call directly), with a
+# fake `claude` executable prepended onto PATH so the real CLI never makes a
+# network call. SWEEP_PASS -> exit 0; SWEEP_FINDINGS (residual after the
+# default one fix cycle, which the same stub also fails to clear) -> exit 2.
+fixture_sweep_only_run() {
+  local root="$1" dir="$root/sweep-only-run" proj bin
+  proj="$dir/proj"; bin="$dir/bin"
+  mkdir -p "$bin"
+  _fixture_sweep_branch_project "$proj" || return 1
+  cat >"$bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '{"result":"fine\\nSWEEP_PASS"}\n'
+STUB
+  chmod +x "$bin/claude"
+  (
+    rc=0
+    PATH="$bin:$PATH" "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only: SWEEP_PASS exits 0" test "$rc" -eq 0
+
+    cat >"$bin/claude" <<'STUB2'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '{"result":"issues\\nSWEEP_FINDINGS: 1"}\n'
+STUB2
+    rc=0
+    PATH="$bin:$PATH" "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only: residual SWEEP_FINDINGS exits 2" test "$rc" -eq 2
     exit 0
   ) >/dev/null || return 1
   return 0
