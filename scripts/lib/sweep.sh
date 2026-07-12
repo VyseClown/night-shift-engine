@@ -107,7 +107,9 @@ write_run_feedback() {
   }
   bullets="$(printf '%s\n' "$result" | grep -E '^- ')"
   [ -n "$bullets" ] || {
-    log "WARN: run feedback skipped (reply had no \`- \` bullet lines, see $raw)"
+    local dropped
+    dropped="$(printf '%s\n' "$result" | grep -c '.')"
+    log "WARN: run feedback skipped (reply had $dropped lines but no \`- \` bullets — dropped, see $raw)"
     return 0
   }
   lines="$(printf '%s\n' "$bullets" | grep -c '^- ')"
@@ -135,11 +137,18 @@ cross-task interactions, regressions between commits, accumulated minor
 findings that add up, removed-behavior gaps, hygiene (test fixtures must be
 neutral stand-ins, no company identifiers, i18n key pairs complete), and
 tests weakened rather than updated. Read the package file below fully.
-For each finding: severity (Critical/Important/Minor), file:line, a concrete
-failure scenario, and the concrete fix. End your reply with exactly one line:
-either `SWEEP_PASS` or `SWEEP_FINDINGS: <count>`.
+The package file is the AUTHORITATIVE diff scope for this review — it is
+already scoped to the exact branch range under review. Do NOT reconstruct
+the diff range yourself from git (e.g. `main...HEAD`); the branch's `main`
+may have advanced since the package was built, which would silently review
+the wrong range. If you cannot read the package file, that failure is your
+ONLY finding: report it and end your reply with exactly `SWEEP_FINDINGS: 1`.
+Otherwise, for each finding: severity (Critical/Important/Minor), file:line,
+a concrete failure scenario, and the concrete fix. End your reply with
+exactly one line: either `SWEEP_PASS` or `SWEEP_FINDINGS: <count>`.
 EOF
-  printf '\nPackage: %s/package.diff (read it with your file tools)\n' "$out"
+  printf '\nPackage: %s/package.diff (read it with your file tools; you have\n' "$out"
+  printf 'been granted access to this directory)\n'
 }
 
 # Run the sweep session. Writes $out/findings.md + $out/verdict.txt; emits
@@ -150,10 +159,16 @@ sweep_run() {
   model="$(resolve_effective_model "$SWEEP_MODEL")"
   raw="$out/session.json"
   # model_flag intentionally word-splits into `--model X` (or nothing); same
-  # idiom as invoke_observer_once.
+  # idiom as invoke_observer_once. --add-dir "$out" is required: $out lives
+  # outside $project (e.g. --sweep-only's own tmp dir), and the session is
+  # sandboxed to the cwd it was launched in with no other grant — without
+  # this it cannot read package.diff at all and was observed to silently
+  # reconstruct the diff itself via `main...HEAD` instead (wrong scope once
+  # main has advanced; proven live). See sweep_prompt's authoritative-scope
+  # instruction above, which this flag makes actually satisfiable.
   # shellcheck disable=SC2046
   (cd "$project" && sweep_prompt "$out" |
-    claude -p $(model_flag "$model") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+    claude -p $(model_flag "$model") --add-dir "$out" --output-format json) >"$raw" 2>"$raw.err" || rc=$?
   if [ "$rc" -ne 0 ] && command -v is_rate_limit_response >/dev/null 2>&1 && is_rate_limit_response "$raw"; then
     # Bound the wait. This session runs at the very tail of an otherwise-
     # successful run (or standalone via --sweep-only) — it is advisory, never
@@ -191,7 +206,7 @@ sweep_run() {
       rc=0
       # shellcheck disable=SC2046
       (cd "$project" && sweep_prompt "$out" |
-        claude -p $(model_flag "$model") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+        claude -p $(model_flag "$model") --add-dir "$out" --output-format json) >"$raw" 2>"$raw.err" || rc=$?
     else
       log "WARN: branch sweep rate-limited; reset wait exceeds NIGHT_SHIFT_SWEEP_MAX_WAIT (${SWEEP_MAX_WAIT}s), could not be parsed, or no run context (STATE unset, e.g. standalone --sweep-only) — skipping retry (advisory)"
     fi
@@ -228,14 +243,17 @@ sweep_fix_cycle() {
     # The fix session's own exit status is not the gate — re-validation below
     # is (a session that "succeeds" but leaves the build red is caught the
     # same as one that crashes outright; both revert). model_flag intentionally
-    # word-splits, same idiom as sweep_run/invoke_observer_once.
+    # word-splits, same idiom as sweep_run/invoke_observer_once. --add-dir "$out"
+    # for the same reason as sweep_run: $out sits outside $project, and this
+    # session may need to consult other sweep artifacts alongside the findings
+    # already piped into its prompt (e.g. package.diff for fuller context).
     # shellcheck disable=SC2046
     (cd "$project" && {
       printf 'Fix ONLY the findings below on the current branch. Commit in\n'
       printf 'logical chunks. Run the covering tests for what you change.\n\n'
       cat "$out/findings.md"
     } | claude -p $(model_flag "$(resolve_effective_model "$IMPLEMENT_MODEL")") \
-      --permission-mode acceptEdits --output-format json) \
+      --add-dir "$out" --permission-mode acceptEdits --output-format json) \
       >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
     emit_event sweep_fix "$(jq -cn --argjson c "$cycles" '{cycle:$c}')"
     # Re-validation needs BOTH a spec to read commands from AND a run to run

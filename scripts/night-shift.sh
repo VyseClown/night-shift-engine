@@ -81,6 +81,12 @@ IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
 # the IMPLEMENT scope bumps to this stronger model. inherit/sonnet to override.
 DESIGN_IMPLEMENT_MODEL="${NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL:-opus}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
+# Run feedback (scripts/lib/sweep.sh write_run_feedback): default ON — the
+# spec requires feedback to exist even when the branch sweep below is off
+# (complete_run calls write_run_feedback unconditionally of BRANCH_SWEEP).
+# This knob is the cost off-switch for that always-on session; set to "0"
+# to skip it entirely.
+RUN_FEEDBACK="${NIGHT_SHIFT_RUN_FEEDBACK:-1}"
 # Optional end-of-run whole-branch sweep (scripts/lib/sweep.sh): one advisory
 # strong-model review of the entire base..HEAD diff after the last task
 # completes, looking for what per-task reviews cannot see (cross-task
@@ -3058,9 +3064,10 @@ complete_run() {
   # Run feedback (Task 3, agentic-gaps tranche): a short fresh session
   # distills this run's journal into <project>/.night-shift/feedback.md for
   # the human who authors specs. Deliberately BEFORE the BRANCH_SWEEP block
-  # below — feedback must exist even when the sweep is off (spec §A). Always
-  # advisory: never blocks or delays completion (see write_run_feedback).
-  write_run_feedback "$PROJECT"
+  # below — feedback must exist even when the sweep is off (spec §A), gated
+  # only on NIGHT_SHIFT_RUN_FEEDBACK (default "1", the cost off-switch).
+  # Always advisory: never blocks or delays completion (see write_run_feedback).
+  [ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$PROJECT"
   # Optional advisory whole-branch review (Task 1, agentic-gaps tranche):
   # never gates completion here — a fix cycle on the verdict lands in a later
   # task. sweep_build_package refusing (main/master tip, empty branch) is a

@@ -302,6 +302,7 @@ run_dry_fixtures() {
   fixture_assert "branch sweep: fix cycle skips revalidation cleanly when SPEC is set but RUN_ROOT is not" fixture_sweep_fix_cycle_no_run_root_skips_revalidation "$root"
   fixture_assert "run feedback: writes one section + event, second run appends" fixture_run_feedback_writes_and_appends "$root"
   fixture_assert "run feedback: session failure warns and never blocks (advisory)" fixture_run_feedback_session_failure_is_advisory "$root"
+  fixture_assert "run feedback: NIGHT_SHIFT_RUN_FEEDBACK=0 skips the session and never writes feedback.md; default runs it" fixture_run_feedback_knob "$root"
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
@@ -6422,7 +6423,7 @@ fixture_sweep_verdict() {
 # fixture_recovery_invoke_observer_once_detects_rate_limit) so the override
 # never leaks into later fixtures in this process.
 fixture_sweep_run() {
-  local root="$1" dir="$root/sweep-run" proj
+  local root="$1" dir="$root/sweep-run" proj argv
   proj="$dir/proj"
   mkdir -p "$proj"
   (
@@ -6459,6 +6460,22 @@ fixture_sweep_run() {
     sweep_run "$proj" "$out"
     fx "sweep event journaled to events.jsonl" \
       bash -c 'grep -q "\"type\":\"sweep\"" "$1"' _ "$RUN_ROOT/events.jsonl"
+
+    # Reviewer finding #1 (phase-A gate): the standalone --sweep-only package
+    # lives OUTSIDE $project (e.g. its own tmp dir) with no other grant, so
+    # without --add-dir the sandboxed session cannot read package.diff at all
+    # and was observed to silently reconstruct the diff itself (wrong scope
+    # once main advances). Record the stub's own argv to a file — same
+    # counter-file idiom as fixture_sweep_fix_cap's call counter, but capturing
+    # the arg vector itself rather than just a hit count — and assert the flag
+    # AND the package dir both appear in the recorded invocation.
+    out="$dir/out-add-dir"; mkdir -p "$out"
+    argv="$dir/add-dir-argv"
+    : >"$argv"
+    claude() { printf '%s\n' "$@" >>"$argv"; cat >/dev/null; printf '{"result":"fine\\nSWEEP_PASS"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run passes --add-dir to claude" grep -qxF -- "--add-dir" "$argv"
+    fx "sweep_run's --add-dir points at the package out dir" grep -qxF -- "$out" "$argv"
     integrity_cleanup
     exit 0
   ) >/dev/null || return 1
@@ -6919,6 +6936,50 @@ fixture_run_feedback_session_failure_is_advisory() {
     fx "feedback.md was never created" test ! -f "$feedback"
     fx "no run_feedback event journaled" \
       bash -c '! grep -q "\"type\":\"run_feedback\"" "$1"' _ "$RUN_ROOT/events.jsonl"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# NIGHT_SHIFT_RUN_FEEDBACK (phase-A gate finding #2): the cost off-switch for
+# the always-on write_run_feedback call in complete_run — default "1" (spec
+# requires feedback to exist even when the branch sweep is off), "0" skips
+# the session entirely. Structural check that complete_run's call site is
+# actually gated on the literal variable (declare -f, same idiom as the
+# integrity_guard wiring check above), plus a functional check exercising
+# THAT SAME guard expression against write_run_feedback: with the knob "0"
+# the feedback session must never be invoked and feedback.md must never be
+# written; with "1" (the default) it must run exactly as the existing
+# unconditional fixtures above already prove.
+fixture_run_feedback_knob() {
+  local root="$1" dir="$root/feedback-knob" proj feedback calls
+  mkdir -p "$dir"
+  case "$(declare -f complete_run)" in
+    *'[ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$PROJECT"'*) ;;
+    *) return 1 ;;
+  esac
+  (
+    _fixture_run_feedback_context "$dir"
+    feedback="$proj/.night-shift/feedback.md"
+    calls="$dir/claude-calls"
+    : >"$calls"
+    claude() {
+      cat >/dev/null
+      printf 'x\n' >>"$calls"
+      printf '{"result":"- one\\n- two\\n- three\\n- four\\n- five\\n- six"}\n'
+    }
+
+    RUN_FEEDBACK=0
+    [ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$proj"
+    fx "RUN_FEEDBACK=0: feedback session never invoked (counter stays 0)" \
+      bash -c '[ ! -s "$1" ]' _ "$calls"
+    fx "RUN_FEEDBACK=0: feedback.md never written" test ! -f "$feedback"
+
+    RUN_FEEDBACK=1
+    [ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$proj"
+    fx "RUN_FEEDBACK=1 (default): feedback session invoked" \
+      bash -c '[ -s "$1" ]' _ "$calls"
+    fx "RUN_FEEDBACK=1 (default): feedback.md written" test -f "$feedback"
     exit 0
   ) >/dev/null || return 1
   return 0

@@ -224,9 +224,10 @@ session (`NIGHT_SHIFT_SWEEP_MODEL`, default = `NIGHT_SHIFT_OBSERVER_MODEL`)
 looking for what per-task reviews can't see — cross-task interactions,
 accumulated minor findings, hygiene (neutral test fixtures, no company
 identifiers, complete i18n key pairs), tests weakened rather than updated.
-Writes `findings.md` + `verdict.txt` (`SWEEP_PASS` / `SWEEP_FINDINGS: <n>` /
-`SWEEP_ERROR` on a session failure) under a printed `night-shift-sweep-<pid>`
-tmp dir.
+Writes `findings.md` (whose last line carries the verdict, e.g.
+`SWEEP_FINDINGS: <n>`) and `verdict.txt` (the bare word only — `SWEEP_PASS` /
+`SWEEP_FINDINGS` / `SWEEP_ERROR` on a session failure, no count) under a
+printed `night-shift-sweep-<pid>` tmp dir.
 
 **Verdict-only by default** — a bare invocation never touches the target
 repo, regardless of `NIGHT_SHIFT_BRANCH_SWEEP`'s value elsewhere; on this
