@@ -297,6 +297,9 @@ run_dry_fixtures() {
   fixture_assert "branch sweep: fix cycle capped at NIGHT_SHIFT_SWEEP_MAX_FIX then residual" fixture_sweep_fix_cap "$root"
   fixture_sweep_only_args
   fixture_assert "branch sweep: --sweep-only exits 0 on SWEEP_PASS / 2 on residual findings" fixture_sweep_only_run "$root"
+  fixture_assert "branch sweep: --sweep-only bare never runs the fix cycle (advisory by default)" fixture_sweep_only_bare_skips_fix "$root"
+  fixture_assert "branch sweep: --sweep-only NIGHT_SHIFT_BRANCH_SWEEP=1 runs the fix cycle (explicit opt-in)" fixture_sweep_only_branch_sweep_1_runs_fix "$root"
+  fixture_assert "branch sweep: fix cycle skips revalidation cleanly when SPEC is set but RUN_ROOT is not" fixture_sweep_fix_cycle_no_run_root_skips_revalidation "$root"
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
@@ -6474,7 +6477,11 @@ _fixture_sweep_branch_project() {
 # which stubs wait_for_rate_limit_reset directly) so the reset math is
 # deterministic and no real sleep ever happens. A reset further out than
 # SWEEP_MAX_WAIT must skip the retry (handle_rate_limit_wait never called,
-# verdict SWEEP_ERROR); a reset within the cap must retry normally.
+# verdict SWEEP_ERROR); a reset within the cap must retry normally — but ONLY
+# in a run context (STATE set): a standalone `--sweep-only` sweep has no
+# STATE at all, and handle_rate_limit_wait reads "$STATE" unguarded, so a
+# near reset with no STATE must ALSO skip the retry (reviewer finding #1,
+# Task 2 fix tranche) rather than crash on an unbound variable.
 fixture_sweep_rate_limit_bound() {
   local root="$1" dir="$root/sweep-rl-bound" proj out
   proj="$dir/proj"
@@ -6486,6 +6493,10 @@ fixture_sweep_rate_limit_bound() {
     # the raw path it receives points inside $out, so a per-arg marker would
     # be fiddly to predict; a fixed path is unambiguous either way.
     handle_rate_limit_wait() { printf 'called\n' >"$dir/rl-waited"; }
+    # This fixture's own "near reset" cases exercise the reset-math bound in
+    # a RUN context — STATE just needs to be non-empty (handle_rate_limit_wait
+    # itself is stubbed above, so nothing actually reads the file).
+    STATE="$dir/state.json"
 
     out="$dir/out-far"; mkdir -p "$out"
     # A reset comfortably beyond SWEEP_MAX_WAIT (+ the buffer already folded
@@ -6517,6 +6528,20 @@ fixture_sweep_rate_limit_bound() {
       bash -c '[ -f "$1" ]' _ "$dir/rl-waited"
     fx "near reset: retry succeeded, verdict is SWEEP_PASS" \
       test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+
+    out="$dir/out-near-no-state"; mkdir -p "$out"
+    # Same near reset, but standalone (no STATE at all) — the exact shape of
+    # a `--sweep-only` invocation. Must skip the retry cleanly (no crash on
+    # the unbound $STATE inside handle_rate_limit_wait) and fall through to
+    # SWEEP_ERROR, same as the far-reset case above.
+    unset STATE
+    rm -f "$dir/rl-waited"
+    claude() { cat >/dev/null; printf '{}\n'; return 1; }
+    sweep_run "$proj" "$out"
+    fx "no STATE: retry skipped without crashing, verdict is SWEEP_ERROR" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    fx "no STATE: handle_rate_limit_wait never invoked" \
+      bash -c '[ ! -f "$1" ]' _ "$dir/rl-waited"
     exit 0
   ) >/dev/null || return 1
   return 0
@@ -6679,6 +6704,123 @@ STUB2
     rc=0
     PATH="$bin:$PATH" "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
     fx "sweep-only: residual SWEEP_FINDINGS exits 2" test "$rc" -eq 2
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# --sweep-only: bare invocation (design ruling, Task 2 fix tranche) is
+# verdict-only by default — BRANCH_SWEEP defaults to "0", which is NOT "1",
+# so the fix cycle must never run even when the sweep verdict is
+# SWEEP_FINDINGS. A real subprocess invocation (the gate lives at the top
+# level of night-shift.sh), with a fake `claude` stub that appends a marker
+# to a counter file ONLY when it receives the fix cycle's distinctive
+# prompt ("Fix ONLY the findings") — so the counter isolates fix-session
+# calls from the sweep session's own (always-run) call. The counter file
+# must stay empty ("stays 0").
+fixture_sweep_only_bare_skips_fix() {
+  local root="$1" dir="$root/sweep-only-bare-skips-fix" proj bin calls
+  proj="$dir/proj"; bin="$dir/bin"
+  mkdir -p "$bin"
+  _fixture_sweep_branch_project "$proj" || return 1
+  calls="$dir/fix-calls"
+  : >"$calls"
+  cat >"$bin/claude" <<'STUB'
+#!/usr/bin/env bash
+input="$(cat)"
+case "$input" in
+  *"Fix ONLY the findings"*) printf 'x\n' >>"$FIXTURE_FIX_CALLS" ;;
+esac
+printf '{"result":"issues\\nSWEEP_FINDINGS: 1"}\n'
+STUB
+  chmod +x "$bin/claude"
+  (
+    rc=0
+    PATH="$bin:$PATH" FIXTURE_FIX_CALLS="$calls" \
+      "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only bare: residual SWEEP_FINDINGS still exits 2" test "$rc" -eq 2
+    fx "sweep-only bare: fix cycle never invoked (counter file stays 0)" \
+      bash -c '[ ! -s "$1" ]' _ "$calls"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# --sweep-only: NIGHT_SHIFT_BRANCH_SWEEP=1 (explicit opt-in per the same
+# design ruling) DOES invoke the fix cycle. Same stub/counter seam as
+# fixture_sweep_only_bare_skips_fix above, but with the env var set; the
+# default NIGHT_SHIFT_SWEEP_MAX_FIX=1 cap means the fix session prompt fires
+# exactly once (see fixture_sweep_fix_cap's 3-call math, applied here at the
+# CLI level: initial sweep + fix + re-sweep, of which only the fix call
+# matches the counter's "Fix ONLY the findings" marker).
+fixture_sweep_only_branch_sweep_1_runs_fix() {
+  local root="$1" dir="$root/sweep-only-opt-in-runs-fix" proj bin calls
+  proj="$dir/proj"; bin="$dir/bin"
+  mkdir -p "$bin"
+  _fixture_sweep_branch_project "$proj" || return 1
+  calls="$dir/fix-calls"
+  : >"$calls"
+  cat >"$bin/claude" <<'STUB'
+#!/usr/bin/env bash
+input="$(cat)"
+case "$input" in
+  *"Fix ONLY the findings"*) printf 'x\n' >>"$FIXTURE_FIX_CALLS" ;;
+esac
+printf '{"result":"issues\\nSWEEP_FINDINGS: 1"}\n'
+STUB
+  chmod +x "$bin/claude"
+  (
+    rc=0
+    PATH="$bin:$PATH" FIXTURE_FIX_CALLS="$calls" NIGHT_SHIFT_BRANCH_SWEEP=1 \
+      "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only BRANCH_SWEEP=1: residual SWEEP_FINDINGS still exits 2" test "$rc" -eq 2
+    fx "sweep-only BRANCH_SWEEP=1: fix cycle invoked exactly once (opt-in honored)" \
+      test "$(wc -l <"$calls")" -eq 1
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep_fix_cycle: revalidation requires BOTH a spec AND a live RUN_ROOT
+# (reviewer finding #2, Task 2 fix tranche). A standalone `--sweep-only
+# --spec X` sets SPEC but never RUN_ROOT (no run/queue at all); before this
+# fix, SPEC alone was enough to flow into run_validation_commands, which
+# writes its per-command log under "$RUN_ROOT/raw/..." unguarded and crashes
+# on the unbound variable. This fixture proves SPEC-set/RUN_ROOT-unset now
+# skips the revalidation branch cleanly: no crash, no reset --hard (nothing
+# was validated so nothing to revert against), and the cycle proceeds to its
+# normal re-sweep.
+fixture_sweep_fix_cycle_no_run_root_skips_revalidation() {
+  local root="$1" dir="$root/sweep-fix-no-run-root" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    unset RUN_ROOT RUN_ID
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"
+    SWEEP_MAX_FIX=1
+    SWEEP_MODEL="inherit"
+    IMPLEMENT_MODEL="inherit"
+    # A spec WITH a "Final validation commands" section — if the RUN_ROOT
+    # guard were missing, extract_validation_commands would return this `false`
+    # command and run_validation_commands would be reached (and crash on
+    # $RUN_ROOT, or if it somehow survived, revert the fix commit below).
+    SPEC="$dir/spec.md"
+    printf -- '- Final validation commands:\n  1. `false`\n' >"$SPEC"
+    # The stub commits a change (as a real fix session would), draining
+    # stdin first (see fixture_sweep_run's SIGPIPE note above), then reports
+    # SWEEP_PASS so the cycle's re-sweep ends the loop deterministically.
+    claude() { cat >/dev/null; git -C "$proj" commit --allow-empty -qm sweepfix >/dev/null; printf '{"result":"fine\\nSWEEP_PASS"}\n'; }
+    rc=0
+    sweep_fix_cycle "$proj" "$out" || rc=$?
+    fx "no RUN_ROOT: sweep_fix_cycle does not crash" test "$rc" -eq 0
+    fx "no RUN_ROOT: revalidation skipped — fix commit NOT reverted" \
+      bash -c 'test "$(git -C "$1" rev-parse HEAD)" != "$2"' _ "$proj" "$tip_before"
+    fx "no RUN_ROOT: cycle completed via the re-sweep (SWEEP_PASS)" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
     exit 0
   ) >/dev/null || return 1
   return 0

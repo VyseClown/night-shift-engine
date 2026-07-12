@@ -89,6 +89,12 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # Any non-"0" value turns the sweep session on; NIGHT_SHIFT_BRANCH_SWEEP=advisory
 # specifically additionally skips the fix cycle below (verdict + findings
 # only, no auto-fix) — any other truthy value (e.g. "1") runs it.
+# --sweep-only (standalone, below) reads this SAME knob but with a stricter,
+# opposite-default posture for the fix cycle: the sweep session itself always
+# runs regardless of this value (there is no "off" for a command whose whole
+# purpose is to sweep), but the fix cycle runs ONLY on the literal "1" —
+# bare/default invocations are verdict-only, so a plain `--sweep-only` can
+# never leave unvalidated fix commits on the user's branch.
 BRANCH_SWEEP="${NIGHT_SHIFT_BRANCH_SWEEP:-0}"
 SWEEP_MODEL="${NIGHT_SHIFT_SWEEP_MODEL:-$OBSERVER_MODEL}"
 # Sweep fix cycle (scripts/lib/sweep.sh sweep_fix_cycle): capped at one round
@@ -102,7 +108,16 @@ SWEEP_MAX_FIX="${NIGHT_SHIFT_SWEEP_MAX_FIX:-1}"
 # tail of an already-successful run (or a standalone --sweep-only call), so a
 # reset more than this many seconds away skips the retry and records
 # SWEEP_ERROR instead of holding the process open for a review nobody gates
-# completion on.
+# completion on. wait_for_rate_limit_reset's own block_run (past
+# RATE_LIMIT_MAX_WAIT_SECONDS) is unreachable from sweep for this reason. The
+# OTHER block_run inside handle_rate_limit_wait (recovery.sh ~line 252, the
+# 5-consecutive-429 cap) is a separate path this cap does not shield — but
+# it is not practically reachable from sweep either: a successful primary
+# turn resets .rate_limit_consecutive to 0 (state_set above), and sweep runs
+# once at the tail of an already-successful run with a single bounded retry
+# (never a loop), so it can push the counter to at most 1 before falling
+# through to SWEEP_ERROR or completing — nowhere near the 5 in a row needed
+# to trip it.
 SWEEP_MAX_WAIT="${NIGHT_SHIFT_SWEEP_MAX_WAIT:-900}"
 # Optional external second perspective via the Codex CLI (gpt-5.5). OFF by
 # default and strictly ADVISORY when on: one bounded `codex exec` review per
@@ -3274,14 +3289,25 @@ if [ "$SWEEP_ONLY" -eq 1 ]; then
   git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
     die "project is not a Git repository: $PROJECT"
   # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
-  # queued specs, so it never touches --spec/NEXT_TASK task selection. The
-  # fix cycle's re-validation is a no-op here unless --spec names a spec with
-  # a "Final validation commands" section (SPEC stays "" otherwise, matching
-  # sweep_fix_cycle's own `[ -z "${SPEC:-}" ]` guard).
+  # queued specs, so it never touches --spec/NEXT_TASK task selection. Even
+  # with --spec given, sweep_fix_cycle's re-validation branch is a no-op
+  # here — it requires BOTH a spec AND a live RUN_ROOT (run_validation_commands
+  # writes under "$RUN_ROOT/raw/...", unguarded), and standalone --sweep-only
+  # never has a RUN_ROOT — so revalidation is in-run-only and cannot be
+  # reached from this surface at all.
+  # Bare/advisory posture: a --sweep-only invocation is verdict-only by
+  # default (BRANCH_SWEEP defaults to "0", which is NOT "1") — it never runs
+  # the fix cycle unless the caller explicitly opts in with
+  # NIGHT_SHIFT_BRANCH_SWEEP=1, so a bare invocation can never leave
+  # unvalidated fix commits on the user's branch.
   out="${TMPDIR:-/tmp}/night-shift-sweep-$$"
   sweep_build_package "$PROJECT" "$out" >/dev/null || die "nothing to sweep"
   sweep_run "$PROJECT" "$out"
-  [ "$BRANCH_SWEEP" = "advisory" ] || sweep_fix_cycle "$PROJECT" "$out"
+  if [ "$BRANCH_SWEEP" = "1" ]; then
+    sweep_fix_cycle "$PROJECT" "$out"
+  else
+    printf 'sweep: verdict-only (no fix cycle) — set NIGHT_SHIFT_BRANCH_SWEEP=1 to auto-fix findings\n'
+  fi
   printf 'sweep artifacts: %s\n' "$out"
   [ "$(cat "$out/verdict.txt")" = "SWEEP_PASS" ] && exit 0 || exit 2
 fi

@@ -96,23 +96,31 @@ sweep_run() {
     # sleep, and only retry if that reset is within NIGHT_SHIFT_SWEEP_MAX_WAIT
     # seconds (default 900s — comfortably under the 6h cap, so this gate is
     # always the binding one for sweep, and wait_for_rate_limit_reset's own
-    # block_run path is unreachable from here under default configuration).
+    # block_run path is unreachable from here under default configuration —
+    # see the SWEEP_MAX_WAIT comment in night-shift.sh for the OTHER block_run,
+    # inside handle_rate_limit_wait itself, that this gate does not shield).
     # An unparsable reset, or one further out than the cap, skips the retry
     # and falls through to SWEEP_ERROR — fail-closed, same direction as a
-    # session failure with no rate-limit shape at all.
+    # session failure with no rate-limit shape at all. Also require a run
+    # context (`$STATE` set): handle_rate_limit_wait reads/writes "$STATE"
+    # unguarded, which only exists for an in-run sweep (end-of-run or
+    # --sweep-only's own future run) — a standalone `--sweep-only` invocation
+    # has no STATE at all, so retrying there would crash on an unbound
+    # variable instead of the advertised SWEEP_ERROR; skip the retry and fall
+    # through the same as an out-of-cap reset.
     local reference reset_epoch wait_seconds=""
     reference="$(file_mtime_epoch "$raw" 2>/dev/null)" || reference="$(now_epoch)"
     if reset_epoch="$(rate_limit_reset_epoch "$raw" "$reference" 2>/dev/null)"; then
       wait_seconds=$((reset_epoch + RATE_LIMIT_BUFFER_SECONDS - $(now_epoch)))
     fi
-    if [ -n "$wait_seconds" ] && [ "$wait_seconds" -le "$SWEEP_MAX_WAIT" ]; then
+    if [ -n "${STATE:-}" ] && [ -n "$wait_seconds" ] && [ "$wait_seconds" -le "$SWEEP_MAX_WAIT" ]; then
       handle_rate_limit_wait "$raw" subagent || true
       rc=0
       # shellcheck disable=SC2046
       (cd "$project" && sweep_prompt "$out" |
         claude -p $(model_flag "$model") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
     else
-      log "WARN: branch sweep rate-limited; reset wait exceeds NIGHT_SHIFT_SWEEP_MAX_WAIT (${SWEEP_MAX_WAIT}s) or could not be parsed — skipping retry (advisory)"
+      log "WARN: branch sweep rate-limited; reset wait exceeds NIGHT_SHIFT_SWEEP_MAX_WAIT (${SWEEP_MAX_WAIT}s), could not be parsed, or no run context (STATE unset, e.g. standalone --sweep-only) — skipping retry (advisory)"
     fi
   fi
   if [ "$rc" -ne 0 ]; then
@@ -157,8 +165,16 @@ sweep_fix_cycle() {
       --permission-mode acceptEdits --output-format json) \
       >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
     emit_event sweep_fix "$(jq -cn --argjson c "$cycles" '{cycle:$c}')"
+    # Re-validation needs BOTH a spec to read commands from AND a run to run
+    # them inside: run_validation_commands writes its per-command logs under
+    # "$RUN_ROOT/raw/..." unguarded, so a standalone --sweep-only invocation
+    # (SPEC may be set via --spec, but there is no RUN_ROOT — no run/queue at
+    # all) would crash on an unbound variable rather than skip cleanly.
+    # Revalidation is in-run-only; --sweep-only never revalidates.
     vcmds=""
-    [ -z "${SPEC:-}" ] || vcmds="$(extract_validation_commands "$SPEC" "Final validation commands")"
+    if [ -n "${SPEC:-}" ] && [ -n "${RUN_ROOT:-}" ]; then
+      vcmds="$(extract_validation_commands "$SPEC" "Final validation commands")"
+    fi
     if [ -n "$vcmds" ]; then
       if ! run_validation_commands sweepfix "$out/revalidation-$cycles.json" "$vcmds" ||
          jq -e 'any(.[]; .exit_status != 0)' "$out/revalidation-$cycles.json" >/dev/null; then
