@@ -155,6 +155,15 @@ On success, retain compact state and validated reviews in
 transient logs. On block or failure, preserve complete state for exact-session
 recovery.
 
+**Overnight chained runs:** when several specs run back-to-back unattended,
+set `NIGHT_SHIFT_BRANCH_SWEEP=1` (or `=advisory` for verdict-only) so the
+branch gets one whole-branch strong-model review — catching cross-task
+interactions and accumulated minor findings the per-task reviews can't see —
+plus a capped fix cycle under `=1`, before you call the shift done. Every run
+also appends spec/process feedback (ambiguities, loops, validation friction)
+to `<project>/.night-shift/feedback.md` regardless of this knob — read it
+first when picking up the next spec.
+
 ---
 
 ## Abort Conditions

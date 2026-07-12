@@ -23,6 +23,7 @@ workspace container (`<workspace>/<app>`).
 | Convert a Figma design into a web component | Figma MCP → web-track generate → visual review | §7 |
 | Extract a design manifest (web or Figma) | `scripts/design-extract.sh …` | §8 |
 | Audit how faithfully a port implements its design manifest | `scripts/port-audit.sh --project <app> --screen <s> --manifest <m>` | §9 |
+| Review a whole branch before merge (verdict-only by default) | `scripts/night-shift.sh --sweep-only --project <path>` | §10 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -209,6 +210,44 @@ Missing tooling, a failed agent pass, or an unresolvable manifest path all skip
 cleanly with a `WARN` log — this never blocks a candidate or fails a run.
 `NIGHT_SHIFT_PORT_AUDIT_OFFLINE=<canned-reply-path>` routes the engine-invoked call
 through `--offline` (fixture/dry-wire use).
+
+## §10 — Review a whole branch before merge → `scripts/night-shift.sh --sweep-only --project <path>`
+
+```bash
+scripts/night-shift.sh --sweep-only --project <workspace>/<app>
+```
+
+One-shot, no run/queue, no `--spec`: builds the merge-base diff package
+(`package.diff` + `package.meta.json`; refuses a default-branch tip — nothing
+branch-shaped to review) and runs one whole-branch strong-model review
+session (`NIGHT_SHIFT_SWEEP_MODEL`, default = `NIGHT_SHIFT_OBSERVER_MODEL`)
+looking for what per-task reviews can't see — cross-task interactions,
+accumulated minor findings, hygiene (neutral test fixtures, no company
+identifiers, complete i18n key pairs), tests weakened rather than updated.
+Writes `findings.md` + `verdict.txt` (`SWEEP_PASS` / `SWEEP_FINDINGS: <n>` /
+`SWEEP_ERROR` on a session failure) under a printed `night-shift-sweep-<pid>`
+tmp dir.
+
+**Verdict-only by default** — a bare invocation never touches the target
+repo, regardless of `NIGHT_SHIFT_BRANCH_SWEEP`'s value elsewhere; on this
+standalone surface only the literal `NIGHT_SHIFT_BRANCH_SWEEP=1` also runs a
+capped fix cycle (`NIGHT_SHIFT_SWEEP_MAX_FIX`, default `1`): an
+implement-model session fixes only the findings and commits directly to the
+project's branch. **Caveat specific to `--sweep-only`:** the fix cycle's
+re-validation + deterministic-revert safety net (final validation commands
+re-run; a failed re-validation `git reset --hard`s back to the pre-fix tip)
+needs both a spec and a live run root, neither of which this standalone
+surface ever has — so here the fix commits land with no re-validation gate
+and no revert net. The in-run sweep (below) gets the full safety net; treat
+`NIGHT_SHIFT_BRANCH_SWEEP=1` on bare `--sweep-only` as "fix and review the
+result yourself," not "fix and trust it." Exit `0` on `SWEEP_PASS`, `2` on
+`SWEEP_FINDINGS` or `SWEEP_ERROR`.
+
+The same review also runs automatically at the end of a normal night-shift
+when `NIGHT_SHIFT_BRANCH_SWEEP` is `1` or `advisory` (`advisory` = findings
+only, never the fix cycle, even on a `SWEEP_FINDINGS` verdict) — never gating
+completion either way. `NIGHT_SHIFT_SWEEP_MAX_WAIT` (default `900`s) bounds
+the sweep session's own rate-limit retry on both surfaces.
 
 ## Prerequisites & environment
 

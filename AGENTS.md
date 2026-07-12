@@ -176,6 +176,8 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project PATH --spec specs/
   the wrapper waits until the reported reset time plus a safety buffer, pauses
   its elapsed-time budgets, and resumes the same explicit stage session.
   Other API failures still stop via `block_run`. Nothing is pushed or merged.
+- **Reviewing a whole branch before merge?** See `docs/COMMAND-PLAYBOOK.md`
+  §10 (`scripts/night-shift.sh --sweep-only --project <path>`).
 
 ---
 

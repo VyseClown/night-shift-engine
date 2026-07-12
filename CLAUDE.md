@@ -40,6 +40,7 @@ that silently breaks).
 | `NIGHT_SHIFT_PERSONA_MODEL` | `sonnet`. Breadth over depth; the observer is the deep gate. |
 | `NIGHT_SHIFT_OBSERVER_MODEL` | Strongest available. Never weaker than the implement model. |
 | `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` | Strongest available for design-contract work; `sonnet` for cosmetic-only specs. |
+| `NIGHT_SHIFT_SWEEP_MODEL` | Strongest available — whole-branch judgment; defaults to the observer model. |
 
 Spec-type adjustments: scratch/demo targets (`nightshift-demo`, throwaway
 specs) run everything on `sonnet` — never spend judgment-tier budget there.
@@ -118,6 +119,23 @@ directory; run engine/workflow git inside the engine directory.
   CLI / failure / timeout skip cleanly and are journaled (`codex_review`
   events). The verdict pipeline stays Claude-only either way — leave this off
   unless you deliberately want a second vendor's perspective.
+- **Branch sweep, in-run (opt-in, default OFF):** `NIGHT_SHIFT_BRANCH_SWEEP=1`
+  or `=advisory` adds one whole-branch strong-model review at run completion —
+  the full merge-base diff, read by `NIGHT_SHIFT_SWEEP_MODEL` (default = the
+  observer model) — for what per-task reviews can't see: cross-task
+  interactions, accumulated minor findings, hygiene. Never gates completion.
+  `=1` additionally runs a capped fix cycle (`NIGHT_SHIFT_SWEEP_MAX_FIX`,
+  default `1`) on a `SWEEP_FINDINGS` verdict — an implement-model session
+  fixes only the findings, final validation re-runs, and a failed
+  re-validation deterministically `git reset --hard`s back to the pre-fix tip
+  rather than trusting the agent to self-revert. `=advisory` writes findings
+  only, no fix cycle. `NIGHT_SHIFT_SWEEP_MAX_WAIT` (default `900`s) bounds the
+  sweep session's own rate-limit retry. Standalone surface: `scripts/night-shift.sh
+  --sweep-only --project <path>` runs the same review outside any run/queue —
+  verdict-only by default regardless of `NIGHT_SHIFT_BRANCH_SWEEP` (that knob
+  must be exactly `1` on this surface to also run the fix cycle), exit `0`
+  `SWEEP_PASS` / `2` `SWEEP_FINDINGS`/`SWEEP_ERROR`. See
+  `docs/COMMAND-PLAYBOOK.md` for the full contract.
 - **Visual fidelity (opt-in):** set `NIGHT_SHIFT_VISUAL_CAPTURE=1` and give an rn
   spec a `## Design Contract` to enable the `visual_review` stage (Figma-MCP
   reference + iOS-simulator capture + `odiff` pixel-diff + agent auto-repair).
