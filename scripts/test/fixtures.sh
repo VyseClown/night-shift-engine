@@ -305,6 +305,10 @@ run_dry_fixtures() {
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
+  fixture_assert "doc-freshness: dir hit + mention hit found, unrelated root doc absent, valid JSON" fixture_doc_freshness_basic "$root"
+  fixture_assert "doc-freshness: candidate list capped at 10 with truncated:true" fixture_doc_freshness_cap "$root"
+  fixture_assert "doc-freshness: empty diff (base==HEAD) yields docs:[] truncated:false" fixture_doc_freshness_empty_diff "$root"
+  fixture_assert "doc-freshness: doc mentioning a diff-added exported symbol is found (symbol: reason)" fixture_doc_freshness_symbol "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -6917,6 +6921,126 @@ fixture_run_feedback_session_failure_is_advisory() {
       bash -c '! grep -q "\"type\":\"run_feedback\"" "$1"' _ "$RUN_ROOT/events.jsonl"
     exit 0
   ) >/dev/null || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Doc-freshness candidate mapper (scripts/lib/doc-freshness.sh; agentic-gaps
+# Task 5). Not yet wired into night-shift.sh's implement-stage prompt (a
+# later task's job) — exercised here as a standalone, sourceable lib, same
+# precedent as fixture_supervisor_decision's direct `. "$NIGHT_SHIFT_LIB/..."`.
+# ---------------------------------------------------------------------------
+
+# Scratch project shared shape for the doc-freshness fixtures: a doc IN the
+# touched directory (dir hit, score 3), a doc elsewhere that MENTIONS the
+# touched basename (mention hit, score 1), and a root README that mentions
+# nothing and sits outside the touched dir's ancestor chain (must stay
+# absent — the fixture that proves the cap/ranking logic doesn't just
+# "find everything"). Returns the setup commit sha on stdout; the caller
+# adds a further commit to build the actual base..HEAD diff under test.
+_fixture_doc_freshness_project() {
+  local proj="$1"
+  mkdir -p "$proj/src/mod" "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  printf 'Unrelated prose that happens to mention util.ts by name.\n' >"$proj/docs/other.md"
+  printf '# README\nTop-level readme, mentions nothing relevant.\n' >"$proj/README.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  git -C "$proj" rev-parse HEAD
+}
+
+fixture_doc_freshness_basic() {
+  local root="$1" proj="$root/dfb-proj" base out
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  base="$(_fixture_doc_freshness_project "$proj")" || return 1
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "output is valid JSON" jq empty "$out"
+  fx "src/mod/CLAUDE.md present (dir:src/mod, score 3)" bash -c '
+    jq -e "[.docs[] | select(.path==\"src/mod/CLAUDE.md\" and .reason==\"dir:src/mod\" and .score==3)] | length==1" "$1" >/dev/null
+  ' _ "$out"
+  fx "docs/other.md present (mentions:util.ts, score 1)" bash -c '
+    jq -e "[.docs[] | select(.path==\"docs/other.md\" and .reason==\"mentions:util.ts\" and .score==1)] | length==1" "$1" >/dev/null
+  ' _ "$out"
+  fx "README.md absent (no dir/mention/symbol hit)" bash -c '
+    jq -e "[.docs[] | select(.path==\"README.md\")] | length==0" "$1" >/dev/null
+  ' _ "$out"
+  return 0
+}
+
+# 12 further committed docs, each mentioning the touched basename, pushes the
+# total candidate count over the cap (CLAUDE.md dir hit + docs/other.md +
+# 12 extras, all score>=1) — proves the cap holds at exactly 10 with
+# truncated:true, regardless of which ties get dropped.
+fixture_doc_freshness_cap() {
+  local root="$1" proj="$root/dfc-proj" base out i
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  mkdir -p "$proj/src/mod" "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  printf 'Unrelated prose that happens to mention util.ts by name.\n' >"$proj/docs/other.md"
+  printf '# README\nTop-level readme, mentions nothing relevant.\n' >"$proj/README.md"
+  for i in $(seq 1 12); do
+    printf 'Extra doc #%s also mentions util.ts in passing.\n' "$i" >"$proj/docs/extra$i.md"
+  done
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "output is valid JSON" jq empty "$out"
+  fx "capped at exactly 10 docs" bash -c 'jq -e "(.docs | length) == 10" "$1" >/dev/null' _ "$out"
+  fx "truncated:true" bash -c 'jq -e ".truncated == true" "$1" >/dev/null' _ "$out"
+  return 0
+}
+
+fixture_doc_freshness_empty_diff() {
+  local root="$1" proj="$root/dfe-proj" head out
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  head="$(_fixture_doc_freshness_project "$proj")" || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$head" "$out" || return 1
+  fx "base==HEAD yields docs:[] truncated:false, still rc 0" bash -c '
+    jq -e ". == {docs:[], truncated:false}" "$1" >/dev/null
+  ' _ "$out"
+  return 0
+}
+
+# A doc that names a diff-added exported symbol (not a touched filename)
+# must be found via the symbol:<name> reason at score 1 — proves the
+# best-effort sed symbol extraction actually feeds the mention/symbol tier,
+# not just the dir-proximity tier the other fixtures exercise.
+fixture_doc_freshness_symbol() {
+  local root="$1" proj="$root/dfs-proj" base out
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  mkdir -p "$proj/lib" "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf 'This doc explains what parseFoo does, in prose.\n' >"$proj/docs/parsing.md"
+  printf '# README\nmentions nothing relevant.\n' >"$proj/README.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/lib/parse.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add parseFoo" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "docs/parsing.md found via symbol:parseFoo, score 1" bash -c '
+    jq -e "[.docs[] | select(.path==\"docs/parsing.md\" and .reason==\"symbol:parseFoo\" and .score==1)] | length==1" "$1" >/dev/null
+  ' _ "$out"
   return 0
 }
 
