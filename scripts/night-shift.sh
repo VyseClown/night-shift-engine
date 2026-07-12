@@ -1139,23 +1139,37 @@ $block"
 # on DOC_FRESHNESS (default ON; "0" disables both the write and the block).
 #
 # Because this runs at implement-stage prompt assembly, HEAD has not advanced
-# past $BASE_COMMIT until a candidate commit exists — so, like
-# check_component_reuse/port_audit_candidate's post-candidate evidence, the
-# FIRST pass through implementation is naturally empty (nothing committed yet
-# to diff) and the list only has real content on a re-review round following
-# an observer BLOCK (HEAD is then the previous candidate). This is deliberate,
-# not a bug: the SAME file this function writes is later read verbatim by
-# doc_freshness_section() for the observer, so the observer spot-checks the
-# implementer's declarations against the EXACT list the implementer was shown,
-# not a re-derived (and possibly different) one.
+# past $BASE_COMMIT until a candidate commit exists — so the FIRST pass
+# through implementation naturally writes an empty list here (nothing
+# committed yet to diff); it only has real content on this call for a
+# re-review round following an observer BLOCK (HEAD is then the previous
+# candidate). That first-pass emptiness is fine for the PROMPT (there is
+# nothing to react to yet), but the SAME file is later read verbatim by
+# doc_freshness_section() for the observer — so verify_candidate's post-
+# candidate slot calls doc_freshness_recompute_candidate (below) to
+# overwrite this file once a candidate commit exists and $BASE_COMMIT..HEAD
+# is a real diff, the same way check_component_reuse/port_audit_candidate
+# compute their post-candidate evidence. That keeps the observer's read
+# populated on a first-pass APPROVE, not just on re-review rounds.
 #
 # Any generation failure (bad args, no jq, unwritable RUN_ROOT) degrades to an
 # empty block — doc-freshness is advisory context, never allowed to block a
 # prompt from being assembled.
+#
+# Task-keyed output path shared by doc_freshness_prompt_block (write, at
+# implement-stage prompt time), the post-candidate recompute
+# (doc_freshness_recompute_candidate, write, after a candidate commit
+# exists), and doc_freshness_section (read, for the observer) — a single
+# helper so the three sites can never drift onto different filenames for the
+# same spec.
+doc_freshness_path() {
+  printf '%s/doc-freshness/%s.json' "$RUN_ROOT" "$(basename "$1" .md)"
+}
+
 doc_freshness_prompt_block() {
   local spec="$1" out lines truncated_note
   [ "$DOC_FRESHNESS" = "1" ] || return 0
-  out="$RUN_ROOT/doc-freshness/$(basename "$spec" .md).json"
+  out="$(doc_freshness_path "$spec")"
   mkdir -p "$(dirname "$out")" 2>/dev/null || return 0
   doc_freshness_candidates "$PROJECT" "$BASE_COMMIT" "$out" 2>/dev/null || return 0
   [ -s "$out" ] || return 0
@@ -2457,6 +2471,18 @@ EOF
   ' --arg candidate "$candidate" --arg now "$(now_iso)"
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
+  # Doc-freshness recompute (Phase-B gate-review fix, closing the tranche §B
+  # gap): the only doc_freshness_candidates call otherwise sat in
+  # doc_freshness_prompt_block, which runs at implement-stage PROMPT time —
+  # before any candidate commit exists, so on a first pass HEAD==BASE_COMMIT
+  # and that write is always {"docs":[]}. doc_freshness_section only READS
+  # the file, so the observer got an empty list on every first-pass-APPROVE
+  # run. Here, post-candidate, HEAD IS $candidate, so $BASE_COMMIT..HEAD is
+  # the full candidate diff — recompute and overwrite the SAME task-keyed
+  # file (doc_freshness_path) so doc_freshness_section's read site needs no
+  # change. Same post-candidate slot and never-blocks posture as the reuse
+  # gate and port audit below.
+  doc_freshness_recompute_candidate
   # Soft reuse gate (port-fidelity Task 6): runs only AFTER every hard check
   # above has passed, on the now-validated candidate; see check_component_reuse
   # for why this never blocks.
@@ -2714,19 +2740,53 @@ SCREENS
   return 0
 }
 
+# Post-candidate doc-freshness recompute (Phase-B gate-review fix). Called
+# from verify_candidate's post-candidate slot, once HEAD is the validated
+# candidate — see the call site's comment for why the implement-stage-prompt
+# write alone left the gate inert on a first-pass run. Overwrites the SAME
+# task-keyed file doc_freshness_prompt_block writes (doc_freshness_path), so
+# doc_freshness_section's read site is unchanged; on a re-review round this
+# simply recomputes against the (unchanged) BASE_COMMIT..HEAD range the
+# prompt-block call already covered, which is harmless idempotent work, not a
+# second source of truth.
+#
+# Advisory only, like check_component_reuse/port_audit_candidate: any failure
+# (knob off, no jq, unwritable RUN_ROOT, doc_freshness_candidates erroring) is
+# a WARN log and a clean return 0 — never block_run.
+doc_freshness_recompute_candidate() {
+  [ "$DOC_FRESHNESS" = "1" ] || return 0
+  local out
+  out="$(doc_freshness_path "$SPEC")"
+  mkdir -p "$(dirname "$out")" 2>/dev/null || {
+    log "WARN: doc-freshness recompute skipped — could not create $(dirname "$out")"
+    return 0
+  }
+  if ! doc_freshness_candidates "$PROJECT" "$BASE_COMMIT" "$out" 2>/dev/null; then
+    log "WARN: doc-freshness recompute failed (advisory only; observer evidence may be stale/empty)"
+    return 0
+  fi
+  jq empty "$out" >/dev/null 2>&1 || {
+    log "WARN: doc-freshness recompute produced invalid JSON; ignoring"
+    return 0
+  }
+  integrity_put "$out"
+  return 0
+}
+
 # Supplementary reviewer surface for the doc-freshness candidate list
 # (agentic-gaps tranche §B) — same non-authoritative framing and dual
 # attachment (implementation-review persona bundle via assemble_review_bundle,
 # observer context via run_observer) as port_audit_section/
-# reuse_violations_section. Reads the SAME $RUN_ROOT/doc-freshness/<task>.json
-# doc_freshness_prompt_block wrote at implement-stage prompt time — this is
-# deliberately keyed on the file existing, not on $DOC_FRESHNESS (mirrors
-# port_audit_section: evidence already on disk is worth surfacing even if the
+# reuse_violations_section. Reads the SAME doc_freshness_path(SPEC) file that
+# doc_freshness_prompt_block writes at implement-stage prompt time AND that
+# doc_freshness_recompute_candidate overwrites post-candidate (verify_candidate)
+# — this is deliberately keyed on the file existing, not on $DOC_FRESHNESS
+# (mirrors port_audit_section: evidence already on disk is worth surfacing even if the
 # knob changed between rounds). Empty when no file exists yet (nothing has
 # been generated this task) or its candidate list is empty.
 doc_freshness_section() {
   local f
-  f="$RUN_ROOT/doc-freshness/$(basename "$SPEC" .md).json"
+  f="$(doc_freshness_path "$SPEC")"
   [ -s "$f" ] || return 0
   jq -e '(.docs // []) | length > 0' "$f" >/dev/null 2>&1 || return 0
   integrity_guard "$f" doc-freshness "the doc-freshness candidate list"

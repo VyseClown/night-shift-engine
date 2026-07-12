@@ -1,6 +1,6 @@
 # Command Playbook — pick the command for the task
 
-> Summary: Task → command index (10 sections) for Figma export, RN
+> Summary: Task → command index for Figma export, RN
 > visual-review/repair/Maestro capture, running a night-shift, the
 > design-extract/port-audit CLIs, and `--sweep-only`. Start at the "Quick
 > chooser" table; each row links to its `§N` section for the full command.

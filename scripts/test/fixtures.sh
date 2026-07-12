@@ -310,10 +310,12 @@ run_dry_fixtures() {
   fixture_assert "doc-freshness: candidate list capped at 10 with truncated:true" fixture_doc_freshness_cap "$root"
   fixture_assert "doc-freshness: empty diff (base==HEAD) yields docs:[] truncated:false" fixture_doc_freshness_empty_diff "$root"
   fixture_assert "doc-freshness: doc mentioning a diff-added exported symbol is found (symbol: reason)" fixture_doc_freshness_symbol "$root"
-  # fixture_doc_freshness_prompt prints its own ok/not-ok (the _run/wrapper
-  # subshell idiom, same as fixture_manifest_prompt above) — invoked directly,
-  # NOT via fixture_assert, which would print a duplicate ok line.
+  # fixture_doc_freshness_prompt / fixture_doc_freshness_recompute print their
+  # own ok/not-ok (the _run/wrapper subshell idiom, same as
+  # fixture_manifest_prompt above) — invoked directly, NOT via fixture_assert,
+  # which would print a duplicate ok line.
   fixture_doc_freshness_prompt
+  fixture_doc_freshness_recompute
   fixture_assert "doc-summaries: --check passes on conforming docs, fails naming the offender on non-conforming ones" fixture_doc_summaries_check "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
@@ -7198,6 +7200,110 @@ fixture_doc_freshness_prompt() {
     printf 'ok - doc-freshness prompt: implement-prompt block + observer section render from candidates; empty on knob-off/empty-diff\n'
   else
     printf 'not ok - doc-freshness prompt: implement-prompt block + observer section render from candidates; empty on knob-off/empty-diff\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# Post-candidate doc-freshness recompute (Phase-B gate-review fix). Unlike
+# _fixture_doc_freshness_prompt_run above — which commits the touched file
+# BEFORE ever calling doc_freshness_prompt_block, so BASE_COMMIT..HEAD is
+# already a real diff by prompt time and the first-pass-inert defect never
+# shows up — this fixture models the REAL first-pass sequence in order:
+#   1. BASE_COMMIT=HEAD with nothing committed yet (true first pass, before
+#      any candidate commit exists);
+#   2. call doc_freshness_prompt_block and assert it renders EMPTY — this
+#      documents the known, unavoidable first-pass prompt behavior (nothing
+#      to diff against yet), not a regression to fix;
+#   3. commit the touched file — this becomes the candidate commit HEAD now
+#      points at;
+#   4. call doc_freshness_recompute_candidate directly (the exact call
+#      verify_candidate's post-candidate slot makes, once HEAD IS the
+#      validated candidate);
+#   5. assert doc_freshness_section NOW renders a POPULATED block — proving
+#      the observer's read site sees real content on a first-pass APPROVE,
+#      not only on a re-review round following a BLOCK.
+# Same engine-global isolation idiom (subshell via command substitution,
+# DELIBERATELY-not-local scratch dir for the EXIT trap) as
+# _fixture_doc_freshness_prompt_run.
+_fixture_doc_freshness_recompute_run() {
+  local proj spec block section
+  DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR="$WORKSPACE_ROOT/.night-shift-fixture-doc-freshness-recompute.$$"
+  mkdir -p "$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR" || return 1
+  trap 'rm -rf "${DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR:-}"' EXIT
+
+  proj="$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR/proj"
+  mkdir -p "$proj/src/mod" "$proj/docs" || return 1
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+
+  # These are the SAME globals the real orchestrator carries through a run
+  # (see _fixture_doc_freshness_prompt_run's comment) — set here only inside
+  # this command-substitution subshell.
+  PROJECT="$proj"
+  BASE_COMMIT="$(git -C "$proj" rev-parse HEAD)"
+  RUN_ROOT="$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR/rr"
+  RUN_ID="doc-freshness-recompute-fixture"
+  mkdir -p "$RUN_ROOT" || return 1
+  spec="$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR/spec.md"
+  printf '# Just a plain spec (no Design Contract needed — this gate is unconditional)\n' >"$spec"
+  SPEC="$spec"
+  DOC_FRESHNESS=1
+
+  # Step 1-2: true first-pass state. BASE_COMMIT==HEAD, nothing committed
+  # yet — the ONLY call site before this fix, and it must render empty here.
+  block="$(doc_freshness_prompt_block "$spec")"
+  [ -z "$block" ] || {
+    printf 'expected an EMPTY first-pass prompt block (BASE_COMMIT==HEAD, nothing committed yet), got: %s\n' "$block"
+    return 1
+  }
+
+  # Step 3: commit the touched file — the candidate commit verify_candidate
+  # would validate; HEAD now moves past BASE_COMMIT.
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+
+  # Step 4: the verify_candidate-slot fix, run directly — HEAD is now exactly
+  # what verify_candidate would have bound to $candidate.
+  doc_freshness_recompute_candidate || {
+    printf 'doc_freshness_recompute_candidate failed\n'
+    return 1
+  }
+
+  # Step 5: the observer's read site must now see real content, sourced from
+  # the recompute, not the (still-empty) prompt-time write.
+  section="$(doc_freshness_section)"
+  fx "observer section: populated after post-candidate recompute (was empty at prompt time)" \
+    bash -c 'printf "%s" "$1" | grep -q "DOC FRESHNESS"' _ "$section"
+  fx "observer section: lists the touched-dir doc" \
+    bash -c 'printf "%s" "$1" | grep -qF "src/mod/CLAUDE.md"' _ "$section"
+
+  # Structural wiring checks (declare -f, per the session-refresh fixture's
+  # pipefail rationale): all three sites — prompt-time write, post-candidate
+  # recompute, observer read — must derive the filename from the ONE shared
+  # doc_freshness_path helper (the no-drift guarantee this whole fixture
+  # relies on), and verify_candidate must actually call the recompute in its
+  # post-candidate slot.
+  case "$(declare -f doc_freshness_prompt_block)" in *doc_freshness_path*) ;; *) return 1 ;; esac
+  case "$(declare -f doc_freshness_recompute_candidate)" in *doc_freshness_path*) ;; *) return 1 ;; esac
+  case "$(declare -f doc_freshness_section)" in *doc_freshness_path*) ;; *) return 1 ;; esac
+  case "$(declare -f verify_candidate)" in *doc_freshness_recompute_candidate*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_doc_freshness_recompute() {
+  local err status
+  err="$(_fixture_doc_freshness_recompute_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - doc-freshness recompute: post-candidate recompute populates the observer section after an empty first-pass prompt block (proves the gate is not inert on a first-pass run)\n'
+  else
+    printf 'not ok - doc-freshness recompute: post-candidate recompute populates the observer section after an empty first-pass prompt block (proves the gate is not inert on a first-pass run)\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi

@@ -53,7 +53,8 @@ check() {
     fi
   done
   if [ "$had_any" -eq 0 ]; then
-    log "no *.md files found in $DOCS_DIR"
+    log "no *.md files found in $DOCS_DIR (empty or mistyped path — treated as a failure, not a silent pass)"
+    return 1
   fi
   if [ "$offenders" -gt 0 ]; then
     log "$offenders file(s) missing a \`> Summary:\` opener"
