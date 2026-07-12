@@ -38,7 +38,11 @@
      command (backticks required); add `- Smoke URL:` for a server the engine
      should poll for HTTP 200 (loopback only — http://127.0.0.1 or
      http://localhost) before killing it, or omit it for a one-shot command
-     that must simply exit 0:
+     that must simply exit 0. Prefer a boot command that does NOT
+     daemonize/detach (a self-daemonizing dev server can outlive the engine's
+     process-group kill); the Smoke URL's port must be exclusive to this
+     run — something already listening there before boot fails the phase
+     loudly rather than risk stealing/racing it:
        - Smoke: `npm run dev -- -p 3999`
        - Smoke URL: `http://127.0.0.1:3999/`
 -->

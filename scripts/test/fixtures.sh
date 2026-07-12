@@ -2494,7 +2494,7 @@ fixture_smoke_phase() {
   # server mode (Smoke URL present) polls the loopback URL for HTTP 200 then
   # TERM-then-KILLs the whole process group via cleanup_smoke_pgid — never a
   # zombie dev server, on success OR on a poll timeout.
-  local root="$1" dir="$root/smoke" spec port rc bgpid
+  local root="$1" dir="$root/smoke" spec port rc bgpid dport cport collider_pid
   mkdir -p "$dir/proj" "$dir/rs/raw" "$dir/rs/validated"
   ( PROJECT="$dir/proj"; RUN_ROOT="$dir/rs"; RUN_ID="smfx"; WORKDIR=""
     spec="$dir/s.md"
@@ -2519,6 +2519,13 @@ fixture_smoke_phase() {
     fx_not "non-loopback Smoke URL is rejected" validate_spec_smoke "$spec" || exit 1
     printf -- '- Smoke: `true`\n- Smoke URL: http://127.0.0.1:3999/\n' >"$spec"
     fx_not "bare (unbackticked) Smoke URL fails loudly" validate_spec_smoke "$spec" || exit 1
+    # --- hostname-prefix bypass: a naive `http://localhost*`/`http://127.0.0.1*`
+    # prefix match would also accept these (evil.com after the loopback-looking
+    # prefix) — the anchored case in validate_spec_smoke must reject both. ---
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://localhost.evil.com:80/`\n' >"$spec"
+    fx_not "hostname-prefix bypass (localhost.evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://127.0.0.1.evil.com/`\n' >"$spec"
+    fx_not "hostname-prefix bypass (127.0.0.1.evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
 
     # --- no-Smoke spec: run_smoke_phase returns 0, writes nothing ---
     printf '# no smoke fields\n' >"$spec"
@@ -2577,6 +2584,49 @@ fixture_smoke_phase() {
         [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-to.json")" -eq 1 ] || exit 1
       sleep 0.3
       fx "timeout: no zombie process left" [ -z "$(pgrep -f 'sleep 41' 2>/dev/null)" ] || exit 1
+      SMOKE_TIMEOUT=20
+
+      # --- daemon-leak class: the Smoke command backgrounds its real listener
+      # under its OWN `set -m` (a genuinely new process group — the same
+      # detachment trick a self-daemonizing dev server uses, live-proven
+      # against Next 16 Turbopack) and the direct child then exits. The old
+      # group-only kill in cleanup_smoke_pgid cannot reach a process outside
+      # its group; only the port-scoped survivor sweep can. Assert no
+      # listener remains on the port once run_smoke_phase returns (regardless
+      # of its rc — the direct child racing ahead of the HTTP poll is exactly
+      # the daemonizing behavior under test). ---
+      if command -v lsof >/dev/null 2>&1; then
+        dport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+        printf -- '- Smoke: `bash -c '"'"'set -m; nohup python3 -m http.server %s --bind 127.0.0.1 >/dev/null 2>&1 & disown; exit 0'"'"'`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+          "$dport" "$dport" >"$dir/s-daemon.md"
+        SPEC="$dir/s-daemon.md"
+        run_smoke_phase daemon "$dir/rs/validated/smoke-daemon.json" "$dir/websrv" || true
+        sleep 1.5
+        fx "daemon-leak: no listener remains on the port (survivor sweep got it)" \
+          [ -z "$(lsof -ti "tcp:$dport" -sTCP:LISTEN 2>/dev/null)" ] || exit 1
+
+        # --- pre-boot collision: something already LISTENs on the Smoke
+        # URL's port before run_smoke_phase ever boots anything. Must refuse
+        # to spawn (rc=1, loud "already in use" message) and must NOT touch
+        # the pre-existing listener — we never booted, so the sweep must not
+        # run against it. ---
+        cport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+        python3 -m http.server "$cport" --bind 127.0.0.1 >/dev/null 2>&1 &
+        collider_pid=$!
+        sleep 0.3
+        printf -- '- Smoke: `python3 -m http.server %s --bind 127.0.0.1`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+          "$cport" "$cport" >"$dir/s-collide.md"
+        SPEC="$dir/s-collide.md"
+        rc=0
+        run_smoke_phase collide "$dir/rs/validated/smoke-collide.json" "$dir/websrv" || rc=$?
+        fx "pre-boot collision: run_smoke_phase returns 1 (refused to spawn)" [ "$rc" -eq 1 ] || exit 1
+        fx "pre-boot collision: output names 'already in use'" \
+          [ -n "$(jq -r '.[0].output' "$dir/rs/validated/smoke-collide.json" | grep -i 'already in use')" ] || exit 1
+        fx "pre-boot collision: pre-existing listener is untouched (still listening)" \
+          [ -n "$(lsof -ti "tcp:$cport" -sTCP:LISTEN 2>/dev/null)" ] || exit 1
+        kill "$collider_pid" 2>/dev/null || true
+        wait "$collider_pid" 2>/dev/null || true
+      fi
     fi
 
     # --- cleanup_smoke_pgid: direct unit test of the registered-group kill,
