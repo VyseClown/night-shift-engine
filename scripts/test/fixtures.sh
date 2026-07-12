@@ -6557,7 +6557,11 @@ fixture_sweep_package() {
   fixture_assert "sweep package: meta has 2 commits" \
     test "$(jq -r '.commit_count' "$out/package.meta.json")" = "2"
   fixture_assert "sweep package: merge-base printed" test -n "$mb"
-  (cd "$proj" && git checkout -q "$(git rev-parse main 2>/dev/null || git rev-parse master)")
+  # --verify -q: plain `git rev-parse main` ECHOES "main" to stdout even when
+  # the ref is missing (exit 1), so on a runner whose scratch repo defaults to
+  # master the substitution fed checkout two words ("main" + the master sha) —
+  # the CI-only pathspec failure this comment memorializes.
+  (cd "$proj" && git checkout -q "$(git rev-parse --verify -q main^{commit} || git rev-parse --verify -q master^{commit})")
   fixture_reject "sweep package: refuses default-branch tip" \
     sweep_build_package "$proj" "$FIXTURE_ROOT/sweep-pkg2"
 }
