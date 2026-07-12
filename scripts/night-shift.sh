@@ -2816,7 +2816,7 @@ test_audit_touched_tests() {
 # Journal: one `test_audit` event per report, {files, final_total} with
 # final_total null when the report is missing/unreadable.
 test_audit_candidate() {
-  local files file report count payload file_args=()
+  local files file report count payload file_args=() src
   [ "$TEST_AUDIT" = "1" ] || return 0
   files="$(test_audit_touched_tests "$PROJECT" "$BASE_COMMIT" "$WORKDIR")"
   [ -n "$files" ] || return 0
@@ -2828,10 +2828,17 @@ $files
 FILES
   [ "${#file_args[@]}" -gt 0 ] || return 0
   count="${#file_args[@]}"
+  # --src scopes the static layer's assert-on-unknown-property rule AND the
+  # agent pass's "source under test" context — same WORKDIR convention as
+  # port_audit_candidate's --scope (project-relative on both sides): the
+  # monorepo subdir when one is set, else the whole project ("." resolves to
+  # $PROJECT itself via test-audit.sh's own resolve_project_path).
+  src="${WORKDIR:-.}"
   report="$PROJECT/.night-shift/test-audit/$(basename "$SPEC" .md).json"
   mkdir -p "$(dirname "$report")" 2>/dev/null || true
   mkdir -p "$RUN_ROOT/raw" 2>/dev/null || true
   if ! "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$PROJECT" --tests "${file_args[@]}" \
+      --src "$src" \
       --model "$(resolve_effective_model "$TEST_AUDIT_MODEL")" --out "$report" \
       >"$RUN_ROOT/raw/test-audit-$(basename "$SPEC" .md).log" 2>&1; then
     log "WARN: test-audit exited non-zero (advisory only; see raw/test-audit-$(basename "$SPEC" .md).log — a non-zero exit here just means findings were found, or degrades cleanly on an infra error)"

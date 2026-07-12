@@ -262,7 +262,15 @@ test_audit_assemble() {
     ($_s[0]) as $static | ($_r[0]) as $reply |
     ($static.findings // []) as $findings |
 
-    def keyed($e): [$e.file, ($e.line | tostring), $e.rule];
+    # The prompt'"'"'s `### <file>` headers are ABSOLUTE (resolve_test_files_for_prompt
+    # gets RESOLVED_TESTS, already absolutized above), but static findings'"'"'
+    # `file` is PROJECT-RELATIVE — a model that echoes the header path back
+    # into judged[]/additional[].file must still key correctly. norm() strips
+    # a leading "$project/" so both sides compare relative; a no-op on a
+    # string that is already relative (ltrimstr is a no-op when the prefix
+    # isn'"'"'t present).
+    def norm($f): ($f | ltrimstr($project + "/"));
+    def keyed($e): [norm($e.file), ($e.line | tostring), $e.rule];
     def is_int_like($v): ($v // "") | tostring | test("^[0-9]+$");
 
     # Validated + deduped (keep-first) judged entries, restricted to
@@ -274,7 +282,7 @@ test_audit_assemble() {
         | select((.file? // "") != "" and (.rule? // "") != "")
         | select(is_int_like(.line))
         | select((.verdict? // "") == "confirm" or (.verdict? // "") == "refute")
-        | {file: .file, line: (.line | tonumber), rule: .rule, verdict: .verdict, reason: (.reason // "")}
+        | {file: norm(.file), line: (.line | tonumber), rule: .rule, verdict: .verdict, reason: (.reason // "")}
       ] | map(. as $e | select($real_keys | any(. == keyed($e))))
         | reduce .[] as $j ([]; if any(.[]; keyed(.) == keyed($j)) then . else . + [$j] end)
     ) as $judged |
@@ -284,7 +292,7 @@ test_audit_assemble() {
     ([($reply.additional // [])[]? | select(type == "object")
         | select((.file? // "") != "" and (.rule? // "") != "")
         | select(is_int_like(.line))
-        | {file: .file, line: (.line | tonumber), rule: .rule, summary: (.summary // "")}
+        | {file: norm(.file), line: (.line | tonumber), rule: .rule, summary: (.summary // "")}
       ] | reduce .[] as $a ([]; if any(.[]; keyed(.) == keyed($a)) then . else . + [$a] end)
     ) as $additional |
 
@@ -375,8 +383,8 @@ else
           printf '\n```\n'
         done
     fi
-    printf '\nYour job has two parts.\n\n(a) For EACH static finding above (identified by file:line:rule), judge\nwhether it is a genuine false-confidence problem ("confirm") or a false\npositive from the mechanical scan ("refute"), with a one-line reason.\n\n(b) Separately, hunt for judgment-tier smells the static scan cannot see:\na mock asserted against itself rather than the real behavior; a\ntautological round-trip (encode then decode the same value, asserting only\nthat they match, with no independent expectation); a guard/branch clearly\npresent in the source under test with no negative-case test covering it; a\n`.skip`/`xit` test that reads as stale rather than deliberately deferred.\nOnly report something you have real evidence for at a specific file:line —\ndo not guess, and do not repeat a static finding as an "additional" one.\n\n'
-    printf 'Reply with ONLY a single fenced json code block containing exactly one\nJSON object: {"judged":[{"file":"<path>","line":<n>,"rule":"<static rule\nname>","verdict":"confirm"|"refute","reason":"<one line>"}, ...],\n"additional":[{"file":"<path>","line":<n>,"rule":"<short-kebab-case\nname>","summary":"<one line>"}, ...]}. Omit judged/additional entries you\nhave nothing to report — do not pad either array.\n'
+    printf '\nYour job has two parts.\n\n(a) For EACH static finding above (identified by file:line:rule), judge\nwhether it is a genuine false-confidence problem ("confirm") or a false\npositive from the mechanical scan ("refute"), with a one-line reason. Your\n`judged` array MUST contain exactly one entry for EVERY static finding\nabove — one confirm or refute each, none omitted. Copy each finding'"'"'s\nfile, line, and rule VERBATIM from the static-findings JSON (those exact\nstrings — NOT the paths in the ### headers).\n\n(b) Separately, hunt for judgment-tier smells the static scan cannot see:\na mock asserted against itself rather than the real behavior; a\ntautological round-trip (encode then decode the same value, asserting only\nthat they match, with no independent expectation); a guard/branch clearly\npresent in the source under test with no negative-case test covering it; a\n`.skip`/`xit` test that reads as stale rather than deliberately deferred.\nOnly report something you have real evidence for at a specific file:line —\ndo not guess, and do not repeat a static finding as an "additional" one.\n\n'
+    printf 'Reply with ONLY a single fenced json code block containing exactly one\nJSON object: {"judged":[{"file":"<path>","line":<n>,"rule":"<static rule\nname>","verdict":"confirm"|"refute","reason":"<one line>"}, ...],\n"additional":[{"file":"<path>","line":<n>,"rule":"<short-kebab-case\nname>","summary":"<one line>"}, ...]}. Omit additional entries you have\nnothing to report for — do not pad that array. `judged` is never empty: it\nmirrors the static findings one-for-one.\n'
   } >"$PROMPT_FILE"
 
   RAW="$TMP_DIR/raw.json"

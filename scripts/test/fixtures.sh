@@ -7616,6 +7616,42 @@ STUB
     exit 0
   ) || return 1
 
+  # (d) [Phase-C gate-review C1 regression] full run, a PATH-stubbed `claude`
+  # emitting a VALID fenced-json judgment whose judged[].file entries are
+  # ABSOLUTE (prefixed with the scratch project dir) — mirroring what the
+  # prompt's own `### <file>` headers look like (RESOLVED_TESTS, already
+  # absolutized) even though static findings' own `file` is project-relative.
+  # Before the fix this silently wiped judged[] (strict keying against
+  # relative $real_keys never matched); test_audit_assemble must normalize
+  # both sides so confirmed/refuted still land, AND emit project-relative
+  # `file` back out (never echo the absolute path into the report).
+  ( dir="$root/full-valid-absolute"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"judgment:\n```json\n{\"judged\":[{\"file\":\"__DIR__/tests/vacuous.test.js\",\"line\":11,\"rule\":\"assert-on-unknown-property\",\"verdict\":\"confirm\",\"reason\":\"wrongName really is absent\"},{\"file\":\"__DIR__/tests/vacuous.test.js\",\"line\":11,\"rule\":\"not-tobe-literal\",\"verdict\":\"refute\",\"reason\":\"covered elsewhere\"}],\"additional\":[]}\n```"}'
+STUB
+    sed -i '' "s#__DIR__#$dir#g" "$dir/bin/claude" 2>/dev/null || sed -i "s#__DIR__#$dir#g" "$dir/bin/claude"
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "absolute-path judged[].file: exits 2 (findings remain: unjudged + additional-less)" [ "$rc" -eq 2 ] || exit 1
+    fx "absolute-path judged[].file: exactly one confirmed despite the absolute path" \
+      bash -c "jq -e '.summary.confirmed == 1' '$out' >/dev/null" || exit 1
+    fx "absolute-path judged[].file: exactly one refuted despite the absolute path" \
+      bash -c "jq -e '.summary.refuted == 1' '$out' >/dev/null" || exit 1
+    fx "absolute-path judged[].file: judged is non-empty (the C1 bug wiped it to [])" \
+      bash -c "jq -e '(.judged | length) == 2' '$out' >/dev/null" || exit 1
+    fx "absolute-path judged[].file: output re-normalizes file to project-relative" \
+      bash -c "jq -e '[.judged[].file] | all(. == \"tests/vacuous.test.js\")' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
   return 0
 }
 
@@ -7624,9 +7660,9 @@ fixture_test_audit_cli() {
   err="$(_fixture_test_audit_cli_run 2>&1)"
   status=$?
   if [ "$status" -eq 0 ]; then
-    printf 'ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n'
+    printf 'ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; an absolute-path judged[].file reply still normalizes and counts correctly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n'
   else
-    printf 'not ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n' >&2
+    printf 'not ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; an absolute-path judged[].file reply still normalizes and counts correctly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
@@ -7753,7 +7789,8 @@ STUB
       fx "knob ON: stub was invoked" [ -s "$argv" ] || exit 1
       fx "knob ON: only the touched test file is passed (not the untouched one)" \
         bash -c 'grep -q "src/touched.test.js" "$1" && ! grep -q "src/untouched.test.js" "$1"' _ "$argv" || exit 1
-      fx "knob ON: --tests appears before --model/--out in argv" grep -q -- "--tests src/touched.test.js --model" "$argv" || exit 1
+      fx "knob ON: --tests appears before --src/--model/--out in argv, --src is the WORKDIR-scoped project root (empty WORKDIR -> \".\")" \
+        grep -q -- "--tests src/touched.test.js --src . --model" "$argv" || exit 1
       report="$PROJECT/.night-shift/test-audit/spec.json"
       fx "knob ON: report generated in the project run dir" [ -s "$report" ] || exit 1
       fx "knob ON: test_audit event journaled with files + numeric final_total" \
