@@ -6561,7 +6561,7 @@ fixture_sweep_package() {
   # the ref is missing (exit 1), so on a runner whose scratch repo defaults to
   # master the substitution fed checkout two words ("main" + the master sha) —
   # the CI-only pathspec failure this comment memorializes.
-  (cd "$proj" && git checkout -q "$(git rev-parse --verify -q main^{commit} || git rev-parse --verify -q master^{commit})")
+  (cd "$proj" && git checkout -q "$(git rev-parse --verify -q 'main^{commit}' || git rev-parse --verify -q 'master^{commit}')")
   fixture_reject "sweep package: refuses default-branch tip" \
     sweep_build_package "$proj" "$FIXTURE_ROOT/sweep-pkg2"
 }
