@@ -2,8 +2,8 @@
 
 > Summary: Task → command index for Figma export, RN
 > visual-review/repair/Maestro capture, running a night-shift, the
-> design-extract/port-audit CLIs, and `--sweep-only`. Start at the "Quick
-> chooser" table; each row links to its `§N` section for the full command.
+> design-extract/port-audit/test-audit CLIs, and `--sweep-only`. Start at the
+> "Quick chooser" table; each row links to its `§N` section for the full command.
 
 A task → command index for the visual-fidelity / Figma / night-shift capabilities in
 this repo. Written for both humans and a fresh Claude instance: **match the task to a
@@ -29,6 +29,7 @@ workspace container (`<workspace>/<app>`).
 | Extract a design manifest (web or Figma) | `scripts/design-extract.sh …` | §8 |
 | Audit how faithfully a port implements its design manifest | `scripts/port-audit.sh --project <app> --screen <s> --manifest <m>` | §9 |
 | Review a whole branch before merge (verdict-only by default) | `scripts/night-shift.sh --sweep-only --project <path>` | §10 |
+| Audit tests for false confidence (vacuous assertions, tautological round-trips) | `scripts/test-audit.sh --project <app> --tests <path...>` | §11 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -254,6 +255,50 @@ when `NIGHT_SHIFT_BRANCH_SWEEP` is `1` or `advisory` (`advisory` = findings
 only, never the fix cycle, even on a `SWEEP_FINDINGS` verdict) — never gating
 completion either way. `NIGHT_SHIFT_SWEEP_MAX_WAIT` (default `900`s) bounds
 the sweep session's own rate-limit retry on both surfaces.
+
+## §11 — Audit tests for false confidence → `scripts/test-audit.sh …`
+
+A zero-dep-static + one-agent-pass CLI that finds tests which PASS while
+asserting nothing meaningful — mirrors `port-audit.sh`'s two-layer
+architecture. Evidence this matters: `expect(result.installmentGroupId)
+.not.toBe("group-a")` passed vacuously because `installmentGroupId` doesn't
+exist on `result` (`undefined !== "group-a"` is trivially true); only a
+sibling positive assertion elsewhere exposed the bug. A deterministic static
+scan (`scripts/lib/test-audit-static.js`) flags mechanical smells
+(vacuous `.not.toBe(<literal>)`, asserts on a property absent from the
+source, `toBe(true)` on constants, empty/expect-less test bodies, stale
+`.skip`/`xit`); ONE bounded `claude -p` agent pass then judges each static
+finding confirm/refute with a one-line reason and hunts judgment-tier smells
+the static scan can't see (a mock tested against itself, a tautological
+round-trip, a guard with no negative-case test). The agent's reply is never
+trusted for arithmetic — every count is recomputed by the script (jq) from
+the static findings + the agent's validated `{file,line,rule}` mapping.
+
+```bash
+scripts/test-audit.sh --project <app> --tests <path...> [--src <dir>] \
+  [--model sonnet] [--offline] [--out <json>]
+```
+
+Writes `<project>/.night-shift/test-audit/report.json` (default `--out`) plus
+a sibling `.md`, schema `night-shift-test-audit/1`:
+`summary.final_total = confirmed + unjudged + additional`. Exit `0` when
+`final_total == 0`, `2` when it's `> 0` (findings exist — this is the common,
+non-error outcome), `3` only on an infra/usage error (nothing written).
+`--offline` skips the paid call entirely (static-only; every finding stays
+unjudged) for a fully deterministic, zero-cost dry run. An agent-pass failure
+(missing `claude`, non-zero exit, an unparseable reply after one retry) is
+NEVER an exit-3 condition either — it degrades to "every static finding stays
+unjudged" (noted in `agent_note`), same fail-open-on-evidence posture as
+`port-audit.sh`.
+
+**Engine wiring (opt-in, non-gating):** set `NIGHT_SHIFT_TEST_AUDIT=1` and
+`night-shift.sh` runs this CLI once per candidate, scoped to ONLY the test
+files the candidate diff touched (skips cleanly when the diff touches none),
+on the `NIGHT_SHIFT_TEST_AUDIT_MODEL` knob (default `sonnet`). Every report on
+disk is attached — indented, advisory, never authoritative — to the
+implementation-review bundle and the observer's evidence, and a `test_audit`
+event (`{files, final_total}`) is journaled. A failed or missing report is a
+`WARN` log only — this never blocks a candidate or fails a run.
 
 ## Prerequisites & environment
 

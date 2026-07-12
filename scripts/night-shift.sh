@@ -141,6 +141,15 @@ CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
 # and a human dry-wire knob.
 PORT_AUDIT="${NIGHT_SHIFT_PORT_AUDIT:-0}"
 PORT_AUDIT_OFFLINE="${NIGHT_SHIFT_PORT_AUDIT_OFFLINE:-}"
+# False-confidence test audit (agentic-gaps tranche §C; scripts/test-audit.sh).
+# OFF by default and strictly ADVISORY when on: runs once per candidate over
+# ONLY the test files the candidate diff touched (test_audit_candidate below),
+# never gates. TEST_AUDIT_MODEL defaults to `sonnet` — breadth-tier judgment,
+# same tier as the persona bench and PORT_AUDIT above (see this repo's own
+# CLAUDE.md Model ruling: judgment-tier escalation is an optional override,
+# not the default, for this knob).
+TEST_AUDIT="${NIGHT_SHIFT_TEST_AUDIT:-0}"
+TEST_AUDIT_MODEL="${NIGHT_SHIFT_TEST_AUDIT_MODEL:-sonnet}"
 # Doc-freshness gate (agentic-gaps tranche §B; scripts/lib/doc-freshness.sh).
 # DEFAULT ON — the tranche's one deliberate exception to "new behavior defaults
 # off": this is prompt-level only (an extra paragraph in the implement prompt
@@ -1858,6 +1867,9 @@ assemble_review_bundle() {
       # Same timing note applies: port_audit_candidate runs post-candidate, so
       # a report only exists here on a re-review round. Empty on a first pass.
       port_audit_section
+      # Ditto: test_audit_candidate runs post-candidate too, so a report only
+      # exists here on a re-review round. Empty on a first pass.
+      test_audit_section
       # doc_freshness_prompt_block writes the candidate list at implement-stage
       # prompt time (this SAME stage), so — unlike the two sections above —
       # this one can already be populated on the current round, not just a
@@ -2490,6 +2502,9 @@ EOF
   # Soft port-fidelity audit (Task 9): same post-candidate slot, same
   # never-blocks posture; see port_audit_candidate.
   port_audit_candidate
+  # Soft false-confidence test audit (agentic-gaps tranche §C): same
+  # post-candidate slot, same never-blocks posture; see test_audit_candidate.
+  test_audit_candidate
   emit_event candidate_validated "$(jq -cn --arg c "$candidate" '{commit:$c}')"
   log "candidate $candidate validated; handing to observer"
   if visual_stage_enabled "$SPEC"; then
@@ -2738,6 +2753,91 @@ port_audit_section() {
 $(port_audit_screens_for_spec "$SPEC")
 SCREENS
   return 0
+}
+
+# Newline list of test-file-shaped paths (mirrors test-audit-static.js's own
+# TEST_FILE_RE: *.test.[jt]sx? / *.spec.[jt]sx?) touched by base..HEAD inside
+# $project, project-relative (matching git diff's own output — direct
+# --tests input to scripts/test-audit.sh, no further resolution needed).
+# Scoped to $workdir when set (a monorepo candidate should only pull in test
+# files from the app actually being touched, same reasoning as port_audit's
+# --scope). Empty output (never a failure) on a bad range/no matches — the
+# caller (test_audit_candidate) treats "nothing touched" as a clean no-op.
+test_audit_touched_tests() {
+  local project="$1" base="$2" workdir="${3:-}" scope
+  scope="${workdir:-.}"
+  git -C "$project" diff --name-only "$base" HEAD -- "$scope" 2>/dev/null |
+    grep -E '\.(test|spec)\.[jt]sx?$'
+  return 0
+}
+
+# Post-candidate, non-gating false-confidence test audit (agentic-gaps
+# tranche §C; scripts/test-audit.sh). Gate: NIGHT_SHIFT_TEST_AUDIT=1 AND the
+# candidate diff (BASE_COMMIT..HEAD, scoped to WORKDIR when set) touches at
+# least one test-shaped file — absent either, this is a silent no-op, same
+# shape as port_audit_candidate's manifest-field gate. Runs test-audit.sh
+# ONCE over exactly the touched test files (scoped, cheap — never a
+# whole-tree sweep; that is the standalone CLI's job per
+# docs/COMMAND-PLAYBOOK.md), on the TEST_AUDIT_MODEL knob resolved through
+# any recorded model fallback. Same soft posture as check_component_reuse/
+# port_audit_candidate: every failure mode is a WARN + skip, NEVER
+# block_run — but a report on disk is attached and journaled regardless of
+# the CLI's exit status (test-audit.sh's own exit 2 just means "findings
+# exist", not an error; that IS the evidence this audit exists to surface).
+# Journal: one `test_audit` event per report, {files, final_total} with
+# final_total null when the report is missing/unreadable.
+test_audit_candidate() {
+  local files file report count payload file_args=()
+  [ "$TEST_AUDIT" = "1" ] || return 0
+  files="$(test_audit_touched_tests "$PROJECT" "$BASE_COMMIT" "$WORKDIR")"
+  [ -n "$files" ] || return 0
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    file_args+=("$file")
+  done <<FILES
+$files
+FILES
+  [ "${#file_args[@]}" -gt 0 ] || return 0
+  count="${#file_args[@]}"
+  report="$PROJECT/.night-shift/test-audit/$(basename "$SPEC" .md).json"
+  mkdir -p "$(dirname "$report")" 2>/dev/null || true
+  mkdir -p "$RUN_ROOT/raw" 2>/dev/null || true
+  if ! "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$PROJECT" --tests "${file_args[@]}" \
+      --model "$(resolve_effective_model "$TEST_AUDIT_MODEL")" --out "$report" \
+      >"$RUN_ROOT/raw/test-audit-$(basename "$SPEC" .md).log" 2>&1; then
+    log "WARN: test-audit exited non-zero (advisory only; see raw/test-audit-$(basename "$SPEC" .md).log — a non-zero exit here just means findings were found, or degrades cleanly on an infra error)"
+  fi
+  if [ -s "$report" ]; then
+    integrity_put "$report"
+    payload="$(jq -cn --argjson files "$count" --slurpfile r "$report" '
+        {files: $files, final_total: ($r[0].summary.final_total // null)}
+      ' 2>/dev/null)"
+    [ -n "$payload" ] || payload="$(jq -cn --argjson files "$count" '{files:$files, final_total:null}')"
+    emit_event test_audit "$payload"
+  else
+    log "WARN: test-audit produced no report (advisory only, skipped)"
+  fi
+  return 0
+}
+
+# Supplementary reviewer surface for the test audit above — same
+# non-authoritative framing and dual attachment (implementation-review
+# persona bundle via assemble_review_bundle, observer context via
+# run_observer) as port_audit_section. Keyed on the CURRENT spec's own
+# task-named report ($(basename "$SPEC" .md).json), same as port_audit_section
+# keys on the spec's own screens — never a blanket glob of
+# .night-shift/test-audit/, which is $PROJECT-scoped and persists across
+# every night-shift run. Deliberately NOT gated on $TEST_AUDIT: an existing
+# report is evidence worth surfacing even if the knob changed between
+# rounds. Empty when no report has been written yet for this task.
+test_audit_section() {
+  local f
+  f="$PROJECT/.night-shift/test-audit/$(basename "$SPEC" .md).json"
+  [ -s "$f" ] || return 0
+  integrity_guard "$f" test-audit "the test-audit report"
+  printf '%s\n' '--- TEST AUDIT (advisory; engine-computed, NOT authoritative) ---'
+  printf 'Static scan + one bounded agent judgment pass over the candidate-touched\ntest files, hunting for false confidence (vacuous assertions, tautological\nround-trips, missing negative cases, stale skips). Weigh as one more input —\nnever gating. Any `confirm`ed or `unjudged` static finding, or any\n`additional` judgment-tier finding, should be addressed or explicitly waived.\n\n'
+  jq -c '.' "$f" 2>/dev/null | sed 's/^/    /'
 }
 
 # Post-candidate doc-freshness recompute (Phase-B gate-review fix). Called
@@ -3096,6 +3196,7 @@ run_observer() {
     codex_review_section "$candidate"
     reuse_violations_section
     port_audit_section
+    test_audit_section
     doc_freshness_section
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do

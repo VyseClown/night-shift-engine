@@ -318,6 +318,8 @@ run_dry_fixtures() {
   fixture_doc_freshness_recompute
   fixture_assert "doc-summaries: --check passes on conforming docs, fails naming the offender on non-conforming ones" fixture_doc_summaries_check "$root"
   fixture_test_audit_static
+  fixture_test_audit_cli
+  fixture_test_audit_wiring
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -7395,6 +7397,276 @@ fixture_test_audit_static() {
     printf 'ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n'
   else
     printf 'not ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/test-audit.sh (agentic-gaps tranche §C, Task 9): the agent-layer
+# wrapper around Task 8's static scanner. A plain external-script invocation
+# (no engine globals touched, same as fixture_doc_summaries_check /
+# fixture_port_audit_offline above), so each case below runs in its own
+# scratch project copied from the SAME Task 8 fixture tree
+# (scripts/test/fixtures/test-audit/) used by fixture_test_audit_static — 6
+# static findings, one per rule, all in vacuous.test.js; clean.test.js
+# contributes zero.
+_test_audit_cli_seed() {
+  local dir="$1"
+  mkdir -p "$dir/tests" || return 1
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/test-audit/." "$dir/tests/" || return 1
+}
+
+_fixture_test_audit_cli_run() {
+  local root="$FIXTURE_ROOT/test-audit-cli"
+  mkdir -p "$root"
+
+  # (a) --offline: static-only, zero cost. Exit 2 iff static findings, and
+  # summary.final_total == the static count exactly (nothing to judge, so
+  # every static finding is "unjudged", and unjudged alone drives final_total).
+  ( dir="$root/offline"; _test_audit_cli_seed "$dir" || exit 1
+    out="$dir/out.json"
+    "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+      --offline --out "$out" >"$dir/run.log" 2>&1
+    rc=$?
+    fx "offline: exits 2 (findings present)" [ "$rc" -eq 2 ] || exit 1
+    fx "offline: schema id" bash -c "jq -e '.schema == \"night-shift-test-audit/1\"' '$out' >/dev/null" || exit 1
+    fx "offline: static_total is 6 (one per rule)" \
+      bash -c "jq -e '.summary.static_total == 6' '$out' >/dev/null" || exit 1
+    fx "offline: final_total equals the static count exactly (nothing judged, no additional)" \
+      bash -c "jq -e '.summary.final_total == .summary.static_total and .summary.confirmed == 0 and .summary.refuted == 0 and .summary.additional == 0' '$out' >/dev/null" || exit 1
+    fx "offline: judged/additional are both empty" \
+      bash -c "jq -e '(.judged == []) and (.additional == [])' '$out' >/dev/null" || exit 1
+    fx "offline: agent_note explains the skip" \
+      bash -c "jq -e '.agent_note | test(\"offline\"; \"i\")' '$out' >/dev/null" || exit 1
+    fx "offline: sibling .md written" [ -s "$dir/out.md" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # (b) full run, a PATH-stubbed `claude` emitting a VALID fenced-json
+  # judgment: confirms one static finding, refutes another, adds one
+  # judgment-tier finding the static scan can't see. Exercises the exact
+  # arithmetic contract: final_total = confirmed + unjudged + additional,
+  # computed by the script (jq), never taken from the agent's own counting.
+  ( dir="$root/full-valid"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"judgment:\n```json\n{\"judged\":[{\"file\":\"tests/vacuous.test.js\",\"line\":11,\"rule\":\"assert-on-unknown-property\",\"verdict\":\"confirm\",\"reason\":\"wrongName really is absent\"},{\"file\":\"tests/vacuous.test.js\",\"line\":11,\"rule\":\"not-tobe-literal\",\"verdict\":\"refute\",\"reason\":\"already covered by the sibling rule, not independently vacuous\"}],\"additional\":[{\"file\":\"tests/vacuous.test.js\",\"line\":16,\"rule\":\"mock-tested-against-mock\",\"summary\":\"asserts the stub value, not real behavior\"}]}\n```"}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "full run: exits 2 (findings remain: unjudged + additional)" [ "$rc" -eq 2 ] || exit 1
+    fx "full run: exactly one confirmed" bash -c "jq -e '.summary.confirmed == 1' '$out' >/dev/null" || exit 1
+    fx "full run: exactly one refuted" bash -c "jq -e '.summary.refuted == 1' '$out' >/dev/null" || exit 1
+    fx "full run: exactly one additional" bash -c "jq -e '.summary.additional == 1' '$out' >/dev/null" || exit 1
+    fx "full run: final_total arithmetic exact (confirmed 1 + unjudged 4 + additional 1 = 6)" \
+      bash -c "jq -e '.summary.final_total == 6' '$out' >/dev/null" || exit 1
+    fx "full run: judged carries both the confirm and the refute verdicts" \
+      bash -c "jq -e '([.judged[].verdict] | sort) == [\"confirm\",\"refute\"]' '$out' >/dev/null" || exit 1
+    fx "full run: agent_note is null (a valid judgment needs no fail-open note)" \
+      bash -c "jq -e '.agent_note == null' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  # (c) full run, a PATH-stubbed `claude` emitting GARBAGE (no judged/
+  # additional keys at all, twice — the retry budget is exhausted): every
+  # static finding must be kept unjudged (fail-open on evidence), the report
+  # must still validate and note the failure, and the exit code still
+  # follows final_total (2, NOT 3 — an agent-pass failure is never treated
+  # as this script's own infra error).
+  ( dir="$root/full-garbage"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"I have opinions about your tests but no JSON for you."}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "garbage: exits 2, not 3 (fail-open, not an infra error)" [ "$rc" -eq 2 ] || exit 1
+    fx "garbage: judged/additional both empty" \
+      bash -c "jq -e '(.judged == []) and (.additional == [])' '$out' >/dev/null" || exit 1
+    fx "garbage: final_total equals the full static count (every finding kept unjudged)" \
+      bash -c "jq -e '.summary.final_total == .summary.static_total and .summary.static_total == 6' '$out' >/dev/null" || exit 1
+    fx "garbage: agent_note records the failure" \
+      bash -c "jq -e '.agent_note | test(\"fail\"; \"i\")' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_test_audit_cli() {
+  local err status
+  err="$(_fixture_test_audit_cli_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n'
+  else
+    printf 'not ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# Engine wiring for scripts/test-audit.sh (agentic-gaps tranche §C):
+# test_audit_candidate/test_audit_section in scripts/night-shift.sh, modeled
+# on port_audit_candidate/port_audit_section. Seeds a throwaway git repo with
+# TWO test files, commits a base, then a "candidate" commit that touches only
+# ONE of them (plus a non-test file) — the scoping contract under test.
+# test-audit.sh itself is stubbed on PATH (argv-capture) so this fixture
+# exercises ONLY the wiring (gating, scoping, journaling, section
+# attachment), not the CLI's own logic (covered by fixture_test_audit_cli).
+_test_audit_wiring_seed() {
+  local dir="$1"
+  mkdir -p "$dir/repo/src" || return 1
+  cat >"$dir/repo/src/touched.test.js" <<'EOF'
+describe('touched', () => { it('is touched by the candidate', () => { expect(1).toBe(1); }); });
+EOF
+  cat >"$dir/repo/src/untouched.test.js" <<'EOF'
+describe('untouched', () => { it('is not touched by the candidate', () => { expect(1).toBe(1); }); });
+EOF
+  printf '// base\n' >"$dir/repo/src/main.js"
+  git -C "$dir/repo" init -q || return 1
+  git -C "$dir/repo" config user.email t@t && git -C "$dir/repo" config user.name t || return 1
+  git -C "$dir/repo" add -A && git -C "$dir/repo" commit -qm base >/dev/null || return 1
+  printf '// changed\n' >"$dir/repo/src/main.js"
+  cat >>"$dir/repo/src/touched.test.js" <<'EOF'
+// a second assertion, added by the candidate
+EOF
+  git -C "$dir/repo" add -A && git -C "$dir/repo" commit -qm candidate >/dev/null || return 1
+  mkdir -p "$dir/rs/control" "$dir/rs/validated" "$dir/rs/raw" || return 1
+  printf '# sample spec\n' >"$dir/spec.md"
+}
+
+_fixture_test_audit_wiring_run() {
+  local root="$FIXTURE_ROOT/test-audit-wiring"
+  mkdir -p "$root"
+
+  # Structural wiring: post-candidate call order + both reviewer surfaces.
+  ( body="$(awk '/^verify_candidate\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "verify_candidate calls test_audit_candidate" \
+      bash -c 'printf "%s" "$1" | grep -q test_audit_candidate' _ "$body"
+    audit_line="$(printf '%s' "$body" | grep -n 'port_audit_candidate' | head -1 | cut -d: -f1)"
+    test_line="$(printf '%s' "$body" | grep -n 'test_audit_candidate' | head -1 | cut -d: -f1)"
+    fx "test audit runs AFTER the port audit (same post-candidate slot)" \
+      test -n "$audit_line" -a -n "$test_line" -a "$test_line" -gt "$audit_line" || exit 1
+    obs="$(awk '/^run_observer\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "run_observer context includes test_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q test_audit_section' _ "$obs" || exit 1
+    bun="$(awk '/^assemble_review_bundle\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "implementation review bundle includes test_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q test_audit_section' _ "$bun" || exit 1
+    exit 0
+  ) || return 1
+
+  # test_audit_touched_tests: scoped to exactly the ONE touched test file.
+  ( dir="$root/scope"; _test_audit_wiring_seed "$dir" || exit 1
+    base="$(git -C "$dir/repo" rev-parse HEAD~1)"
+    touched="$(test_audit_touched_tests "$dir/repo" "$base" "")"
+    fx "scope: names only the touched test file" \
+      bash -c 'test "$1" = "src/touched.test.js"' _ "$touched" || exit 1
+    exit 0
+  ) || return 1
+
+  # Gate: knob OFF -> no-op, stub never invoked, nothing journaled/attached.
+  # The stub lives at $WORKSPACE_ROOT/scripts/test-audit.sh (WORKSPACE_ROOT
+  # itself is overridden to this scratch dir) since test_audit_candidate
+  # invokes that fully-qualified path directly, never a bare PATH lookup.
+  ( dir="$root/off"; _test_audit_wiring_seed "$dir" || exit 1
+    mkdir -p "$dir/scripts"
+    argv="$dir/argv.log"
+    cat >"$dir/scripts/test-audit.sh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$argv"
+exit 0
+STUB
+    chmod +x "$dir/scripts/test-audit.sh"
+    ( RUN_ROOT="$dir/rs"; RUN_ID="tawire-off"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+      STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+      WORKDIR=""; BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD~1)"
+      TEST_AUDIT=0 TEST_AUDIT_MODEL="inherit"
+      WORKSPACE_ROOT="$dir"
+      test_audit_candidate || exit 1
+      fx_not "knob OFF: stub never invoked" [ -e "$argv" ] || exit 1
+      fx_not "knob OFF: no report written" [ -e "$PROJECT/.night-shift/test-audit/spec.json" ] || exit 1
+      fx_not "knob OFF: no test_audit event journaled" \
+        bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q test_audit '$RUN_ROOT/events.jsonl'" || exit 1
+      fx "knob OFF: test_audit_section is empty (no report)" test -z "$(test_audit_section)" || exit 1
+    ) || exit 1
+    exit 0
+  ) || return 1
+
+  # Happy path: knob ON -> the engine invokes test-audit.sh with ONLY the
+  # touched test file (argv-captured via the stub), a report lands (the stub
+  # writes one), a test_audit event carries {files, final_total}, and the
+  # section/persona bundle surface it indented and labeled non-authoritative.
+  ( dir="$root/on"; _test_audit_wiring_seed "$dir" || exit 1
+    mkdir -p "$dir/scripts"
+    argv="$dir/argv.log"
+    cat >"$dir/scripts/test-audit.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"__ARGV__"
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--out" ]; then out="$a"; fi
+  prev="$a"
+done
+[ -n "$out" ] || exit 3
+mkdir -p "$(dirname "$out")"
+printf '{"schema":"night-shift-test-audit/1","summary":{"static_total":1,"confirmed":0,"refuted":0,"additional":0,"final_total":1}}\n' >"$out"
+exit 2
+STUB
+    sed -i '' "s#__ARGV__#$argv#" "$dir/scripts/test-audit.sh" 2>/dev/null || sed -i "s#__ARGV__#$argv#" "$dir/scripts/test-audit.sh"
+    chmod +x "$dir/scripts/test-audit.sh"
+    ( RUN_ROOT="$dir/rs"; RUN_ID="tawire-on"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+      STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+      WORKDIR=""; BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD~1)"
+      printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+      TEST_AUDIT=1 TEST_AUDIT_MODEL="inherit"
+      WORKSPACE_ROOT="$dir"
+      test_audit_candidate || exit 1
+      fx "knob ON: stub was invoked" [ -s "$argv" ] || exit 1
+      fx "knob ON: only the touched test file is passed (not the untouched one)" \
+        bash -c 'grep -q "src/touched.test.js" "$1" && ! grep -q "src/untouched.test.js" "$1"' _ "$argv" || exit 1
+      fx "knob ON: --tests appears before --model/--out in argv" grep -q -- "--tests src/touched.test.js --model" "$argv" || exit 1
+      report="$PROJECT/.night-shift/test-audit/spec.json"
+      fx "knob ON: report generated in the project run dir" [ -s "$report" ] || exit 1
+      fx "knob ON: test_audit event journaled with files + numeric final_total" \
+        bash -c "jq -e 'select(.type==\"test_audit\") | .payload.files==1 and .payload.final_total==1' '$RUN_ROOT/events.jsonl' >/dev/null" || exit 1
+      sec="$(test_audit_section)"
+      fx "section prints the advisory marker" bash -c 'printf "%s" "$1" | grep -q "TEST AUDIT"' _ "$sec" || exit 1
+      fx "section labeled non-authoritative" bash -c 'printf "%s" "$1" | grep -q "NOT authoritative"' _ "$sec" || exit 1
+      fx "section indents the report (no section forgery)" bash -c 'printf "%s" "$1" | grep -q "^    {"' _ "$sec" || exit 1
+      assemble_review_bundle implementation "$dir/bundle.md" || exit 1
+      fx "implementation persona bundle references the test audit" grep -q 'TEST AUDIT' "$dir/bundle.md" || exit 1
+    ) || exit 1
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_test_audit_wiring() {
+  local err status
+  err="$(_fixture_test_audit_wiring_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - test-audit wiring: post-candidate slot after port-audit, gated on the knob, scoped to ONLY the candidate-touched test files, {files,final_total} journaled, attached to persona bundle/observer\n'
+  else
+    printf 'not ok - test-audit wiring: post-candidate slot after port-audit, gated on the knob, scoped to ONLY the candidate-touched test files, {files,final_total} journaled, attached to persona bundle/observer\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi

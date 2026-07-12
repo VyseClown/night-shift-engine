@@ -112,6 +112,21 @@ directory; run engine/workflow git inside the engine directory.
   spec with a `## Design Contract` (judgment-heavy design-fidelity build — Flow B), and
   `NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) for the independent final gate —
   any set to `inherit` to fall back to the CLI's startup model.
+- **Test audit (opt-in, default OFF):** `NIGHT_SHIFT_TEST_AUDIT=1` runs
+  `scripts/test-audit.sh` once per candidate over ONLY the test files the
+  candidate diff touched (skips cleanly when none), on
+  `NIGHT_SHIFT_TEST_AUDIT_MODEL` (default `sonnet` — the Model ruling's
+  breadth tier, same as `NIGHT_SHIFT_PERSONA_MODEL`/port-audit; escalate to a
+  judgment-tier model only for specs where false-confidence findings would be
+  expensive to miss, it is not the default). A deterministic static scan for
+  vacuous-assertion smells plus one bounded agent judgment pass (confirm/
+  refute each static finding, hunt additional judgment-tier smells like a mock
+  tested against itself) — every count in the report is recomputed by the
+  script, never taken from the agent. NON-gating: the report is attached to
+  the implementation-review bundle and the observer's evidence, and a
+  `test_audit` event (`{files, final_total}`) is journaled; a failed or
+  missing report only WARNs. See `docs/COMMAND-PLAYBOOK.md` §11 for the
+  standalone CLI contract.
 - **Codex second opinion (opt-in, default OFF):** `NIGHT_SHIFT_CODEX_REVIEW=1`
   adds one bounded `codex exec -s read-only` advisory review per candidate
   (gpt-5.5 via the Codex CLI), handed to the observer as supplementary,
