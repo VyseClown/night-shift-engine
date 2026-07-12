@@ -1,5 +1,10 @@
 # In-loop visual-repair — validation record
 
+> Summary: End-to-end smoke of the engine-invoked `run_visual_inloop_repair`
+> wiring against a real perturbed candidate: capture → over-tolerance →
+> repair → `fix(visual): auto-repair …` commit → refreshed report for the
+> observer. All checks green.
+
 Date: 2026-06-25. Branch `feat/visual-repair-in-loop` (PR #28). This records the
 real, end-to-end smoke of the engine-invoked in-loop repair wiring.
 

@@ -328,6 +328,18 @@ NEED:    [what information or decision would unblock you]
 
 ---
 
+## Doc summaries + doc-freshness gate
+
+Every top-level `docs/*.md` opens with `> Summary: <1-3 lines>` in its first 7
+lines (`scripts/doc-summaries.sh --check` enforces this in CI) — not imposed
+on `docs/examples/`, `docs/proposals/`, `docs/superpowers/`, or target repos.
+Doc-freshness (`NIGHT_SHIFT_DOC_FRESHNESS`, default ON): the implement stage
+gets a candidate-stale-doc list and must update-or-declare `unaffected:` per
+doc; the observer spot-checks it, never gates. See
+`docs/superpowers/specs/2026-07-11-agentic-gaps-tranche-design.md` §B.
+
+---
+
 ## Related Files
 
 - `NIGHT_SHIFT_HOWTO.md` — human guide: what to write first and how a run works

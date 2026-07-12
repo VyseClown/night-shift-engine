@@ -141,6 +141,15 @@ CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
 # and a human dry-wire knob.
 PORT_AUDIT="${NIGHT_SHIFT_PORT_AUDIT:-0}"
 PORT_AUDIT_OFFLINE="${NIGHT_SHIFT_PORT_AUDIT_OFFLINE:-}"
+# Doc-freshness gate (agentic-gaps tranche §B; scripts/lib/doc-freshness.sh).
+# DEFAULT ON — the tranche's one deliberate exception to "new behavior defaults
+# off": this is prompt-level only (an extra paragraph in the implement prompt
+# + an advisory observer-evidence section), costs nothing extra when the
+# candidate-stale-doc list is empty (the common case — most diffs touch no
+# doc-adjacent path), and never gates a run — the observer is the enforcement
+# point (spot-checks the implementer's update-or-declare against the diff),
+# exactly like the reuse gate and port-audit before it. Set to "0" to disable.
+DOC_FRESHNESS="${NIGHT_SHIFT_DOC_FRESHNESS:-1}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
@@ -192,6 +201,10 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # End-of-run whole-branch sweep (NIGHT_SHIFT_BRANCH_SWEEP). See scripts/lib/sweep.sh.
 # shellcheck source=scripts/lib/sweep.sh
 . "$NIGHT_SHIFT_LIB/sweep.sh"
+# Doc-freshness candidate mapper (NIGHT_SHIFT_DOC_FRESHNESS). See
+# scripts/lib/doc-freshness.sh.
+# shellcheck source=scripts/lib/doc-freshness.sh
+. "$NIGHT_SHIFT_LIB/doc-freshness.sh"
 # Verdict extraction + live-model verdict normalization. See scripts/lib/normalize.sh.
 # shellcheck source=scripts/lib/normalize.sh
 . "$NIGHT_SHIFT_LIB/normalize.sh"
@@ -1118,6 +1131,48 @@ $block"
   printf '%s' "$out"
 }
 
+# Generates + inlines the candidate-stale-doc list into the implement-stage
+# prompt (agentic-gaps tranche §B, opening on Task 5's doc_freshness_candidates).
+# Self-contained generate-then-render, mirroring component_inventory_prompt_block:
+# writes $RUN_ROOT/doc-freshness/<task>.json fresh on every call (diffing
+# $BASE_COMMIT..HEAD — cheap, deterministic) and renders it if non-empty. Gated
+# on DOC_FRESHNESS (default ON; "0" disables both the write and the block).
+#
+# Because this runs at implement-stage prompt assembly, HEAD has not advanced
+# past $BASE_COMMIT until a candidate commit exists — so, like
+# check_component_reuse/port_audit_candidate's post-candidate evidence, the
+# FIRST pass through implementation is naturally empty (nothing committed yet
+# to diff) and the list only has real content on a re-review round following
+# an observer BLOCK (HEAD is then the previous candidate). This is deliberate,
+# not a bug: the SAME file this function writes is later read verbatim by
+# doc_freshness_section() for the observer, so the observer spot-checks the
+# implementer's declarations against the EXACT list the implementer was shown,
+# not a re-derived (and possibly different) one.
+#
+# Any generation failure (bad args, no jq, unwritable RUN_ROOT) degrades to an
+# empty block — doc-freshness is advisory context, never allowed to block a
+# prompt from being assembled.
+doc_freshness_prompt_block() {
+  local spec="$1" out lines truncated_note
+  [ "$DOC_FRESHNESS" = "1" ] || return 0
+  out="$RUN_ROOT/doc-freshness/$(basename "$spec" .md).json"
+  mkdir -p "$(dirname "$out")" 2>/dev/null || return 0
+  doc_freshness_candidates "$PROJECT" "$BASE_COMMIT" "$out" 2>/dev/null || return 0
+  [ -s "$out" ] || return 0
+  jq empty "$out" >/dev/null 2>&1 || return 0
+  integrity_put "$out"
+  jq -e '(.docs // []) | length > 0' "$out" >/dev/null 2>&1 || return 0
+  lines="$(jq -r '.docs[] | "- " + .path + " (" + .reason + ")"' "$out" 2>/dev/null)"
+  [ -n "$lines" ] || return 0
+  truncated_note=""
+  [ "$(jq -r '.truncated // false' "$out" 2>/dev/null)" != "true" ] ||
+    truncated_note=" (list capped at 10 — more candidates may exist)"
+  printf '\n## Doc-freshness candidates%s\n' "$truncated_note"
+  printf 'These docs sit near or mention files this candidate has touched so far and\nmay now describe stale behavior:\n'
+  printf '%s\n' "$lines"
+  printf '\nFor each doc above: update it in this candidate if your changes invalidate any\nclaim it makes, OR include a line `unaffected: <path>: <one-line reason>` in your\ncompletion summary. The observer will spot-check declarations against the diff.\n'
+}
+
 COMPONENT_INVENTORY_ROW_CAP=40
 
 # Generates + inlines the target project's component inventory into the planning
@@ -1198,7 +1253,7 @@ primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
-  local rejection_note malformed_prev
+  local rejection_note malformed_prev doc_freshness_note
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
@@ -1261,6 +1316,7 @@ Fix exactly that and rewrite the WHOLE file this turn in the required shape belo
 "
   fi
   design_build_note=""
+  doc_freshness_note=""
   case "$stage" in
     planning)
       if spec_has_design_contract "$SPEC"; then
@@ -1270,6 +1326,12 @@ piece of the design to a reuse decision before implementation starts.
 $(component_inventory_prompt_block "$SPEC")"
       fi ;;
     implementation|implementation_review)
+      # Doc-freshness (agentic-gaps §B): unconditional, unlike design_build_note
+      # above — every spec's implement stage gets the candidate-stale-doc list,
+      # not just Design-Contract ones. Empty string (zero cost) when the knob is
+      # off, no candidates match, or (the common first-pass case) nothing has
+      # been committed yet to diff against.
+      doc_freshness_note="$(doc_freshness_prompt_block "$SPEC")"
       if spec_has_design_contract "$SPEC"; then
         design_build_note="
 Design-fidelity build (this spec has a \`## Design Contract\`). You are building this
@@ -1308,6 +1370,7 @@ Current stage: $stage
 Base commit: $BASE_COMMIT
 $workdir_note
 $design_build_note
+$doc_freshness_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
 You own planning, implementation, resolving review findings, validation,
@@ -1781,6 +1844,11 @@ assemble_review_bundle() {
       # Same timing note applies: port_audit_candidate runs post-candidate, so
       # a report only exists here on a re-review round. Empty on a first pass.
       port_audit_section
+      # doc_freshness_prompt_block writes the candidate list at implement-stage
+      # prompt time (this SAME stage), so — unlike the two sections above —
+      # this one can already be populated on the current round, not just a
+      # re-review round.
+      doc_freshness_section
     fi
   } >"$out"
 }
@@ -2646,6 +2714,27 @@ SCREENS
   return 0
 }
 
+# Supplementary reviewer surface for the doc-freshness candidate list
+# (agentic-gaps tranche §B) — same non-authoritative framing and dual
+# attachment (implementation-review persona bundle via assemble_review_bundle,
+# observer context via run_observer) as port_audit_section/
+# reuse_violations_section. Reads the SAME $RUN_ROOT/doc-freshness/<task>.json
+# doc_freshness_prompt_block wrote at implement-stage prompt time — this is
+# deliberately keyed on the file existing, not on $DOC_FRESHNESS (mirrors
+# port_audit_section: evidence already on disk is worth surfacing even if the
+# knob changed between rounds). Empty when no file exists yet (nothing has
+# been generated this task) or its candidate list is empty.
+doc_freshness_section() {
+  local f
+  f="$RUN_ROOT/doc-freshness/$(basename "$SPEC" .md).json"
+  [ -s "$f" ] || return 0
+  jq -e '(.docs // []) | length > 0' "$f" >/dev/null 2>&1 || return 0
+  integrity_guard "$f" doc-freshness "the doc-freshness candidate list"
+  printf '%s\n' '--- DOC FRESHNESS (candidate-stale docs; implementer must have updated or declared) ---'
+  printf 'Docs likely stale from this change (proximity/mention-ranked; advisory, NOT\nauthoritative). The implementer was instructed to either update each doc listed\nor declare `unaffected: <path>: <reason>` in its completion summary — spot-check\nany declarations against the diff; a declaration that does not hold up is itself\na finding.\n\n'
+  jq -c '.docs[]' "$f" 2>/dev/null | sed 's/^/    /'
+}
+
 # Seam for fixtures: is the Codex CLI available? (command -v inline would make
 # the missing-CLI path untestable on machines that have codex installed.)
 codex_available() { command -v codex >/dev/null 2>&1; }
@@ -2717,7 +2806,10 @@ $retry_note
 The sections marked "authoritative" (the engine-computed base..candidate diff and
 the engine-run validation) are ground truth produced by the wrapper, not the
 implementer — weight them over any primary-supplied artifact, which is
-supplementary and may be incomplete.
+supplementary and may be incomplete. If a "--- DOC FRESHNESS ---" section is
+present, spot-check each \`unaffected: <path>: <reason>\` declaration in the
+primary's completion summary against the candidate diff — a declaration that
+does not hold up under the diff is itself a finding.
 
 Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:
@@ -2944,6 +3036,7 @@ run_observer() {
     codex_review_section "$candidate"
     reuse_violations_section
     port_audit_section
+    doc_freshness_section
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30

@@ -1,5 +1,10 @@
 # Command Playbook — pick the command for the task
 
+> Summary: Task → command index (10 sections) for Figma export, RN
+> visual-review/repair/Maestro capture, running a night-shift, the
+> design-extract/port-audit CLIs, and `--sweep-only`. Start at the "Quick
+> chooser" table; each row links to its `§N` section for the full command.
+
 A task → command index for the visual-fidelity / Figma / night-shift capabilities in
 this repo. Written for both humans and a fresh Claude instance: **match the task to a
 row, run the command.** Script paths (`scripts/…`) are relative to the engine repo

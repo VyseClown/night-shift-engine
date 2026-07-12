@@ -1,5 +1,10 @@
 # Codex CLI Setup
 
+> Summary: Personal machine setup log for the Codex CLI — the `[tui]`
+> status-line config in `~/.codex/config.toml`, Zsh completion, and command
+> aliases (`c`, `cr`, `cf`, `cx`, `cdoctor`, `cfeatures`). Not engine code;
+> a historical record of a local terminal customization.
+
 This document describes the Codex CLI customization added on June 5, 2026.
 The configuration focuses on session visibility, usage limits, token totals,
 project context, and faster terminal workflows.

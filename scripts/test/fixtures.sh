@@ -310,6 +310,11 @@ run_dry_fixtures() {
   fixture_assert "doc-freshness: candidate list capped at 10 with truncated:true" fixture_doc_freshness_cap "$root"
   fixture_assert "doc-freshness: empty diff (base==HEAD) yields docs:[] truncated:false" fixture_doc_freshness_empty_diff "$root"
   fixture_assert "doc-freshness: doc mentioning a diff-added exported symbol is found (symbol: reason)" fixture_doc_freshness_symbol "$root"
+  # fixture_doc_freshness_prompt prints its own ok/not-ok (the _run/wrapper
+  # subshell idiom, same as fixture_manifest_prompt above) — invoked directly,
+  # NOT via fixture_assert, which would print a duplicate ok line.
+  fixture_doc_freshness_prompt
+  fixture_assert "doc-summaries: --check passes on conforming docs, fails naming the offender on non-conforming ones" fixture_doc_summaries_check "$root"
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -7102,6 +7107,127 @@ fixture_doc_freshness_symbol() {
   fx "docs/parsing.md found via symbol:parseFoo, score 1" bash -c '
     jq -e "[.docs[] | select(.path==\"docs/parsing.md\" and .reason==\"symbol:parseFoo\" and .score==1)] | length==1" "$1" >/dev/null
   ' _ "$out"
+  return 0
+}
+
+# doc_freshness_prompt_block / doc_freshness_section (agentic-gaps tranche §B,
+# Task 6): the implement-stage prompt injection + observer-evidence surface
+# built atop doc_freshness_candidates above. Both live in night-shift.sh
+# itself (already in scope here, same as manifest_prompt_block/
+# component_inventory_prompt_block, sourced by the orchestrator AFTER their
+# definitions) and read/write engine globals (PROJECT, BASE_COMMIT, SPEC,
+# RUN_ROOT, DOC_FRESHNESS) that MUST NOT leak into later fixtures — run in an
+# isolating subshell via command substitution (the _run/wrapper split +
+# "DELIBERATELY NOT local" dir idiom from _fixture_manifest_prompt_run).
+_fixture_doc_freshness_prompt_run() {
+  local proj base spec spec2 block section
+  # DELIBERATELY NOT local for the dir itself, same reasoning as
+  # _fixture_manifest_prompt_run: the EXIT trap fires after this function
+  # returns (the last statement of the enclosing command-substitution
+  # subshell), when a `local` dir would already be out of scope.
+  DOC_FRESHNESS_PROMPT_FIXTURE_DIR="$WORKSPACE_ROOT/.night-shift-fixture-doc-freshness-prompt.$$"
+  mkdir -p "$DOC_FRESHNESS_PROMPT_FIXTURE_DIR" || return 1
+  trap 'rm -rf "${DOC_FRESHNESS_PROMPT_FIXTURE_DIR:-}"' EXIT
+
+  proj="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/proj"
+  mkdir -p "$proj/src/mod" "$proj/docs" || return 1
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  printf 'Unrelated prose that happens to mention util.ts by name.\n' >"$proj/docs/other.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+
+  # These are the SAME globals the real orchestrator carries through a run;
+  # setting them here (inside the command-substitution subshell only) is what
+  # lets doc_freshness_prompt_block/doc_freshness_section run exactly as they
+  # would mid-run, without touching the outer fixture suite's own state.
+  PROJECT="$proj"
+  BASE_COMMIT="$base"
+  RUN_ROOT="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/rr"
+  RUN_ID="doc-freshness-prompt-fixture"
+  mkdir -p "$RUN_ROOT" || return 1
+  spec="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/spec.md"
+  printf '# Just a plain spec (no Design Contract needed — this gate is unconditional)\n' >"$spec"
+  SPEC="$spec"
+  DOC_FRESHNESS=1
+
+  block="$(doc_freshness_prompt_block "$spec")"
+  fx "prompt block: JSON generated at RUN_ROOT/doc-freshness/<task>.json" \
+    [ -s "$RUN_ROOT/doc-freshness/$(basename "$spec" .md).json" ]
+  fx "prompt block: mentions the doc-freshness heading" \
+    bash -c 'printf "%s" "$1" | grep -q "Doc-freshness candidates"' _ "$block"
+  fx "prompt block: lists src/mod/CLAUDE.md with its dir reason" \
+    bash -c 'printf "%s" "$1" | grep -qF "src/mod/CLAUDE.md (dir:src/mod)"' _ "$block"
+  fx "prompt block: instructs update-or-declare unaffected" \
+    bash -c 'printf "%s" "$1" | grep -q "unaffected:"' _ "$block"
+
+  section="$(doc_freshness_section)"
+  fx "observer section: DOC FRESHNESS heading present" \
+    bash -c 'printf "%s" "$1" | grep -q "DOC FRESHNESS"' _ "$section"
+  fx "observer section: same doc entry surfaced to the observer" \
+    bash -c 'printf "%s" "$1" | grep -q "src/mod/CLAUDE.md"' _ "$section"
+
+  # Knob off -> empty block, regardless of the file already on disk.
+  DOC_FRESHNESS=0
+  block="$(doc_freshness_prompt_block "$spec")"
+  [ -z "$block" ] || { printf 'expected empty block with DOC_FRESHNESS=0, got: %s\n' "$block"; return 1; }
+  DOC_FRESHNESS=1
+
+  # Empty candidate list (BASE_COMMIT==HEAD, nothing to diff) -> empty block,
+  # on a second spec so the first spec's file/section above are untouched.
+  spec2="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/spec2.md"
+  printf '# A second plain spec\n' >"$spec2"
+  SPEC="$spec2"
+  BASE_COMMIT="$(git -C "$proj" rev-parse HEAD)"
+  block="$(doc_freshness_prompt_block "$spec2")"
+  [ -z "$block" ] || { printf 'expected empty block for an empty candidate diff, got: %s\n' "$block"; return 1; }
+  return 0
+}
+
+fixture_doc_freshness_prompt() {
+  local err status
+  err="$(_fixture_doc_freshness_prompt_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - doc-freshness prompt: implement-prompt block + observer section render from candidates; empty on knob-off/empty-diff\n'
+  else
+    printf 'not ok - doc-freshness prompt: implement-prompt block + observer section render from candidates; empty on knob-off/empty-diff\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/doc-summaries.sh (agentic-gaps tranche §B): the `docs/*.md` `>
+# Summary:` convention checker. Exercises the DOC_SUMMARIES_DIR test seam
+# (documented in the script's own header) against throwaway fixture docs —
+# never the real docs/ tree — so this passes regardless of whether this
+# repo's own docs currently conform. A plain external-script invocation (no
+# engine globals touched), so no subshell-isolation wrapper is needed, same
+# as fixture_doc_freshness_basic above.
+fixture_doc_summaries_check() {
+  local root="$1" dir out rc
+  dir="$root/doc-summaries-fixture"
+  mkdir -p "$dir/good" "$dir/bad" || return 1
+  printf '# Good doc\n\n> Summary: this doc conforms to the convention.\n\nBody.\n' >"$dir/good/ok.md"
+  printf '# Bad doc\n\nNo summary line anywhere in the first 7 lines.\n' >"$dir/bad/missing.md"
+  printf '# Also good\n\n> Summary: this one conforms too, in the same dir as the bad one.\n\nBody.\n' >"$dir/bad/ok.md"
+
+  fx "conforming dir: --check exits 0" \
+    env "DOC_SUMMARIES_DIR=$dir/good" "$WORKSPACE_ROOT/scripts/doc-summaries.sh" --check
+
+  out="$(DOC_SUMMARIES_DIR="$dir/bad" "$WORKSPACE_ROOT/scripts/doc-summaries.sh" --check 2>&1)"
+  rc=$?
+  [ "$rc" -eq 1 ] || { printf 'expected exit 1 on a non-conforming dir, got %s (output: %s)\n' "$rc" "$out"; return 1; }
+  fx "non-conforming dir: names the offending file" \
+    bash -c 'printf "%s" "$1" | grep -q "missing.md"' _ "$out"
+  fx_not "non-conforming dir: the conforming file in the same dir is not flagged" \
+    bash -c 'printf "%s" "$1" | grep -q "bad/ok.md"' _ "$out"
   return 0
 }
 

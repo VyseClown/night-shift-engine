@@ -1,5 +1,10 @@
 # Review Personas
 
+> Summary: The six rn-track review personas, their Review Profiles
+> (`full`/`frontend`/`logic`/`native`) and floor, the four cross-track
+> optional personas (Product/Design Fidelity/Security/API Contract Reviewer),
+> the `- Personas:` override, and the visual-validation follow-up status.
+
 Six specialized reviewers used for plan and implementation review. All six
 always respond. Each persona has a narrow focus and owns the matching
 documentation assessment. When no domain-relevant behavior or documentation
