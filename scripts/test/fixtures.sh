@@ -317,6 +317,7 @@ run_dry_fixtures() {
   fixture_doc_freshness_prompt
   fixture_doc_freshness_recompute
   fixture_assert "doc-summaries: --check passes on conforming docs, fails naming the offender on non-conforming ones" fixture_doc_summaries_check "$root"
+  fixture_test_audit_static
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -7335,5 +7336,67 @@ fixture_doc_summaries_check() {
   fx_not "non-conforming dir: the conforming file in the same dir is not flagged" \
     bash -c 'printf "%s" "$1" | grep -q "bad/ok.md"' _ "$out"
   return 0
+}
+
+# scripts/lib/test-audit-static.js (agentic-gaps tranche §C): the
+# false-confidence test-audit deterministic layer — a zero-dep line scan for
+# tests that PASS while asserting nothing (evidence: 2026-07-11,
+# `expect(result.installmentGroupId).not.toBe("group-a")` passed vacuously
+# because the property doesn't exist). Exercises the CLI directly against
+# scripts/test/fixtures/test-audit/ (vacuous.test.js: one instance of every
+# rule; clean.test.js: genuine assertions only) plus a tiny src/ fixture for
+# --src, same pattern as fixture_port_audit_static above — no chrome/
+# network/claude CLI, runs unconditionally everywhere incl. CI.
+_fixture_test_audit_static_run() {
+  local fixture_dir out status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/test-audit"
+  # DELIBERATELY NOT local, same reasoning as _fixture_port_audit_static_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  TEST_AUDIT_STATIC_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-test-audit-static.$$"
+  mkdir -p "$TEST_AUDIT_STATIC_OUT_DIR" || return 1
+  trap 'rm -rf "${TEST_AUDIT_STATIC_OUT_DIR:-}"' EXIT
+
+  out="$TEST_AUDIT_STATIC_OUT_DIR/report.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$fixture_dir" --src "$fixture_dir/src" --out "$out" >"$out.log" 2>&1; then
+    status=$?
+    printf 'test-audit-static.js dispatch failed (exit %s): %s\n' "$status" "$(cat "$out.log")"
+    return 1
+  fi
+  [ -s "$out" ] || { printf 'report missing/empty: %s\n' "$out"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-test-audit-static/1\"' '$out' >/dev/null"
+  fx "not-tobe-literal: property never asserted truthy elsewhere -> flagged exactly once" \
+    bash -c "jq -e '.counts[\"not-tobe-literal\"] == 1' '$out' >/dev/null"
+  fx "assert-on-unknown-property: bogus property flagged, real property (groupId) passes -> exactly one finding" \
+    bash -c "jq -e '.counts[\"assert-on-unknown-property\"] == 1' '$out' >/dev/null"
+  fx "tobe-true-constant: expect(true).toBe(true) flagged exactly once" \
+    bash -c "jq -e '.counts[\"tobe-true-constant\"] == 1' '$out' >/dev/null"
+  fx "empty-test-body: it(..., () => {}) flagged exactly once" \
+    bash -c "jq -e '.counts[\"empty-test-body\"] == 1' '$out' >/dev/null"
+  fx "expectless-test: code-but-no-expect body flagged exactly once" \
+    bash -c "jq -e '.counts[\"expectless-test\"] == 1' '$out' >/dev/null"
+  fx "skipped-test: describe.skip flagged exactly once" \
+    bash -c "jq -e '.counts[\"skipped-test\"] == 1' '$out' >/dev/null"
+  fx "clean.test.js contributes zero findings" \
+    bash -c "jq -e '[.findings[] | select(.file | endswith(\"clean.test.js\"))] | length == 0' '$out' >/dev/null"
+  fx "every finding names the vacuous fixture file" \
+    bash -c "jq -e '[.findings[] | select(.file | endswith(\"vacuous.test.js\") | not)] | length == 0' '$out' >/dev/null"
+  return 0
+}
+
+fixture_test_audit_static() {
+  local err status
+  err="$(_fixture_test_audit_static_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n'
+  else
+    printf 'not ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
 }
 
