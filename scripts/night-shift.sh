@@ -80,6 +80,13 @@ IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
 # the IMPLEMENT scope bumps to this stronger model. inherit/sonnet to override.
 DESIGN_IMPLEMENT_MODEL="${NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL:-opus}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
+# Optional end-of-run whole-branch sweep (scripts/lib/sweep.sh): one advisory
+# strong-model review of the entire base..HEAD diff after the last task
+# completes, looking for what per-task reviews cannot see (cross-task
+# interactions, accumulated minor findings, hygiene). OFF by default; the
+# sweep model defaults to the observer's (same "strong final gate" tier).
+BRANCH_SWEEP="${NIGHT_SHIFT_BRANCH_SWEEP:-0}"
+SWEEP_MODEL="${NIGHT_SHIFT_SWEEP_MODEL:-$OBSERVER_MODEL}"
 # Optional external second perspective via the Codex CLI (gpt-5.5). OFF by
 # default and strictly ADVISORY when on: one bounded `codex exec` review per
 # candidate, handed to the observer as supplementary (non-gating) evidence.
@@ -144,6 +151,9 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # Engine-private integrity anchor for wrapper-owned files. See scripts/lib/integrity.sh.
 # shellcheck source=scripts/lib/integrity.sh
 . "$NIGHT_SHIFT_LIB/integrity.sh"
+# End-of-run whole-branch sweep (NIGHT_SHIFT_BRANCH_SWEEP). See scripts/lib/sweep.sh.
+# shellcheck source=scripts/lib/sweep.sh
+. "$NIGHT_SHIFT_LIB/sweep.sh"
 # Verdict extraction + live-model verdict normalization. See scripts/lib/normalize.sh.
 # shellcheck source=scripts/lib/normalize.sh
 . "$NIGHT_SHIFT_LIB/normalize.sh"
@@ -3011,6 +3021,15 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  # Optional advisory whole-branch review (Task 1, agentic-gaps tranche):
+  # never gates completion here — a fix cycle on the verdict lands in a later
+  # task. sweep_build_package refusing (main/master tip, empty branch) is a
+  # clean skip, not a failure; its stderr names the reason for the log line.
+  if [ "$BRANCH_SWEEP" != "0" ]; then
+    sweep_build_package "$PROJECT" "$RUN_ROOT/sweep" >/dev/null 2>"$RUN_ROOT/sweep-skip.log" &&
+      sweep_run "$PROJECT" "$RUN_ROOT/sweep" ||
+      log "branch sweep skipped: $(tail -1 "$RUN_ROOT/sweep-skip.log" 2>/dev/null)"
+  fi
   # The journal is anchored on every append (events.sh); verify it here — the
   # last trust point before it becomes the archived record of the run.
   integrity_guard "$RUN_ROOT/events.jsonl" events "the decision journal"

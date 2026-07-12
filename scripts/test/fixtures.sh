@@ -287,6 +287,9 @@ run_dry_fixtures() {
   fixture_port_audit_normalize
   fixture_port_audit_offline
   fixture_port_audit_wiring
+  fixture_sweep_package
+  fixture_sweep_verdict
+  fixture_assert "branch sweep: session run writes verdict + journals a sweep event" fixture_sweep_run "$root"
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
@@ -6341,6 +6344,88 @@ fixture_recovery_guard_ratelimit_dirty() {
   rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
   fx "recover_run completes the auto-recovery path (rc 0), guard never evaluated" test "$rc" = "0"
   fx "the rate-limit wait path was actually taken (not the guard's die)" test -f "$dir/waited.txt"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Branch sweep (scripts/lib/sweep.sh; agentic-gaps Task 1, advisory core).
+# ---------------------------------------------------------------------------
+
+# sweep: package builder is deterministic and refuses main/master tips
+fixture_sweep_package() {
+  local proj out mb
+  proj="$FIXTURE_ROOT/sweep-pkg-proj"
+  _fixture_recovery_guard_project "$proj" || return 1
+  (cd "$proj" && git checkout -q -b feat/x &&
+    printf 'a\n' >f.txt && git add f.txt && git commit -qm one &&
+    printf 'b\n' >>f.txt && git add f.txt && git commit -qm two)
+  out="$FIXTURE_ROOT/sweep-pkg"
+  mb="$(sweep_build_package "$proj" "$out")"
+  fixture_assert "sweep package: diff written" test -s "$out/package.diff"
+  fixture_assert "sweep package: meta has 2 commits" \
+    test "$(jq -r '.commit_count' "$out/package.meta.json")" = "2"
+  fixture_assert "sweep package: merge-base printed" test -n "$mb"
+  (cd "$proj" && git checkout -q "$(git rev-parse main 2>/dev/null || git rev-parse master)")
+  fixture_reject "sweep package: refuses default-branch tip" \
+    sweep_build_package "$proj" "$FIXTURE_ROOT/sweep-pkg2"
+}
+
+# sweep: verdict parsing accepts only the two contract words
+fixture_sweep_verdict() {
+  fixture_assert "verdict: PASS parsed" \
+    test "$(printf 'blah\nSWEEP_PASS\n' | sweep_parse_verdict)" = "SWEEP_PASS"
+  fixture_assert "verdict: FINDINGS parsed" \
+    test "$(printf 'SWEEP_FINDINGS: 3\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
+  fixture_assert "verdict: garbage -> FINDINGS (fail-closed)" \
+    test "$(printf 'no verdict here\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
+  local prompt; prompt="$(sweep_prompt "/tmp/sweep-out")"
+  fixture_assert "sweep prompt: names both contract words + the package path" \
+    bash -c 'case "$1" in
+      *SWEEP_PASS*SWEEP_FINDINGS*"/tmp/sweep-out/package.diff"*) exit 0 ;;
+      *) exit 1 ;;
+    esac' _ "$prompt"
+}
+
+# sweep: end-to-end session run against a stubbed `claude` — verdict.txt
+# content on PASS and on FINDINGS, plus a `sweep` event line when RUN_ROOT is
+# set. Stubs `claude` as a shell function inside a subshell (same seam as
+# fixture_recovery_invoke_observer_once_detects_rate_limit) so the override
+# never leaks into later fixtures in this process.
+fixture_sweep_run() {
+  local root="$1" dir="$root/sweep-run" proj
+  proj="$dir/proj"
+  mkdir -p "$proj"
+  (
+    OBSERVER_MODEL="inherit"; SWEEP_MODEL="inherit"
+    local out
+
+    out="$dir/out-pass"; mkdir -p "$out"
+    # Drain stdin like the real `claude -p` CLI does before replying: sweep_prompt
+    # writes its prompt via a heredoc, and bash's heredoc plumbing piped into a
+    # STUBBED FUNCTION (not the real external binary) that never reads stdin can
+    # SIGPIPE the writer — a test-only artifact of the pipe/heredoc/function
+    # combination, invisible in production where claude always reads the prompt.
+    claude() { cat >/dev/null; printf '{"result":"looks fine\nSWEEP_PASS"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run (PASS): verdict.txt is SWEEP_PASS" \
+      bash -c 'test "$(cat "$1")" = "SWEEP_PASS"' _ "$out/verdict.txt"
+
+    out="$dir/out-findings"; mkdir -p "$out"
+    claude() { cat >/dev/null; printf '{"result":"issues found\nSWEEP_FINDINGS: 2"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run (FINDINGS): verdict.txt is SWEEP_FINDINGS" \
+      bash -c 'test "$(cat "$1")" = "SWEEP_FINDINGS"' _ "$out/verdict.txt"
+
+    # RUN_ROOT set: the sweep event must land in the run's decision journal.
+    RUN_ROOT="$dir/run"; RUN_ID="sweeprun-$$"
+    mkdir -p "$RUN_ROOT"
+    out="$dir/out-journal"; mkdir -p "$out"
+    claude() { cat >/dev/null; printf '{"result":"fine\nSWEEP_PASS"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep event journaled to events.jsonl" \
+      bash -c 'grep -q "\"type\":\"sweep\"" "$1"' _ "$RUN_ROOT/events.jsonl"
+    exit 0
+  ) >/dev/null || return 1
   return 0
 }
 
