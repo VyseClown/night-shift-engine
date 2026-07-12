@@ -53,6 +53,79 @@ sweep_parse_verdict() {
   esac
 }
 
+# Distill this run's journal into feedback for the human who authors specs
+# and runs the engine — a separate, always-on concern from the sweep above
+# (that one reviews the branch's code; this one reviews the RUN itself: spec
+# ambiguities, loops, validation friction). Runs unconditionally at completion
+# regardless of BRANCH_SWEEP (see complete_run's call site, which sits before
+# the sweep block). By completion the stage-scoped sessions are already gone,
+# so this is a short FRESH `claude -p` session, same idiom as sweep_run, fed
+# the spec path + the tail of events.jsonl + the review-round count rather
+# than asked to explore the repo itself.
+# Every failure mode (no run context, session error, empty/unparsable reply,
+# no bullet lines, an unwritable feedback.md) warns and returns 0 — feedback
+# must never block or delay completion. Guards every run-scoped global with
+# ${VAR:-} (set -u is in effect for the whole orchestrator).
+write_run_feedback() {
+  local project="$1" out feedback model raw rc=0 tail_events round result bullets lines
+  [ -n "${RUN_ROOT:-}" ] && [ -n "${SPEC:-}" ] && [ -f "${STATE:-}" ] || {
+    log "WARN: run feedback skipped (no run context — RUN_ROOT/SPEC/STATE unset)"
+    return 0
+  }
+  [ -f "${RUN_ROOT}/events.jsonl" ] || {
+    log "WARN: run feedback skipped (no events.jsonl at $RUN_ROOT)"
+    return 0
+  }
+  out="$RUN_ROOT/feedback"
+  mkdir -p "$out" || { log "WARN: run feedback skipped (mkdir failed for $out)"; return 0; }
+  feedback="$project/.night-shift/feedback.md"
+  tail_events="$(tail -n 200 "$RUN_ROOT/events.jsonl" 2>/dev/null)"
+  round="$(jq -r '.review_round // 0' "$STATE" 2>/dev/null)" || round=""
+  [ -n "$round" ] || round=0
+  model="$(resolve_effective_model "${IMPLEMENT_MODEL:-sonnet}")"
+  raw="$out/session.json"
+  # model_flag intentionally word-splits into `--model X` (or nothing); same
+  # idiom as sweep_run/invoke_observer_once.
+  # shellcheck disable=SC2046
+  (cd "$project" && {
+    printf 'Spec: %s\n' "$SPEC"
+    printf 'Review rounds completed: %s\n\n' "$round"
+    printf 'Write 5-15 bullet lines of feedback for the human who authors specs and\n'
+    printf 'runs this engine: spec ambiguities you can infer from the journal below,\n'
+    printf 'stages that looped, validation friction, anything a better spec would\n'
+    printf 'have prevented. Plain `- ` bullets only, no headings.\n\n'
+    printf '## events.jsonl (last 200 lines)\n%s\n' "$tail_events"
+  } | claude -p $(model_flag "$model") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "WARN: run feedback session failed (rc=$rc; see $raw.err)"
+    return 0
+  fi
+  result="$(jq -r '.result // empty' "$raw" 2>/dev/null)"
+  [ -n "$result" ] || {
+    log "WARN: run feedback skipped (empty/unparsable claude reply, see $raw)"
+    return 0
+  }
+  bullets="$(printf '%s\n' "$result" | grep -E '^- ')"
+  [ -n "$bullets" ] || {
+    log "WARN: run feedback skipped (reply had no \`- \` bullet lines, see $raw)"
+    return 0
+  }
+  lines="$(printf '%s\n' "$bullets" | grep -c '^- ')"
+  mkdir -p "$project/.night-shift" || {
+    log "WARN: run feedback skipped (mkdir failed for $project/.night-shift)"
+    return 0
+  }
+  {
+    printf '\n## run %s — %s — %s\n\n' "$RUN_ID" "$(now_iso)" "$(basename "$SPEC")"
+    printf '%s\n' "$bullets"
+  } >>"$feedback" || {
+    log "WARN: run feedback append to $feedback failed"
+    return 0
+  }
+  emit_event run_feedback "$(jq -cn --argjson n "$lines" '{lines:$n}')"
+  return 0
+}
+
 sweep_prompt() {
   local out="$1"
   cat <<'EOF'

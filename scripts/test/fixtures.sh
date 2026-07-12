@@ -300,6 +300,8 @@ run_dry_fixtures() {
   fixture_assert "branch sweep: --sweep-only bare never runs the fix cycle (advisory by default)" fixture_sweep_only_bare_skips_fix "$root"
   fixture_assert "branch sweep: --sweep-only NIGHT_SHIFT_BRANCH_SWEEP=1 runs the fix cycle (explicit opt-in)" fixture_sweep_only_branch_sweep_1_runs_fix "$root"
   fixture_assert "branch sweep: fix cycle skips revalidation cleanly when SPEC is set but RUN_ROOT is not" fixture_sweep_fix_cycle_no_run_root_skips_revalidation "$root"
+  fixture_assert "run feedback: writes one section + event, second run appends" fixture_run_feedback_writes_and_appends "$root"
+  fixture_assert "run feedback: session failure warns and never blocks (advisory)" fixture_run_feedback_session_failure_is_advisory "$root"
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
@@ -6821,6 +6823,98 @@ fixture_sweep_fix_cycle_no_run_root_skips_revalidation() {
       bash -c 'test "$(git -C "$1" rev-parse HEAD)" != "$2"' _ "$proj" "$tip_before"
     fx "no RUN_ROOT: cycle completed via the re-sweep (SWEEP_PASS)" \
       test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Run feedback (scripts/lib/sweep.sh; agentic-gaps Task 3 — write_run_feedback).
+# Same run-wrap-up concern as the branch sweep above: a short fresh session
+# distills the run's journal into feedback.md for the human who authors specs.
+# Unlike sweep it runs unconditionally at completion (not gated by
+# BRANCH_SWEEP), so its fixtures set up a full RUN_ROOT/STATE/SPEC context of
+# their own rather than reusing _fixture_sweep_branch_project.
+# ---------------------------------------------------------------------------
+
+# Shared setup: a project dir + a run context (RUN_ROOT/RUN_ID/STATE/SPEC) with
+# a minimal events.jsonl and a state.json carrying a review_round, so
+# write_run_feedback has everything it gathers without touching a real run.
+# Called directly (never via command substitution, which would fork a
+# subshell and lose every assignment below) — writes into the CALLER's
+# locals via bash's dynamic scoping (same idiom this file already uses; see
+# the SC2318 note in the file-header suppression block), so the caller must
+# `local proj feedback` (or similar) before calling.
+_fixture_run_feedback_context() {
+  local base="$1"
+  proj="$base/proj"
+  mkdir -p "$proj/.night-shift" "$base/run"
+  RUN_ROOT="$base/run"
+  RUN_ID="feedback-$$"
+  STATE="$RUN_ROOT/state.json"
+  SPEC="$base/spec.md"
+  IMPLEMENT_MODEL="inherit"
+  printf -- '- Track: node\n' >"$SPEC"
+  jq -n '{review_round:2}' >"$STATE"
+  printf '{"ts":"2026-07-12T00:00:00Z","run":"feedback","stage":"implement","type":"stage_start","payload":null}\n' \
+    >"$RUN_ROOT/events.jsonl"
+}
+
+# write_run_feedback: a stubbed claude reply with 6 bullet lines lands one
+# `## run` section in <project>/.night-shift/feedback.md with all 6 `- ` lines,
+# and a run_feedback event with lines:6 in events.jsonl. A second invocation
+# APPENDS a second section rather than overwriting the first.
+fixture_run_feedback_writes_and_appends() {
+  local root="$1" dir="$root/feedback-ok" proj feedback
+  mkdir -p "$dir"
+  (
+    _fixture_run_feedback_context "$dir"
+    feedback="$proj/.night-shift/feedback.md"
+    claude() {
+      cat >/dev/null
+      printf '{"result":"- one\\n- two\\n- three\\n- four\\n- five\\n- six"}\n'
+    }
+    write_run_feedback "$proj"
+    fx "feedback.md created" test -f "$feedback"
+    fx "feedback.md has exactly one ## run section" \
+      test "$(grep -c '^## run ' "$feedback")" -eq 1
+    fx "feedback.md has 6 bullet lines" \
+      test "$(grep -c '^- ' "$feedback")" -eq 6
+    fx "run_feedback event journaled with lines:6" \
+      bash -c 'grep -q "\"type\":\"run_feedback\".*\"lines\":6" "$1"' _ "$RUN_ROOT/events.jsonl"
+
+    # Second invocation (a later run against the same project) appends rather
+    # than overwrites.
+    claude() {
+      cat >/dev/null
+      printf '{"result":"- seven\\n- eight"}\n'
+    }
+    write_run_feedback "$proj"
+    fx "feedback.md now has two ## run sections" \
+      test "$(grep -c '^## run ' "$feedback")" -eq 2
+    fx "feedback.md now has 8 bullet lines total" \
+      test "$(grep -c '^- ' "$feedback")" -eq 8
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# write_run_feedback: every failure mode (a failing claude session here) must
+# warn and return 0 without ever creating/mutating feedback.md — feedback is
+# advisory and must never block or delay completion.
+fixture_run_feedback_session_failure_is_advisory() {
+  local root="$1" dir="$root/feedback-fail" proj feedback rc
+  mkdir -p "$dir"
+  (
+    _fixture_run_feedback_context "$dir"
+    feedback="$proj/.night-shift/feedback.md"
+    claude() { cat >/dev/null; exit 1; }
+    rc=0
+    write_run_feedback "$proj" || rc=$?
+    fx "write_run_feedback returns 0 even on session failure" test "$rc" -eq 0
+    fx "feedback.md was never created" test ! -f "$feedback"
+    fx "no run_feedback event journaled" \
+      bash -c '! grep -q "\"type\":\"run_feedback\"" "$1"' _ "$RUN_ROOT/events.jsonl"
     exit 0
   ) >/dev/null || return 1
   return 0

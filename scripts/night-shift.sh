@@ -3055,6 +3055,12 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  # Run feedback (Task 3, agentic-gaps tranche): a short fresh session
+  # distills this run's journal into <project>/.night-shift/feedback.md for
+  # the human who authors specs. Deliberately BEFORE the BRANCH_SWEEP block
+  # below — feedback must exist even when the sweep is off (spec §A). Always
+  # advisory: never blocks or delays completion (see write_run_feedback).
+  write_run_feedback "$PROJECT"
   # Optional advisory whole-branch review (Task 1, agentic-gaps tranche):
   # never gates completion here — a fix cycle on the verdict lands in a later
   # task. sweep_build_package refusing (main/master tip, empty branch) is a
