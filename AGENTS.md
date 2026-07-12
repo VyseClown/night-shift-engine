@@ -238,6 +238,12 @@ npm run test:e2e               # 5. E2E through the real UI against the real API
 
 If any step fails: fix it, re-run from step 1. Do not commit with failures.
 
+An optional `- Smoke:` (+ `- Smoke URL:` for a server) spec field adds one more
+gated step to every track above: the engine actually BOOTS the app — runs the
+command to a clean exit, or starts it and polls a loopback URL for HTTP 200 —
+instead of trusting that green tsc/lint/tests mean it runs. See any template's
+Repository section for the field syntax.
+
 ---
 
 ## Commit Rules

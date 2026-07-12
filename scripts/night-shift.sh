@@ -132,6 +132,10 @@ SWEEP_MAX_WAIT="${NIGHT_SHIFT_SWEEP_MAX_WAIT:-900}"
 # pipeline and wire contracts are untouched either way.
 CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
 CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
+# Timeout (seconds) for the spec-declared smoke-run validation phase
+# (run_smoke_phase, scripts/lib/preflight.sh) — how long a server-mode smoke
+# command gets to answer HTTP 200, or an exit-mode smoke command gets to exit.
+SMOKE_TIMEOUT="${NIGHT_SHIFT_SMOKE_TIMEOUT:-120}"
 # Optional post-candidate design-fidelity audit (port-fidelity Task 9, closing
 # Phase B; scripts/port-audit.sh). OFF by default and strictly ADVISORY when
 # on: gated additionally on the spec's Design Contract listing at least one
@@ -886,6 +890,11 @@ initialize_run() {
   run_validation_commands baseline "$RUN_ROOT/validated/baseline.json" "$baseline_commands" ||
     block_run "baseline validation commands are missing or could not run"
   assert_tools_available "$RUN_ROOT/validated/baseline.json" "baseline"
+  # Smoke-run phase (skips silently, writes nothing, when the spec has no
+  # `- Smoke:` field). Baseline never gates on the smoke exit status — same
+  # as every other baseline command, a pre-broken smoke check is recorded here
+  # and only judged for REGRESSION against final (verify_candidate).
+  run_smoke_phase baseline "$RUN_ROOT/validated/smoke-baseline.json"
   test_command="$(sed -nE 's/^- First failing test or executable check: `([^`]+)`.*/\1/p' "$SPEC" | head -n 1)"
   [ -n "$test_command" ] || block_run "test-first command is missing"
   run_test_command failing "$test_command" "$RUN_ROOT/validated/test-first-failing.json"
@@ -947,6 +956,7 @@ recover_run() {
   RUN_ID="$(jq -r '.run_id' "$STATE")"
   SPEC="$(jq -r '.task' "$STATE")"
   set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
+  validate_spec_smoke "$SPEC" || die "resumed spec Smoke field is invalid"
   OBSERVER="$(jq -r '.observer' "$STATE")"
   BASE_COMMIT="$(jq -r '.base_commit' "$STATE")"
   BASE_BRANCH="$(jq -r '.base_branch' "$STATE")"
@@ -1617,6 +1627,10 @@ block_run() {
   # signal arriving mid-cleanup would re-enter block_run (double cleanup, garbled
   # reason). The EXIT trap still runs release_lock. (HUP/INT/TERM only; not EXIT.)
   trap '' HUP INT TERM
+  # Kill any smoke-run server this run started BEFORE anything else: a signal
+  # arriving mid-poll (run_smoke_phase's `wait`/`sleep`) lands here, and a slow
+  # cleanup below must never race a lingering dev server.
+  cleanup_smoke_pgid 2>/dev/null || true
   # BEFORE cleanup_observer_tmp (which removes the workers' neutral cwds): stop
   # any live paid persona sessions and salvage the interrupted batch's costs.
   reap_persona_workers 2>/dev/null || true
@@ -1856,6 +1870,11 @@ assemble_review_bundle() {
       if [ -s "$RUN_ROOT/validated/baseline.json" ]; then
         printf '\n## Baseline validation output\n\n```json\n'
         cat "$RUN_ROOT/validated/baseline.json"
+        printf '\n```\n'
+      fi
+      if [ -s "$RUN_ROOT/validated/smoke-baseline.json" ]; then
+        printf '\n## Baseline smoke check (app boot proof)\n\n```json\n'
+        cat "$RUN_ROOT/validated/smoke-baseline.json"
         printf '\n```\n'
       fi
       # A reuse-violations.json can only exist from an EARLIER candidate in
@@ -2466,6 +2485,16 @@ EOF
   run_validation_commands final "$RUN_ROOT/validated/final.json" "$final_commands" "$validation_worktree" ||
     block_run "final validation commands are missing or could not run"
   assert_tools_available "$RUN_ROOT/validated/final.json" "final"
+  # Smoke-run phase, same skip-silently contract as the baseline call. A
+  # present Smoke field always produces both smoke-baseline.json (written
+  # above) and smoke-final.json here, so gate on the final file existing —
+  # never invent a parallel regression mechanism, reuse validation_not_regressed
+  # + block_run exactly like the ordinary final-validation gate below.
+  run_smoke_phase final "$RUN_ROOT/validated/smoke-final.json" "$validation_worktree"
+  if [ -s "$RUN_ROOT/validated/smoke-final.json" ]; then
+    validation_not_regressed "$RUN_ROOT/validated/smoke-baseline.json" "$RUN_ROOT/validated/smoke-final.json" ||
+      block_run "final smoke check introduced a new or worsened failure"
+  fi
   validation_not_regressed "$RUN_ROOT/validated/baseline.json" "$RUN_ROOT/validated/final.json" ||
     block_run "final validation introduced a new or worsened failure"
   evidence_exit_status_matches "$evidence" final_validation "$RUN_ROOT/validated/final.json" ||
@@ -3156,6 +3185,10 @@ observer_wrapper_evidence() {
     printf '\n%s\n' '--- ENGINE-RUN FINAL VALIDATION (at candidate, isolated worktree; authoritative) ---'
     cat "$RUN_ROOT/validated/final.json"
   fi
+  if [ -s "$RUN_ROOT/validated/smoke-final.json" ]; then
+    printf '\n%s\n' '--- ENGINE-RUN SMOKE CHECK (app boot proof, at candidate; authoritative) ---'
+    cat "$RUN_ROOT/validated/smoke-final.json"
+  fi
   if [ -s "$RUN_ROOT/validated/test-first-passing.json" ]; then
     printf '\n%s\n' '--- ENGINE-RUN TEST-FIRST (passing at candidate; authoritative) ---'
     cat "$RUN_ROOT/validated/test-first-passing.json"
@@ -3405,6 +3438,7 @@ EOF
   # with state pointing at the NEW spec, so --resume re-validates that spec and
   # re-surfaces the real problem instead of re-driving the completed task.
   set_spec_workdir "$SPEC" || block_run "next TODO spec has an invalid Workdir"
+  validate_spec_smoke "$SPEC" || block_run "next TODO spec has an invalid Smoke field"
   check_branch_and_worktree "$SPEC" ||
     block_run "next task branch or worktree routing is unsafe"
   baseline_commands="$(extract_validation_commands "$SPEC" "Baseline validation commands")"
@@ -3413,6 +3447,9 @@ EOF
   cp "$RUN_ROOT/validated/baseline-$(basename "$SPEC" .md).json" "$RUN_ROOT/validated/baseline.json"
   integrity_put "$RUN_ROOT/validated/baseline.json"
   assert_tools_available "$RUN_ROOT/validated/baseline.json" "next task baseline"
+  # Smoke-run phase for the chained next task — same skip-silently, non-
+  # gating-at-baseline contract as the initial run_baseline call.
+  run_smoke_phase baseline "$RUN_ROOT/validated/smoke-baseline.json"
   test_command="$(sed -nE 's/^- First failing test or executable check: `([^`]+)`.*/\1/p' "$SPEC" | head -n 1)"
   run_test_command failing "$test_command" "$RUN_ROOT/validated/test-first-failing.json"
   test_first_exit="$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-failing.json")"
@@ -3459,8 +3496,10 @@ main_run() {
   acquire_lock
   # Release the lock on normal exit AND on any signal.  The HUP/INT/TERM trap
   # is set below (after initialize_run) so it can call block_run; that trap
-  # does NOT replace this EXIT trap — both fire on exit.
-  trap 'release_lock' EXIT
+  # does NOT replace this EXIT trap — both fire on exit. cleanup_smoke_pgid
+  # first: a normal exit already clears SMOKE_PGID in run_smoke_phase, but this
+  # is the last line of defense against a crash mid-phase leaving a live server.
+  trap 'cleanup_smoke_pgid 2>/dev/null || true; release_lock' EXIT
 
   if recover_run; then
     :
@@ -3479,6 +3518,7 @@ main_run() {
     validate_spec_project "$SPEC" ||
       die "spec Project path does not match --project"
     set_spec_workdir "$SPEC" || die "spec Workdir is invalid"
+    validate_spec_smoke "$SPEC" || die "spec Smoke field is invalid"
     check_branch_and_worktree "$SPEC" ||
       die "current branch or worktree does not safely match the spec"
     initialize_run

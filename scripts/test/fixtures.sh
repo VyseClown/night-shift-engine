@@ -152,6 +152,7 @@ run_dry_fixtures() {
   fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
+  fixture_assert "Smoke phase: field parsing/validation, exit + server modes, timeout/abort leave no zombie" fixture_smoke_phase "$root"
   fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
   fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
@@ -1563,7 +1564,7 @@ fixture_event_stream() {
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
-    stage_transition codex_review model_fallback reuse_violation port_audit; do
+    stage_transition codex_review model_fallback reuse_violation port_audit smoke; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -2478,6 +2479,117 @@ fixture_workdir_field() {
     rc=$?
     fx "red-against-base returns setup-failure 6 when the workdir is absent at BASE" \
       [ "$rc" -eq 6 ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_smoke_phase() {
+  # Spec-declared `- Smoke:`/`- Smoke URL:` validation phase (agentic-gaps
+  # Task 11): proves the app actually BOOTS, not just that tsc/eslint/jest
+  # pass (evidence: a Release-bundle break that passed every one of those).
+  # Same backticked-value dialect + loud-malformed-field contract as Workdir.
+  # run_smoke_phase itself: skips silently (return 0, write nothing) with no
+  # Smoke field; exit mode requires the command to exit 0 within the timeout;
+  # server mode (Smoke URL present) polls the loopback URL for HTTP 200 then
+  # TERM-then-KILLs the whole process group via cleanup_smoke_pgid — never a
+  # zombie dev server, on success OR on a poll timeout.
+  local root="$1" dir="$root/smoke" spec port rc bgpid
+  mkdir -p "$dir/proj" "$dir/rs/raw" "$dir/rs/validated"
+  ( PROJECT="$dir/proj"; RUN_ROOT="$dir/rs"; RUN_ID="smfx"; WORKDIR=""
+    spec="$dir/s.md"
+
+    # --- field parsing + loud-malformed-field validation ---
+    printf -- '- Smoke: `npm run dev`\n' >"$spec"
+    fx "spec_smoke_field: backticked value" \
+      [ "$(spec_smoke_field "$spec")" = "npm run dev" ] || exit 1
+    fx "validate_spec_smoke accepts a bare Smoke command" \
+      validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `npm run dev`\n- Smoke URL: `http://127.0.0.1:3999/`\n' >"$spec"
+    fx "spec_smoke_url_field: backticked value" \
+      [ "$(spec_smoke_url_field "$spec")" = "http://127.0.0.1:3999/" ] || exit 1
+    fx "validate_spec_smoke accepts a loopback 127.0.0.1 URL" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://localhost:4000/`\n' >"$spec"
+    fx "validate_spec_smoke accepts localhost" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: npm run dev\n' >"$spec"
+    fx_not "bare (unbackticked) Smoke value fails loudly" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke URL: `http://127.0.0.1:3999/`\n' >"$spec"
+    fx_not "Smoke URL without a Smoke field is malformed" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://example.com/`\n' >"$spec"
+    fx_not "non-loopback Smoke URL is rejected" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: http://127.0.0.1:3999/\n' >"$spec"
+    fx_not "bare (unbackticked) Smoke URL fails loudly" validate_spec_smoke "$spec" || exit 1
+
+    # --- no-Smoke spec: run_smoke_phase returns 0, writes nothing ---
+    printf '# no smoke fields\n' >"$spec"
+    SPEC="$spec"
+    rc=0
+    run_smoke_phase none "$dir/rs/validated/smoke-none.json" || rc=$?
+    fx "no Smoke field: run_smoke_phase returns 0" [ "$rc" -eq 0 ] || exit 1
+    fx "no Smoke field: writes nothing" [ ! -e "$dir/rs/validated/smoke-none.json" ] || exit 1
+
+    # --- exit mode: command itself must exit 0 within the timeout ---
+    printf -- '- Smoke: `true`\n' >"$dir/s-true.md"
+    SPEC="$dir/s-true.md"
+    rc=0
+    run_smoke_phase probe "$dir/rs/validated/smoke-true.json" || rc=$?
+    fx "exit mode success: run_smoke_phase returns 0" [ "$rc" -eq 0 ] || exit 1
+    fx "exit mode success: json exit_status 0" \
+      [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-true.json")" -eq 0 ] || exit 1
+    fx "exit mode success: json command is labeled smoke:" \
+      [ "$(jq -r '.[0].command' "$dir/rs/validated/smoke-true.json")" = "smoke: true" ] || exit 1
+
+    printf -- '- Smoke: `false`\n' >"$dir/s-false.md"
+    SPEC="$dir/s-false.md"
+    rc=0
+    run_smoke_phase probe "$dir/rs/validated/smoke-false.json" || rc=$?
+    fx "exit mode failure: run_smoke_phase returns nonzero (phase failure)" [ "$rc" -ne 0 ] || exit 1
+    fx "exit mode failure: json exit_status nonzero" \
+      [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-false.json")" -ne 0 ] || exit 1
+
+    # --- server mode: real python3 http.server stub (skips cleanly without
+    # python3, matching the design-extract-web fixture's guard) ---
+    if command -v python3 >/dev/null 2>&1; then
+      mkdir -p "$dir/websrv"
+      printf 'ok\n' >"$dir/websrv/index.html"
+      port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+      printf -- '- Smoke: `python3 -m http.server %s --bind 127.0.0.1`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+        "$port" "$port" >"$dir/s-srv.md"
+      SPEC="$dir/s-srv.md"
+      rc=0
+      run_smoke_phase srv "$dir/rs/validated/smoke-srv.json" "$dir/websrv" || rc=$?
+      fx "server mode success: run_smoke_phase returns 0" [ "$rc" -eq 0 ] || exit 1
+      fx "server mode success: json exit_status 0" \
+        [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-srv.json")" -eq 0 ] || exit 1
+      sleep 0.3
+      fx "server mode success: SMOKE_PGID cleared after cleanup" [ -z "$SMOKE_PGID" ] || exit 1
+      fx "server mode success: process group is gone (no lingering server)" \
+        [ -z "$(pgrep -f "http.server $port" 2>/dev/null)" ] || exit 1
+
+      # --- never-serves: fixture-shortened timeout, rc 1, no zombie ---
+      printf -- '- Smoke: `sleep 41`\n- Smoke URL: `http://127.0.0.1:%s/`\n' "$port" >"$dir/s-to.md"
+      SPEC="$dir/s-to.md"
+      SMOKE_TIMEOUT=4
+      rc=0
+      run_smoke_phase to "$dir/rs/validated/smoke-to.json" "$dir/websrv" || rc=$?
+      fx "timeout: run_smoke_phase returns 1 (never served)" [ "$rc" -eq 1 ] || exit 1
+      fx "timeout: json exit_status 1" \
+        [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-to.json")" -eq 1 ] || exit 1
+      sleep 0.3
+      fx "timeout: no zombie process left" [ -z "$(pgrep -f 'sleep 41' 2>/dev/null)" ] || exit 1
+    fi
+
+    # --- cleanup_smoke_pgid: direct unit test of the registered-group kill,
+    # independent of run_smoke_phase (the abort-trap wiring calls it bare) ---
+    set -m
+    ( exec sleep 42 ) & bgpid=$!
+    set +m
+    SMOKE_PGID="$bgpid"
+    cleanup_smoke_pgid
+    sleep 0.3
+    fx "cleanup_smoke_pgid kills the registered group directly" \
+      [ -z "$(pgrep -f 'sleep 42' 2>/dev/null)" ] || exit 1
+    fx "cleanup_smoke_pgid clears SMOKE_PGID" [ -z "$SMOKE_PGID" ] || exit 1
     exit 0
   ) || return 1
   return 0

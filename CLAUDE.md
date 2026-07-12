@@ -101,6 +101,20 @@ directory; run engine/workflow git inside the engine directory.
   and only on runs started *without* `--spec` (the engine picks the task from
   TODO). An explicit `--spec` run is a single task: on `NEXT_TASK` it completes
   and exits 0 so an external wrapper can own cross-spec sequencing/branching.
+- **Smoke-run validation (opt-in per spec):** an optional `- Smoke: `<command>`` field
+  (+ `- Smoke URL: `<http://127.0.0.1:PORT/…>`` for a server) adds a gated phase
+  right after baseline and final validation, on both the initial and any chained
+  task — proof the app actually BOOTS, not just that tsc/eslint/jest pass (the
+  evidence class: a Release-bundle break that passed every one of those). No URL
+  ⇒ exit mode (the command itself must exit 0 within `NIGHT_SHIFT_SMOKE_TIMEOUT`,
+  default 120s); URL present ⇒ server mode (poll for HTTP 200 every 2s until the
+  timeout, then TERM-then-KILL the whole process group — never leaves a zombie
+  dev server, including on an interrupted run). Baseline never blocks on its own
+  smoke result (recorded and only judged for regression, exactly like any other
+  baseline command); final regresses the candidate exactly like the ordinary
+  final-validation gate. The URL must be loopback-only (`http://127.0.0.1` or
+  `http://localhost`) and both fields require backticks — malformed or missing
+  fields fail loudly at spec selection, same dialect as `- Workdir:`.
 - **Cost knobs:** the primary runs as **stage-scoped sessions** by default
   (`NIGHT_SHIFT_SESSION_SCOPE=stage`) — a fresh Claude session per stage scope
   (plan → implement → observe) handing off through files, which avoids replaying
