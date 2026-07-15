@@ -2,7 +2,8 @@
 # scripts/lib/preflight.sh
 # Spec parsing/validation, path canonicalization, launch-readiness preflight,
 # and validation-command extraction/execution + evidence matching. Sourced by
-# night-shift.sh; uses PROJECT/WORKSPACE_ROOT/RUN_ROOT globals + log/die at runtime.
+# night-shift.sh; uses PROJECT/WORKSPACE_ROOT/RUN_ROOT/SPEC/SMOKE_TIMEOUT
+# globals + log/die/emit_event/integrity_put at runtime.
 
 canonical_dir() {
   [ -d "$1" ] || return 1
@@ -261,6 +262,58 @@ set_spec_workdir() {
 
 workdir_path() { printf '%s%s' "$1" "${WORKDIR:+/$WORKDIR}"; }
 
+# Optional `- Smoke: `<command>`` (+ `- Smoke URL: `<url>``) spec fields: same
+# backticked-value dialect as Workdir. spec_smoke_field/spec_smoke_url_field are
+# bare extractors (empty when absent OR malformed — a bare, unbackticked value
+# is indistinguishable from absent at this layer, which is why validation below
+# re-checks presence via grep); validate_spec_smoke is the loud spec-selection
+# gate, mirroring set_spec_workdir: a present-but-unparseable Smoke field, a
+# Smoke URL without a Smoke command, or a non-loopback Smoke URL all fail
+# LOUDLY here rather than silently no-op'ing run_smoke_phase mid-run.
+spec_smoke_field() {
+  sed -nE 's/^- Smoke: `([^`]+)`.*/\1/p' "$1" | head -n 1
+}
+
+spec_smoke_url_field() {
+  sed -nE 's/^- Smoke URL: `([^`]+)`.*/\1/p' "$1" | head -n 1
+}
+
+validate_spec_smoke() {
+  local file="$1" url
+  if grep -Eq '^- Smoke:' "$file"; then
+    [ -n "$(spec_smoke_field "$file")" ] ||
+      { printf 'malformed Smoke field — use: - Smoke: `<command>` (backticks required)\n' >&2; return 1; }
+  elif grep -Eq '^- Smoke URL:' "$file"; then
+    printf 'Smoke URL present without a Smoke field — add: - Smoke: `<command>`\n' >&2
+    return 1
+  else
+    return 0
+  fi
+  if grep -Eq '^- Smoke URL:' "$file"; then
+    url="$(spec_smoke_url_field "$file")"
+    [ -n "$url" ] ||
+      { printf 'malformed Smoke URL field — use: - Smoke URL: `http://127.0.0.1:<port>/...` (backticks required)\n' >&2; return 1; }
+    # Reject userinfo BEFORE the loopback check. `http://127.0.0.1:80@evil.com/`
+    # puts `127.0.0.1:80` in the userinfo and `evil.com` as the real host, yet
+    # the `:*` port glob below would swallow `80@evil.com/` and accept it — a
+    # verified bypass of the "never reaches out" invariant. Extract the authority
+    # (between `://` and the first `/`) and refuse any `@` in it.
+    local smoke_authority="${url#*://}"
+    smoke_authority="${smoke_authority%%/*}"
+    case "$smoke_authority" in
+      *@*) printf 'Smoke URL must not contain userinfo (@ before the path) — the real host is whatever follows @, not the loopback address: %s\n' "$url" >&2; return 1 ;;
+    esac
+    # Anchored — NOT a prefix match: `http://127.0.0.1*`/`http://localhost*`
+    # would also accept `http://localhost.evil.com/` (hostname-prefix bypass).
+    # Each accepted host form is spelled out fully: bare, `:<port>`, or `/<path>`.
+    case "$url" in
+      http://127.0.0.1|http://127.0.0.1:*|http://127.0.0.1/*|http://localhost|http://localhost:*|http://localhost/*) ;;
+      *) printf 'Smoke URL must be loopback-only (http://127.0.0.1 or http://localhost — a smoke probe never reaches out): %s\n' "$url" >&2; return 1 ;;
+    esac
+  fi
+  return 0
+}
+
 run_test_command() {
   local phase="$1" command="$2" target="$3" run_dir="${4:-$PROJECT}" output rc=0 exec_dir
   output="$RUN_ROOT/raw/test-first-$phase.log"
@@ -377,6 +430,135 @@ EOF
   # night-shift.sh (the only sourcer today); the command -v guard keeps this lib
   # safe to source standalone, and keeps the function's exit status clean.
   ! command -v integrity_put >/dev/null 2>&1 || integrity_put "$target"
+}
+
+# The smoke server process group this run currently owns, if any — set by
+# run_smoke_phase's server mode, cleared by cleanup_smoke_pgid. night-shift.sh
+# registers cleanup_smoke_pgid on both the HUP/INT/TERM abort path (block_run)
+# and the EXIT trap, so a run interrupted mid-poll (or crashing elsewhere)
+# never leaves a zombie dev server behind.
+SMOKE_PGID=""
+
+cleanup_smoke_pgid() {
+  [ -n "${SMOKE_PGID:-}" ] || return 0
+  local pgid="$SMOKE_PGID"
+  SMOKE_PGID=""
+  # Group first (the common case — see run_smoke_phase); bare-pid fallback
+  # mirrors reap_persona_workers, in case the group somehow already exited.
+  kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pgid" 2>/dev/null || true
+  sleep 1
+  kill -KILL -- "-$pgid" 2>/dev/null || kill -KILL "$pgid" 2>/dev/null || true
+}
+
+# Spec-declared smoke-run validation phase: proves the app actually BOOTS, not
+# just that tsc/eslint/jest pass (evidence: a Release-bundle break that passed
+# every one of those). Skips silently (return 0, write nothing) when the spec
+# has no `- Smoke:` field. Two modes selected by the presence of `- Smoke URL:`:
+#   - server mode: start $cmd under `set -m` (monitor mode), which makes the
+#     backgrounded job its OWN process group (pid == pgid) — the same portable
+#     idiom reap_persona_workers already uses for the persona workers, chosen
+#     over the external `setsid` binary because stock macOS ships no `setsid`
+#     (only via a non-default util-linux install). Poll the URL every 2s for
+#     an HTTP 200 until NIGHT_SHIFT_SMOKE_TIMEOUT, then TERM-then-KILL the
+#     whole group via cleanup_smoke_pgid; a server that dies before timeout
+#     breaks the poll loop early. A self-daemonizing command (one that
+#     double-forks/disowns its real listener — live-proven against Next 16
+#     Turbopack) can survive that group kill, so server mode is bracketed by
+#     a port-scoped guard on BOTH sides: before booting, if the Smoke URL
+#     names a port and something already LISTENs on it, refuse to spawn at
+#     all (rc=1, loud message, no singleton-steal collision) — which is also
+#     what makes the after-cleanup step safe: since the port was confirmed
+#     free at boot, anything still LISTENing on it after cleanup_smoke_pgid
+#     can only be a survivor of OUR command, so it's swept directly by port
+#     (TERM, wait 1s, re-check, KILL). Both steps need `lsof` and a parsed
+#     port (a Smoke URL with no explicit `:<port>` skips them and falls back
+#     to the plain group-kill).
+#   - exit mode: the command itself must exit 0 within the timeout (a portable
+#     watchdog — no GNU `timeout` on macOS — same TERM-based pattern as
+#     codex_review_candidate's advisory review timeout), escalating to KILL
+#     if the TERM hasn't landed ~2s later.
+# Writes $target shaped exactly like a run_validation_commands entry list
+# (single-element array) so validation_not_regressed and the viewer render it
+# unchanged; returns the smoke command's exit status (or the poll's timeout
+# rc=1) so callers can gate on it exactly like any other validation command.
+run_smoke_phase() {
+  local kind="$1" target="$2" run_dir="${3:-$PROJECT}" cmd url rc=0 pid out wd exec_dir port survivors
+  # shellcheck disable=SC2153
+  # ^ $SPEC is the night-shift.sh runtime global (the current task's spec
+  # path) — not a typo of the unrelated lowercase `spec` locals other
+  # functions in this file use for their own file-path parameters.
+  cmd="$(spec_smoke_field "$SPEC")"; [ -n "$cmd" ] || return 0
+  url="$(spec_smoke_url_field "$SPEC")"
+  out="$RUN_ROOT/raw/smoke-$kind.log"
+  exec_dir="$(workdir_path "$run_dir")"
+  if [ -n "$url" ]; then
+    # server mode: own process group (see comment above) so the whole tree
+    # (e.g. a package-manager wrapper spawning the real dev server) dies
+    # together on kill, not just the shim.
+    port="$(printf '%s' "$url" | sed -nE 's#^https?://[^/:]+:([0-9]+).*#\1#p')"
+    if [ -n "$port" ] && command -v lsof >/dev/null 2>&1 && [ -n "$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)" ]; then
+      # Pre-boot collision: something is already LISTENing on this port.
+      # Never spawn — a singleton-steal race here would be worse than a
+      # loud, cheap failure, and it's the precondition that makes the
+      # post-cleanup sweep below provably safe.
+      printf 'night-shift: smoke port %s already in use before boot — free it or pick an exclusive Smoke URL port\n' "$port" >"$out"
+      rc=1
+    else
+      set -m
+      (cd "$exec_dir" && bash -lc "$cmd" >"$out" 2>&1 </dev/null) & pid=$!
+      set +m
+      SMOKE_PGID="$pid"
+      rc=1
+      # WALL-CLOCK deadline, not a sleep counter: each poll's curl can itself
+      # burn up to --max-time 5s, so counting only the sleeps would stretch a
+      # declared SMOKE_TIMEOUT of 120s to ~7min against a server that accepts
+      # TCP but never answers. now_epoch is the engine's portable clock.
+      local deadline http_code
+      deadline=$(( $(now_epoch) + SMOKE_TIMEOUT ))
+      while [ "$(now_epoch)" -lt "$deadline" ]; do
+        # Boot proof is a real 2xx, not merely "curl didn't error": bare
+        # `curl -fsS` also exits 0 on a 3xx redirect (an auth/login redirect or
+        # redirect loop is NOT the app serving its content), so capture the code
+        # and require 200-299.
+        http_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null || printf '000')"
+        case "$http_code" in 2[0-9][0-9]) rc=0; break ;; esac
+        kill -0 "$pid" 2>/dev/null || break   # server died early
+        sleep 2
+      done
+      cleanup_smoke_pgid
+      wait "$pid" 2>/dev/null || true
+      # Port-scoped survivor sweep: the pre-boot check above proved the port
+      # was free, so anything still LISTENing on it now descends from our
+      # (possibly self-daemonizing) command, never a bystander.
+      if [ -n "$port" ] && command -v lsof >/dev/null 2>&1; then
+        survivors="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
+        if [ -n "$survivors" ]; then
+          # shellcheck disable=SC2086  # word-splitting intentional: space-separated PID list
+          kill -TERM $survivors 2>/dev/null || true
+          sleep 1
+          survivors="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null)"
+          # shellcheck disable=SC2086
+          [ -z "$survivors" ] || kill -KILL $survivors 2>/dev/null || true
+        fi
+      fi
+    fi
+  else
+    # exit mode: command must succeed within the timeout (portable watchdog —
+    # same TERM-based pattern as codex_review_candidate). If TERM hasn't
+    # landed ~2s later, escalate to KILL rather than leave a stuck process
+    # running past the declared timeout.
+    (cd "$exec_dir" && bash -lc "$cmd") >"$out" 2>&1 </dev/null & pid=$!
+    ( sleep "$SMOKE_TIMEOUT"; kill -TERM "$pid" 2>/dev/null
+      sleep 2; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    ) & wd=$!
+    wait "$pid"; rc=$?; kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null || true
+  fi
+  jq -n --arg command "smoke: $cmd" --argjson exit_status "$rc" \
+    --arg output "$(tail -c 20000 "$out")" \
+    '[{command:$command, exit_status:$exit_status, output:$output}]' >"$target"
+  ! command -v integrity_put >/dev/null 2>&1 || integrity_put "$target"
+  ! command -v emit_event >/dev/null 2>&1 || emit_event smoke "$(jq -cn --arg kind "$kind" --argjson rc "$rc" '{kind:$kind, exit_status:$rc}')"
+  return "$rc"
 }
 
 validation_not_regressed() {

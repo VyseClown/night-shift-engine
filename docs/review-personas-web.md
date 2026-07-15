@@ -1,5 +1,10 @@
 # Review Personas — Web Track
 
+> Summary: The six web-track review personas (`- Track: web`, also drawn on
+> by `node`/`fullstack`), their Review Profiles (`full`/`frontend`/`logic`/
+> `data`) and floor, and each persona's focus + checklist. See
+> `review-personas.md` for the rn track and the cross-track optional personas.
+
 The **web** counterpart to `review-personas.md` (the React Native track). A spec
 selects this set by declaring `- Track: web`; the `node` and `fullstack` tracks
 also draw their persona lenses from this file. Six specialized reviewers used for

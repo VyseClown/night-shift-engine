@@ -37,6 +37,11 @@ jobs:
           shellcheck --version
           find scripts -name '*.sh' -type f -exec shellcheck -s bash {} +
 
+      # Enforces the docs/*.md `> Summary:` convention (agentic-gaps §B) —
+      # cheap, so it rides along in the same job as the other static checks.
+      - name: Doc summaries
+        run: scripts/doc-summaries.sh --check
+
   # ── Job B: Deterministic fixture suite ─────────────────────────────────────
   fixtures:
     name: Fixture tests

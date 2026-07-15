@@ -1,5 +1,11 @@
 # Optional Personas — Implementation Brief (self-contained)
 
+> Summary: Historical implementation brief (now shipped) for
+> `PERSONAS_OPTIONAL` — the Product Reviewer and Design Fidelity Reviewer,
+> activated via `- Optional reviewers:` or an auto-activating contract
+> section. See `docs/review-personas.md`'s "Optional Personas" section for
+> the current, live behavior.
+
 This is a complete, standalone spec for one change to the night-shift workflow.
 Implement exactly this. Do not assume any prior conversation context.
 

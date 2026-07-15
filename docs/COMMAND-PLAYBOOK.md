@@ -1,5 +1,10 @@
 # Command Playbook — pick the command for the task
 
+> Summary: Task → command index for Figma export, RN
+> visual-review/repair/Maestro capture, running a night-shift, the
+> design-extract/port-audit/test-audit CLIs, and `--sweep-only`. Start at the
+> "Quick chooser" table; each row links to its `§N` section for the full command.
+
 A task → command index for the visual-fidelity / Figma / night-shift capabilities in
 this repo. Written for both humans and a fresh Claude instance: **match the task to a
 row, run the command.** Script paths (`scripts/…`) are relative to the engine repo
@@ -23,6 +28,8 @@ workspace container (`<workspace>/<app>`).
 | Convert a Figma design into a web component | Figma MCP → web-track generate → visual review | §7 |
 | Extract a design manifest (web or Figma) | `scripts/design-extract.sh …` | §8 |
 | Audit how faithfully a port implements its design manifest | `scripts/port-audit.sh --project <app> --screen <s> --manifest <m>` | §9 |
+| Review a whole branch before merge (verdict-only by default) | `scripts/night-shift.sh --sweep-only --project <path>` | §10 |
+| Audit tests for false confidence (vacuous assertions, tautological round-trips) | `scripts/test-audit.sh --project <app> --tests <path...>` | §11 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -209,6 +216,89 @@ Missing tooling, a failed agent pass, or an unresolvable manifest path all skip
 cleanly with a `WARN` log — this never blocks a candidate or fails a run.
 `NIGHT_SHIFT_PORT_AUDIT_OFFLINE=<canned-reply-path>` routes the engine-invoked call
 through `--offline` (fixture/dry-wire use).
+
+## §10 — Review a whole branch before merge → `scripts/night-shift.sh --sweep-only --project <path>`
+
+```bash
+scripts/night-shift.sh --sweep-only --project <workspace>/<app>
+```
+
+One-shot, no run/queue, no `--spec`: builds the merge-base diff package
+(`package.diff` + `package.meta.json`; refuses a default-branch tip — nothing
+branch-shaped to review) and runs one whole-branch strong-model review
+session (`NIGHT_SHIFT_SWEEP_MODEL`, default = `NIGHT_SHIFT_OBSERVER_MODEL`)
+looking for what per-task reviews can't see — cross-task interactions,
+accumulated minor findings, hygiene (neutral test fixtures, no company
+identifiers, complete i18n key pairs), tests weakened rather than updated.
+Writes `findings.md` (whose last line carries the verdict, e.g.
+`SWEEP_FINDINGS: <n>`) and `verdict.txt` (the bare word only — `SWEEP_PASS` /
+`SWEEP_FINDINGS` / `SWEEP_ERROR` on a session failure, no count) under a
+printed `night-shift-sweep-<pid>` tmp dir.
+
+**Verdict-only by default** — a bare invocation never touches the target
+repo, regardless of `NIGHT_SHIFT_BRANCH_SWEEP`'s value elsewhere; on this
+standalone surface only the literal `NIGHT_SHIFT_BRANCH_SWEEP=1` also runs a
+capped fix cycle (`NIGHT_SHIFT_SWEEP_MAX_FIX`, default `1`): an
+implement-model session fixes only the findings and commits directly to the
+project's branch. **Caveat specific to `--sweep-only`:** the fix cycle's
+re-validation + deterministic-revert safety net (final validation commands
+re-run; a failed re-validation `git reset --hard`s back to the pre-fix tip)
+needs both a spec and a live run root, neither of which this standalone
+surface ever has — so here the fix commits land with no re-validation gate
+and no revert net. The in-run sweep (below) gets the full safety net; treat
+`NIGHT_SHIFT_BRANCH_SWEEP=1` on bare `--sweep-only` as "fix and review the
+result yourself," not "fix and trust it." Exit `0` on `SWEEP_PASS`, `2` on
+`SWEEP_FINDINGS` or `SWEEP_ERROR`.
+
+The same review also runs automatically at the end of a normal night-shift
+when `NIGHT_SHIFT_BRANCH_SWEEP` is `1` or `advisory` (`advisory` = findings
+only, never the fix cycle, even on a `SWEEP_FINDINGS` verdict) — never gating
+completion either way. `NIGHT_SHIFT_SWEEP_MAX_WAIT` (default `900`s) bounds
+the sweep session's own rate-limit retry on both surfaces.
+
+## §11 — Audit tests for false confidence → `scripts/test-audit.sh …`
+
+A zero-dep-static + one-agent-pass CLI that finds tests which PASS while
+asserting nothing meaningful — mirrors `port-audit.sh`'s two-layer
+architecture. Evidence this matters: `expect(result.installmentGroupId)
+.not.toBe("group-a")` passed vacuously because `installmentGroupId` doesn't
+exist on `result` (`undefined !== "group-a"` is trivially true); only a
+sibling positive assertion elsewhere exposed the bug. A deterministic static
+scan (`scripts/lib/test-audit-static.js`) flags mechanical smells
+(vacuous `.not.toBe(<literal>)`, asserts on a property absent from the
+source, `toBe(true)` on constants, empty/expect-less test bodies, stale
+`.skip`/`xit`); ONE bounded `claude -p` agent pass then judges each static
+finding confirm/refute with a one-line reason and hunts judgment-tier smells
+the static scan can't see (a mock tested against itself, a tautological
+round-trip, a guard with no negative-case test). The agent's reply is never
+trusted for arithmetic — every count is recomputed by the script (jq) from
+the static findings + the agent's validated `{file,line,rule}` mapping.
+
+```bash
+scripts/test-audit.sh --project <app> --tests <path...> [--src <dir>] \
+  [--model <name>] [--offline] [--out <json>]
+```
+
+Writes `<project>/.night-shift/test-audit/report.json` (default `--out`) plus
+a sibling `.md`, schema `night-shift-test-audit/1`:
+`summary.final_total = confirmed + unjudged + additional`. Exit `0` when
+`final_total == 0`, `2` when it's `> 0` (findings exist — this is the common,
+non-error outcome), `3` only on an infra/usage error (nothing written).
+`--offline` skips the paid call entirely (static-only; every finding stays
+unjudged) for a fully deterministic, zero-cost dry run. An agent-pass failure
+(missing `claude`, non-zero exit, an unparseable reply after one retry) is
+NEVER an exit-3 condition either — it degrades to "every static finding stays
+unjudged" (noted in `agent_note`), same fail-open-on-evidence posture as
+`port-audit.sh`.
+
+**Engine wiring (opt-in, non-gating):** set `NIGHT_SHIFT_TEST_AUDIT=1` and
+`night-shift.sh` runs this CLI once per candidate, scoped to ONLY the test
+files the candidate diff touched (skips cleanly when the diff touches none),
+on the `NIGHT_SHIFT_TEST_AUDIT_MODEL` knob (default `sonnet`). Every report on
+disk is attached — indented, advisory, never authoritative — to the
+implementation-review bundle and the observer's evidence, and a `test_audit`
+event (`{files, final_total}`) is journaled. A failed or missing report is a
+`WARN` log only — this never blocks a candidate or fails a run.
 
 ## Prerequisites & environment
 

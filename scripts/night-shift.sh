@@ -19,6 +19,7 @@ LIST_OPTIONAL_PERSONAS=0
 LIST_CONFIG=0
 PREFLIGHT=0
 RESUME=0
+SWEEP_ONLY=0
 MAX_STAGE_TURNS="${NIGHT_SHIFT_MAX_STAGE_TURNS:-12}"
 MAX_STAGE_SECONDS="${NIGHT_SHIFT_MAX_STAGE_SECONDS:-3600}"
 MAX_TASK_TURNS="${NIGHT_SHIFT_MAX_TASK_TURNS:-36}"
@@ -80,6 +81,50 @@ IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
 # the IMPLEMENT scope bumps to this stronger model. inherit/sonnet to override.
 DESIGN_IMPLEMENT_MODEL="${NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL:-opus}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
+# Run feedback (scripts/lib/sweep.sh write_run_feedback): default ON — the
+# spec requires feedback to exist even when the branch sweep below is off
+# (complete_run calls write_run_feedback unconditionally of BRANCH_SWEEP).
+# This knob is the cost off-switch for that always-on session; set to "0"
+# to skip it entirely.
+RUN_FEEDBACK="${NIGHT_SHIFT_RUN_FEEDBACK:-1}"
+# Optional end-of-run whole-branch sweep (scripts/lib/sweep.sh): one advisory
+# strong-model review of the entire base..HEAD diff after the last task
+# completes, looking for what per-task reviews cannot see (cross-task
+# interactions, accumulated minor findings, hygiene). OFF by default; the
+# sweep model defaults to the observer's (same "strong final gate" tier).
+# Any non-"0" value turns the sweep session on; NIGHT_SHIFT_BRANCH_SWEEP=advisory
+# specifically additionally skips the fix cycle below (verdict + findings
+# only, no auto-fix) — any other truthy value (e.g. "1") runs it.
+# --sweep-only (standalone, below) reads this SAME knob but with a stricter,
+# opposite-default posture for the fix cycle: the sweep session itself always
+# runs regardless of this value (there is no "off" for a command whose whole
+# purpose is to sweep), but the fix cycle runs ONLY on the literal "1" —
+# bare/default invocations are verdict-only, so a plain `--sweep-only` can
+# never leave unvalidated fix commits on the user's branch.
+BRANCH_SWEEP="${NIGHT_SHIFT_BRANCH_SWEEP:-0}"
+SWEEP_MODEL="${NIGHT_SHIFT_SWEEP_MODEL:-$OBSERVER_MODEL}"
+# Sweep fix cycle (scripts/lib/sweep.sh sweep_fix_cycle): capped at one round
+# by default — a residual SWEEP_FINDINGS after the cap is logged and left for
+# a human, never looped indefinitely. NIGHT_SHIFT_BRANCH_SWEEP=advisory (as
+# opposed to =1) skips the fix cycle entirely — verdict only, no auto-fix.
+SWEEP_MAX_FIX="${NIGHT_SHIFT_SWEEP_MAX_FIX:-1}"
+# Sanity ceiling on the sweep's OWN rate-limit retry wait (sweep_run in
+# scripts/lib/sweep.sh) — deliberately much smaller than
+# RATE_LIMIT_MAX_WAIT_SECONDS above: the sweep is an advisory review at the
+# tail of an already-successful run (or a standalone --sweep-only call), so a
+# reset more than this many seconds away skips the retry and records
+# SWEEP_ERROR instead of holding the process open for a review nobody gates
+# completion on. wait_for_rate_limit_reset's own block_run (past
+# RATE_LIMIT_MAX_WAIT_SECONDS) is unreachable from sweep for this reason. The
+# OTHER block_run inside handle_rate_limit_wait (recovery.sh ~line 252, the
+# 5-consecutive-429 cap) is a separate path this cap does not shield — but
+# it is not practically reachable from sweep either: a successful primary
+# turn resets .rate_limit_consecutive to 0 (state_set above), and sweep runs
+# once at the tail of an already-successful run with a single bounded retry
+# (never a loop), so it can push the counter to at most 1 before falling
+# through to SWEEP_ERROR or completing — nowhere near the 5 in a row needed
+# to trip it.
+SWEEP_MAX_WAIT="${NIGHT_SHIFT_SWEEP_MAX_WAIT:-900}"
 # Optional external second perspective via the Codex CLI (gpt-5.5). OFF by
 # default and strictly ADVISORY when on: one bounded `codex exec` review per
 # candidate, handed to the observer as supplementary (non-gating) evidence.
@@ -87,6 +132,10 @@ OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
 # pipeline and wire contracts are untouched either way.
 CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
 CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
+# Timeout (seconds) for the spec-declared smoke-run validation phase
+# (run_smoke_phase, scripts/lib/preflight.sh) — how long a server-mode smoke
+# command gets to answer HTTP 200, or an exit-mode smoke command gets to exit.
+SMOKE_TIMEOUT="${NIGHT_SHIFT_SMOKE_TIMEOUT:-120}"
 # Optional post-candidate design-fidelity audit (port-fidelity Task 9, closing
 # Phase B; scripts/port-audit.sh). OFF by default and strictly ADVISORY when
 # on: gated additionally on the spec's Design Contract listing at least one
@@ -96,6 +145,25 @@ CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
 # and a human dry-wire knob.
 PORT_AUDIT="${NIGHT_SHIFT_PORT_AUDIT:-0}"
 PORT_AUDIT_OFFLINE="${NIGHT_SHIFT_PORT_AUDIT_OFFLINE:-}"
+# False-confidence test audit (agentic-gaps tranche §C; scripts/test-audit.sh).
+# OFF by default and strictly ADVISORY when on: runs once per candidate over
+# ONLY the test files the candidate diff touched (test_audit_candidate below),
+# never gates. TEST_AUDIT_MODEL defaults to `sonnet` — breadth-tier judgment,
+# same tier as the persona bench and PORT_AUDIT above (see this repo's own
+# CLAUDE.md Model ruling: judgment-tier escalation is an optional override,
+# not the default, for this knob).
+TEST_AUDIT="${NIGHT_SHIFT_TEST_AUDIT:-0}"
+TEST_AUDIT_MODEL="${NIGHT_SHIFT_TEST_AUDIT_MODEL:-sonnet}"
+# Doc-freshness gate (agentic-gaps tranche §B; scripts/lib/doc-freshness.sh).
+# DEFAULT ON — the tranche's one deliberate exception to "new behavior defaults
+# off": this is prompt-level only (an extra paragraph in the implement prompt
+# + an advisory observer-evidence section), costs nothing extra when the
+# candidate-stale-doc list is empty (the common case — most diffs touch no
+# doc-adjacent path), and never gates a run — the observer is the enforcement
+# point (judges each listed doc against the candidate diff: a doc the change
+# clearly invalidates, left un-updated, is a finding), exactly like the reuse
+# gate and port-audit before it. Set to "0" to disable.
+DOC_FRESHNESS="${NIGHT_SHIFT_DOC_FRESHNESS:-1}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
 # the simulator/diff tooling is present (see scripts/lib/visual-capture.sh).
@@ -144,6 +212,13 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # Engine-private integrity anchor for wrapper-owned files. See scripts/lib/integrity.sh.
 # shellcheck source=scripts/lib/integrity.sh
 . "$NIGHT_SHIFT_LIB/integrity.sh"
+# End-of-run whole-branch sweep (NIGHT_SHIFT_BRANCH_SWEEP). See scripts/lib/sweep.sh.
+# shellcheck source=scripts/lib/sweep.sh
+. "$NIGHT_SHIFT_LIB/sweep.sh"
+# Doc-freshness candidate mapper (NIGHT_SHIFT_DOC_FRESHNESS). See
+# scripts/lib/doc-freshness.sh.
+# shellcheck source=scripts/lib/doc-freshness.sh
+. "$NIGHT_SHIFT_LIB/doc-freshness.sh"
 # Verdict extraction + live-model verdict normalization. See scripts/lib/normalize.sh.
 # shellcheck source=scripts/lib/normalize.sh
 . "$NIGHT_SHIFT_LIB/normalize.sh"
@@ -180,6 +255,7 @@ Usage:
   scripts/night-shift.sh --list-config              # NIGHT_SHIFT_* knobs + defaults, no run
   scripts/night-shift.sh --preflight --project PATH --spec PATH  # JSON readiness, no run
   scripts/night-shift.sh --project PATH [--spec PATH] --resume    # resume a preserved blocked run
+  scripts/night-shift.sh --sweep-only --project PATH  # one-shot branch sweep, no run/queue; exit 0 SWEEP_PASS, 2 residual findings
 
 Claude runs the entire flow: stage-scoped primary sessions implement (a fresh
 session per stage scope — plan, implement, observe — handing off through files
@@ -233,6 +309,7 @@ while [ "$#" -gt 0 ]; do
     --list-config) LIST_CONFIG=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
     --resume) RESUME=1; shift ;;
+    --sweep-only) SWEEP_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -674,6 +751,20 @@ compact_success() {
     [ ! -f "$run_dir/events.jsonl" ] || cp "$run_dir/events.jsonl" "$archive/events.jsonl" || copy_ok=0
     # ...and so is the human log, run.log (the timestamped mirror of every log line).
     [ ! -f "$run_dir/run.log" ] || cp "$run_dir/run.log" "$archive/run.log" || copy_ok=0
+    # The branch sweep's residual findings/verdict/package matter exactly when
+    # a run completes with unresolved sweep findings (BRANCH_SWEEP=advisory, or
+    # the fix cycle exhausted its rounds) — archive the whole sweep/ dir
+    # (findings.md, verdict.txt, package.diff, package.meta.json, any
+    # fix-session-N.json) alongside validated/ rather than letting it evaporate
+    # with the rest of run_dir below.
+    [ ! -d "$run_dir/sweep" ] || cp -R "$run_dir/sweep" "$archive/sweep" || copy_ok=0
+    # The test-audit and doc-freshness reports are the same evidence class as
+    # sweep/: advisory findings the observer weighed, worth studying after the
+    # run. Without archiving them here the delete loop below destroys them (and
+    # the journal's {files, final_total} summary points at findings that no
+    # longer exist). Archive the whole dirs alongside sweep/.
+    [ ! -d "$run_dir/test-audit" ] || cp -R "$run_dir/test-audit" "$archive/test-audit" || copy_ok=0
+    [ ! -d "$run_dir/doc-freshness" ] || cp -R "$run_dir/doc-freshness" "$archive/doc-freshness" || copy_ok=0
   fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
@@ -699,7 +790,15 @@ compact_success() {
   fi
   for entry in "$run_dir"/* "$run_dir"/.[!.]* "$run_dir"/..?*; do
     [ -e "$entry" ] || continue
-    [ "$entry" = "$run_dir/archive" ] || rm -rf "$entry"
+    # feedback.md (write_run_feedback) is a PERSISTENT cross-run file living
+    # directly under RUN_ROOT ($project/.night-shift/feedback.md) — unlike
+    # everything else compacted here it is not per-run evidence, it is the
+    # human-facing feedback log that accumulates across every run against
+    # this project, so it must survive compaction untouched.
+    case "$entry" in
+      "$run_dir/archive"|"$run_dir/feedback.md") continue ;;
+    esac
+    rm -rf "$entry"
   done
 }
 
@@ -814,6 +913,11 @@ initialize_run() {
   run_validation_commands baseline "$RUN_ROOT/validated/baseline.json" "$baseline_commands" ||
     block_run "baseline validation commands are missing or could not run"
   assert_tools_available "$RUN_ROOT/validated/baseline.json" "baseline"
+  # Smoke-run phase (skips silently, writes nothing, when the spec has no
+  # `- Smoke:` field). Baseline never gates on the smoke exit status — same
+  # as every other baseline command, a pre-broken smoke check is recorded here
+  # and only judged for REGRESSION against final (verify_candidate).
+  run_smoke_phase baseline "$RUN_ROOT/validated/smoke-baseline.json"
   test_command="$(sed -nE 's/^- First failing test or executable check: `([^`]+)`.*/\1/p' "$SPEC" | head -n 1)"
   [ -n "$test_command" ] || block_run "test-first command is missing"
   run_test_command failing "$test_command" "$RUN_ROOT/validated/test-first-failing.json"
@@ -875,6 +979,7 @@ recover_run() {
   RUN_ID="$(jq -r '.run_id' "$STATE")"
   SPEC="$(jq -r '.task' "$STATE")"
   set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
+  validate_spec_smoke "$SPEC" || die "resumed spec Smoke field is invalid"
   OBSERVER="$(jq -r '.observer' "$STATE")"
   BASE_COMMIT="$(jq -r '.base_commit' "$STATE")"
   BASE_BRANCH="$(jq -r '.base_branch' "$STATE")"
@@ -1068,6 +1173,62 @@ $block"
   printf '%s' "$out"
 }
 
+# Generates + inlines the candidate-stale-doc list into the implement-stage
+# prompt (agentic-gaps tranche §B, opening on Task 5's doc_freshness_candidates).
+# Self-contained generate-then-render, mirroring component_inventory_prompt_block:
+# writes $RUN_ROOT/doc-freshness/<task>.json fresh on every call (diffing
+# $BASE_COMMIT..HEAD — cheap, deterministic) and renders it if non-empty. Gated
+# on DOC_FRESHNESS (default ON; "0" disables both the write and the block).
+#
+# Because this runs at implement-stage prompt assembly, HEAD has not advanced
+# past $BASE_COMMIT until a candidate commit exists — so the FIRST pass
+# through implementation naturally writes an empty list here (nothing
+# committed yet to diff); it only has real content on this call for a
+# re-review round following an observer BLOCK (HEAD is then the previous
+# candidate). That first-pass emptiness is fine for the PROMPT (there is
+# nothing to react to yet), but the SAME file is later read verbatim by
+# doc_freshness_section() for the observer — so verify_candidate's post-
+# candidate slot calls doc_freshness_recompute_candidate (below) to
+# overwrite this file once a candidate commit exists and $BASE_COMMIT..HEAD
+# is a real diff, the same way check_component_reuse/port_audit_candidate
+# compute their post-candidate evidence. That keeps the observer's read
+# populated on a first-pass APPROVE, not just on re-review rounds.
+#
+# Any generation failure (bad args, no jq, unwritable RUN_ROOT) degrades to an
+# empty block — doc-freshness is advisory context, never allowed to block a
+# prompt from being assembled.
+#
+# Task-keyed output path shared by doc_freshness_prompt_block (write, at
+# implement-stage prompt time), the post-candidate recompute
+# (doc_freshness_recompute_candidate, write, after a candidate commit
+# exists), and doc_freshness_section (read, for the observer) — a single
+# helper so the three sites can never drift onto different filenames for the
+# same spec.
+doc_freshness_path() {
+  printf '%s/doc-freshness/%s.json' "$RUN_ROOT" "$(basename "$1" .md)"
+}
+
+doc_freshness_prompt_block() {
+  local spec="$1" out lines truncated_note
+  [ "$DOC_FRESHNESS" = "1" ] || return 0
+  out="$(doc_freshness_path "$spec")"
+  mkdir -p "$(dirname "$out")" 2>/dev/null || return 0
+  doc_freshness_candidates "$PROJECT" "$BASE_COMMIT" "$out" 2>/dev/null || return 0
+  [ -s "$out" ] || return 0
+  jq empty "$out" >/dev/null 2>&1 || return 0
+  integrity_put "$out"
+  jq -e '(.docs // []) | length > 0' "$out" >/dev/null 2>&1 || return 0
+  lines="$(jq -r '.docs[] | "- " + .path + " (" + .reason + ")"' "$out" 2>/dev/null)"
+  [ -n "$lines" ] || return 0
+  truncated_note=""
+  [ "$(jq -r '.truncated // false' "$out" 2>/dev/null)" != "true" ] ||
+    truncated_note=" (list capped at 10 — more candidates may exist)"
+  printf '\n## Doc-freshness candidates%s\n' "$truncated_note"
+  printf 'These docs sit near or mention files this candidate has touched so far and\nmay now describe stale behavior:\n'
+  printf '%s\n' "$lines"
+  printf '\nFor each doc above: if your changes invalidate any claim it makes, update it in\nthis candidate. A doc your change does not affect needs no edit — do not touch it\nto satisfy the list. The observer judges the docs above against your actual diff:\na doc whose claims your change clearly breaks, left un-updated, is a finding.\n'
+}
+
 COMPONENT_INVENTORY_ROW_CAP=40
 
 # Generates + inlines the target project's component inventory into the planning
@@ -1148,7 +1309,7 @@ primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
-  local rejection_note malformed_prev
+  local rejection_note malformed_prev doc_freshness_note
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
@@ -1211,6 +1372,7 @@ Fix exactly that and rewrite the WHOLE file this turn in the required shape belo
 "
   fi
   design_build_note=""
+  doc_freshness_note=""
   case "$stage" in
     planning)
       if spec_has_design_contract "$SPEC"; then
@@ -1220,6 +1382,12 @@ piece of the design to a reuse decision before implementation starts.
 $(component_inventory_prompt_block "$SPEC")"
       fi ;;
     implementation|implementation_review)
+      # Doc-freshness (agentic-gaps §B): unconditional, unlike design_build_note
+      # above — every spec's implement stage gets the candidate-stale-doc list,
+      # not just Design-Contract ones. Empty string (zero cost) when the knob is
+      # off, no candidates match, or (the common first-pass case) nothing has
+      # been committed yet to diff against.
+      doc_freshness_note="$(doc_freshness_prompt_block "$SPEC")"
       if spec_has_design_contract "$SPEC"; then
         design_build_note="
 Design-fidelity build (this spec has a \`## Design Contract\`). You are building this
@@ -1258,6 +1426,7 @@ Current stage: $stage
 Base commit: $BASE_COMMIT
 $workdir_note
 $design_build_note
+$doc_freshness_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
 You own planning, implementation, resolving review findings, validation,
@@ -1481,6 +1650,10 @@ block_run() {
   # signal arriving mid-cleanup would re-enter block_run (double cleanup, garbled
   # reason). The EXIT trap still runs release_lock. (HUP/INT/TERM only; not EXIT.)
   trap '' HUP INT TERM
+  # Kill any smoke-run server this run started BEFORE anything else: a signal
+  # arriving mid-poll (run_smoke_phase's `wait`/`sleep`) lands here, and a slow
+  # cleanup below must never race a lingering dev server.
+  cleanup_smoke_pgid 2>/dev/null || true
   # BEFORE cleanup_observer_tmp (which removes the workers' neutral cwds): stop
   # any live paid persona sessions and salvage the interrupted batch's costs.
   reap_persona_workers 2>/dev/null || true
@@ -1722,6 +1895,11 @@ assemble_review_bundle() {
         cat "$RUN_ROOT/validated/baseline.json"
         printf '\n```\n'
       fi
+      if [ -s "$RUN_ROOT/validated/smoke-baseline.json" ]; then
+        printf '\n## Baseline smoke check (app boot proof)\n\n```json\n'
+        cat "$RUN_ROOT/validated/smoke-baseline.json"
+        printf '\n```\n'
+      fi
       # A reuse-violations.json can only exist from an EARLIER candidate in
       # this task (check_component_reuse runs post-candidate, after the FIRST
       # implementation-review round has already judged the working tree) — so
@@ -1731,6 +1909,14 @@ assemble_review_bundle() {
       # Same timing note applies: port_audit_candidate runs post-candidate, so
       # a report only exists here on a re-review round. Empty on a first pass.
       port_audit_section
+      # Ditto: test_audit_candidate runs post-candidate too, so a report only
+      # exists here on a re-review round. Empty on a first pass.
+      test_audit_section
+      # doc_freshness_prompt_block writes the candidate list at implement-stage
+      # prompt time (this SAME stage), so — unlike the two sections above —
+      # this one can already be populated on the current round, not just a
+      # re-review round.
+      doc_freshness_section
     fi
   } >"$out"
 }
@@ -2322,6 +2508,16 @@ EOF
   run_validation_commands final "$RUN_ROOT/validated/final.json" "$final_commands" "$validation_worktree" ||
     block_run "final validation commands are missing or could not run"
   assert_tools_available "$RUN_ROOT/validated/final.json" "final"
+  # Smoke-run phase, same skip-silently contract as the baseline call. A
+  # present Smoke field always produces both smoke-baseline.json (written
+  # above) and smoke-final.json here, so gate on the final file existing —
+  # never invent a parallel regression mechanism, reuse validation_not_regressed
+  # + block_run exactly like the ordinary final-validation gate below.
+  run_smoke_phase final "$RUN_ROOT/validated/smoke-final.json" "$validation_worktree"
+  if [ -s "$RUN_ROOT/validated/smoke-final.json" ]; then
+    validation_not_regressed "$RUN_ROOT/validated/smoke-baseline.json" "$RUN_ROOT/validated/smoke-final.json" ||
+      block_run "final smoke check introduced a new or worsened failure"
+  fi
   validation_not_regressed "$RUN_ROOT/validated/baseline.json" "$RUN_ROOT/validated/final.json" ||
     block_run "final validation introduced a new or worsened failure"
   evidence_exit_status_matches "$evidence" final_validation "$RUN_ROOT/validated/final.json" ||
@@ -2339,6 +2535,18 @@ EOF
   ' --arg candidate "$candidate" --arg now "$(now_iso)"
   cp "$evidence" "$RUN_ROOT/validated/execution-$candidate.json"
   state_set '.candidate_verified=true'
+  # Doc-freshness recompute (Phase-B gate-review fix, closing the tranche §B
+  # gap): the only doc_freshness_candidates call otherwise sat in
+  # doc_freshness_prompt_block, which runs at implement-stage PROMPT time —
+  # before any candidate commit exists, so on a first pass HEAD==BASE_COMMIT
+  # and that write is always {"docs":[]}. doc_freshness_section only READS
+  # the file, so the observer got an empty list on every first-pass-APPROVE
+  # run. Here, post-candidate, HEAD IS $candidate, so $BASE_COMMIT..HEAD is
+  # the full candidate diff — recompute and overwrite the SAME task-keyed
+  # file (doc_freshness_path) so doc_freshness_section's read site needs no
+  # change. Same post-candidate slot and never-blocks posture as the reuse
+  # gate and port audit below.
+  doc_freshness_recompute_candidate
   # Soft reuse gate (port-fidelity Task 6): runs only AFTER every hard check
   # above has passed, on the now-validated candidate; see check_component_reuse
   # for why this never blocks.
@@ -2346,6 +2554,9 @@ EOF
   # Soft port-fidelity audit (Task 9): same post-candidate slot, same
   # never-blocks posture; see port_audit_candidate.
   port_audit_candidate
+  # Soft false-confidence test audit (agentic-gaps tranche §C): same
+  # post-candidate slot, same never-blocks posture; see test_audit_candidate.
+  test_audit_candidate
   emit_event candidate_validated "$(jq -cn --arg c "$candidate" '{commit:$c}')"
   log "candidate $candidate validated; handing to observer"
   if visual_stage_enabled "$SPEC"; then
@@ -2596,6 +2807,155 @@ SCREENS
   return 0
 }
 
+# Newline list of test-file-shaped paths (mirrors test-audit-static.js's own
+# TEST_FILE_RE: *.test.[jt]sx? / *.spec.[jt]sx?) touched by base..HEAD inside
+# $project, project-relative (matching git diff's own output — direct
+# --tests input to scripts/test-audit.sh, no further resolution needed).
+# Scoped to $workdir when set (a monorepo candidate should only pull in test
+# files from the app actually being touched, same reasoning as port_audit's
+# --scope). Empty output (never a failure) on a bad range/no matches — the
+# caller (test_audit_candidate) treats "nothing touched" as a clean no-op.
+test_audit_touched_tests() {
+  local project="$1" base="$2" workdir="${3:-}" scope
+  scope="${workdir:-.}"
+  git -C "$project" diff --name-only "$base" HEAD -- "$scope" 2>/dev/null |
+    grep -E '\.(test|spec)\.[jt]sx?$'
+  return 0
+}
+
+# Post-candidate, non-gating false-confidence test audit (agentic-gaps
+# tranche §C; scripts/test-audit.sh). Gate: NIGHT_SHIFT_TEST_AUDIT=1 AND the
+# candidate diff (BASE_COMMIT..HEAD, scoped to WORKDIR when set) touches at
+# least one test-shaped file — absent either, this is a silent no-op, same
+# shape as port_audit_candidate's manifest-field gate. Runs test-audit.sh
+# ONCE over exactly the touched test files (scoped, cheap — never a
+# whole-tree sweep; that is the standalone CLI's job per
+# docs/COMMAND-PLAYBOOK.md), on the TEST_AUDIT_MODEL knob resolved through
+# any recorded model fallback. Same soft posture as check_component_reuse/
+# port_audit_candidate: every failure mode is a WARN + skip, NEVER
+# block_run — but a report on disk is attached and journaled regardless of
+# the CLI's exit status (test-audit.sh's own exit 2 just means "findings
+# exist", not an error; that IS the evidence this audit exists to surface).
+# Journal: one `test_audit` event per report, {files, final_total} with
+# final_total null when the report is missing/unreadable.
+test_audit_candidate() {
+  local files file report count payload file_args=() src
+  [ "$TEST_AUDIT" = "1" ] || return 0
+  files="$(test_audit_touched_tests "$PROJECT" "$BASE_COMMIT" "$WORKDIR")"
+  [ -n "$files" ] || return 0
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    file_args+=("$file")
+  done <<FILES
+$files
+FILES
+  [ "${#file_args[@]}" -gt 0 ] || return 0
+  count="${#file_args[@]}"
+  # --src scopes the static layer's assert-on-unknown-property rule AND the
+  # agent pass's "source under test" context — same WORKDIR convention as
+  # port_audit_candidate's --scope (project-relative on both sides): the
+  # monorepo subdir when one is set, else the whole project ("." resolves to
+  # $PROJECT itself via test-audit.sh's own resolve_project_path).
+  src="${WORKDIR:-.}"
+  report="$PROJECT/.night-shift/test-audit/$(basename "$SPEC" .md).json"
+  mkdir -p "$(dirname "$report")" 2>/dev/null || true
+  mkdir -p "$RUN_ROOT/raw" 2>/dev/null || true
+  if ! "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$PROJECT" --tests "${file_args[@]}" \
+      --src "$src" \
+      --model "$(resolve_effective_model "$TEST_AUDIT_MODEL")" --out "$report" \
+      >"$RUN_ROOT/raw/test-audit-$(basename "$SPEC" .md).log" 2>&1; then
+    log "WARN: test-audit exited non-zero (advisory only; see raw/test-audit-$(basename "$SPEC" .md).log — a non-zero exit here just means findings were found, or degrades cleanly on an infra error)"
+  fi
+  if [ -s "$report" ]; then
+    integrity_put "$report"
+    payload="$(jq -cn --argjson files "$count" --slurpfile r "$report" '
+        {files: $files, final_total: ($r[0].summary.final_total // null)}
+      ' 2>/dev/null)"
+    [ -n "$payload" ] || payload="$(jq -cn --argjson files "$count" '{files:$files, final_total:null}')"
+    emit_event test_audit "$payload"
+  else
+    log "WARN: test-audit produced no report (advisory only, skipped)"
+  fi
+  return 0
+}
+
+# Supplementary reviewer surface for the test audit above — same
+# non-authoritative framing and dual attachment (implementation-review
+# persona bundle via assemble_review_bundle, observer context via
+# run_observer) as port_audit_section. Keyed on the CURRENT spec's own
+# task-named report ($(basename "$SPEC" .md).json), same as port_audit_section
+# keys on the spec's own screens — never a blanket glob of
+# .night-shift/test-audit/. Within a run this dir lives under RUN_ROOT and is
+# compacted at completion — compact_success archives it (alongside sweep/) so
+# the findings survive under archive/test-audit/. Deliberately NOT gated on
+# $TEST_AUDIT: an existing
+# report is evidence worth surfacing even if the knob changed between
+# rounds. Empty when no report has been written yet for this task.
+test_audit_section() {
+  local f
+  f="$PROJECT/.night-shift/test-audit/$(basename "$SPEC" .md).json"
+  [ -s "$f" ] || return 0
+  integrity_guard "$f" test-audit "the test-audit report"
+  printf '%s\n' '--- TEST AUDIT (advisory; engine-computed, NOT authoritative) ---'
+  printf 'Static scan + one bounded agent judgment pass over the candidate-touched\ntest files, hunting for false confidence (vacuous assertions, tautological\nround-trips, missing negative cases, stale skips). Weigh as one more input —\nnever gating. Any `confirm`ed or `unjudged` static finding, or any\n`additional` judgment-tier finding, should be addressed or explicitly waived.\n\n'
+  jq -c '.' "$f" 2>/dev/null | sed 's/^/    /'
+}
+
+# Post-candidate doc-freshness recompute (Phase-B gate-review fix). Called
+# from verify_candidate's post-candidate slot, once HEAD is the validated
+# candidate — see the call site's comment for why the implement-stage-prompt
+# write alone left the gate inert on a first-pass run. Overwrites the SAME
+# task-keyed file doc_freshness_prompt_block writes (doc_freshness_path), so
+# doc_freshness_section's read site is unchanged; on a re-review round this
+# simply recomputes against the (unchanged) BASE_COMMIT..HEAD range the
+# prompt-block call already covered, which is harmless idempotent work, not a
+# second source of truth.
+#
+# Advisory only, like check_component_reuse/port_audit_candidate: any failure
+# (knob off, no jq, unwritable RUN_ROOT, doc_freshness_candidates erroring) is
+# a WARN log and a clean return 0 — never block_run.
+doc_freshness_recompute_candidate() {
+  [ "$DOC_FRESHNESS" = "1" ] || return 0
+  local out
+  out="$(doc_freshness_path "$SPEC")"
+  mkdir -p "$(dirname "$out")" 2>/dev/null || {
+    log "WARN: doc-freshness recompute skipped — could not create $(dirname "$out")"
+    return 0
+  }
+  if ! doc_freshness_candidates "$PROJECT" "$BASE_COMMIT" "$out" 2>/dev/null; then
+    log "WARN: doc-freshness recompute failed (advisory only; observer evidence may be stale/empty)"
+    return 0
+  fi
+  jq empty "$out" >/dev/null 2>&1 || {
+    log "WARN: doc-freshness recompute produced invalid JSON; ignoring"
+    return 0
+  }
+  integrity_put "$out"
+  return 0
+}
+
+# Supplementary reviewer surface for the doc-freshness candidate list
+# (agentic-gaps tranche §B) — same non-authoritative framing and dual
+# attachment (implementation-review persona bundle via assemble_review_bundle,
+# observer context via run_observer) as port_audit_section/
+# reuse_violations_section. Reads the SAME doc_freshness_path(SPEC) file that
+# doc_freshness_prompt_block writes at implement-stage prompt time AND that
+# doc_freshness_recompute_candidate overwrites post-candidate (verify_candidate)
+# — this is deliberately keyed on the file existing, not on $DOC_FRESHNESS
+# (mirrors port_audit_section: evidence already on disk is worth surfacing even if the
+# knob changed between rounds). Empty when no file exists yet (nothing has
+# been generated this task) or its candidate list is empty.
+doc_freshness_section() {
+  local f
+  f="$(doc_freshness_path "$SPEC")"
+  [ -s "$f" ] || return 0
+  jq -e '(.docs // []) | length > 0' "$f" >/dev/null 2>&1 || return 0
+  integrity_guard "$f" doc-freshness "the doc-freshness candidate list"
+  printf '%s\n' '--- DOC FRESHNESS (candidate-stale docs; judge each against the candidate diff) ---'
+  printf 'Docs likely stale from this change (proximity/mention-ranked; advisory, NOT\nauthoritative). For each doc listed, judge it against the authoritative\nbase..candidate diff: if the change clearly invalidates a claim the doc makes\nand the candidate did NOT update that doc, that is a finding. Docs the change\ndoes not affect need no update — absence of an edit is only a finding when the\ndiff plainly contradicts the doc.\n\n'
+  jq -c '.docs[]' "$f" 2>/dev/null | sed 's/^/    /'
+}
+
 # Seam for fixtures: is the Codex CLI available? (command -v inline would make
 # the missing-CLI path untestable on machines that have codex installed.)
 codex_available() { command -v codex >/dev/null 2>&1; }
@@ -2667,7 +3027,10 @@ $retry_note
 The sections marked "authoritative" (the engine-computed base..candidate diff and
 the engine-run validation) are ground truth produced by the wrapper, not the
 implementer — weight them over any primary-supplied artifact, which is
-supplementary and may be incomplete.
+supplementary and may be incomplete. If a "--- DOC FRESHNESS ---" section is
+present, check each doc it lists against the candidate diff — a doc whose claims
+the change clearly invalidates, left un-updated in the candidate, is a finding;
+docs the change does not affect need no edit.
 
 Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:
@@ -2854,6 +3217,10 @@ observer_wrapper_evidence() {
     printf '\n%s\n' '--- ENGINE-RUN FINAL VALIDATION (at candidate, isolated worktree; authoritative) ---'
     cat "$RUN_ROOT/validated/final.json"
   fi
+  if [ -s "$RUN_ROOT/validated/smoke-final.json" ]; then
+    printf '\n%s\n' '--- ENGINE-RUN SMOKE CHECK (app boot proof, at candidate; authoritative) ---'
+    cat "$RUN_ROOT/validated/smoke-final.json"
+  fi
   if [ -s "$RUN_ROOT/validated/test-first-passing.json" ]; then
     printf '\n%s\n' '--- ENGINE-RUN TEST-FIRST (passing at candidate; authoritative) ---'
     cat "$RUN_ROOT/validated/test-first-passing.json"
@@ -2894,6 +3261,8 @@ run_observer() {
     codex_review_section "$candidate"
     reuse_violations_section
     port_audit_section
+    test_audit_section
+    doc_freshness_section
   } >"$context"
   jq -r '.artifacts[]' "$signal" | while IFS= read -r artifact; do
     resolved="$(resolve_artifact "$artifact")" || exit 30
@@ -3011,6 +3380,28 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  # Run feedback (Task 3, agentic-gaps tranche): a short fresh session
+  # distills this run's journal into <project>/.night-shift/feedback.md for
+  # the human who authors specs. Deliberately BEFORE the BRANCH_SWEEP block
+  # below — feedback must exist even when the sweep is off (spec §A), gated
+  # only on NIGHT_SHIFT_RUN_FEEDBACK (default "1", the cost off-switch).
+  # Always advisory: never blocks or delays completion (see write_run_feedback).
+  [ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$PROJECT"
+  # Optional advisory whole-branch review (Task 1, agentic-gaps tranche):
+  # never gates completion here — a fix cycle on the verdict lands in a later
+  # task. sweep_build_package refusing (main/master tip, empty branch) is a
+  # clean skip, not a failure; its stderr names the reason for the log line.
+  if [ "$BRANCH_SWEEP" != "0" ]; then
+    if sweep_build_package "$PROJECT" "$RUN_ROOT/sweep" >/dev/null 2>"$RUN_ROOT/sweep-skip.log" &&
+      sweep_run "$PROJECT" "$RUN_ROOT/sweep"; then
+      # advisory: verdict + findings only, no auto-fix. Any other value
+      # (default "1") runs the capped fix cycle (Task 2, agentic-gaps
+      # tranche) — never gates completion either way.
+      [ "$BRANCH_SWEEP" = "advisory" ] || sweep_fix_cycle "$PROJECT" "$RUN_ROOT/sweep"
+    else
+      log "branch sweep skipped: $(tail -1 "$RUN_ROOT/sweep-skip.log" 2>/dev/null)"
+    fi
+  fi
   # The journal is anchored on every append (events.sh); verify it here — the
   # last trust point before it becomes the archived record of the run.
   integrity_guard "$RUN_ROOT/events.jsonl" events "the decision journal"
@@ -3053,6 +3444,12 @@ EOF
   [ -n "$next_spec" ] || { complete_run; return; }
   validate_spec "$next_spec" || block_run "next TODO spec is incomplete"
   SPEC="$next_spec"
+  # Clear stale smoke evidence from the completed task BEFORE this task's own
+  # baseline/final smoke runs (if it declares a Smoke field) write fresh files.
+  # Without this, a follow-up task with no Smoke field at all would silently
+  # inherit and re-present the PREVIOUS task's smoke-baseline.json/
+  # smoke-final.json as if they belonged to it.
+  rm -f "$RUN_ROOT/validated/smoke-final.json" "$RUN_ROOT/validated/smoke-baseline.json"
   BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
   BASE_BRANCH="$(git -C "$PROJECT" branch --show-current)"
   BASE_STATUS="$RUN_ROOT/baseline-status-$(basename "$SPEC" .md).txt"
@@ -3079,6 +3476,7 @@ EOF
   # with state pointing at the NEW spec, so --resume re-validates that spec and
   # re-surfaces the real problem instead of re-driving the completed task.
   set_spec_workdir "$SPEC" || block_run "next TODO spec has an invalid Workdir"
+  validate_spec_smoke "$SPEC" || block_run "next TODO spec has an invalid Smoke field"
   check_branch_and_worktree "$SPEC" ||
     block_run "next task branch or worktree routing is unsafe"
   baseline_commands="$(extract_validation_commands "$SPEC" "Baseline validation commands")"
@@ -3087,6 +3485,9 @@ EOF
   cp "$RUN_ROOT/validated/baseline-$(basename "$SPEC" .md).json" "$RUN_ROOT/validated/baseline.json"
   integrity_put "$RUN_ROOT/validated/baseline.json"
   assert_tools_available "$RUN_ROOT/validated/baseline.json" "next task baseline"
+  # Smoke-run phase for the chained next task — same skip-silently, non-
+  # gating-at-baseline contract as the initial run_baseline call.
+  run_smoke_phase baseline "$RUN_ROOT/validated/smoke-baseline.json"
   test_command="$(sed -nE 's/^- First failing test or executable check: `([^`]+)`.*/\1/p' "$SPEC" | head -n 1)"
   run_test_command failing "$test_command" "$RUN_ROOT/validated/test-first-failing.json"
   test_first_exit="$(jq -r '.exit_status' "$RUN_ROOT/validated/test-first-failing.json")"
@@ -3126,6 +3527,13 @@ main_run() {
   case "$RATE_LIMIT_BUFFER_SECONDS" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS must be a non-negative integer" ;;
   esac
+  # SMOKE_TIMEOUT feeds a `timeout` invocation inside run_smoke_phase, deep
+  # into a build; a non-integer override used to surface only as a mid-phase
+  # arithmetic/usage error there. Validate loudly at startup instead, same
+  # posture as RATE_LIMIT_BUFFER_SECONDS above.
+  case "$SMOKE_TIMEOUT" in
+    ''|*[!0-9]*) die "NIGHT_SHIFT_SMOKE_TIMEOUT must be a non-negative integer" ;;
+  esac
 
   # Acquire a per-project lock BEFORE touching state.json; two concurrent runs
   # on the same --project would otherwise corrupt the shared state. The lock
@@ -3133,8 +3541,10 @@ main_run() {
   acquire_lock
   # Release the lock on normal exit AND on any signal.  The HUP/INT/TERM trap
   # is set below (after initialize_run) so it can call block_run; that trap
-  # does NOT replace this EXIT trap — both fire on exit.
-  trap 'release_lock' EXIT
+  # does NOT replace this EXIT trap — both fire on exit. cleanup_smoke_pgid
+  # first: a normal exit already clears SMOKE_PGID in run_smoke_phase, but this
+  # is the last line of defense against a crash mid-phase leaving a live server.
+  trap 'cleanup_smoke_pgid 2>/dev/null || true; release_lock' EXIT
 
   if recover_run; then
     :
@@ -3153,6 +3563,7 @@ main_run() {
     validate_spec_project "$SPEC" ||
       die "spec Project path does not match --project"
     set_spec_workdir "$SPEC" || die "spec Workdir is invalid"
+    validate_spec_smoke "$SPEC" || die "spec Smoke field is invalid"
     check_branch_and_worktree "$SPEC" ||
       die "current branch or worktree does not safely match the spec"
     initialize_run
@@ -3217,4 +3628,39 @@ if [ "$FIXTURE_TEST" -eq 1 ]; then
   exit 0
 fi
 [ "$DRY_RUN" -eq 0 ] || die "--dry-run is valid only with --fixture-test"
+# shellcheck disable=SC2031
+# ^ False positive, tree-wide runs only: when fixtures.sh is also a shellcheck
+#   input (CI passes every scripts/**/*.sh together), its test-scaffolding
+#   subshell `PROJECT=` assignments (SC2030/SC2031 are file-wide-suppressed
+#   THERE for exactly this) taint every later top-level `$PROJECT` use in this
+#   file. The fixture path `exit 0`s above before this block can ever run, so
+#   no subshell modification is live here.
+if [ "$SWEEP_ONLY" -eq 1 ]; then
+  require_command git
+  [ -n "$PROJECT" ] || die "--sweep-only requires --project"
+  git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "project is not a Git repository: $PROJECT"
+  # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
+  # queued specs, so it never touches --spec/NEXT_TASK task selection. Even
+  # with --spec given, sweep_fix_cycle's re-validation branch is a no-op
+  # here — it requires BOTH a spec AND a live RUN_ROOT (run_validation_commands
+  # writes under "$RUN_ROOT/raw/...", unguarded), and standalone --sweep-only
+  # never has a RUN_ROOT — so revalidation is in-run-only and cannot be
+  # reached from this surface at all.
+  # Bare/advisory posture: a --sweep-only invocation is verdict-only by
+  # default (BRANCH_SWEEP defaults to "0", which is NOT "1") — it never runs
+  # the fix cycle unless the caller explicitly opts in with
+  # NIGHT_SHIFT_BRANCH_SWEEP=1, so a bare invocation can never leave
+  # unvalidated fix commits on the user's branch.
+  out="${TMPDIR:-/tmp}/night-shift-sweep-$$"
+  sweep_build_package "$PROJECT" "$out" >/dev/null || die "nothing to sweep"
+  sweep_run "$PROJECT" "$out"
+  if [ "$BRANCH_SWEEP" = "1" ]; then
+    sweep_fix_cycle "$PROJECT" "$out"
+  else
+    printf 'sweep: verdict-only (no fix cycle) — set NIGHT_SHIFT_BRANCH_SWEEP=1 to auto-fix findings\n'
+  fi
+  printf 'sweep artifacts: %s\n' "$out"
+  [ "$(cat "$out/verdict.txt")" = "SWEEP_PASS" ] && exit 0 || exit 2
+fi
 main_run

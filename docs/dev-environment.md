@@ -1,5 +1,9 @@
 # Developer Environment Setup
 
+> Summary: Personal machine setup log — Codex aliases, nvm/Node, Nerd Font +
+> Ghostty + Starship prompt, zsh-autosuggestions/syntax-highlighting, RN shell
+> shortcuts, the `claude-usage` reporter, and the Claude Code status line.
+
 > Last updated: 2026-06-05 (added Nerd Font, Ghostty config, zsh plugins)  
 > Platform: macOS (Apple Silicon) · Shell: zsh
 

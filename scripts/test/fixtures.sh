@@ -152,6 +152,7 @@ run_dry_fixtures() {
   fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
+  fixture_assert "Smoke phase: field parsing/validation, exit + server modes, timeout/abort leave no zombie" fixture_smoke_phase "$root"
   fixture_assert "material_token counts untracked files as material change (stall-reset)" fixture_material_token_untracked "$root"
   fixture_assert "finding-history write failure blocks with its own reason, not 'unchanged'" fixture_finding_history_failure_reason "$root"
   fixture_assert "compact_success preserves full state when the archive copy fails" fixture_compact_success_copy_guard "$root"
@@ -287,9 +288,44 @@ run_dry_fixtures() {
   fixture_port_audit_normalize
   fixture_port_audit_offline
   fixture_port_audit_wiring
+  fixture_sweep_package
+  fixture_sweep_verdict
+  fixture_assert "branch sweep: session run writes verdict + journals a sweep event" fixture_sweep_run "$root"
+  fixture_assert "branch sweep: rate-limit retry bounded by NIGHT_SHIFT_SWEEP_MAX_WAIT" fixture_sweep_rate_limit_bound "$root"
+  fixture_assert "branch sweep: package + SWEEP_ERROR verdict anchor into the integrity dir" fixture_sweep_integrity "$root"
+  fixture_assert "branch sweep: SWEEP_ERROR skips the fix cycle untouched" fixture_sweep_error_skips_fix "$root"
+  fixture_assert "branch sweep: fix cycle reverts on failed re-validation" fixture_sweep_fix_revert "$root"
+  fixture_assert "branch sweep: fix cycle reverts a dirty tree (uncommitted work) before revalidation" fixture_sweep_fix_dirty_guard "$root"
+  fixture_assert "branch sweep: fix cycle rebuilds the package before the re-sweep (fixed code judged, not stale diff)" fixture_sweep_rebuild_before_resweep "$root"
+  fixture_assert "branch sweep: fix-cycle re-validation runs in an isolated worktree, not the live tree" fixture_sweep_fix_worktree_isolation "$root"
+  fixture_assert "branch sweep: fix cycle capped at NIGHT_SHIFT_SWEEP_MAX_FIX then residual" fixture_sweep_fix_cap "$root"
+  fixture_sweep_only_args
+  fixture_assert "branch sweep: --sweep-only exits 0 on SWEEP_PASS / 2 on residual findings" fixture_sweep_only_run "$root"
+  fixture_assert "branch sweep: --sweep-only bare never runs the fix cycle (advisory by default)" fixture_sweep_only_bare_skips_fix "$root"
+  fixture_assert "branch sweep: --sweep-only NIGHT_SHIFT_BRANCH_SWEEP=1 runs the fix cycle (explicit opt-in)" fixture_sweep_only_branch_sweep_1_runs_fix "$root"
+  fixture_assert "branch sweep: fix cycle skips revalidation cleanly when SPEC is set but RUN_ROOT is not" fixture_sweep_fix_cycle_no_run_root_skips_revalidation "$root"
+  fixture_assert "run feedback: writes one section + event, second run appends" fixture_run_feedback_writes_and_appends "$root"
+  fixture_assert "run feedback: session failure warns and never blocks (advisory)" fixture_run_feedback_session_failure_is_advisory "$root"
+  fixture_assert "run feedback: NIGHT_SHIFT_RUN_FEEDBACK=0 skips the session and never writes feedback.md; default runs it" fixture_run_feedback_knob "$root"
+  fixture_assert "compact_success preserves feedback.md and archives residual sweep findings" fixture_compact_success_preserves_feedback_and_sweep "$root"
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
+  fixture_assert "doc-freshness: dir hit + mention hit found, unrelated root doc absent, valid JSON" fixture_doc_freshness_basic "$root"
+  fixture_assert "doc-freshness: candidate list capped at 10 with truncated:true" fixture_doc_freshness_cap "$root"
+  fixture_assert "doc-freshness: empty diff (base==HEAD) yields docs:[] truncated:false" fixture_doc_freshness_empty_diff "$root"
+  fixture_assert "doc-freshness: doc mentioning a diff-added exported symbol is found (symbol: reason)" fixture_doc_freshness_symbol "$root"
+  fixture_assert "doc-freshness: no root-'.' flood; a just-updated doc is not re-flagged" fixture_doc_freshness_no_flood "$root"
+  # fixture_doc_freshness_prompt / fixture_doc_freshness_recompute print their
+  # own ok/not-ok (the _run/wrapper subshell idiom, same as
+  # fixture_manifest_prompt above) — invoked directly, NOT via fixture_assert,
+  # which would print a duplicate ok line.
+  fixture_doc_freshness_prompt
+  fixture_doc_freshness_recompute
+  fixture_assert "doc-summaries: --check passes on conforming docs, fails naming the offender on non-conforming ones" fixture_doc_summaries_check "$root"
+  fixture_test_audit_static
+  fixture_test_audit_cli
+  fixture_test_audit_wiring
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -1533,7 +1569,8 @@ fixture_event_stream() {
   for e in signal_rejected run_blocked run_complete persona_verdict integrity_violation \
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
-    stage_transition codex_review model_fallback reuse_violation port_audit; do
+    stage_transition codex_review model_fallback reuse_violation port_audit smoke \
+    sweep sweep_fix sweep_fix_reverted run_feedback test_audit; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -2448,6 +2485,204 @@ fixture_workdir_field() {
     rc=$?
     fx "red-against-base returns setup-failure 6 when the workdir is absent at BASE" \
       [ "$rc" -eq 6 ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_smoke_phase() {
+  # Spec-declared `- Smoke:`/`- Smoke URL:` validation phase (agentic-gaps
+  # Task 11): proves the app actually BOOTS, not just that tsc/eslint/jest
+  # pass (evidence: a Release-bundle break that passed every one of those).
+  # Same backticked-value dialect + loud-malformed-field contract as Workdir.
+  # run_smoke_phase itself: skips silently (return 0, write nothing) with no
+  # Smoke field; exit mode requires the command to exit 0 within the timeout;
+  # server mode (Smoke URL present) polls the loopback URL for HTTP 200 then
+  # TERM-then-KILLs the whole process group via cleanup_smoke_pgid — never a
+  # zombie dev server, on success OR on a poll timeout.
+  local root="$1" dir="$root/smoke" spec port rc bgpid dport cport collider_pid
+  mkdir -p "$dir/proj" "$dir/rs/raw" "$dir/rs/validated"
+  ( PROJECT="$dir/proj"; RUN_ROOT="$dir/rs"; RUN_ID="smfx"; WORKDIR=""
+    spec="$dir/s.md"
+
+    # --- field parsing + loud-malformed-field validation ---
+    printf -- '- Smoke: `npm run dev`\n' >"$spec"
+    fx "spec_smoke_field: backticked value" \
+      [ "$(spec_smoke_field "$spec")" = "npm run dev" ] || exit 1
+    fx "validate_spec_smoke accepts a bare Smoke command" \
+      validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `npm run dev`\n- Smoke URL: `http://127.0.0.1:3999/`\n' >"$spec"
+    fx "spec_smoke_url_field: backticked value" \
+      [ "$(spec_smoke_url_field "$spec")" = "http://127.0.0.1:3999/" ] || exit 1
+    fx "validate_spec_smoke accepts a loopback 127.0.0.1 URL" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://localhost:4000/`\n' >"$spec"
+    fx "validate_spec_smoke accepts localhost" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: npm run dev\n' >"$spec"
+    fx_not "bare (unbackticked) Smoke value fails loudly" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke URL: `http://127.0.0.1:3999/`\n' >"$spec"
+    fx_not "Smoke URL without a Smoke field is malformed" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://example.com/`\n' >"$spec"
+    fx_not "non-loopback Smoke URL is rejected" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: http://127.0.0.1:3999/\n' >"$spec"
+    fx_not "bare (unbackticked) Smoke URL fails loudly" validate_spec_smoke "$spec" || exit 1
+    # --- hostname-prefix bypass: a naive `http://localhost*`/`http://127.0.0.1*`
+    # prefix match would also accept these (evil.com after the loopback-looking
+    # prefix) — the anchored case in validate_spec_smoke must reject both. ---
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://localhost.evil.com:80/`\n' >"$spec"
+    fx_not "hostname-prefix bypass (localhost.evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://127.0.0.1.evil.com/`\n' >"$spec"
+    fx_not "hostname-prefix bypass (127.0.0.1.evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    # --- userinfo bypass: `http://127.0.0.1:80@evil.com/` puts the loopback in
+    # the userinfo and evil.com as the real host; the `:*` port glob would
+    # otherwise swallow `@evil.com`. Any `@` in the authority must be rejected. ---
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://127.0.0.1:80@evil.com/health`\n' >"$spec"
+    fx_not "userinfo bypass (127.0.0.1:80@evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://localhost:3000@evil.com/`\n' >"$spec"
+    fx_not "userinfo bypass (localhost@evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    # A `@` in the PATH (not the authority) is fine — the authority is loopback.
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://127.0.0.1:3999/a@b`\n' >"$spec"
+    fx "loopback URL with @ in the path is accepted" validate_spec_smoke "$spec" || exit 1
+
+    # --- no-Smoke spec: run_smoke_phase returns 0, writes nothing ---
+    printf '# no smoke fields\n' >"$spec"
+    SPEC="$spec"
+    rc=0
+    run_smoke_phase none "$dir/rs/validated/smoke-none.json" || rc=$?
+    fx "no Smoke field: run_smoke_phase returns 0" [ "$rc" -eq 0 ] || exit 1
+    fx "no Smoke field: writes nothing" [ ! -e "$dir/rs/validated/smoke-none.json" ] || exit 1
+
+    # --- exit mode: command itself must exit 0 within the timeout ---
+    printf -- '- Smoke: `true`\n' >"$dir/s-true.md"
+    SPEC="$dir/s-true.md"
+    rc=0
+    run_smoke_phase probe "$dir/rs/validated/smoke-true.json" || rc=$?
+    fx "exit mode success: run_smoke_phase returns 0" [ "$rc" -eq 0 ] || exit 1
+    fx "exit mode success: json exit_status 0" \
+      [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-true.json")" -eq 0 ] || exit 1
+    fx "exit mode success: json command is labeled smoke:" \
+      [ "$(jq -r '.[0].command' "$dir/rs/validated/smoke-true.json")" = "smoke: true" ] || exit 1
+
+    printf -- '- Smoke: `false`\n' >"$dir/s-false.md"
+    SPEC="$dir/s-false.md"
+    rc=0
+    run_smoke_phase probe "$dir/rs/validated/smoke-false.json" || rc=$?
+    fx "exit mode failure: run_smoke_phase returns nonzero (phase failure)" [ "$rc" -ne 0 ] || exit 1
+    fx "exit mode failure: json exit_status nonzero" \
+      [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-false.json")" -ne 0 ] || exit 1
+
+    # --- server mode: real python3 http.server stub (skips cleanly without
+    # python3, matching the design-extract-web fixture's guard) ---
+    if command -v python3 >/dev/null 2>&1; then
+      mkdir -p "$dir/websrv"
+      printf 'ok\n' >"$dir/websrv/index.html"
+      port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+      printf -- '- Smoke: `python3 -m http.server %s --bind 127.0.0.1`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+        "$port" "$port" >"$dir/s-srv.md"
+      SPEC="$dir/s-srv.md"
+      rc=0
+      run_smoke_phase srv "$dir/rs/validated/smoke-srv.json" "$dir/websrv" || rc=$?
+      fx "server mode success: run_smoke_phase returns 0" [ "$rc" -eq 0 ] || exit 1
+      fx "server mode success: json exit_status 0" \
+        [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-srv.json")" -eq 0 ] || exit 1
+      sleep 0.3
+      fx "server mode success: SMOKE_PGID cleared after cleanup" [ -z "$SMOKE_PGID" ] || exit 1
+      fx "server mode success: process group is gone (no lingering server)" \
+        [ -z "$(pgrep -f "http.server $port" 2>/dev/null)" ] || exit 1
+
+      # --- never-serves: fixture-shortened timeout, rc 1, no zombie ---
+      printf -- '- Smoke: `sleep 41`\n- Smoke URL: `http://127.0.0.1:%s/`\n' "$port" >"$dir/s-to.md"
+      SPEC="$dir/s-to.md"
+      SMOKE_TIMEOUT=4
+      rc=0
+      run_smoke_phase to "$dir/rs/validated/smoke-to.json" "$dir/websrv" || rc=$?
+      fx "timeout: run_smoke_phase returns 1 (never served)" [ "$rc" -eq 1 ] || exit 1
+      fx "timeout: json exit_status 1" \
+        [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-to.json")" -eq 1 ] || exit 1
+      sleep 0.3
+      fx "timeout: no zombie process left" [ -z "$(pgrep -f 'sleep 41' 2>/dev/null)" ] || exit 1
+      SMOKE_TIMEOUT=20
+
+      # --- strict 2xx: a server that only ever 302-redirects is NOT boot proof.
+      # Bare `curl -fsS` exits 0 on a 3xx (accepting an auth bounce / redirect
+      # loop as "up"); run_smoke_phase must require 200-299, so this must time
+      # out (rc 1), never pass. ---
+      rport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+      cat >"$dir/redirect-server.py" <<'PYEOF'
+import http.server, socketserver, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302); self.send_header("Location", "/elsewhere"); self.end_headers()
+    def log_message(self, *a):
+        pass
+socketserver.TCPServer.allow_reuse_address = True
+socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYEOF
+      printf -- '- Smoke: `python3 %s/redirect-server.py %s`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+        "$dir" "$rport" "$rport" >"$dir/s-302.md"
+      SPEC="$dir/s-302.md"
+      SMOKE_TIMEOUT=4
+      rc=0
+      run_smoke_phase r302 "$dir/rs/validated/smoke-302.json" "$dir/websrv" || rc=$?
+      fx "strict 2xx: a 302-only server is not boot proof (times out, rc 1)" [ "$rc" -eq 1 ] || exit 1
+      sleep 0.3
+      fx "strict 2xx: redirect server cleaned up (no lingering process)" \
+        [ -z "$(pgrep -f "redirect-server.py $rport" 2>/dev/null)" ] || exit 1
+      SMOKE_TIMEOUT=20
+
+      # --- daemon-leak class: the Smoke command backgrounds its real listener
+      # under its OWN `set -m` (a genuinely new process group — the same
+      # detachment trick a self-daemonizing dev server uses, live-proven
+      # against Next 16 Turbopack) and the direct child then exits. The old
+      # group-only kill in cleanup_smoke_pgid cannot reach a process outside
+      # its group; only the port-scoped survivor sweep can. Assert no
+      # listener remains on the port once run_smoke_phase returns (regardless
+      # of its rc — the direct child racing ahead of the HTTP poll is exactly
+      # the daemonizing behavior under test). ---
+      if command -v lsof >/dev/null 2>&1; then
+        dport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+        printf -- '- Smoke: `bash -c '"'"'set -m; nohup python3 -m http.server %s --bind 127.0.0.1 >/dev/null 2>&1 & disown; exit 0'"'"'`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+          "$dport" "$dport" >"$dir/s-daemon.md"
+        SPEC="$dir/s-daemon.md"
+        run_smoke_phase daemon "$dir/rs/validated/smoke-daemon.json" "$dir/websrv" || true
+        sleep 1.5
+        fx "daemon-leak: no listener remains on the port (survivor sweep got it)" \
+          [ -z "$(lsof -ti "tcp:$dport" -sTCP:LISTEN 2>/dev/null)" ] || exit 1
+
+        # --- pre-boot collision: something already LISTENs on the Smoke
+        # URL's port before run_smoke_phase ever boots anything. Must refuse
+        # to spawn (rc=1, loud "already in use" message) and must NOT touch
+        # the pre-existing listener — we never booted, so the sweep must not
+        # run against it. ---
+        cport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+        python3 -m http.server "$cport" --bind 127.0.0.1 >/dev/null 2>&1 &
+        collider_pid=$!
+        sleep 0.3
+        printf -- '- Smoke: `python3 -m http.server %s --bind 127.0.0.1`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+          "$cport" "$cport" >"$dir/s-collide.md"
+        SPEC="$dir/s-collide.md"
+        rc=0
+        run_smoke_phase collide "$dir/rs/validated/smoke-collide.json" "$dir/websrv" || rc=$?
+        fx "pre-boot collision: run_smoke_phase returns 1 (refused to spawn)" [ "$rc" -eq 1 ] || exit 1
+        fx "pre-boot collision: output names 'already in use'" \
+          [ -n "$(jq -r '.[0].output' "$dir/rs/validated/smoke-collide.json" | grep -i 'already in use')" ] || exit 1
+        fx "pre-boot collision: pre-existing listener is untouched (still listening)" \
+          [ -n "$(lsof -ti "tcp:$cport" -sTCP:LISTEN 2>/dev/null)" ] || exit 1
+        kill "$collider_pid" 2>/dev/null || true
+        wait "$collider_pid" 2>/dev/null || true
+      fi
+    fi
+
+    # --- cleanup_smoke_pgid: direct unit test of the registered-group kill,
+    # independent of run_smoke_phase (the abort-trap wiring calls it bare) ---
+    set -m
+    ( exec sleep 42 ) & bgpid=$!
+    set +m
+    SMOKE_PGID="$bgpid"
+    cleanup_smoke_pgid
+    sleep 0.3
+    fx "cleanup_smoke_pgid kills the registered group directly" \
+      [ -z "$(pgrep -f 'sleep 42' 2>/dev/null)" ] || exit 1
+    fx "cleanup_smoke_pgid clears SMOKE_PGID" [ -z "$SMOKE_PGID" ] || exit 1
     exit 0
   ) || return 1
   return 0
@@ -6342,5 +6577,1678 @@ fixture_recovery_guard_ratelimit_dirty() {
   fx "recover_run completes the auto-recovery path (rc 0), guard never evaluated" test "$rc" = "0"
   fx "the rate-limit wait path was actually taken (not the guard's die)" test -f "$dir/waited.txt"
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Branch sweep (scripts/lib/sweep.sh; agentic-gaps Task 1 advisory core +
+# Task 2 fix cycle / --sweep-only / rate-limit bound / integrity anchoring).
+# ---------------------------------------------------------------------------
+
+# sweep: package builder is deterministic and refuses main/master tips
+fixture_sweep_package() {
+  local proj out mb
+  proj="$FIXTURE_ROOT/sweep-pkg-proj"
+  _fixture_recovery_guard_project "$proj" || return 1
+  (cd "$proj" && git checkout -q -b feat/x &&
+    printf 'a\n' >f.txt && git add f.txt && git commit -qm one &&
+    printf 'b\n' >>f.txt && git add f.txt && git commit -qm two)
+  out="$FIXTURE_ROOT/sweep-pkg"
+  mb="$(sweep_build_package "$proj" "$out")"
+  fixture_assert "sweep package: diff written" test -s "$out/package.diff"
+  fixture_assert "sweep package: meta has 2 commits" \
+    test "$(jq -r '.commit_count' "$out/package.meta.json")" = "2"
+  fixture_assert "sweep package: merge-base printed" test -n "$mb"
+  # --verify -q: plain `git rev-parse main` ECHOES "main" to stdout even when
+  # the ref is missing (exit 1), so on a runner whose scratch repo defaults to
+  # master the substitution fed checkout two words ("main" + the master sha) —
+  # the CI-only pathspec failure this comment memorializes.
+  (cd "$proj" && git checkout -q "$(git rev-parse --verify -q 'main^{commit}' || git rev-parse --verify -q 'master^{commit}')")
+  fixture_reject "sweep package: refuses default-branch tip" \
+    sweep_build_package "$proj" "$FIXTURE_ROOT/sweep-pkg2"
+}
+
+# sweep: verdict parsing accepts only the two contract words
+fixture_sweep_verdict() {
+  fixture_assert "verdict: PASS parsed" \
+    test "$(printf 'blah\nSWEEP_PASS\n' | sweep_parse_verdict)" = "SWEEP_PASS"
+  fixture_assert "verdict: FINDINGS parsed" \
+    test "$(printf 'SWEEP_FINDINGS: 3\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
+  fixture_assert "verdict: garbage -> FINDINGS (fail-closed)" \
+    test "$(printf 'no verdict here\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
+  # Hardening (Task 1 reviewer finding): the verdict is the LAST non-empty
+  # line, anchored — not an anywhere-in-text grep. A finding sentence that
+  # merely NAMES "SWEEP_PASS" in passing, with a genuine SWEEP_FINDINGS verdict
+  # on the actual last line, must parse as FINDINGS.
+  fixture_assert "verdict: last-line anchor ignores a mid-text SWEEP_PASS mention" \
+    test "$(printf 'this note mentions SWEEP_PASS but is not the verdict line\nSWEEP_FINDINGS: 4\n' | sweep_parse_verdict)" = "SWEEP_FINDINGS"
+  # ...and symmetrically, a genuine trailing SWEEP_PASS still parses as PASS
+  # even when an earlier line merely mentions SWEEP_FINDINGS in passing.
+  fixture_assert "verdict: last-line anchor honors a genuine trailing SWEEP_PASS despite an earlier SWEEP_FINDINGS mention" \
+    test "$(printf 'an earlier note mentions SWEEP_FINDINGS: 1 in passing\nSWEEP_PASS\n' | sweep_parse_verdict)" = "SWEEP_PASS"
+  # Trailing blank lines after the real verdict must not blank it out.
+  fixture_assert "verdict: trailing blank lines after PASS are skipped" \
+    test "$(printf 'SWEEP_PASS\n\n\n' | sweep_parse_verdict)" = "SWEEP_PASS"
+  local prompt; prompt="$(sweep_prompt "/tmp/sweep-out")"
+  fixture_assert "sweep prompt: names both contract words + the package path" \
+    bash -c 'case "$1" in
+      *SWEEP_PASS*SWEEP_FINDINGS*"/tmp/sweep-out/package.diff"*) exit 0 ;;
+      *) exit 1 ;;
+    esac' _ "$prompt"
+}
+
+# sweep: end-to-end session run against a stubbed `claude` — verdict.txt
+# content on PASS and on FINDINGS, plus a `sweep` event line when RUN_ROOT is
+# set. Stubs `claude` as a shell function inside a subshell (same seam as
+# fixture_recovery_invoke_observer_once_detects_rate_limit) so the override
+# never leaks into later fixtures in this process.
+fixture_sweep_run() {
+  local root="$1" dir="$root/sweep-run" proj argv
+  proj="$dir/proj"
+  mkdir -p "$proj"
+  (
+    OBSERVER_MODEL="inherit"; SWEEP_MODEL="inherit"
+    local out
+
+    out="$dir/out-pass"; mkdir -p "$out"
+    # Drain stdin like the real `claude -p` CLI does before replying: sweep_prompt
+    # writes its prompt via a heredoc, and bash's heredoc plumbing piped into a
+    # STUBBED FUNCTION (not the real external binary) that never reads stdin can
+    # SIGPIPE the writer — a test-only artifact of the pipe/heredoc/function
+    # combination, invisible in production where claude always reads the prompt.
+    # NOTE the escaped \\n: it must land in the JSON as the two characters
+    # backslash-n (a raw newline inside a JSON string is invalid — jq would
+    # reject the whole reply, sweep_run would cp the raw JSON as findings.md,
+    # and the last line would read `SWEEP_PASS"}`, which the anchored
+    # last-line parser rightly refuses).
+    claude() { cat >/dev/null; printf '{"result":"looks fine\\nSWEEP_PASS"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run (PASS): verdict.txt is SWEEP_PASS" \
+      bash -c 'test "$(cat "$1")" = "SWEEP_PASS"' _ "$out/verdict.txt"
+
+    out="$dir/out-findings"; mkdir -p "$out"
+    claude() { cat >/dev/null; printf '{"result":"issues found\\nSWEEP_FINDINGS: 2"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run (FINDINGS): verdict.txt is SWEEP_FINDINGS" \
+      bash -c 'test "$(cat "$1")" = "SWEEP_FINDINGS"' _ "$out/verdict.txt"
+
+    # RUN_ROOT set: the sweep event must land in the run's decision journal.
+    RUN_ROOT="$dir/run"; RUN_ID="sweeprun-$$"
+    mkdir -p "$RUN_ROOT"
+    out="$dir/out-journal"; mkdir -p "$out"
+    claude() { cat >/dev/null; printf '{"result":"fine\\nSWEEP_PASS"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep event journaled to events.jsonl" \
+      bash -c 'grep -q "\"type\":\"sweep\"" "$1"' _ "$RUN_ROOT/events.jsonl"
+
+    # Reviewer finding #1 (phase-A gate): the standalone --sweep-only package
+    # lives OUTSIDE $project (e.g. its own tmp dir) with no other grant, so
+    # without --add-dir the sandboxed session cannot read package.diff at all
+    # and was observed to silently reconstruct the diff itself (wrong scope
+    # once main advances). Record the stub's own argv to a file — same
+    # counter-file idiom as fixture_sweep_fix_cap's call counter, but capturing
+    # the arg vector itself rather than just a hit count — and assert the flag
+    # AND the package dir both appear in the recorded invocation.
+    out="$dir/out-add-dir"; mkdir -p "$out"
+    argv="$dir/add-dir-argv"
+    : >"$argv"
+    claude() { printf '%s\n' "$@" >>"$argv"; cat >/dev/null; printf '{"result":"fine\\nSWEEP_PASS"}\n'; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run passes --add-dir to claude" grep -qxF -- "--add-dir" "$argv"
+    fx "sweep_run's --add-dir points at the package out dir" grep -qxF -- "$out" "$argv"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Shared setup for the Task 2 fix-cycle fixtures below: a committed repo (via
+# _fixture_recovery_guard_project) already checked out on a feature branch
+# with one real commit over the default branch, so sweep_build_package's own
+# guards (feature branch, commits-over-base) are satisfied without each
+# fixture repeating the git plumbing.
+_fixture_sweep_branch_project() {
+  local proj="$1"
+  _fixture_recovery_guard_project "$proj" || return 1
+  (cd "$proj" && git checkout -q -b feat/x &&
+    printf 'a\n' >f.txt && git add f.txt && git commit -qm one) || return 1
+}
+
+# sweep: rate-limit retry is bounded by NIGHT_SHIFT_SWEEP_MAX_WAIT (reviewer
+# finding #3, Task 1 -> Task 2). Stubs is_rate_limit_response/
+# rate_limit_reset_epoch (same seam as fixture_recovery_guard_ratelimit_dirty,
+# which stubs wait_for_rate_limit_reset directly) so the reset math is
+# deterministic and no real sleep ever happens. A reset further out than
+# SWEEP_MAX_WAIT must skip the retry (handle_rate_limit_wait never called,
+# verdict SWEEP_ERROR); a reset within the cap must retry normally — but ONLY
+# in a run context (STATE set): a standalone `--sweep-only` sweep has no
+# STATE at all, and handle_rate_limit_wait reads "$STATE" unguarded, so a
+# near reset with no STATE must ALSO skip the retry (reviewer finding #1,
+# Task 2 fix tranche) rather than crash on an unbound variable.
+fixture_sweep_rate_limit_bound() {
+  local root="$1" dir="$root/sweep-rl-bound" proj out
+  proj="$dir/proj"
+  mkdir -p "$proj"
+  (
+    SWEEP_MODEL="inherit"
+    is_rate_limit_response() { return 0; }
+    # The wait stub records into a FIXED file (not one derived from its $1):
+    # the raw path it receives points inside $out, so a per-arg marker would
+    # be fiddly to predict; a fixed path is unambiguous either way.
+    handle_rate_limit_wait() { printf 'called\n' >"$dir/rl-waited"; }
+    # This fixture's own "near reset" cases exercise the reset-math bound in
+    # a RUN context — STATE just needs to be non-empty (handle_rate_limit_wait
+    # itself is stubbed above, so nothing actually reads the file).
+    STATE="$dir/state.json"
+
+    out="$dir/out-far"; mkdir -p "$out"
+    # A reset comfortably beyond SWEEP_MAX_WAIT (+ the buffer already folded
+    # into sweep_run's own wait_seconds math).
+    rate_limit_reset_epoch() { printf '%s\n' "$(($(now_epoch) + SWEEP_MAX_WAIT + 3600))"; }
+    claude() { cat >/dev/null; printf '{}\n'; return 1; }
+    sweep_run "$proj" "$out"
+    fx "far reset: retry skipped, verdict is SWEEP_ERROR" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    fx "far reset: handle_rate_limit_wait never invoked" \
+      bash -c '[ ! -f "$1" ]' _ "$dir/rl-waited"
+
+    out="$dir/out-near"; mkdir -p "$out"
+    # A reset comfortably within SWEEP_MAX_WAIT.
+    rate_limit_reset_epoch() { printf '%s\n' "$(($(now_epoch) + 30))"; }
+    # File-based invocation counter: the stub runs inside sweep_run's
+    # (cd "$project" && ...) subshell, so a plain shell variable would reset
+    # to its parent value on every call and the "second call succeeds" branch
+    # would be unreachable.
+    : >"$dir/rl-calls"
+    claude() {
+      cat >/dev/null
+      printf 'x\n' >>"$dir/rl-calls"
+      if [ "$(wc -l <"$dir/rl-calls")" -le 1 ]; then printf '{}\n'; return 1; fi
+      printf '{"result":"fine\\nSWEEP_PASS"}\n'
+    }
+    sweep_run "$proj" "$out"
+    fx "near reset: handle_rate_limit_wait invoked (retry attempted)" \
+      bash -c '[ -f "$1" ]' _ "$dir/rl-waited"
+    fx "near reset: retry succeeded, verdict is SWEEP_PASS" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+
+    out="$dir/out-near-no-state"; mkdir -p "$out"
+    # Same near reset, but standalone (no STATE at all) — the exact shape of
+    # a `--sweep-only` invocation. Must skip the retry cleanly (no crash on
+    # the unbound $STATE inside handle_rate_limit_wait) and fall through to
+    # SWEEP_ERROR, same as the far-reset case above.
+    unset STATE
+    rm -f "$dir/rl-waited"
+    claude() { cat >/dev/null; printf '{}\n'; return 1; }
+    sweep_run "$proj" "$out"
+    fx "no STATE: retry skipped without crashing, verdict is SWEEP_ERROR" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    fx "no STATE: handle_rate_limit_wait never invoked" \
+      bash -c '[ ! -f "$1" ]' _ "$dir/rl-waited"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep: integrity anchoring (reviewer finding #4, Task 1 -> Task 2).
+# sweep_build_package must anchor package.diff/package.meta.json when RUN_ROOT
+# is set, and sweep_run must anchor a SWEEP_ERROR verdict.txt the same way the
+# PASS/FINDINGS path already anchors findings.md/verdict.txt.
+fixture_sweep_integrity() {
+  local root="$1" dir="$root/sweep-integrity" proj out anchor
+  proj="$dir/proj"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    RUN_ROOT="$dir/run"; RUN_ID="sweepintegrity-$$"
+    mkdir -p "$RUN_ROOT"
+    out="$RUN_ROOT/sweep"
+    sweep_build_package "$proj" "$out" >/dev/null || exit 1
+    anchor="$(integrity_dir)"
+    fx "package.diff anchored into the integrity dir" test -f "$anchor/sweep/package.diff"
+    fx "package.meta.json anchored into the integrity dir" test -f "$anchor/sweep/package.meta.json"
+    claude() { cat >/dev/null; exit 1; }
+    sweep_run "$proj" "$out"
+    fx "sweep_run session failure yields SWEEP_ERROR" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    fx "SWEEP_ERROR verdict.txt anchored into the integrity dir" test -f "$anchor/sweep/verdict.txt"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep: SWEEP_ERROR (advisory session failure) must skip the fix cycle
+# entirely — nothing coherent to fix (reviewer finding #2, Task 1 -> Task 2).
+# The guard is the existing literal-string verdict check at the top of
+# sweep_fix_cycle; this fixture proves SWEEP_ERROR takes the same early-return
+# path as SWEEP_PASS, never invoking claude or touching the project.
+fixture_sweep_error_skips_fix() {
+  local root="$1" dir="$root/sweep-error-skip" proj out calls
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$proj" "$out"
+  calls="$dir/claude-calls"
+  (
+    printf 'SWEEP_ERROR\n' >"$out/verdict.txt"
+    printf 'branch sweep session failed\n' >"$out/findings.md"
+    : >"$calls"
+    claude() { cat >/dev/null; printf 'x\n' >>"$calls"; printf '{"result":"should never run"}\n'; }
+    SWEEP_MAX_FIX=1
+    sweep_fix_cycle "$proj" "$out"
+    fx "sweep_fix_cycle returns 0 on SWEEP_ERROR" test "$?" -eq 0
+    fx "SWEEP_ERROR: fix cycle never invokes claude" bash -c '[ ! -s "$1" ]' _ "$calls"
+    fx "SWEEP_ERROR: verdict.txt left untouched" test "$(cat "$out/verdict.txt")" = "SWEEP_ERROR"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: a stubbed "fix" session commits a bad change; a `false`
+# final-validation command then fails re-validation; sweep_fix_cycle must
+# deterministically reset --hard to the recorded pre-fix tip rather than trust
+# the agent to have undone its own commit, journal sweep_fix_reverted, and
+# leave the verdict at the residual SWEEP_FINDINGS (nothing was actually
+# fixed).
+fixture_sweep_fix_revert() {
+  local root="$1" dir="$root/sweep-fix-revert" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"
+    SWEEP_MAX_FIX=1
+    IMPLEMENT_MODEL="inherit"
+    SPEC="$dir/spec.md"
+    printf -- '- Final validation commands:\n  1. `false`\n' >"$SPEC"
+    RUN_ROOT="$dir/run"; RUN_ID="sweepfixrevert-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    # The stub commits a change (as an implement session would) then replies —
+    # draining stdin first (see fixture_sweep_run's SIGPIPE note above).
+    claude() { cat >/dev/null; git -C "$proj" commit --allow-empty -qm sweepfix >/dev/null; printf '{"result":"done"}\n'; }
+    sweep_fix_cycle "$proj" "$out"
+    fx "fix revert: tip restored to the pre-fix commit" \
+      test "$(git -C "$proj" rev-parse HEAD)" = "$tip_before"
+    fx "fix revert: sweep_fix_reverted event emitted" \
+      grep -q '"type":"sweep_fix_reverted"' "$RUN_ROOT/events.jsonl"
+    fx "fix revert: verdict stays SWEEP_FINDINGS (residual)" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_FINDINGS"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: a session that edits files but does NOT commit leaves the
+# tree dirty. Re-validation runs against the LIVE working tree, so it would
+# green-light content that is in no commit (and fails a clean checkout). The
+# dirty-tree guard must revert BEFORE re-validation — even when the validation
+# command would PASS (`true` here) — and journal reason=dirty_tree.
+fixture_sweep_fix_dirty_guard() {
+  local root="$1" dir="$root/sweep-fix-dirty" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"
+    SWEEP_MAX_FIX=1
+    IMPLEMENT_MODEL="inherit"
+    SPEC="$dir/spec.md"
+    # Validation would PASS — proving the guard, not the validation, reverts.
+    printf -- '- Final validation commands:\n  1. `true`\n' >"$SPEC"
+    RUN_ROOT="$dir/run"; RUN_ID="sweepfixdirty-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    # The stub writes an UNTRACKED file and never commits — a dirty tree.
+    claude() { cat >/dev/null; printf 'leftover\n' >"$proj/uncommitted-helper.txt"; printf '{"result":"done"}\n'; }
+    sweep_fix_cycle "$proj" "$out"
+    fx "dirty guard: tip restored to the pre-fix commit" \
+      test "$(git -C "$proj" rev-parse HEAD)" = "$tip_before"
+    fx "dirty guard: sweep_fix_reverted event carries reason=dirty_tree" \
+      grep -q '"reason":"dirty_tree"' "$RUN_ROOT/events.jsonl"
+    fx "dirty guard: no revalidation ran (guard fired first — no revalidation-1.json)" \
+      test ! -e "$out/revalidation-1.json"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: proves the package is REBUILT before the re-sweep. The stub's
+# re-sweep verdict is driven by whether $out/package.diff still contains the
+# fixed-away marker — so if sweep_fix_cycle re-read the STALE pre-fix package
+# (the bug), the verdict would stay SWEEP_FINDINGS; with the rebuild it flips to
+# SWEEP_PASS. No RUN_ROOT -> re-validation is skipped, isolating rebuild+re-sweep.
+fixture_sweep_rebuild_before_resweep() {
+  local root="$1" dir="$root/sweep-rebuild" proj out
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    printf 'const x = "BUGMARKER";\n' >"$proj/feature.js"
+    git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm "add feature" >/dev/null
+    # A STALE package.diff that still names the marker (what the pre-fix sweep saw).
+    printf '## diff\n+const x = "BUGMARKER";\n' >"$out/package.diff"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: remove the BUGMARKER\n' >"$out/findings.md"
+    PROJECT="$proj"; SWEEP_MODEL="inherit"; IMPLEMENT_MODEL="inherit"; SWEEP_MAX_FIX=1
+    claude() {
+      local input; input="$(cat)"
+      case "$input" in
+        *"Fix ONLY the findings"*)
+          printf 'const x = "clean";\n' >"$proj/feature.js"
+          git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm sweepfix >/dev/null
+          printf '{"result":"done"}\n' ;;
+        *)
+          if grep -q BUGMARKER "$out/package.diff" 2>/dev/null; then
+            printf '{"result":"still bad\\nSWEEP_FINDINGS: 1"}\n'
+          else
+            printf '{"result":"clean now\\nSWEEP_PASS"}\n'
+          fi ;;
+      esac
+    }
+    sweep_fix_cycle "$proj" "$out"
+    fx "rebuild: re-sweep judged the REBUILT package (fixed code) -> verdict flips to SWEEP_PASS" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+    fx "rebuild: package.diff was regenerated (no longer contains the fixed-away marker)" \
+      bash -c '! grep -q BUGMARKER "$1"' _ "$out/package.diff"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: re-validation runs in an ISOLATED worktree, not the live tree
+# (sweep_revalidate_isolated, parity with verify_candidate's final gate). Proof:
+# a gitignored file present in the live tree keeps `git status --porcelain` clean
+# (so the dirty guard does NOT fire) and makes `test -f secret.txt` PASS in the
+# live tree — but a fresh detached worktree at the fixed tip lacks it, so the
+# isolated re-validation FAILS and reverts. The revert (reason=revalidation, not
+# dirty_tree) can only happen if re-validation ran in the worktree.
+fixture_sweep_fix_worktree_isolation() {
+  local root="$1" dir="$root/sweep-wt-iso" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    printf 'secret.txt\n' >"$proj/.gitignore"
+    git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm gitignore >/dev/null
+    printf 'live-only\n' >"$proj/secret.txt"    # gitignored, present -> porcelain clean
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"; SWEEP_MAX_FIX=1; IMPLEMENT_MODEL="inherit"
+    SPEC="$dir/spec.md"
+    printf -- '- Final validation commands:\n  1. `test -f secret.txt`\n' >"$SPEC"
+    RUN_ROOT="$dir/run"; RUN_ID="sweepwtiso-$$"
+    mkdir -p "$RUN_ROOT/raw" "$RUN_ROOT/validated"
+    # FIX makes a COMMITTED change so the tree stays clean (dirty guard passes).
+    claude() { cat >/dev/null; printf 'x\n' >"$proj/somefile.txt"; git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm fix >/dev/null; printf '{"result":"done"}\n'; }
+    sweep_fix_cycle "$proj" "$out"
+    fx "worktree isolation: fixed tip reverted — validation that passes in the live tree fails in a clean worktree" \
+      test "$(git -C "$proj" rev-parse HEAD)" = "$tip_before"
+    fx "worktree isolation: revert reason is revalidation, not dirty_tree" \
+      grep -q '"reason":"revalidation"' "$RUN_ROOT/events.jsonl"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: capped at NIGHT_SHIFT_SWEEP_MAX_FIX (default 1) fix round,
+# then residual findings — never loops indefinitely against a session that
+# keeps reporting findings. Counts claude invocations via a counter file: one
+# initial sweep_run (the caller's, before the fix cycle) + one fix session +
+# one re-sweep, all inside sweep_fix_cycle's single allowed cycle.
+fixture_sweep_fix_cap() {
+  local root="$1" dir="$root/sweep-fix-cap" proj out calls
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  calls="$dir/claude-calls"
+  (
+    : >"$calls"
+    PROJECT="$proj"
+    SWEEP_MODEL="inherit"
+    IMPLEMENT_MODEL="inherit"
+    SWEEP_MAX_FIX=1
+    claude() { cat >/dev/null; printf 'x\n' >>"$calls"; printf '{"result":"still broken\\nSWEEP_FINDINGS: 1"}\n'; }
+    sweep_run "$proj" "$out"
+    sweep_fix_cycle "$proj" "$out"
+    fx "fix cap: sweep_fix_cycle returns 0 (advisory, never blocks)" test "$?" -eq 0
+    fx "fix cap: exactly one fix cycle ran (initial sweep + fix + re-sweep = 3 calls)" \
+      test "$(wc -l <"$calls")" -eq 3
+    fx "fix cap: residual findings after the cap" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_FINDINGS"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# --sweep-only: arg parsing. Requires --project; dies (rejects) without it,
+# before ever touching git or spawning a sweep session.
+fixture_sweep_only_args() {
+  fixture_reject "--sweep-only without --project dies" \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only
+}
+
+# --sweep-only: end-to-end CLI exit codes. A real subprocess invocation (the
+# arg-parsing/dispatch code under test lives at the top level of
+# night-shift.sh, outside any function this suite can call directly), with a
+# fake `claude` executable prepended onto PATH so the real CLI never makes a
+# network call. SWEEP_PASS -> exit 0; SWEEP_FINDINGS (residual after the
+# default one fix cycle, which the same stub also fails to clear) -> exit 2.
+fixture_sweep_only_run() {
+  local root="$1" dir="$root/sweep-only-run" proj bin
+  proj="$dir/proj"; bin="$dir/bin"
+  mkdir -p "$bin"
+  _fixture_sweep_branch_project "$proj" || return 1
+  cat >"$bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '{"result":"fine\\nSWEEP_PASS"}\n'
+STUB
+  chmod +x "$bin/claude"
+  (
+    rc=0
+    PATH="$bin:$PATH" "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only: SWEEP_PASS exits 0" test "$rc" -eq 0
+
+    cat >"$bin/claude" <<'STUB2'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '{"result":"issues\\nSWEEP_FINDINGS: 1"}\n'
+STUB2
+    rc=0
+    PATH="$bin:$PATH" "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only: residual SWEEP_FINDINGS exits 2" test "$rc" -eq 2
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# --sweep-only: bare invocation (design ruling, Task 2 fix tranche) is
+# verdict-only by default — BRANCH_SWEEP defaults to "0", which is NOT "1",
+# so the fix cycle must never run even when the sweep verdict is
+# SWEEP_FINDINGS. A real subprocess invocation (the gate lives at the top
+# level of night-shift.sh), with a fake `claude` stub that appends a marker
+# to a counter file ONLY when it receives the fix cycle's distinctive
+# prompt ("Fix ONLY the findings") — so the counter isolates fix-session
+# calls from the sweep session's own (always-run) call. The counter file
+# must stay empty ("stays 0").
+fixture_sweep_only_bare_skips_fix() {
+  local root="$1" dir="$root/sweep-only-bare-skips-fix" proj bin calls
+  proj="$dir/proj"; bin="$dir/bin"
+  mkdir -p "$bin"
+  _fixture_sweep_branch_project "$proj" || return 1
+  calls="$dir/fix-calls"
+  : >"$calls"
+  cat >"$bin/claude" <<'STUB'
+#!/usr/bin/env bash
+input="$(cat)"
+case "$input" in
+  *"Fix ONLY the findings"*) printf 'x\n' >>"$FIXTURE_FIX_CALLS" ;;
+esac
+printf '{"result":"issues\\nSWEEP_FINDINGS: 1"}\n'
+STUB
+  chmod +x "$bin/claude"
+  (
+    rc=0
+    PATH="$bin:$PATH" FIXTURE_FIX_CALLS="$calls" \
+      "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only bare: residual SWEEP_FINDINGS still exits 2" test "$rc" -eq 2
+    fx "sweep-only bare: fix cycle never invoked (counter file stays 0)" \
+      bash -c '[ ! -s "$1" ]' _ "$calls"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# --sweep-only: NIGHT_SHIFT_BRANCH_SWEEP=1 (explicit opt-in per the same
+# design ruling) DOES invoke the fix cycle. Same stub/counter seam as
+# fixture_sweep_only_bare_skips_fix above, but with the env var set; the
+# default NIGHT_SHIFT_SWEEP_MAX_FIX=1 cap means the fix session prompt fires
+# exactly once (see fixture_sweep_fix_cap's 3-call math, applied here at the
+# CLI level: initial sweep + fix + re-sweep, of which only the fix call
+# matches the counter's "Fix ONLY the findings" marker).
+fixture_sweep_only_branch_sweep_1_runs_fix() {
+  local root="$1" dir="$root/sweep-only-opt-in-runs-fix" proj bin calls
+  proj="$dir/proj"; bin="$dir/bin"
+  mkdir -p "$bin"
+  _fixture_sweep_branch_project "$proj" || return 1
+  calls="$dir/fix-calls"
+  : >"$calls"
+  cat >"$bin/claude" <<'STUB'
+#!/usr/bin/env bash
+input="$(cat)"
+case "$input" in
+  *"Fix ONLY the findings"*) printf 'x\n' >>"$FIXTURE_FIX_CALLS" ;;
+esac
+printf '{"result":"issues\\nSWEEP_FINDINGS: 1"}\n'
+STUB
+  chmod +x "$bin/claude"
+  (
+    rc=0
+    PATH="$bin:$PATH" FIXTURE_FIX_CALLS="$calls" NIGHT_SHIFT_BRANCH_SWEEP=1 \
+      "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only BRANCH_SWEEP=1: residual SWEEP_FINDINGS still exits 2" test "$rc" -eq 2
+    fx "sweep-only BRANCH_SWEEP=1: fix cycle invoked exactly once (opt-in honored)" \
+      test "$(wc -l <"$calls")" -eq 1
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep_fix_cycle: revalidation requires BOTH a spec AND a live RUN_ROOT
+# (reviewer finding #2, Task 2 fix tranche). A standalone `--sweep-only
+# --spec X` sets SPEC but never RUN_ROOT (no run/queue at all); before this
+# fix, SPEC alone was enough to flow into run_validation_commands, which
+# writes its per-command log under "$RUN_ROOT/raw/..." unguarded and crashes
+# on the unbound variable. This fixture proves SPEC-set/RUN_ROOT-unset now
+# skips the revalidation branch cleanly: no crash, no reset --hard (nothing
+# was validated so nothing to revert against), and the cycle proceeds to its
+# normal re-sweep.
+fixture_sweep_fix_cycle_no_run_root_skips_revalidation() {
+  local root="$1" dir="$root/sweep-fix-no-run-root" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    unset RUN_ROOT RUN_ID
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"
+    SWEEP_MAX_FIX=1
+    SWEEP_MODEL="inherit"
+    IMPLEMENT_MODEL="inherit"
+    # A spec WITH a "Final validation commands" section — if the RUN_ROOT
+    # guard were missing, extract_validation_commands would return this `false`
+    # command and run_validation_commands would be reached (and crash on
+    # $RUN_ROOT, or if it somehow survived, revert the fix commit below).
+    SPEC="$dir/spec.md"
+    printf -- '- Final validation commands:\n  1. `false`\n' >"$SPEC"
+    # The stub commits a change (as a real fix session would), draining
+    # stdin first (see fixture_sweep_run's SIGPIPE note above), then reports
+    # SWEEP_PASS so the cycle's re-sweep ends the loop deterministically.
+    claude() { cat >/dev/null; git -C "$proj" commit --allow-empty -qm sweepfix >/dev/null; printf '{"result":"fine\\nSWEEP_PASS"}\n'; }
+    rc=0
+    sweep_fix_cycle "$proj" "$out" || rc=$?
+    fx "no RUN_ROOT: sweep_fix_cycle does not crash" test "$rc" -eq 0
+    fx "no RUN_ROOT: revalidation skipped — fix commit NOT reverted" \
+      bash -c 'test "$(git -C "$1" rev-parse HEAD)" != "$2"' _ "$proj" "$tip_before"
+    fx "no RUN_ROOT: cycle completed via the re-sweep (SWEEP_PASS)" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Run feedback (scripts/lib/sweep.sh; agentic-gaps Task 3 — write_run_feedback).
+# Same run-wrap-up concern as the branch sweep above: a short fresh session
+# distills the run's journal into feedback.md for the human who authors specs.
+# Unlike sweep it runs unconditionally at completion (not gated by
+# BRANCH_SWEEP), so its fixtures set up a full RUN_ROOT/STATE/SPEC context of
+# their own rather than reusing _fixture_sweep_branch_project.
+# ---------------------------------------------------------------------------
+
+# Shared setup: a project dir + a run context (RUN_ROOT/RUN_ID/STATE/SPEC) with
+# a minimal events.jsonl and a state.json carrying a review_round, so
+# write_run_feedback has everything it gathers without touching a real run.
+# Called directly (never via command substitution, which would fork a
+# subshell and lose every assignment below) — writes into the CALLER's
+# locals via bash's dynamic scoping (same idiom this file already uses; see
+# the SC2318 note in the file-header suppression block), so the caller must
+# `local proj feedback` (or similar) before calling.
+_fixture_run_feedback_context() {
+  local base="$1"
+  proj="$base/proj"
+  mkdir -p "$proj/.night-shift" "$base/run"
+  RUN_ROOT="$base/run"
+  RUN_ID="feedback-$$"
+  STATE="$RUN_ROOT/state.json"
+  SPEC="$base/spec.md"
+  IMPLEMENT_MODEL="inherit"
+  printf -- '- Track: node\n' >"$SPEC"
+  jq -n '{review_round:2}' >"$STATE"
+  printf '{"ts":"2026-07-12T00:00:00Z","run":"feedback","stage":"implement","type":"stage_start","payload":null}\n' \
+    >"$RUN_ROOT/events.jsonl"
+}
+
+# write_run_feedback: a stubbed claude reply with 6 bullet lines lands one
+# `## run` section in <project>/.night-shift/feedback.md with all 6 `- ` lines,
+# and a run_feedback event with lines:6 in events.jsonl. A second invocation
+# APPENDS a second section rather than overwriting the first.
+fixture_run_feedback_writes_and_appends() {
+  local root="$1" dir="$root/feedback-ok" proj feedback
+  mkdir -p "$dir"
+  (
+    _fixture_run_feedback_context "$dir"
+    feedback="$proj/.night-shift/feedback.md"
+    claude() {
+      cat >/dev/null
+      printf '{"result":"- one\\n- two\\n- three\\n- four\\n- five\\n- six"}\n'
+    }
+    write_run_feedback "$proj"
+    fx "feedback.md created" test -f "$feedback"
+    fx "feedback.md has exactly one ## run section" \
+      test "$(grep -c '^## run ' "$feedback")" -eq 1
+    fx "feedback.md has 6 bullet lines" \
+      test "$(grep -c '^- ' "$feedback")" -eq 6
+    fx "run_feedback event journaled with lines:6" \
+      bash -c 'grep -q "\"type\":\"run_feedback\".*\"lines\":6" "$1"' _ "$RUN_ROOT/events.jsonl"
+
+    # Second invocation (a later run against the same project) appends rather
+    # than overwrites.
+    claude() {
+      cat >/dev/null
+      printf '{"result":"- seven\\n- eight"}\n'
+    }
+    write_run_feedback "$proj"
+    fx "feedback.md now has two ## run sections" \
+      test "$(grep -c '^## run ' "$feedback")" -eq 2
+    fx "feedback.md now has 8 bullet lines total" \
+      test "$(grep -c '^- ' "$feedback")" -eq 8
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# write_run_feedback: every failure mode (a failing claude session here) must
+# warn and return 0 without ever creating/mutating feedback.md — feedback is
+# advisory and must never block or delay completion.
+fixture_run_feedback_session_failure_is_advisory() {
+  local root="$1" dir="$root/feedback-fail" proj feedback rc
+  mkdir -p "$dir"
+  (
+    _fixture_run_feedback_context "$dir"
+    feedback="$proj/.night-shift/feedback.md"
+    claude() { cat >/dev/null; exit 1; }
+    rc=0
+    write_run_feedback "$proj" || rc=$?
+    fx "write_run_feedback returns 0 even on session failure" test "$rc" -eq 0
+    fx "feedback.md was never created" test ! -f "$feedback"
+    fx "no run_feedback event journaled" \
+      bash -c '! grep -q "\"type\":\"run_feedback\"" "$1"' _ "$RUN_ROOT/events.jsonl"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# NIGHT_SHIFT_RUN_FEEDBACK (phase-A gate finding #2): the cost off-switch for
+# the always-on write_run_feedback call in complete_run — default "1" (spec
+# requires feedback to exist even when the branch sweep is off), "0" skips
+# the session entirely. Structural check that complete_run's call site is
+# actually gated on the literal variable (declare -f, same idiom as the
+# integrity_guard wiring check above), plus a functional check exercising
+# THAT SAME guard expression against write_run_feedback: with the knob "0"
+# the feedback session must never be invoked and feedback.md must never be
+# written; with "1" (the default) it must run exactly as the existing
+# unconditional fixtures above already prove.
+fixture_run_feedback_knob() {
+  local root="$1" dir="$root/feedback-knob" proj feedback calls
+  mkdir -p "$dir"
+  case "$(declare -f complete_run)" in
+    *'[ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$PROJECT"'*) ;;
+    *) return 1 ;;
+  esac
+  (
+    _fixture_run_feedback_context "$dir"
+    feedback="$proj/.night-shift/feedback.md"
+    calls="$dir/claude-calls"
+    : >"$calls"
+    claude() {
+      cat >/dev/null
+      printf 'x\n' >>"$calls"
+      printf '{"result":"- one\\n- two\\n- three\\n- four\\n- five\\n- six"}\n'
+    }
+
+    RUN_FEEDBACK=0
+    [ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$proj"
+    fx "RUN_FEEDBACK=0: feedback session never invoked (counter stays 0)" \
+      bash -c '[ ! -s "$1" ]' _ "$calls"
+    fx "RUN_FEEDBACK=0: feedback.md never written" test ! -f "$feedback"
+
+    RUN_FEEDBACK=1
+    [ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$proj"
+    fx "RUN_FEEDBACK=1 (default): feedback session invoked" \
+      bash -c '[ -s "$1" ]' _ "$calls"
+    fx "RUN_FEEDBACK=1 (default): feedback.md written" test -f "$feedback"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# compact_success (final-review C1): feedback.md (write_run_feedback) and the
+# branch sweep's residual artifacts used to be destroyed by compact_success's
+# delete-everything-but-archive loop, which ran over the SAME dir as RUN_ROOT
+# in production ($project/.night-shift IS run_dir) — so a successful run wiped
+# the persistent cross-run feedback log and any unresolved sweep findings in
+# the very moment they'd matter most. Unlike the standalone compact fixtures
+# elsewhere in this file, RUN_ROOT here is deliberately set to
+# "$proj/.night-shift" (not an unrelated sibling dir) to reproduce that real
+# invariant — feedback.md's absolute path and run_dir are the same directory.
+fixture_compact_success_preserves_feedback_and_sweep() {
+  local root="$1" dir="$root/compact-persist" proj feedback
+  mkdir -p "$dir/proj/.night-shift"
+  (
+    proj="$dir/proj"
+    RUN_ROOT="$proj/.night-shift"
+    RUN_ID="compact-persist-$$"
+    STATE="$RUN_ROOT/state.json"
+    SPEC="$dir/spec.md"
+    IMPLEMENT_MODEL="inherit"
+    printf -- '- Track: node\n' >"$SPEC"
+    jq -n '{review_round:1}' >"$STATE"
+    printf '{"ts":"2026-07-12T00:00:00Z","run":"compact-persist","stage":"implement","type":"stage_start","payload":null}\n' \
+      >"$RUN_ROOT/events.jsonl"
+    feedback="$proj/.night-shift/feedback.md"
+    claude() {
+      cat >/dev/null
+      printf '{"result":"- keep me\\n- and me"}\n'
+    }
+    write_run_feedback "$proj"
+    fx "feedback.md written before compaction" test -f "$feedback"
+
+    mkdir -p "$RUN_ROOT/sweep"
+    printf '## a residual finding\n' >"$RUN_ROOT/sweep/findings.md"
+    printf 'SWEEP_FINDINGS\n' >"$RUN_ROOT/sweep/verdict.txt"
+    printf 'diff content\n' >"$RUN_ROOT/sweep/package.diff"
+
+    # test-audit + doc-freshness reports are the same evidence class as sweep/ —
+    # advisory findings the observer weighed. They must be archived, not wiped.
+    mkdir -p "$RUN_ROOT/test-audit" "$RUN_ROOT/doc-freshness"
+    printf '{"final_total":3}\n' >"$RUN_ROOT/test-audit/spec.json"
+    printf '{"docs":[]}\n' >"$RUN_ROOT/doc-freshness/spec.json"
+
+    ( log() { :; }; compact_success "$RUN_ROOT" "$RUN_ID" ) || exit 1
+
+    fx "feedback.md survives compaction" test -f "$feedback"
+    fx "feedback.md keeps its content" grep -q "keep me" "$feedback"
+    fx "feedback.md is NOT duplicated into the archive (stays only at its persistent path)" \
+      test ! -e "$RUN_ROOT/archive/$RUN_ID/feedback.md"
+    fx "sweep dir archived alongside validated/" \
+      test -f "$RUN_ROOT/archive/$RUN_ID/sweep/findings.md"
+    fx "archived sweep findings keep their content" \
+      grep -q "a residual finding" "$RUN_ROOT/archive/$RUN_ID/sweep/findings.md"
+    fx "archived sweep dir also has verdict.txt + package.diff" \
+      bash -c 'test -f "$1/verdict.txt" && test -f "$1/package.diff"' _ "$RUN_ROOT/archive/$RUN_ID/sweep"
+    fx "live sweep dir removed from run_dir after compaction" \
+      test ! -d "$RUN_ROOT/sweep"
+    fx "test-audit report archived (findings survive with the summary journal)" \
+      test -f "$RUN_ROOT/archive/$RUN_ID/test-audit/spec.json"
+    fx "doc-freshness report archived" \
+      test -f "$RUN_ROOT/archive/$RUN_ID/doc-freshness/spec.json"
+    fx "live test-audit dir removed from run_dir after compaction" \
+      test ! -d "$RUN_ROOT/test-audit"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Doc-freshness candidate mapper (scripts/lib/doc-freshness.sh; agentic-gaps
+# Task 5). Not yet wired into night-shift.sh's implement-stage prompt (a
+# later task's job) — exercised here as a standalone, sourceable lib, same
+# precedent as fixture_supervisor_decision's direct `. "$NIGHT_SHIFT_LIB/..."`.
+# ---------------------------------------------------------------------------
+
+# Scratch project shared shape for the doc-freshness fixtures: a doc IN the
+# touched directory (dir hit, score 3), a doc elsewhere that MENTIONS the
+# touched basename (mention hit, score 1), and a root README that mentions
+# nothing and sits outside the touched dir's ancestor chain (must stay
+# absent — the fixture that proves the cap/ranking logic doesn't just
+# "find everything"). Returns the setup commit sha on stdout; the caller
+# adds a further commit to build the actual base..HEAD diff under test.
+_fixture_doc_freshness_project() {
+  local proj="$1"
+  mkdir -p "$proj/src/mod" "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  printf 'Unrelated prose that happens to mention util.ts by name.\n' >"$proj/docs/other.md"
+  printf '# README\nTop-level readme, mentions nothing relevant.\n' >"$proj/README.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  git -C "$proj" rev-parse HEAD
+}
+
+fixture_doc_freshness_basic() {
+  local root="$1" proj="$root/dfb-proj" base out
+  # shellcheck source=scripts/lib/doc-freshness.sh
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  base="$(_fixture_doc_freshness_project "$proj")" || return 1
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "output is valid JSON" jq empty "$out"
+  fx "src/mod/CLAUDE.md present (dir:src/mod, score 3)" bash -c '
+    jq -e "[.docs[] | select(.path==\"src/mod/CLAUDE.md\" and .reason==\"dir:src/mod\" and .score==3)] | length==1" "$1" >/dev/null
+  ' _ "$out"
+  fx "docs/other.md present (mentions:util.ts, score 1)" bash -c '
+    jq -e "[.docs[] | select(.path==\"docs/other.md\" and .reason==\"mentions:util.ts\" and .score==1)] | length==1" "$1" >/dev/null
+  ' _ "$out"
+  fx "README.md absent (no dir/mention/symbol hit)" bash -c '
+    jq -e "[.docs[] | select(.path==\"README.md\")] | length==0" "$1" >/dev/null
+  ' _ "$out"
+  return 0
+}
+
+# 12 further committed docs, each mentioning the touched basename, pushes the
+# total candidate count over the cap (CLAUDE.md dir hit + docs/other.md +
+# 12 extras, all score>=1) — proves the cap holds at exactly 10 with
+# truncated:true, regardless of which ties get dropped.
+fixture_doc_freshness_cap() {
+  local root="$1" proj="$root/dfc-proj" base out i
+  # shellcheck source=scripts/lib/doc-freshness.sh
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  mkdir -p "$proj/src/mod" "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  printf 'Unrelated prose that happens to mention util.ts by name.\n' >"$proj/docs/other.md"
+  printf '# README\nTop-level readme, mentions nothing relevant.\n' >"$proj/README.md"
+  for i in $(seq 1 12); do
+    printf 'Extra doc #%s also mentions util.ts in passing.\n' "$i" >"$proj/docs/extra$i.md"
+  done
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "output is valid JSON" jq empty "$out"
+  fx "capped at exactly 10 docs" bash -c 'jq -e "(.docs | length) == 10" "$1" >/dev/null' _ "$out"
+  fx "truncated:true" bash -c 'jq -e ".truncated == true" "$1" >/dev/null' _ "$out"
+  return 0
+}
+
+fixture_doc_freshness_empty_diff() {
+  local root="$1" proj="$root/dfe-proj" head out
+  # shellcheck source=scripts/lib/doc-freshness.sh
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  head="$(_fixture_doc_freshness_project "$proj")" || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$head" "$out" || return 1
+  fx "base==HEAD yields docs:[] truncated:false, still rc 0" bash -c '
+    jq -e ". == {docs:[], truncated:false}" "$1" >/dev/null
+  ' _ "$out"
+  return 0
+}
+
+# A doc that names a diff-added exported symbol (not a touched filename)
+# must be found via the symbol:<name> reason at score 1 — proves the
+# best-effort sed symbol extraction actually feeds the mention/symbol tier,
+# not just the dir-proximity tier the other fixtures exercise.
+fixture_doc_freshness_symbol() {
+  local root="$1" proj="$root/dfs-proj" base out
+  # shellcheck source=scripts/lib/doc-freshness.sh
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  mkdir -p "$proj/lib" "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf 'This doc explains what parseFoo does, in prose.\n' >"$proj/docs/parsing.md"
+  printf '# README\nmentions nothing relevant.\n' >"$proj/README.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/lib/parse.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add parseFoo" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "docs/parsing.md found via symbol:parseFoo, score 1" bash -c '
+    jq -e "[.docs[] | select(.path==\"docs/parsing.md\" and .reason==\"symbol:parseFoo\" and .score==1)] | length==1" "$1" >/dev/null
+  ' _ "$out"
+  return 0
+}
+
+# Regression for the max-score false-positive flood: (1) a touched file at the
+# project ROOT must NOT same-dir-match every root-level doc (a single package.json
+# edit used to flag CLAUDE.md/AGENTS.md/README.md all at score 3), and (2) a doc
+# the candidate ITSELF updated must not reappear as its own staleness candidate
+# (complying with the gate would otherwise inflate the next round). Root docs may
+# still surface precisely via mention/symbol.
+fixture_doc_freshness_no_flood() {
+  local root="$1" proj="$root/dfn-proj" base out
+  # shellcheck source=scripts/lib/doc-freshness.sh
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  mkdir -p "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nRoot instructions, mentions nothing relevant.\n' >"$proj/CLAUDE.md"
+  printf '# AGENTS.md\nRoot agent doc, mentions nothing relevant.\n' >"$proj/AGENTS.md"
+  printf '# README\nTop-level readme, mentions nothing relevant.\n' >"$proj/README.md"
+  printf '{"name":"thing"}\n' >"$proj/package.json"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  # Candidate: edit a root-level source file AND update one root doc (compliance).
+  printf '{"name":"thing","version":"2"}\n' >"$proj/package.json"
+  printf '# CLAUDE.md\nRoot instructions, now updated for the change.\n' >"$proj/CLAUDE.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "bump + update CLAUDE.md" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "output is valid JSON" jq empty "$out"
+  fx "no root-'.' same-dir flood: AGENTS.md/README.md not flagged score 3" bash -c '
+    jq -e "[.docs[] | select((.path==\"AGENTS.md\" or .path==\"README.md\") and .score==3)] | length==0" "$1" >/dev/null
+  ' _ "$out"
+  fx "the just-updated CLAUDE.md is not re-flagged as its own stale candidate" bash -c '
+    jq -e "[.docs[] | select(.path==\"CLAUDE.md\")] | length==0" "$1" >/dev/null
+  ' _ "$out"
+  return 0
+}
+
+# doc_freshness_prompt_block / doc_freshness_section (agentic-gaps tranche §B,
+# Task 6): the implement-stage prompt injection + observer-evidence surface
+# built atop doc_freshness_candidates above. Both live in night-shift.sh
+# itself (already in scope here, same as manifest_prompt_block/
+# component_inventory_prompt_block, sourced by the orchestrator AFTER their
+# definitions) and read/write engine globals (PROJECT, BASE_COMMIT, SPEC,
+# RUN_ROOT, DOC_FRESHNESS) that MUST NOT leak into later fixtures — run in an
+# isolating subshell via command substitution (the _run/wrapper split +
+# "DELIBERATELY NOT local" dir idiom from _fixture_manifest_prompt_run).
+_fixture_doc_freshness_prompt_run() {
+  local proj base spec spec2 block section
+  # DELIBERATELY NOT local for the dir itself, same reasoning as
+  # _fixture_manifest_prompt_run: the EXIT trap fires after this function
+  # returns (the last statement of the enclosing command-substitution
+  # subshell), when a `local` dir would already be out of scope.
+  DOC_FRESHNESS_PROMPT_FIXTURE_DIR="$WORKSPACE_ROOT/.night-shift-fixture-doc-freshness-prompt.$$"
+  mkdir -p "$DOC_FRESHNESS_PROMPT_FIXTURE_DIR" || return 1
+  trap 'rm -rf "${DOC_FRESHNESS_PROMPT_FIXTURE_DIR:-}"' EXIT
+
+  proj="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/proj"
+  mkdir -p "$proj/src/mod" "$proj/docs" || return 1
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  printf 'Unrelated prose that happens to mention util.ts by name.\n' >"$proj/docs/other.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+
+  # These are the SAME globals the real orchestrator carries through a run;
+  # setting them here (inside the command-substitution subshell only) is what
+  # lets doc_freshness_prompt_block/doc_freshness_section run exactly as they
+  # would mid-run, without touching the outer fixture suite's own state.
+  PROJECT="$proj"
+  BASE_COMMIT="$base"
+  RUN_ROOT="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/rr"
+  RUN_ID="doc-freshness-prompt-fixture"
+  mkdir -p "$RUN_ROOT" || return 1
+  spec="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/spec.md"
+  printf '# Just a plain spec (no Design Contract needed — this gate is unconditional)\n' >"$spec"
+  SPEC="$spec"
+  DOC_FRESHNESS=1
+
+  block="$(doc_freshness_prompt_block "$spec")"
+  fx "prompt block: JSON generated at RUN_ROOT/doc-freshness/<task>.json" \
+    [ -s "$RUN_ROOT/doc-freshness/$(basename "$spec" .md).json" ]
+  fx "prompt block: mentions the doc-freshness heading" \
+    bash -c 'printf "%s" "$1" | grep -q "Doc-freshness candidates"' _ "$block"
+  fx "prompt block: lists src/mod/CLAUDE.md with its dir reason" \
+    bash -c 'printf "%s" "$1" | grep -qF "src/mod/CLAUDE.md (dir:src/mod)"' _ "$block"
+  fx "prompt block: anchors the gate on the actual diff, not a declaration channel" \
+    bash -c 'printf "%s" "$1" | grep -q "against your actual diff"' _ "$block"
+  fx "prompt block: does NOT reference the removed unaffected: completion-summary channel" \
+    bash -c '! printf "%s" "$1" | grep -q "unaffected:"' _ "$block"
+
+  section="$(doc_freshness_section)"
+  fx "observer section: DOC FRESHNESS heading present" \
+    bash -c 'printf "%s" "$1" | grep -q "DOC FRESHNESS"' _ "$section"
+  fx "observer section: same doc entry surfaced to the observer" \
+    bash -c 'printf "%s" "$1" | grep -q "src/mod/CLAUDE.md"' _ "$section"
+  fx "observer section: judges docs against the diff, no unaffected declaration" \
+    bash -c '! printf "%s" "$1" | grep -q "unaffected:"' _ "$section"
+
+  # Knob off -> empty block, regardless of the file already on disk.
+  DOC_FRESHNESS=0
+  block="$(doc_freshness_prompt_block "$spec")"
+  [ -z "$block" ] || { printf 'expected empty block with DOC_FRESHNESS=0, got: %s\n' "$block"; return 1; }
+  DOC_FRESHNESS=1
+
+  # Empty candidate list (BASE_COMMIT==HEAD, nothing to diff) -> empty block,
+  # on a second spec so the first spec's file/section above are untouched.
+  spec2="$DOC_FRESHNESS_PROMPT_FIXTURE_DIR/spec2.md"
+  printf '# A second plain spec\n' >"$spec2"
+  SPEC="$spec2"
+  BASE_COMMIT="$(git -C "$proj" rev-parse HEAD)"
+  block="$(doc_freshness_prompt_block "$spec2")"
+  [ -z "$block" ] || { printf 'expected empty block for an empty candidate diff, got: %s\n' "$block"; return 1; }
+  return 0
+}
+
+fixture_doc_freshness_prompt() {
+  local err status
+  err="$(_fixture_doc_freshness_prompt_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - doc-freshness prompt: implement-prompt block + observer section render from candidates; empty on knob-off/empty-diff\n'
+  else
+    printf 'not ok - doc-freshness prompt: implement-prompt block + observer section render from candidates; empty on knob-off/empty-diff\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# Post-candidate doc-freshness recompute (Phase-B gate-review fix). Unlike
+# _fixture_doc_freshness_prompt_run above — which commits the touched file
+# BEFORE ever calling doc_freshness_prompt_block, so BASE_COMMIT..HEAD is
+# already a real diff by prompt time and the first-pass-inert defect never
+# shows up — this fixture models the REAL first-pass sequence in order:
+#   1. BASE_COMMIT=HEAD with nothing committed yet (true first pass, before
+#      any candidate commit exists);
+#   2. call doc_freshness_prompt_block and assert it renders EMPTY — this
+#      documents the known, unavoidable first-pass prompt behavior (nothing
+#      to diff against yet), not a regression to fix;
+#   3. commit the touched file — this becomes the candidate commit HEAD now
+#      points at;
+#   4. call doc_freshness_recompute_candidate directly (the exact call
+#      verify_candidate's post-candidate slot makes, once HEAD IS the
+#      validated candidate);
+#   5. assert doc_freshness_section NOW renders a POPULATED block — proving
+#      the observer's read site sees real content on a first-pass APPROVE,
+#      not only on a re-review round following a BLOCK.
+# Same engine-global isolation idiom (subshell via command substitution,
+# DELIBERATELY-not-local scratch dir for the EXIT trap) as
+# _fixture_doc_freshness_prompt_run.
+_fixture_doc_freshness_recompute_run() {
+  local proj spec block section
+  DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR="$WORKSPACE_ROOT/.night-shift-fixture-doc-freshness-recompute.$$"
+  mkdir -p "$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR" || return 1
+  trap 'rm -rf "${DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR:-}"' EXIT
+
+  proj="$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR/proj"
+  mkdir -p "$proj/src/mod" "$proj/docs" || return 1
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nPlaceholder module doc for src/mod.\n' >"$proj/src/mod/CLAUDE.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+
+  # These are the SAME globals the real orchestrator carries through a run
+  # (see _fixture_doc_freshness_prompt_run's comment) — set here only inside
+  # this command-substitution subshell.
+  PROJECT="$proj"
+  BASE_COMMIT="$(git -C "$proj" rev-parse HEAD)"
+  RUN_ROOT="$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR/rr"
+  RUN_ID="doc-freshness-recompute-fixture"
+  mkdir -p "$RUN_ROOT" || return 1
+  spec="$DOC_FRESHNESS_RECOMPUTE_FIXTURE_DIR/spec.md"
+  printf '# Just a plain spec (no Design Contract needed — this gate is unconditional)\n' >"$spec"
+  SPEC="$spec"
+  DOC_FRESHNESS=1
+
+  # Step 1-2: true first-pass state. BASE_COMMIT==HEAD, nothing committed
+  # yet — the ONLY call site before this fix, and it must render empty here.
+  block="$(doc_freshness_prompt_block "$spec")"
+  [ -z "$block" ] || {
+    printf 'expected an EMPTY first-pass prompt block (BASE_COMMIT==HEAD, nothing committed yet), got: %s\n' "$block"
+    return 1
+  }
+
+  # Step 3: commit the touched file — the candidate commit verify_candidate
+  # would validate; HEAD now moves past BASE_COMMIT.
+  printf 'export function parseFoo(x) { return x; }\n' >"$proj/src/mod/util.ts"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "add util.ts" >/dev/null 2>&1 || return 1
+
+  # Step 4: the verify_candidate-slot fix, run directly — HEAD is now exactly
+  # what verify_candidate would have bound to $candidate.
+  doc_freshness_recompute_candidate || {
+    printf 'doc_freshness_recompute_candidate failed\n'
+    return 1
+  }
+
+  # Step 5: the observer's read site must now see real content, sourced from
+  # the recompute, not the (still-empty) prompt-time write.
+  section="$(doc_freshness_section)"
+  fx "observer section: populated after post-candidate recompute (was empty at prompt time)" \
+    bash -c 'printf "%s" "$1" | grep -q "DOC FRESHNESS"' _ "$section"
+  fx "observer section: lists the touched-dir doc" \
+    bash -c 'printf "%s" "$1" | grep -qF "src/mod/CLAUDE.md"' _ "$section"
+
+  # Structural wiring checks (declare -f, per the session-refresh fixture's
+  # pipefail rationale): all three sites — prompt-time write, post-candidate
+  # recompute, observer read — must derive the filename from the ONE shared
+  # doc_freshness_path helper (the no-drift guarantee this whole fixture
+  # relies on), and verify_candidate must actually call the recompute in its
+  # post-candidate slot.
+  case "$(declare -f doc_freshness_prompt_block)" in *doc_freshness_path*) ;; *) return 1 ;; esac
+  case "$(declare -f doc_freshness_recompute_candidate)" in *doc_freshness_path*) ;; *) return 1 ;; esac
+  case "$(declare -f doc_freshness_section)" in *doc_freshness_path*) ;; *) return 1 ;; esac
+  case "$(declare -f verify_candidate)" in *doc_freshness_recompute_candidate*) ;; *) return 1 ;; esac
+  return 0
+}
+
+fixture_doc_freshness_recompute() {
+  local err status
+  err="$(_fixture_doc_freshness_recompute_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - doc-freshness recompute: post-candidate recompute populates the observer section after an empty first-pass prompt block (proves the gate is not inert on a first-pass run)\n'
+  else
+    printf 'not ok - doc-freshness recompute: post-candidate recompute populates the observer section after an empty first-pass prompt block (proves the gate is not inert on a first-pass run)\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/doc-summaries.sh (agentic-gaps tranche §B): the `docs/*.md` `>
+# Summary:` convention checker. Exercises the DOC_SUMMARIES_DIR test seam
+# (documented in the script's own header) against throwaway fixture docs —
+# never the real docs/ tree — so this passes regardless of whether this
+# repo's own docs currently conform. A plain external-script invocation (no
+# engine globals touched), so no subshell-isolation wrapper is needed, same
+# as fixture_doc_freshness_basic above.
+fixture_doc_summaries_check() {
+  local root="$1" dir out rc
+  dir="$root/doc-summaries-fixture"
+  mkdir -p "$dir/good" "$dir/bad" || return 1
+  printf '# Good doc\n\n> Summary: this doc conforms to the convention.\n\nBody.\n' >"$dir/good/ok.md"
+  printf '# Bad doc\n\nNo summary line anywhere in the first 7 lines.\n' >"$dir/bad/missing.md"
+  printf '# Also good\n\n> Summary: this one conforms too, in the same dir as the bad one.\n\nBody.\n' >"$dir/bad/ok.md"
+
+  fx "conforming dir: --check exits 0" \
+    env "DOC_SUMMARIES_DIR=$dir/good" "$WORKSPACE_ROOT/scripts/doc-summaries.sh" --check
+
+  out="$(DOC_SUMMARIES_DIR="$dir/bad" "$WORKSPACE_ROOT/scripts/doc-summaries.sh" --check 2>&1)"
+  rc=$?
+  [ "$rc" -eq 1 ] || { printf 'expected exit 1 on a non-conforming dir, got %s (output: %s)\n' "$rc" "$out"; return 1; }
+  fx "non-conforming dir: names the offending file" \
+    bash -c 'printf "%s" "$1" | grep -q "missing.md"' _ "$out"
+  fx_not "non-conforming dir: the conforming file in the same dir is not flagged" \
+    bash -c 'printf "%s" "$1" | grep -q "bad/ok.md"' _ "$out"
+  return 0
+}
+
+# scripts/lib/test-audit-static.js (agentic-gaps tranche §C): the
+# false-confidence test-audit deterministic layer — a zero-dep line scan for
+# tests that PASS while asserting nothing (evidence: 2026-07-11,
+# `expect(result.installmentGroupId).not.toBe("group-a")` passed vacuously
+# because the property doesn't exist). Exercises the CLI directly against
+# scripts/test/fixtures/test-audit/ (vacuous.test.js: one instance of every
+# rule; clean.test.js: genuine assertions only) plus a tiny src/ fixture for
+# --src, same pattern as fixture_port_audit_static above — no chrome/
+# network/claude CLI, runs unconditionally everywhere incl. CI.
+_fixture_test_audit_static_run() {
+  local fixture_dir out status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/test-audit"
+  # DELIBERATELY NOT local, same reasoning as _fixture_port_audit_static_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  TEST_AUDIT_STATIC_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-test-audit-static.$$"
+  mkdir -p "$TEST_AUDIT_STATIC_OUT_DIR" || return 1
+  trap 'rm -rf "${TEST_AUDIT_STATIC_OUT_DIR:-}"' EXIT
+
+  out="$TEST_AUDIT_STATIC_OUT_DIR/report.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$fixture_dir" --src "$fixture_dir/src" --out "$out" >"$out.log" 2>&1; then
+    status=$?
+    printf 'test-audit-static.js dispatch failed (exit %s): %s\n' "$status" "$(cat "$out.log")"
+    return 1
+  fi
+  [ -s "$out" ] || { printf 'report missing/empty: %s\n' "$out"; return 1; }
+
+  fx "schema id" bash -c "jq -e '.schema == \"night-shift-test-audit-static/1\"' '$out' >/dev/null"
+  fx "not-tobe-literal: property never asserted truthy elsewhere -> flagged exactly once" \
+    bash -c "jq -e '.counts[\"not-tobe-literal\"] == 1' '$out' >/dev/null"
+  fx "assert-on-unknown-property: bogus property flagged, real property (groupId) passes -> exactly one finding" \
+    bash -c "jq -e '.counts[\"assert-on-unknown-property\"] == 1' '$out' >/dev/null"
+  fx "tobe-true-constant: expect(true).toBe(true) flagged exactly once" \
+    bash -c "jq -e '.counts[\"tobe-true-constant\"] == 1' '$out' >/dev/null"
+  fx "empty-test-body: it(..., () => {}) flagged exactly once" \
+    bash -c "jq -e '.counts[\"empty-test-body\"] == 1' '$out' >/dev/null"
+  fx "expectless-test: code-but-no-expect body flagged exactly once" \
+    bash -c "jq -e '.counts[\"expectless-test\"] == 1' '$out' >/dev/null"
+  fx "skipped-test: describe.skip flagged exactly once" \
+    bash -c "jq -e '.counts[\"skipped-test\"] == 1' '$out' >/dev/null"
+  fx "clean.test.js contributes zero findings" \
+    bash -c "jq -e '[.findings[] | select(.file | endswith(\"clean.test.js\"))] | length == 0' '$out' >/dev/null"
+  fx "every finding names the vacuous fixture file" \
+    bash -c "jq -e '[.findings[] | select(.file | endswith(\"vacuous.test.js\") | not)] | length == 0' '$out' >/dev/null"
+
+  # Regression: the WIRED path passes --src at the project ROOT, so the audited
+  # test file sits inside the source walk. collectSourceWords must exclude test
+  # files, or the asserted property is always "known" and the rule goes inert.
+  # Point --src at the parent dir (which CONTAINS vacuous.test.js) and require
+  # the bogus-property finding to survive.
+  local rootout="$TEST_AUDIT_STATIC_OUT_DIR/root.json"
+  node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$fixture_dir/vacuous.test.js" --src "$fixture_dir" --out "$rootout" >/dev/null 2>&1
+  fx "assert-on-unknown-property survives --src at project root (test files excluded from source words)" \
+    bash -c "jq -e '.counts[\"assert-on-unknown-property\"] == 1' '$rootout' >/dev/null"
+
+  # node:assert style (the engine's own `node` track: node:test + node:assert).
+  # assert.equal(...)/assert.throws(...) are real assertions — the scanner must
+  # NOT flag them expectless. Written to a temp dir so the corpus-wide scan above
+  # is unaffected.
+  local na="$TEST_AUDIT_STATIC_OUT_DIR/node-assert.test.js" naout="$TEST_AUDIT_STATIC_OUT_DIR/na.json"
+  cat >"$na" <<'NODEASSERT'
+const assert = require('node:assert');
+const { test } = require('node:test');
+test('adds two numbers', () => {
+  const sum = 1 + 1;
+  assert.equal(sum, 2);
+});
+test('throws on bad input', () => {
+  assert.throws(() => { throw new Error('bad'); });
+});
+NODEASSERT
+  node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$na" --out "$naout" >/dev/null 2>&1
+  fx "node:assert style (assert.equal/assert.throws) yields zero findings — no expectless false positive" \
+    bash -c "jq -e '(.findings | length) == 0' '$naout' >/dev/null"
+
+  # it.each curried form + a .skip() method call that is NOT a skipped test +
+  # xtest (a skip alias the old regex missed). Expect exactly one skipped-test
+  # (the xtest), and zero empty/expectless (the it.each callback IS found).
+  local pat="$TEST_AUDIT_STATIC_OUT_DIR/patterns.test.js" patout="$TEST_AUDIT_STATIC_OUT_DIR/pat.json"
+  cat >"$pat" <<'PATTERNS'
+describe('pattern fixtures', () => {
+  it.each([[1, 2, 3], [2, 3, 5]])('adds %i + %i', (a, b, expected) => {
+    expect(a + b).toBe(expected);
+  });
+  it('paginates without being a skipped test', () => {
+    const query = { skip: () => query, limit: () => query, run: () => [] };
+    query.skip(10).limit(5);
+    expect(query.run()).toHaveLength(0);
+  });
+  xtest('a disabled alias test', () => {
+    expect(loadValue()).toHaveLength(3);
+  });
+});
+PATTERNS
+  node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$pat" --out "$patout" >/dev/null 2>&1
+  fx "it.each callback is found (no empty/expectless) and .skip() method call is not a skipped test" \
+    bash -c "jq -e '(.counts[\"empty-test-body\"] // 0) == 0 and (.counts[\"expectless-test\"] // 0) == 0' '$patout' >/dev/null"
+  fx "xtest alias flagged as skipped-test exactly once" \
+    bash -c "jq -e '.counts[\"skipped-test\"] == 1' '$patout' >/dev/null"
+  return 0
+}
+
+fixture_test_audit_static() {
+  local err status
+  err="$(_fixture_test_audit_static_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n'
+  else
+    printf 'not ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/test-audit.sh (agentic-gaps tranche §C, Task 9): the agent-layer
+# wrapper around Task 8's static scanner. A plain external-script invocation
+# (no engine globals touched, same as fixture_doc_summaries_check /
+# fixture_port_audit_offline above), so each case below runs in its own
+# scratch project copied from the SAME Task 8 fixture tree
+# (scripts/test/fixtures/test-audit/) used by fixture_test_audit_static — 6
+# static findings, one per rule, all in vacuous.test.js; clean.test.js
+# contributes zero.
+_test_audit_cli_seed() {
+  local dir="$1"
+  mkdir -p "$dir/tests" || return 1
+  cp -r "$WORKSPACE_ROOT/scripts/test/fixtures/test-audit/." "$dir/tests/" || return 1
+}
+
+_fixture_test_audit_cli_run() {
+  local root="$FIXTURE_ROOT/test-audit-cli"
+  mkdir -p "$root"
+
+  # (a) --offline: static-only, zero cost. Exit 2 iff static findings, and
+  # summary.final_total == the static count exactly (nothing to judge, so
+  # every static finding is "unjudged", and unjudged alone drives final_total).
+  ( dir="$root/offline"; _test_audit_cli_seed "$dir" || exit 1
+    out="$dir/out.json"
+    "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+      --offline --out "$out" >"$dir/run.log" 2>&1
+    rc=$?
+    fx "offline: exits 2 (findings present)" [ "$rc" -eq 2 ] || exit 1
+    fx "offline: schema id" bash -c "jq -e '.schema == \"night-shift-test-audit/1\"' '$out' >/dev/null" || exit 1
+    fx "offline: static_total is 6 (one per rule)" \
+      bash -c "jq -e '.summary.static_total == 6' '$out' >/dev/null" || exit 1
+    fx "offline: final_total equals the static count exactly (nothing judged, no additional)" \
+      bash -c "jq -e '.summary.final_total == .summary.static_total and .summary.confirmed == 0 and .summary.refuted == 0 and .summary.additional == 0' '$out' >/dev/null" || exit 1
+    fx "offline: judged/additional are both empty" \
+      bash -c "jq -e '(.judged == []) and (.additional == [])' '$out' >/dev/null" || exit 1
+    fx "offline: agent_note explains the skip" \
+      bash -c "jq -e '.agent_note | test(\"offline\"; \"i\")' '$out' >/dev/null" || exit 1
+    fx "offline: sibling .md written" [ -s "$dir/out.md" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # (b) full run, a PATH-stubbed `claude` emitting a VALID fenced-json
+  # judgment: confirms one static finding, refutes another, adds one
+  # judgment-tier finding the static scan can't see. Exercises the exact
+  # arithmetic contract: final_total = confirmed + unjudged + additional,
+  # computed by the script (jq), never taken from the agent's own counting.
+  ( dir="$root/full-valid"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"judgment:\n```json\n{\"judged\":[{\"file\":\"tests/vacuous.test.js\",\"line\":11,\"rule\":\"assert-on-unknown-property\",\"verdict\":\"confirm\",\"reason\":\"wrongName really is absent\"},{\"file\":\"tests/vacuous.test.js\",\"line\":11,\"rule\":\"not-tobe-literal\",\"verdict\":\"refute\",\"reason\":\"already covered by the sibling rule, not independently vacuous\"}],\"additional\":[{\"file\":\"tests/vacuous.test.js\",\"line\":16,\"rule\":\"mock-tested-against-mock\",\"summary\":\"asserts the stub value, not real behavior\"}]}\n```"}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "full run: exits 2 (findings remain: unjudged + additional)" [ "$rc" -eq 2 ] || exit 1
+    fx "full run: exactly one confirmed" bash -c "jq -e '.summary.confirmed == 1' '$out' >/dev/null" || exit 1
+    fx "full run: exactly one refuted" bash -c "jq -e '.summary.refuted == 1' '$out' >/dev/null" || exit 1
+    fx "full run: exactly one additional" bash -c "jq -e '.summary.additional == 1' '$out' >/dev/null" || exit 1
+    fx "full run: final_total arithmetic exact (confirmed 1 + unjudged 4 + additional 1 = 6)" \
+      bash -c "jq -e '.summary.final_total == 6' '$out' >/dev/null" || exit 1
+    fx "full run: judged carries both the confirm and the refute verdicts" \
+      bash -c "jq -e '([.judged[].verdict] | sort) == [\"confirm\",\"refute\"]' '$out' >/dev/null" || exit 1
+    fx "full run: agent_note is null (a valid judgment needs no fail-open note)" \
+      bash -c "jq -e '.agent_note == null' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  # (c) full run, a PATH-stubbed `claude` emitting GARBAGE (no judged/
+  # additional keys at all, twice — the retry budget is exhausted): every
+  # static finding must be kept unjudged (fail-open on evidence), the report
+  # must still validate and note the failure, and the exit code still
+  # follows final_total (2, NOT 3 — an agent-pass failure is never treated
+  # as this script's own infra error).
+  ( dir="$root/full-garbage"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"I have opinions about your tests but no JSON for you."}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "garbage: exits 2, not 3 (fail-open, not an infra error)" [ "$rc" -eq 2 ] || exit 1
+    fx "garbage: judged/additional both empty" \
+      bash -c "jq -e '(.judged == []) and (.additional == [])' '$out' >/dev/null" || exit 1
+    fx "garbage: final_total equals the full static count (every finding kept unjudged)" \
+      bash -c "jq -e '.summary.final_total == .summary.static_total and .summary.static_total == 6' '$out' >/dev/null" || exit 1
+    fx "garbage: agent_note records the failure" \
+      bash -c "jq -e '.agent_note | test(\"fail\"; \"i\")' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  # (d) [Phase-C gate-review C1 regression] full run, a PATH-stubbed `claude`
+  # emitting a VALID fenced-json judgment whose judged[].file entries are
+  # ABSOLUTE (prefixed with the scratch project dir) — mirroring what the
+  # prompt's own `### <file>` headers look like (RESOLVED_TESTS, already
+  # absolutized) even though static findings' own `file` is project-relative.
+  # Before the fix this silently wiped judged[] (strict keying against
+  # relative $real_keys never matched); test_audit_assemble must normalize
+  # both sides so confirmed/refuted still land, AND emit project-relative
+  # `file` back out (never echo the absolute path into the report).
+  ( dir="$root/full-valid-absolute"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"judgment:\n```json\n{\"judged\":[{\"file\":\"__DIR__/tests/vacuous.test.js\",\"line\":11,\"rule\":\"assert-on-unknown-property\",\"verdict\":\"confirm\",\"reason\":\"wrongName really is absent\"},{\"file\":\"__DIR__/tests/vacuous.test.js\",\"line\":11,\"rule\":\"not-tobe-literal\",\"verdict\":\"refute\",\"reason\":\"covered elsewhere\"}],\"additional\":[]}\n```"}'
+STUB
+    sed -i '' "s#__DIR__#$dir#g" "$dir/bin/claude" 2>/dev/null || sed -i "s#__DIR__#$dir#g" "$dir/bin/claude"
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "absolute-path judged[].file: exits 2 (findings remain: unjudged + additional-less)" [ "$rc" -eq 2 ] || exit 1
+    fx "absolute-path judged[].file: exactly one confirmed despite the absolute path" \
+      bash -c "jq -e '.summary.confirmed == 1' '$out' >/dev/null" || exit 1
+    fx "absolute-path judged[].file: exactly one refuted despite the absolute path" \
+      bash -c "jq -e '.summary.refuted == 1' '$out' >/dev/null" || exit 1
+    fx "absolute-path judged[].file: judged is non-empty (the C1 bug wiped it to [])" \
+      bash -c "jq -e '(.judged | length) == 2' '$out' >/dev/null" || exit 1
+    fx "absolute-path judged[].file: output re-normalizes file to project-relative" \
+      bash -c "jq -e '[.judged[].file] | all(. == \"tests/vacuous.test.js\")' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  # (e) [final-review I1] --src pruning + size cap: --src is commonly wired to
+  # the project root, so a node_modules dir living under it must NEVER reach
+  # the paid prompt, and a src tree bigger than the 200KB budget must be
+  # truncated (not silently dumped in full) with the truncation noted in the
+  # prompt text. The stub `claude` captures its own stdin (the exact prompt
+  # sent) to a file for inspection — the only way to see the prompt, since
+  # test-audit.sh's own PROMPT_FILE lives in a mktemp dir cleaned up on exit.
+  ( dir="$root/src-prune-cap"; _test_audit_cli_seed "$dir" || exit 1
+    mkdir -p "$dir/tests/src/node_modules/evil"
+    printf 'const SENTINEL_NODE_MODULES_CONTENT_SHOULD_NOT_APPEAR = 1;\n' \
+      >"$dir/tests/src/node_modules/evil/junk.js"
+    # Two ~150KB files (sorted before sample.js): big1.js alone fits the 200KB
+    # cap, big2.js would push the running total over it and must be skipped,
+    # and sample.js (encountered after truncation kicks in) must be skipped too.
+    head -c 153600 /dev/zero | tr '\0' 'a' >"$dir/tests/src/big1.js"
+    head -c 153600 /dev/zero | tr '\0' 'b' >"$dir/tests/src/big2.js"
+    mkdir -p "$dir/bin"
+    prompt_capture="$dir/prompt-capture.txt"
+    cat >"$dir/bin/claude" <<STUB
+#!/usr/bin/env bash
+cat >"$prompt_capture"
+printf '%s\n' '{"result":"judgment:\n\`\`\`json\n{\"judged\":[],\"additional\":[]}\n\`\`\`"}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$dir" --tests tests --src tests/src \
+        --out "$out" >"$dir/run.log" 2>&1
+    )
+    fx "src-prune-cap: run completed (some exit status; report was still written)" [ -s "$out" ] || exit 1
+    fx "src-prune-cap: prompt was captured" [ -s "$prompt_capture" ] || exit 1
+    fx "node_modules content never reaches the prompt" \
+      bash -c '! grep -q SENTINEL_NODE_MODULES_CONTENT_SHOULD_NOT_APPEAR "$1"' _ "$prompt_capture" || exit 1
+    fx "node_modules path itself never reaches the prompt" \
+      bash -c '! grep -q "node_modules/evil/junk.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "big1.js (fits under the cap) is included" \
+      bash -c 'grep -q "### .*big1.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "big2.js (would exceed the cap) is skipped" \
+      bash -c '! grep -q "### .*big2.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "sample.js (encountered after truncation) is skipped" \
+      bash -c '! grep -q "### .*sample.js" "$1"' _ "$prompt_capture" || exit 1
+    fx "truncation is noted in the prompt text" \
+      bash -c 'grep -q "source dump truncated" "$1"' _ "$prompt_capture" || exit 1
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_test_audit_cli() {
+  local err status
+  err="$(_fixture_test_audit_cli_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; an absolute-path judged[].file reply still normalizes and counts correctly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n'
+  else
+    printf 'not ok - test-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; an absolute-path judged[].file reply still normalizes and counts correctly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# Engine wiring for scripts/test-audit.sh (agentic-gaps tranche §C):
+# test_audit_candidate/test_audit_section in scripts/night-shift.sh, modeled
+# on port_audit_candidate/port_audit_section. Seeds a throwaway git repo with
+# TWO test files, commits a base, then a "candidate" commit that touches only
+# ONE of them (plus a non-test file) — the scoping contract under test.
+# test-audit.sh itself is stubbed on PATH (argv-capture) so this fixture
+# exercises ONLY the wiring (gating, scoping, journaling, section
+# attachment), not the CLI's own logic (covered by fixture_test_audit_cli).
+_test_audit_wiring_seed() {
+  local dir="$1"
+  mkdir -p "$dir/repo/src" || return 1
+  cat >"$dir/repo/src/touched.test.js" <<'EOF'
+describe('touched', () => { it('is touched by the candidate', () => { expect(1).toBe(1); }); });
+EOF
+  cat >"$dir/repo/src/untouched.test.js" <<'EOF'
+describe('untouched', () => { it('is not touched by the candidate', () => { expect(1).toBe(1); }); });
+EOF
+  printf '// base\n' >"$dir/repo/src/main.js"
+  git -C "$dir/repo" init -q || return 1
+  git -C "$dir/repo" config user.email t@t && git -C "$dir/repo" config user.name t || return 1
+  git -C "$dir/repo" add -A && git -C "$dir/repo" commit -qm base >/dev/null || return 1
+  printf '// changed\n' >"$dir/repo/src/main.js"
+  cat >>"$dir/repo/src/touched.test.js" <<'EOF'
+// a second assertion, added by the candidate
+EOF
+  git -C "$dir/repo" add -A && git -C "$dir/repo" commit -qm candidate >/dev/null || return 1
+  mkdir -p "$dir/rs/control" "$dir/rs/validated" "$dir/rs/raw" || return 1
+  printf '# sample spec\n' >"$dir/spec.md"
+}
+
+_fixture_test_audit_wiring_run() {
+  local root="$FIXTURE_ROOT/test-audit-wiring"
+  mkdir -p "$root"
+
+  # Structural wiring: post-candidate call order + both reviewer surfaces.
+  ( body="$(awk '/^verify_candidate\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "verify_candidate calls test_audit_candidate" \
+      bash -c 'printf "%s" "$1" | grep -q test_audit_candidate' _ "$body"
+    audit_line="$(printf '%s' "$body" | grep -n 'port_audit_candidate' | head -1 | cut -d: -f1)"
+    test_line="$(printf '%s' "$body" | grep -n 'test_audit_candidate' | head -1 | cut -d: -f1)"
+    fx "test audit runs AFTER the port audit (same post-candidate slot)" \
+      test -n "$audit_line" -a -n "$test_line" -a "$test_line" -gt "$audit_line" || exit 1
+    obs="$(awk '/^run_observer\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "run_observer context includes test_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q test_audit_section' _ "$obs" || exit 1
+    bun="$(awk '/^assemble_review_bundle\(\) \{/,/^\}/' "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+    fx "implementation review bundle includes test_audit_section" \
+      bash -c 'printf "%s" "$1" | grep -q test_audit_section' _ "$bun" || exit 1
+    exit 0
+  ) || return 1
+
+  # test_audit_touched_tests: scoped to exactly the ONE touched test file.
+  ( dir="$root/scope"; _test_audit_wiring_seed "$dir" || exit 1
+    base="$(git -C "$dir/repo" rev-parse HEAD~1)"
+    touched="$(test_audit_touched_tests "$dir/repo" "$base" "")"
+    fx "scope: names only the touched test file" \
+      bash -c 'test "$1" = "src/touched.test.js"' _ "$touched" || exit 1
+    exit 0
+  ) || return 1
+
+  # Gate: knob OFF -> no-op, stub never invoked, nothing journaled/attached.
+  # The stub lives at $WORKSPACE_ROOT/scripts/test-audit.sh (WORKSPACE_ROOT
+  # itself is overridden to this scratch dir) since test_audit_candidate
+  # invokes that fully-qualified path directly, never a bare PATH lookup.
+  ( dir="$root/off"; _test_audit_wiring_seed "$dir" || exit 1
+    mkdir -p "$dir/scripts"
+    argv="$dir/argv.log"
+    cat >"$dir/scripts/test-audit.sh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$argv"
+exit 0
+STUB
+    chmod +x "$dir/scripts/test-audit.sh"
+    ( RUN_ROOT="$dir/rs"; RUN_ID="tawire-off"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+      STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+      WORKDIR=""; BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD~1)"
+      TEST_AUDIT=0 TEST_AUDIT_MODEL="inherit"
+      WORKSPACE_ROOT="$dir"
+      test_audit_candidate || exit 1
+      fx_not "knob OFF: stub never invoked" [ -e "$argv" ] || exit 1
+      fx_not "knob OFF: no report written" [ -e "$PROJECT/.night-shift/test-audit/spec.json" ] || exit 1
+      fx_not "knob OFF: no test_audit event journaled" \
+        bash -c "[ -f '$RUN_ROOT/events.jsonl' ] && grep -q test_audit '$RUN_ROOT/events.jsonl'" || exit 1
+      fx "knob OFF: test_audit_section is empty (no report)" test -z "$(test_audit_section)" || exit 1
+    ) || exit 1
+    exit 0
+  ) || return 1
+
+  # Happy path: knob ON -> the engine invokes test-audit.sh with ONLY the
+  # touched test file (argv-captured via the stub), a report lands (the stub
+  # writes one), a test_audit event carries {files, final_total}, and the
+  # section/persona bundle surface it indented and labeled non-authoritative.
+  ( dir="$root/on"; _test_audit_wiring_seed "$dir" || exit 1
+    mkdir -p "$dir/scripts"
+    argv="$dir/argv.log"
+    cat >"$dir/scripts/test-audit.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"__ARGV__"
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--out" ]; then out="$a"; fi
+  prev="$a"
+done
+[ -n "$out" ] || exit 3
+mkdir -p "$(dirname "$out")"
+printf '{"schema":"night-shift-test-audit/1","summary":{"static_total":1,"confirmed":0,"refuted":0,"additional":0,"final_total":1}}\n' >"$out"
+exit 2
+STUB
+    sed -i '' "s#__ARGV__#$argv#" "$dir/scripts/test-audit.sh" 2>/dev/null || sed -i "s#__ARGV__#$argv#" "$dir/scripts/test-audit.sh"
+    chmod +x "$dir/scripts/test-audit.sh"
+    ( RUN_ROOT="$dir/rs"; RUN_ID="tawire-on"; PROJECT="$dir/repo"; SPEC="$dir/spec.md"
+      STATE="$RUN_ROOT/state.json"; printf '{"stage":"candidate_review"}' >"$STATE"
+      WORKDIR=""; BASE_COMMIT="$(git -C "$PROJECT" rev-parse HEAD~1)"
+      printf '# plan\n' >"$RUN_ROOT/control/plan.md"
+      TEST_AUDIT=1 TEST_AUDIT_MODEL="inherit"
+      WORKSPACE_ROOT="$dir"
+      test_audit_candidate || exit 1
+      fx "knob ON: stub was invoked" [ -s "$argv" ] || exit 1
+      fx "knob ON: only the touched test file is passed (not the untouched one)" \
+        bash -c 'grep -q "src/touched.test.js" "$1" && ! grep -q "src/untouched.test.js" "$1"' _ "$argv" || exit 1
+      fx "knob ON: --tests appears before --src/--model/--out in argv, --src is the WORKDIR-scoped project root (empty WORKDIR -> \".\")" \
+        grep -q -- "--tests src/touched.test.js --src . --model" "$argv" || exit 1
+      report="$PROJECT/.night-shift/test-audit/spec.json"
+      fx "knob ON: report generated in the project run dir" [ -s "$report" ] || exit 1
+      fx "knob ON: test_audit event journaled with files + numeric final_total" \
+        bash -c "jq -e 'select(.type==\"test_audit\") | .payload.files==1 and .payload.final_total==1' '$RUN_ROOT/events.jsonl' >/dev/null" || exit 1
+      sec="$(test_audit_section)"
+      fx "section prints the advisory marker" bash -c 'printf "%s" "$1" | grep -q "TEST AUDIT"' _ "$sec" || exit 1
+      fx "section labeled non-authoritative" bash -c 'printf "%s" "$1" | grep -q "NOT authoritative"' _ "$sec" || exit 1
+      fx "section indents the report (no section forgery)" bash -c 'printf "%s" "$1" | grep -q "^    {"' _ "$sec" || exit 1
+      assemble_review_bundle implementation "$dir/bundle.md" || exit 1
+      fx "implementation persona bundle references the test audit" grep -q 'TEST AUDIT' "$dir/bundle.md" || exit 1
+    ) || exit 1
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_test_audit_wiring() {
+  local err status
+  err="$(_fixture_test_audit_wiring_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - test-audit wiring: post-candidate slot after port-audit, gated on the knob, scoped to ONLY the candidate-touched test files, {files,final_total} journaled, attached to persona bundle/observer\n'
+  else
+    printf 'not ok - test-audit wiring: post-candidate slot after port-audit, gated on the knob, scoped to ONLY the candidate-touched test files, {files,final_total} journaled, attached to persona bundle/observer\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
 }
 

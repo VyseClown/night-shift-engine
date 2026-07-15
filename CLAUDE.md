@@ -40,6 +40,7 @@ that silently breaks).
 | `NIGHT_SHIFT_PERSONA_MODEL` | `sonnet`. Breadth over depth; the observer is the deep gate. |
 | `NIGHT_SHIFT_OBSERVER_MODEL` | Strongest available. Never weaker than the implement model. |
 | `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` | Strongest available for design-contract work; `sonnet` for cosmetic-only specs. |
+| `NIGHT_SHIFT_SWEEP_MODEL` | Strongest available — whole-branch judgment; defaults to the observer model. |
 
 Spec-type adjustments: scratch/demo targets (`nightshift-demo`, throwaway
 specs) run everything on `sonnet` — never spend judgment-tier budget there.
@@ -100,6 +101,20 @@ directory; run engine/workflow git inside the engine directory.
   and only on runs started *without* `--spec` (the engine picks the task from
   TODO). An explicit `--spec` run is a single task: on `NEXT_TASK` it completes
   and exits 0 so an external wrapper can own cross-spec sequencing/branching.
+- **Smoke-run validation (opt-in per spec):** an optional `- Smoke: `<command>`` field
+  (+ `- Smoke URL: `<http://127.0.0.1:PORT/…>`` for a server) adds a gated phase
+  right after baseline and final validation, on both the initial and any chained
+  task — proof the app actually BOOTS, not just that tsc/eslint/jest pass (the
+  evidence class: a Release-bundle break that passed every one of those). No URL
+  ⇒ exit mode (the command itself must exit 0 within `NIGHT_SHIFT_SMOKE_TIMEOUT`,
+  default 120s); URL present ⇒ server mode (poll for HTTP 200 every 2s until the
+  timeout, then TERM-then-KILL the whole process group — never leaves a zombie
+  dev server, including on an interrupted run). Baseline never blocks on its own
+  smoke result (recorded and only judged for regression, exactly like any other
+  baseline command); final regresses the candidate exactly like the ordinary
+  final-validation gate. The URL must be loopback-only (`http://127.0.0.1` or
+  `http://localhost`) and both fields require backticks — malformed or missing
+  fields fail loudly at spec selection, same dialect as `- Workdir:`.
 - **Cost knobs:** the primary runs as **stage-scoped sessions** by default
   (`NIGHT_SHIFT_SESSION_SCOPE=stage`) — a fresh Claude session per stage scope
   (plan → implement → observe) handing off through files, which avoids replaying
@@ -111,6 +126,27 @@ directory; run engine/workflow git inside the engine directory.
   spec with a `## Design Contract` (judgment-heavy design-fidelity build — Flow B), and
   `NIGHT_SHIFT_OBSERVER_MODEL` (default `opus`) for the independent final gate —
   any set to `inherit` to fall back to the CLI's startup model.
+- **Test audit (opt-in, default OFF):** `NIGHT_SHIFT_TEST_AUDIT=1` runs
+  `scripts/test-audit.sh` once per candidate over ONLY the test files the
+  candidate diff touched (skips cleanly when none), on
+  `NIGHT_SHIFT_TEST_AUDIT_MODEL` (default `sonnet` — the Model ruling's
+  breadth tier, same as `NIGHT_SHIFT_PERSONA_MODEL`/port-audit; escalate to a
+  judgment-tier model only for specs where false-confidence findings would be
+  expensive to miss, it is not the default). A deterministic static scan for
+  vacuous-assertion smells plus one bounded agent judgment pass (confirm/
+  refute each static finding, hunt additional judgment-tier smells like a mock
+  tested against itself) — every count in the report is recomputed by the
+  script, never taken from the agent. NON-gating: the report is attached to
+  the implementation-review bundle and the observer's evidence, and a
+  `test_audit` event (`{files, final_total}`) is journaled; a failed or
+  missing report only WARNs. See `docs/COMMAND-PLAYBOOK.md` §11 for the
+  standalone CLI contract.
+- **Journal events added by this tranche** (for anyone grepping
+  `events.jsonl`): `sweep` (branch-sweep verdict), `sweep_fix` /
+  `sweep_fix_reverted` (fix-cycle round + deterministic revert, the latter
+  carrying a `reason` of `dirty_tree` or a failed re-validation), `run_feedback`
+  (feedback entry appended), and `smoke` (smoke-phase result). All are advisory;
+  none gates a run.
 - **Codex second opinion (opt-in, default OFF):** `NIGHT_SHIFT_CODEX_REVIEW=1`
   adds one bounded `codex exec -s read-only` advisory review per candidate
   (gpt-5.5 via the Codex CLI), handed to the observer as supplementary,
@@ -118,6 +154,32 @@ directory; run engine/workflow git inside the engine directory.
   CLI / failure / timeout skip cleanly and are journaled (`codex_review`
   events). The verdict pipeline stays Claude-only either way — leave this off
   unless you deliberately want a second vendor's perspective.
+- **Run feedback (default ON):** at every run's completion (before the branch
+  sweep block below, and regardless of `NIGHT_SHIFT_BRANCH_SWEEP`), a short
+  fresh session distills the run's journal into 5-15 bullets for the human who
+  authors specs — spec ambiguities, stages that looped, validation friction —
+  appended to `<project>/.night-shift/feedback.md` (a persistent, cross-run
+  file; never touched by `compact_success`). Gated on `NIGHT_SHIFT_RUN_FEEDBACK`
+  (default `1`; set `=0` to skip the session's cost entirely). Advisory only —
+  a session failure or unparseable reply WARNs and never blocks or delays
+  completion.
+- **Branch sweep, in-run (opt-in, default OFF):** `NIGHT_SHIFT_BRANCH_SWEEP=1`
+  or `=advisory` adds one whole-branch strong-model review at run completion —
+  the full merge-base diff, read by `NIGHT_SHIFT_SWEEP_MODEL` (default = the
+  observer model) — for what per-task reviews can't see: cross-task
+  interactions, accumulated minor findings, hygiene. Never gates completion.
+  `=1` additionally runs a capped fix cycle (`NIGHT_SHIFT_SWEEP_MAX_FIX`,
+  default `1`) on a `SWEEP_FINDINGS` verdict — an implement-model session
+  fixes only the findings, final validation re-runs, and a failed
+  re-validation deterministically `git reset --hard`s back to the pre-fix tip
+  rather than trusting the agent to self-revert. `=advisory` writes findings
+  only, no fix cycle. `NIGHT_SHIFT_SWEEP_MAX_WAIT` (default `900`s) bounds the
+  sweep session's own rate-limit retry. Standalone surface: `scripts/night-shift.sh
+  --sweep-only --project <path>` runs the same review outside any run/queue —
+  verdict-only by default regardless of `NIGHT_SHIFT_BRANCH_SWEEP` (that knob
+  must be exactly `1` on this surface to also run the fix cycle), exit `0`
+  `SWEEP_PASS` / `2` `SWEEP_FINDINGS`/`SWEEP_ERROR`. See
+  `docs/COMMAND-PLAYBOOK.md` for the full contract.
 - **Visual fidelity (opt-in):** set `NIGHT_SHIFT_VISUAL_CAPTURE=1` and give an rn
   spec a `## Design Contract` to enable the `visual_review` stage (Figma-MCP
   reference + iOS-simulator capture + `odiff` pixel-diff + agent auto-repair).

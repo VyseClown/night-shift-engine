@@ -1,5 +1,10 @@
 # Terminal Setup
 
+> Summary: Personal machine setup log for `~/.zshrc` — PATH, shared history,
+> the two-line prompt, Zsh/Codex completion, RN aliases, and the `rninfo`
+> diagnostic function. Historical record; see `dev-environment.md` for the
+> fuller environment writeup (Nerd Font/Ghostty/Starship/status line).
+
 This document describes the terminal and Zsh customization added on
 June 5, 2026, with additional helpers for React Native development.
 

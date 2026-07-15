@@ -1,5 +1,11 @@
 # Visual-review live path — bringing `visual-review.sh` end-to-end on iOS 26
 
+> Summary: Validation record for taking design-fidelity capture from scaffold
+> to a real iOS-26 simulator run: three failure modes found (stale worktree,
+> `app/`-dir test files breaking the Release bundle, iOS 16+'s "Open in app?"
+> prompt) and the `--drive file` prompt-free capture mode added to fix the
+> third.
+
 Date: 2026-06-24. Target: `water-tracker-app` (`feat/water-tracker`). This records
 the gaps found taking the design-fidelity pass from "half-built" (engine wrapper +
 Design-Fidelity persona only) to **real simulator capture of seeded preview

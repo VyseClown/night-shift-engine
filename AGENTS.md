@@ -176,6 +176,8 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project PATH --spec specs/
   the wrapper waits until the reported reset time plus a safety buffer, pauses
   its elapsed-time budgets, and resumes the same explicit stage session.
   Other API failures still stop via `block_run`. Nothing is pushed or merged.
+- **Reviewing a whole branch before merge?** See `docs/COMMAND-PLAYBOOK.md`
+  §10 (`scripts/night-shift.sh --sweep-only --project <path>`).
 
 ---
 
@@ -235,6 +237,12 @@ npm run test:e2e               # 5. E2E through the real UI against the real API
 ```
 
 If any step fails: fix it, re-run from step 1. Do not commit with failures.
+
+An optional `- Smoke:` (+ `- Smoke URL:` for a server) spec field adds one more
+gated step to every track above: the engine actually BOOTS the app — runs the
+command to a clean exit, or starts it and polls a loopback URL for HTTP 200 —
+instead of trusting that green tsc/lint/tests mean it runs. See any template's
+Repository section for the field syntax.
 
 ---
 
@@ -323,6 +331,18 @@ BLOCKED: [what you were trying to do]
 REASON:  [what you tried and why it did not work]
 NEED:    [what information or decision would unblock you]
 ```
+
+---
+
+## Doc summaries + doc-freshness gate
+
+Every top-level `docs/*.md` opens with `> Summary: <1-3 lines>` in its first 7
+lines (`scripts/doc-summaries.sh --check` enforces this in CI) — not imposed
+on `docs/examples/`, `docs/proposals/`, `docs/superpowers/`, or target repos.
+Doc-freshness (`NIGHT_SHIFT_DOC_FRESHNESS`, default ON): the implement stage
+gets a candidate-stale-doc list and must update-or-declare `unaffected:` per
+doc; the observer spot-checks it, never gates. See
+`docs/superpowers/specs/2026-07-11-agentic-gaps-tranche-design.md` §B.
 
 ---
 
