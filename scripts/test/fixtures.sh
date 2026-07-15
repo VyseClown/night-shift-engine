@@ -296,6 +296,8 @@ run_dry_fixtures() {
   fixture_assert "branch sweep: SWEEP_ERROR skips the fix cycle untouched" fixture_sweep_error_skips_fix "$root"
   fixture_assert "branch sweep: fix cycle reverts on failed re-validation" fixture_sweep_fix_revert "$root"
   fixture_assert "branch sweep: fix cycle reverts a dirty tree (uncommitted work) before revalidation" fixture_sweep_fix_dirty_guard "$root"
+  fixture_assert "branch sweep: fix cycle rebuilds the package before the re-sweep (fixed code judged, not stale diff)" fixture_sweep_rebuild_before_resweep "$root"
+  fixture_assert "branch sweep: fix-cycle re-validation runs in an isolated worktree, not the live tree" fixture_sweep_fix_worktree_isolation "$root"
   fixture_assert "branch sweep: fix cycle capped at NIGHT_SHIFT_SWEEP_MAX_FIX then residual" fixture_sweep_fix_cap "$root"
   fixture_sweep_only_args
   fixture_assert "branch sweep: --sweep-only exits 0 on SWEEP_PASS / 2 on residual findings" fixture_sweep_only_run "$root"
@@ -2598,6 +2600,33 @@ fixture_smoke_phase() {
         [ "$(jq -r '.[0].exit_status' "$dir/rs/validated/smoke-to.json")" -eq 1 ] || exit 1
       sleep 0.3
       fx "timeout: no zombie process left" [ -z "$(pgrep -f 'sleep 41' 2>/dev/null)" ] || exit 1
+      SMOKE_TIMEOUT=20
+
+      # --- strict 2xx: a server that only ever 302-redirects is NOT boot proof.
+      # Bare `curl -fsS` exits 0 on a 3xx (accepting an auth bounce / redirect
+      # loop as "up"); run_smoke_phase must require 200-299, so this must time
+      # out (rc 1), never pass. ---
+      rport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+      cat >"$dir/redirect-server.py" <<'PYEOF'
+import http.server, socketserver, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302); self.send_header("Location", "/elsewhere"); self.end_headers()
+    def log_message(self, *a):
+        pass
+socketserver.TCPServer.allow_reuse_address = True
+socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYEOF
+      printf -- '- Smoke: `python3 %s/redirect-server.py %s`\n- Smoke URL: `http://127.0.0.1:%s/`\n' \
+        "$dir" "$rport" "$rport" >"$dir/s-302.md"
+      SPEC="$dir/s-302.md"
+      SMOKE_TIMEOUT=4
+      rc=0
+      run_smoke_phase r302 "$dir/rs/validated/smoke-302.json" "$dir/websrv" || rc=$?
+      fx "strict 2xx: a 302-only server is not boot proof (times out, rc 1)" [ "$rc" -eq 1 ] || exit 1
+      sleep 0.3
+      fx "strict 2xx: redirect server cleaned up (no lingering process)" \
+        [ -z "$(pgrep -f "redirect-server.py $rport" 2>/dev/null)" ] || exit 1
       SMOKE_TIMEOUT=20
 
       # --- daemon-leak class: the Smoke command backgrounds its real listener
@@ -6881,6 +6910,86 @@ fixture_sweep_fix_dirty_guard() {
       grep -q '"reason":"dirty_tree"' "$RUN_ROOT/events.jsonl"
     fx "dirty guard: no revalidation ran (guard fired first — no revalidation-1.json)" \
       test ! -e "$out/revalidation-1.json"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: proves the package is REBUILT before the re-sweep. The stub's
+# re-sweep verdict is driven by whether $out/package.diff still contains the
+# fixed-away marker — so if sweep_fix_cycle re-read the STALE pre-fix package
+# (the bug), the verdict would stay SWEEP_FINDINGS; with the rebuild it flips to
+# SWEEP_PASS. No RUN_ROOT -> re-validation is skipped, isolating rebuild+re-sweep.
+fixture_sweep_rebuild_before_resweep() {
+  local root="$1" dir="$root/sweep-rebuild" proj out
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    printf 'const x = "BUGMARKER";\n' >"$proj/feature.js"
+    git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm "add feature" >/dev/null
+    # A STALE package.diff that still names the marker (what the pre-fix sweep saw).
+    printf '## diff\n+const x = "BUGMARKER";\n' >"$out/package.diff"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: remove the BUGMARKER\n' >"$out/findings.md"
+    PROJECT="$proj"; SWEEP_MODEL="inherit"; IMPLEMENT_MODEL="inherit"; SWEEP_MAX_FIX=1
+    claude() {
+      local input; input="$(cat)"
+      case "$input" in
+        *"Fix ONLY the findings"*)
+          printf 'const x = "clean";\n' >"$proj/feature.js"
+          git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm sweepfix >/dev/null
+          printf '{"result":"done"}\n' ;;
+        *)
+          if grep -q BUGMARKER "$out/package.diff" 2>/dev/null; then
+            printf '{"result":"still bad\\nSWEEP_FINDINGS: 1"}\n'
+          else
+            printf '{"result":"clean now\\nSWEEP_PASS"}\n'
+          fi ;;
+      esac
+    }
+    sweep_fix_cycle "$proj" "$out"
+    fx "rebuild: re-sweep judged the REBUILT package (fixed code) -> verdict flips to SWEEP_PASS" \
+      test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+    fx "rebuild: package.diff was regenerated (no longer contains the fixed-away marker)" \
+      bash -c '! grep -q BUGMARKER "$1"' _ "$out/package.diff"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# sweep fix cycle: re-validation runs in an ISOLATED worktree, not the live tree
+# (sweep_revalidate_isolated, parity with verify_candidate's final gate). Proof:
+# a gitignored file present in the live tree keeps `git status --porcelain` clean
+# (so the dirty guard does NOT fire) and makes `test -f secret.txt` PASS in the
+# live tree — but a fresh detached worktree at the fixed tip lacks it, so the
+# isolated re-validation FAILS and reverts. The revert (reason=revalidation, not
+# dirty_tree) can only happen if re-validation ran in the worktree.
+fixture_sweep_fix_worktree_isolation() {
+  local root="$1" dir="$root/sweep-wt-iso" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    printf 'secret.txt\n' >"$proj/.gitignore"
+    git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm gitignore >/dev/null
+    printf 'live-only\n' >"$proj/secret.txt"    # gitignored, present -> porcelain clean
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"; SWEEP_MAX_FIX=1; IMPLEMENT_MODEL="inherit"
+    SPEC="$dir/spec.md"
+    printf -- '- Final validation commands:\n  1. `test -f secret.txt`\n' >"$SPEC"
+    RUN_ROOT="$dir/run"; RUN_ID="sweepwtiso-$$"
+    mkdir -p "$RUN_ROOT/raw" "$RUN_ROOT/validated"
+    # FIX makes a COMMITTED change so the tree stays clean (dirty guard passes).
+    claude() { cat >/dev/null; printf 'x\n' >"$proj/somefile.txt"; git -C "$proj" add -A >/dev/null; git -C "$proj" commit -qm fix >/dev/null; printf '{"result":"done"}\n'; }
+    sweep_fix_cycle "$proj" "$out"
+    fx "worktree isolation: fixed tip reverted — validation that passes in the live tree fails in a clean worktree" \
+      test "$(git -C "$proj" rev-parse HEAD)" = "$tip_before"
+    fx "worktree isolation: revert reason is revalidation, not dirty_tree" \
+      grep -q '"reason":"revalidation"' "$RUN_ROOT/events.jsonl"
     integrity_cleanup
     exit 0
   ) >/dev/null || return 1

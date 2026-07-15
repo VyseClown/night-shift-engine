@@ -229,6 +229,61 @@ sweep_run() {
 
 # One capped fix cycle: hand findings to an implement-model session inside the
 # project, re-run final validation, re-sweep once. Deterministic revert if
+# Re-validate the post-fix tip the SAME way the run's own final gate does:
+# verify_candidate validates a detached worktree at the candidate commit (never
+# the live working tree), then re-runs the smoke phase and regresses it against
+# the baseline. sweep_fix_cycle must match that or a "successful" fix could ship
+# a tip that only passes because of live-tree state absent from a clean checkout
+# (e.g. a gitignored file present locally). Builds a detached worktree at HEAD,
+# links dependencies NON-blockingly (a link failure degrades to a conservative
+# revert, never a run-killing block_run — sweep is advisory), runs the final
+# validation commands + smoke there, and returns 0 iff the fixed tip passes.
+# In-run only (needs RUN_ROOT for per-command logs + the baseline smoke ref);
+# --sweep-only never reaches this.
+sweep_revalidate_isolated() {
+  local project="$1" out="$2" cycles="$3" vcmds="$4" tip wt rc=0 rel src dst pnpm=0
+  tip="$(git -C "$project" rev-parse HEAD)"
+  wt="$(tmp_base)/night-shift-sweepfix-${RUN_ID:-x}-${cycles}-${tip}"
+  prepare_validation_worktree "$project" "$wt" "$tip" || return 1
+  # Non-blocking mirror of link_worktree_dependencies (which block_runs on
+  # failure — unacceptable for an advisory sweep). Covers DEPENDENCY_LINKS, the
+  # pnpm workspace package dirs, and the Nx cache; anything missing is skipped.
+  # pnpm node_modules go through the SAME entry-wise isolation production uses
+  # (link_node_modules_isolated): a whole-dir symlink would make pnpm's relative
+  # workspace links resolve back to the LIVE project sources, silently defeating
+  # the isolation this whole path exists for.
+  [ ! -f "$project/pnpm-workspace.yaml" ] || pnpm=1
+  # shellcheck disable=SC2046,SC2086
+  for rel in $DEPENDENCY_LINKS $(pnpm_workspace_links 2>/dev/null); do
+    src="$project/$rel"; dst="$wt/$rel"
+    { [ -e "$src" ] && [ ! -e "$dst" ]; } || continue
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || continue
+    if [ "$pnpm" -eq 1 ] && [ "$(basename "$rel")" = "node_modules" ]; then
+      link_node_modules_isolated "$src" "$dst" "$wt" 2>/dev/null || true
+    else
+      ln -s "$src" "$dst" 2>/dev/null || true
+    fi
+  done
+  [ ! -d "$project/.nx/cache" ] ||
+    { mkdir -p "$wt/.nx" 2>/dev/null && ln -s "$project/.nx/cache" "$wt/.nx/cache" 2>/dev/null || true; }
+  if [ -n "$vcmds" ]; then
+    run_validation_commands sweepfix "$out/revalidation-$cycles.json" "$vcmds" "$wt" || rc=1
+    if [ "$rc" -eq 0 ] && jq -e 'any(.[]; .exit_status != 0)' "$out/revalidation-$cycles.json" >/dev/null; then rc=1; fi
+  fi
+  # Smoke re-run in the same worktree, regressed against the run's baseline smoke
+  # — exactly verify_candidate's contract. A spec with no Smoke field makes
+  # run_smoke_phase a silent no-op (writes nothing), so this cleanly skips.
+  if [ "$rc" -eq 0 ]; then
+    run_smoke_phase sweepfix "$out/smoke-sweepfix-$cycles.json" "$wt"
+    if [ -s "$out/smoke-sweepfix-$cycles.json" ] && [ -f "$RUN_ROOT/validated/smoke-baseline.json" ]; then
+      validation_not_regressed "$RUN_ROOT/validated/smoke-baseline.json" "$out/smoke-sweepfix-$cycles.json" || rc=1
+    fi
+  fi
+  git -C "$project" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  git -C "$project" worktree prune 2>/dev/null || true
+  return "$rc"
+}
+
 # re-validation fails: reset --hard to the recorded tip (never trust the agent
 # to undo its own commits). Always returns 0 — sweep is advisory end to end.
 # The verdict gate below only ever proceeds on the literal string
@@ -269,21 +324,23 @@ sweep_fix_cycle() {
       return 0
     fi
     # Re-validation needs BOTH a spec to read commands from AND a run to run
-    # them inside: run_validation_commands writes its per-command logs under
-    # "$RUN_ROOT/raw/..." unguarded, so a standalone --sweep-only invocation
-    # (SPEC may be set via --spec, but there is no RUN_ROOT — no run/queue at
-    # all) would crash on an unbound variable rather than skip cleanly.
-    # Revalidation is in-run-only; --sweep-only never revalidates.
+    # them inside: run_validation_commands + run_smoke_phase write per-command
+    # logs under "$RUN_ROOT/raw/..." unguarded, so a standalone --sweep-only
+    # invocation (SPEC may be set via --spec, but there is no RUN_ROOT — no
+    # run/queue at all) would crash on an unbound variable rather than skip
+    # cleanly. Revalidation is in-run-only; --sweep-only never revalidates.
     vcmds=""
     if [ -n "${SPEC:-}" ] && [ -n "${RUN_ROOT:-}" ]; then
       vcmds="$(extract_validation_commands "$SPEC" "Final validation commands")"
     fi
-    if [ -n "$vcmds" ]; then
-      if ! run_validation_commands sweepfix "$out/revalidation-$cycles.json" "$vcmds" ||
-         jq -e 'any(.[]; .exit_status != 0)' "$out/revalidation-$cycles.json" >/dev/null; then
+    # Isolated (worktree) re-validation + smoke re-run at the fixed tip — parity
+    # with verify_candidate's final gate, never the live tree. A failure or an
+    # un-buildable worktree reverts to the pre-fix tip.
+    if [ -n "${RUN_ROOT:-}" ] && { [ -n "$vcmds" ] || [ -f "$RUN_ROOT/validated/smoke-baseline.json" ]; }; then
+      if ! sweep_revalidate_isolated "$project" "$out" "$cycles" "$vcmds"; then
         git -C "$project" reset --hard "$tip_before" >/dev/null
-        emit_event sweep_fix_reverted "$(jq -cn --argjson c "$cycles" '{cycle:$c}')"
-        log "WARN: sweep fix cycle $cycles failed re-validation — reverted to $tip_before"
+        emit_event sweep_fix_reverted "$(jq -cn --argjson c "$cycles" '{cycle:$c, reason:"revalidation"}')"
+        log "WARN: sweep fix cycle $cycles failed isolated re-validation — reverted to $tip_before"
         return 0
       fi
     fi

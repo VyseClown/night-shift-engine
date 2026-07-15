@@ -482,7 +482,7 @@ cleanup_smoke_pgid() {
 # unchanged; returns the smoke command's exit status (or the poll's timeout
 # rc=1) so callers can gate on it exactly like any other validation command.
 run_smoke_phase() {
-  local kind="$1" target="$2" run_dir="${3:-$PROJECT}" cmd url rc=0 pid out t=0 wd exec_dir port survivors
+  local kind="$1" target="$2" run_dir="${3:-$PROJECT}" cmd url rc=0 pid out wd exec_dir port survivors
   # shellcheck disable=SC2153
   # ^ $SPEC is the night-shift.sh runtime global (the current task's spec
   # path) — not a typo of the unrelated lowercase `spec` locals other
@@ -509,10 +509,21 @@ run_smoke_phase() {
       set +m
       SMOKE_PGID="$pid"
       rc=1
-      while [ "$t" -lt "$SMOKE_TIMEOUT" ]; do
-        if curl -fsS -o /dev/null --max-time 5 "$url"; then rc=0; break; fi
+      # WALL-CLOCK deadline, not a sleep counter: each poll's curl can itself
+      # burn up to --max-time 5s, so counting only the sleeps would stretch a
+      # declared SMOKE_TIMEOUT of 120s to ~7min against a server that accepts
+      # TCP but never answers. now_epoch is the engine's portable clock.
+      local deadline http_code
+      deadline=$(( $(now_epoch) + SMOKE_TIMEOUT ))
+      while [ "$(now_epoch)" -lt "$deadline" ]; do
+        # Boot proof is a real 2xx, not merely "curl didn't error": bare
+        # `curl -fsS` also exits 0 on a 3xx redirect (an auth/login redirect or
+        # redirect loop is NOT the app serving its content), so capture the code
+        # and require 200-299.
+        http_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null || printf '000')"
+        case "$http_code" in 2[0-9][0-9]) rc=0; break ;; esac
         kill -0 "$pid" 2>/dev/null || break   # server died early
-        sleep 2; t=$((t + 2))
+        sleep 2
       done
       cleanup_smoke_pgid
       wait "$pid" 2>/dev/null || true
