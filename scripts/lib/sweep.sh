@@ -256,6 +256,18 @@ sweep_fix_cycle() {
       --add-dir "$out" --permission-mode acceptEdits --output-format json) \
       >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
     emit_event sweep_fix "$(jq -cn --argjson c "$cycles" '{cycle:$c}')"
+    # The fix session must commit everything it changed. A dirty tree here
+    # (uncommitted edits or untracked files) means re-validation below — which
+    # runs against the LIVE working tree — would green-light content that is in
+    # no commit and would fail a clean checkout (the untracked-file gap from
+    # PR#46). Refuse to trust partial work: revert and stop, same as a failed
+    # re-validation.
+    if [ -n "$(git -C "$project" status --porcelain 2>/dev/null)" ]; then
+      git -C "$project" reset --hard "$tip_before" >/dev/null 2>&1
+      emit_event sweep_fix_reverted "$(jq -cn --argjson c "$cycles" '{cycle:$c, reason:"dirty_tree"}')"
+      log "WARN: sweep fix cycle $cycles left the tree dirty (uncommitted/untracked) — reverted to $tip_before"
+      return 0
+    fi
     # Re-validation needs BOTH a spec to read commands from AND a run to run
     # them inside: run_validation_commands writes its per-command logs under
     # "$RUN_ROOT/raw/..." unguarded, so a standalone --sweep-only invocation
@@ -275,6 +287,12 @@ sweep_fix_cycle() {
         return 0
       fi
     fi
+    # Rebuild the package before re-reviewing: the fix session added commits, so
+    # the pre-fix package.diff no longer describes HEAD. Without this the re-sweep
+    # (which is told the package IS the authoritative scope) re-reads stale code,
+    # re-reports the same findings, and never sees the fix — leaving the verdict
+    # stuck at SWEEP_FINDINGS on a genuinely-fixed branch.
+    sweep_build_package "$project" "$out" >/dev/null 2>&1 || return 0
     sweep_run "$project" "$out"
     [ "$(cat "$out/verdict.txt")" = "SWEEP_FINDINGS" ] || return 0
   done

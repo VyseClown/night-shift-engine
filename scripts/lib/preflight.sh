@@ -293,6 +293,16 @@ validate_spec_smoke() {
     url="$(spec_smoke_url_field "$file")"
     [ -n "$url" ] ||
       { printf 'malformed Smoke URL field — use: - Smoke URL: `http://127.0.0.1:<port>/...` (backticks required)\n' >&2; return 1; }
+    # Reject userinfo BEFORE the loopback check. `http://127.0.0.1:80@evil.com/`
+    # puts `127.0.0.1:80` in the userinfo and `evil.com` as the real host, yet
+    # the `:*` port glob below would swallow `80@evil.com/` and accept it — a
+    # verified bypass of the "never reaches out" invariant. Extract the authority
+    # (between `://` and the first `/`) and refuse any `@` in it.
+    local smoke_authority="${url#*://}"
+    smoke_authority="${smoke_authority%%/*}"
+    case "$smoke_authority" in
+      *@*) printf 'Smoke URL must not contain userinfo (@ before the path) — the real host is whatever follows @, not the loopback address: %s\n' "$url" >&2; return 1 ;;
+    esac
     # Anchored — NOT a prefix match: `http://127.0.0.1*`/`http://localhost*`
     # would also accept `http://localhost.evil.com/` (hostname-prefix bypass).
     # Each accepted host form is spelled out fully: bare, `:<port>`, or `/<path>`.

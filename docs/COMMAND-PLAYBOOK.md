@@ -276,7 +276,7 @@ the static findings + the agent's validated `{file,line,rule}` mapping.
 
 ```bash
 scripts/test-audit.sh --project <app> --tests <path...> [--src <dir>] \
-  [--model sonnet] [--offline] [--out <json>]
+  [--model <name>] [--offline] [--out <json>]
 ```
 
 Writes `<project>/.night-shift/test-audit/report.json` (default `--out`) plus

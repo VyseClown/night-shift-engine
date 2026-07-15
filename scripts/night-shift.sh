@@ -160,8 +160,9 @@ TEST_AUDIT_MODEL="${NIGHT_SHIFT_TEST_AUDIT_MODEL:-sonnet}"
 # + an advisory observer-evidence section), costs nothing extra when the
 # candidate-stale-doc list is empty (the common case — most diffs touch no
 # doc-adjacent path), and never gates a run — the observer is the enforcement
-# point (spot-checks the implementer's update-or-declare against the diff),
-# exactly like the reuse gate and port-audit before it. Set to "0" to disable.
+# point (judges each listed doc against the candidate diff: a doc the change
+# clearly invalidates, left un-updated, is a finding), exactly like the reuse
+# gate and port-audit before it. Set to "0" to disable.
 DOC_FRESHNESS="${NIGHT_SHIFT_DOC_FRESHNESS:-1}"
 # Design-fidelity visual capture. OFF by default: the visual_review stage is a
 # clean no-op SKIP unless this is 1 AND the spec has a `## Design Contract` AND
@@ -757,6 +758,13 @@ compact_success() {
     # fix-session-N.json) alongside validated/ rather than letting it evaporate
     # with the rest of run_dir below.
     [ ! -d "$run_dir/sweep" ] || cp -R "$run_dir/sweep" "$archive/sweep" || copy_ok=0
+    # The test-audit and doc-freshness reports are the same evidence class as
+    # sweep/: advisory findings the observer weighed, worth studying after the
+    # run. Without archiving them here the delete loop below destroys them (and
+    # the journal's {files, final_total} summary points at findings that no
+    # longer exist). Archive the whole dirs alongside sweep/.
+    [ ! -d "$run_dir/test-audit" ] || cp -R "$run_dir/test-audit" "$archive/test-audit" || copy_ok=0
+    [ ! -d "$run_dir/doc-freshness" ] || cp -R "$run_dir/doc-freshness" "$archive/doc-freshness" || copy_ok=0
   fi
   # Preserve per-turn cost telemetry built incrementally by record_cost (every
   # primary turn + the observer). It is independent of the raw files, so it
@@ -1218,7 +1226,7 @@ doc_freshness_prompt_block() {
   printf '\n## Doc-freshness candidates%s\n' "$truncated_note"
   printf 'These docs sit near or mention files this candidate has touched so far and\nmay now describe stale behavior:\n'
   printf '%s\n' "$lines"
-  printf '\nFor each doc above: update it in this candidate if your changes invalidate any\nclaim it makes, OR include a line `unaffected: <path>: <one-line reason>` in your\ncompletion summary. The observer will spot-check declarations against the diff.\n'
+  printf '\nFor each doc above: if your changes invalidate any claim it makes, update it in\nthis candidate. A doc your change does not affect needs no edit — do not touch it\nto satisfy the list. The observer judges the docs above against your actual diff:\na doc whose claims your change clearly breaks, left un-updated, is a finding.\n'
 }
 
 COMPONENT_INVENTORY_ROW_CAP=40
@@ -2877,8 +2885,10 @@ FILES
 # run_observer) as port_audit_section. Keyed on the CURRENT spec's own
 # task-named report ($(basename "$SPEC" .md).json), same as port_audit_section
 # keys on the spec's own screens — never a blanket glob of
-# .night-shift/test-audit/, which is $PROJECT-scoped and persists across
-# every night-shift run. Deliberately NOT gated on $TEST_AUDIT: an existing
+# .night-shift/test-audit/. Within a run this dir lives under RUN_ROOT and is
+# compacted at completion — compact_success archives it (alongside sweep/) so
+# the findings survive under archive/test-audit/. Deliberately NOT gated on
+# $TEST_AUDIT: an existing
 # report is evidence worth surfacing even if the knob changed between
 # rounds. Empty when no report has been written yet for this task.
 test_audit_section() {
@@ -2941,8 +2951,8 @@ doc_freshness_section() {
   [ -s "$f" ] || return 0
   jq -e '(.docs // []) | length > 0' "$f" >/dev/null 2>&1 || return 0
   integrity_guard "$f" doc-freshness "the doc-freshness candidate list"
-  printf '%s\n' '--- DOC FRESHNESS (candidate-stale docs; implementer must have updated or declared) ---'
-  printf 'Docs likely stale from this change (proximity/mention-ranked; advisory, NOT\nauthoritative). The implementer was instructed to either update each doc listed\nor declare `unaffected: <path>: <reason>` in its completion summary — spot-check\nany declarations against the diff; a declaration that does not hold up is itself\na finding.\n\n'
+  printf '%s\n' '--- DOC FRESHNESS (candidate-stale docs; judge each against the candidate diff) ---'
+  printf 'Docs likely stale from this change (proximity/mention-ranked; advisory, NOT\nauthoritative). For each doc listed, judge it against the authoritative\nbase..candidate diff: if the change clearly invalidates a claim the doc makes\nand the candidate did NOT update that doc, that is a finding. Docs the change\ndoes not affect need no update — absence of an edit is only a finding when the\ndiff plainly contradicts the doc.\n\n'
   jq -c '.docs[]' "$f" 2>/dev/null | sed 's/^/    /'
 }
 
@@ -3018,9 +3028,9 @@ The sections marked "authoritative" (the engine-computed base..candidate diff an
 the engine-run validation) are ground truth produced by the wrapper, not the
 implementer — weight them over any primary-supplied artifact, which is
 supplementary and may be incomplete. If a "--- DOC FRESHNESS ---" section is
-present, spot-check each \`unaffected: <path>: <reason>\` declaration in the
-primary's completion summary against the candidate diff — a declaration that
-does not hold up under the diff is itself a finding.
+present, check each doc it lists against the candidate diff — a doc whose claims
+the change clearly invalidates, left un-updated in the candidate, is a finding;
+docs the change does not affect need no edit.
 
 Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:

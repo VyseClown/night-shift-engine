@@ -7,8 +7,8 @@
 # likely to have gone stale (CLAUDE.md/AGENTS.md/README.md/docs/**/*.md
 # tracked in the project) so an implement session can be handed a short,
 # proximity-ranked list instead of having to guess or grep the whole tree
-# itself. Non-gating: this file only produces the candidate list; enforcement
-# (update-or-declare-unaffected) is the caller's/observer's job.
+# itself. Non-gating: this file only produces the candidate list; judging each
+# listed doc against the candidate diff is the caller's/observer's job.
 #
 # Pure bash + jq + grep/sed — no node — and sourceable standalone: no top-
 # level statements run at source time, and the one function below only
@@ -27,9 +27,11 @@
 #   2 - the doc sits in an ANCESTOR directory of a touched file's directory
 #       (the chain from the touched file's dir up to, but excluding, the
 #       project root — a root-level README/CLAUDE/AGENTS would otherwise
-#       "ancestor-match" every diff in the repo, which is not useful signal;
-#       it can still score 3 via same-dir when a touched file is itself at
-#       the project root, or 1 via mention/symbol below).
+#       "ancestor-match" every diff in the repo, which is not useful signal.
+#       The project root "." is ALSO excluded from the same-dir (score-3)
+#       match for the same reason — a single root-level edit would flood every
+#       root doc at top score — so a root doc surfaces only via 1 mention/symbol
+#       below).
 #   1 - the doc's tracked content mentions a touched file's basename, or an
 #       exported symbol name added by the diff, as a whole word (grep -w).
 #
@@ -79,12 +81,20 @@ doc_freshness_candidates() {
   # file (may include "." for a top-level touched file). ancestor_dirs: every
   # directory strictly between a touched file's dir and the project root,
   # excluding the root itself (see the score-2 comment above).
+  # A touched file at the project root (dir ".") must NOT same-dir-match every
+  # root-level doc: a single edit to package.json would otherwise flag
+  # CLAUDE.md + AGENTS.md + README.md all at the top score, flooding the list
+  # (and, since complying by updating a doc re-touches it, the flood compounds
+  # every round). Root docs can still surface precisely via mention/symbol
+  # (score 1). So "." is deliberately excluded from same_dirs below.
   local same_dirs="" ancestor_dirs="" f d cur parent
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     d="$(dirname -- "$f")"
-    same_dirs="$same_dirs
+    if [ "$d" != "." ]; then
+      same_dirs="$same_dirs
 $d"
+    fi
     cur="$d"
     while :; do
       parent="$(dirname -- "$cur")"
@@ -129,6 +139,13 @@ $(basename -- "$f")"
   local docpath doc_dir score reason content bn sym esc depth is_root
   while IFS= read -r docpath; do
     [ -n "$docpath" ] || continue
+    # A doc the candidate already touched is not a staleness candidate — it was
+    # just edited. Leaving it in flags a freshly-updated doc (and, via same-dir,
+    # its siblings) every round, so complying with the gate inflates the next
+    # list; drop it.
+    if printf '%s\n' "$touched" | grep -qFx -- "$docpath"; then
+      continue
+    fi
     doc_dir="$(dirname -- "$docpath")"
     score=0
     reason=""

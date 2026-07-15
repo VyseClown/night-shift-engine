@@ -295,6 +295,7 @@ run_dry_fixtures() {
   fixture_assert "branch sweep: package + SWEEP_ERROR verdict anchor into the integrity dir" fixture_sweep_integrity "$root"
   fixture_assert "branch sweep: SWEEP_ERROR skips the fix cycle untouched" fixture_sweep_error_skips_fix "$root"
   fixture_assert "branch sweep: fix cycle reverts on failed re-validation" fixture_sweep_fix_revert "$root"
+  fixture_assert "branch sweep: fix cycle reverts a dirty tree (uncommitted work) before revalidation" fixture_sweep_fix_dirty_guard "$root"
   fixture_assert "branch sweep: fix cycle capped at NIGHT_SHIFT_SWEEP_MAX_FIX then residual" fixture_sweep_fix_cap "$root"
   fixture_sweep_only_args
   fixture_assert "branch sweep: --sweep-only exits 0 on SWEEP_PASS / 2 on residual findings" fixture_sweep_only_run "$root"
@@ -312,6 +313,7 @@ run_dry_fixtures() {
   fixture_assert "doc-freshness: candidate list capped at 10 with truncated:true" fixture_doc_freshness_cap "$root"
   fixture_assert "doc-freshness: empty diff (base==HEAD) yields docs:[] truncated:false" fixture_doc_freshness_empty_diff "$root"
   fixture_assert "doc-freshness: doc mentioning a diff-added exported symbol is found (symbol: reason)" fixture_doc_freshness_symbol "$root"
+  fixture_assert "doc-freshness: no root-'.' flood; a just-updated doc is not re-flagged" fixture_doc_freshness_no_flood "$root"
   # fixture_doc_freshness_prompt / fixture_doc_freshness_recompute print their
   # own ok/not-ok (the _run/wrapper subshell idiom, same as
   # fixture_manifest_prompt above) — invoked directly, NOT via fixture_assert,
@@ -2528,6 +2530,16 @@ fixture_smoke_phase() {
     fx_not "hostname-prefix bypass (localhost.evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
     printf -- '- Smoke: `true`\n- Smoke URL: `http://127.0.0.1.evil.com/`\n' >"$spec"
     fx_not "hostname-prefix bypass (127.0.0.1.evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    # --- userinfo bypass: `http://127.0.0.1:80@evil.com/` puts the loopback in
+    # the userinfo and evil.com as the real host; the `:*` port glob would
+    # otherwise swallow `@evil.com`. Any `@` in the authority must be rejected. ---
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://127.0.0.1:80@evil.com/health`\n' >"$spec"
+    fx_not "userinfo bypass (127.0.0.1:80@evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://localhost:3000@evil.com/`\n' >"$spec"
+    fx_not "userinfo bypass (localhost@evil.com) is rejected" validate_spec_smoke "$spec" || exit 1
+    # A `@` in the PATH (not the authority) is fine — the authority is loopback.
+    printf -- '- Smoke: `true`\n- Smoke URL: `http://127.0.0.1:3999/a@b`\n' >"$spec"
+    fx "loopback URL with @ in the path is accepted" validate_spec_smoke "$spec" || exit 1
 
     # --- no-Smoke spec: run_smoke_phase returns 0, writes nothing ---
     printf '# no smoke fields\n' >"$spec"
@@ -6838,6 +6850,43 @@ fixture_sweep_fix_revert() {
   return 0
 }
 
+# sweep fix cycle: a session that edits files but does NOT commit leaves the
+# tree dirty. Re-validation runs against the LIVE working tree, so it would
+# green-light content that is in no commit (and fails a clean checkout). The
+# dirty-tree guard must revert BEFORE re-validation — even when the validation
+# command would PASS (`true` here) — and journal reason=dirty_tree.
+fixture_sweep_fix_dirty_guard() {
+  local root="$1" dir="$root/sweep-fix-dirty" proj out tip_before
+  proj="$dir/proj"; out="$dir/out"
+  mkdir -p "$out"
+  _fixture_sweep_branch_project "$proj" || return 1
+  (
+    tip_before="$(git -C "$proj" rev-parse HEAD)"
+    printf 'SWEEP_FINDINGS\n' >"$out/verdict.txt"
+    printf 'finding: fix the thing\n' >"$out/findings.md"
+    PROJECT="$proj"
+    SWEEP_MAX_FIX=1
+    IMPLEMENT_MODEL="inherit"
+    SPEC="$dir/spec.md"
+    # Validation would PASS — proving the guard, not the validation, reverts.
+    printf -- '- Final validation commands:\n  1. `true`\n' >"$SPEC"
+    RUN_ROOT="$dir/run"; RUN_ID="sweepfixdirty-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    # The stub writes an UNTRACKED file and never commits — a dirty tree.
+    claude() { cat >/dev/null; printf 'leftover\n' >"$proj/uncommitted-helper.txt"; printf '{"result":"done"}\n'; }
+    sweep_fix_cycle "$proj" "$out"
+    fx "dirty guard: tip restored to the pre-fix commit" \
+      test "$(git -C "$proj" rev-parse HEAD)" = "$tip_before"
+    fx "dirty guard: sweep_fix_reverted event carries reason=dirty_tree" \
+      grep -q '"reason":"dirty_tree"' "$RUN_ROOT/events.jsonl"
+    fx "dirty guard: no revalidation ran (guard fired first — no revalidation-1.json)" \
+      test ! -e "$out/revalidation-1.json"
+    integrity_cleanup
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
 # sweep fix cycle: capped at NIGHT_SHIFT_SWEEP_MAX_FIX (default 1) fix round,
 # then residual findings — never loops indefinitely against a session that
 # keeps reporting findings. Counts claude invocations via a counter file: one
@@ -7199,6 +7248,12 @@ fixture_compact_success_preserves_feedback_and_sweep() {
     printf 'SWEEP_FINDINGS\n' >"$RUN_ROOT/sweep/verdict.txt"
     printf 'diff content\n' >"$RUN_ROOT/sweep/package.diff"
 
+    # test-audit + doc-freshness reports are the same evidence class as sweep/ —
+    # advisory findings the observer weighed. They must be archived, not wiped.
+    mkdir -p "$RUN_ROOT/test-audit" "$RUN_ROOT/doc-freshness"
+    printf '{"final_total":3}\n' >"$RUN_ROOT/test-audit/spec.json"
+    printf '{"docs":[]}\n' >"$RUN_ROOT/doc-freshness/spec.json"
+
     ( log() { :; }; compact_success "$RUN_ROOT" "$RUN_ID" ) || exit 1
 
     fx "feedback.md survives compaction" test -f "$feedback"
@@ -7213,6 +7268,12 @@ fixture_compact_success_preserves_feedback_and_sweep() {
       bash -c 'test -f "$1/verdict.txt" && test -f "$1/package.diff"' _ "$RUN_ROOT/archive/$RUN_ID/sweep"
     fx "live sweep dir removed from run_dir after compaction" \
       test ! -d "$RUN_ROOT/sweep"
+    fx "test-audit report archived (findings survive with the summary journal)" \
+      test -f "$RUN_ROOT/archive/$RUN_ID/test-audit/spec.json"
+    fx "doc-freshness report archived" \
+      test -f "$RUN_ROOT/archive/$RUN_ID/doc-freshness/spec.json"
+    fx "live test-audit dir removed from run_dir after compaction" \
+      test ! -d "$RUN_ROOT/test-audit"
     exit 0
   ) >/dev/null || return 1
   return 0
@@ -7342,6 +7403,44 @@ fixture_doc_freshness_symbol() {
   return 0
 }
 
+# Regression for the max-score false-positive flood: (1) a touched file at the
+# project ROOT must NOT same-dir-match every root-level doc (a single package.json
+# edit used to flag CLAUDE.md/AGENTS.md/README.md all at score 3), and (2) a doc
+# the candidate ITSELF updated must not reappear as its own staleness candidate
+# (complying with the gate would otherwise inflate the next round). Root docs may
+# still surface precisely via mention/symbol.
+fixture_doc_freshness_no_flood() {
+  local root="$1" proj="$root/dfn-proj" base out
+  # shellcheck source=scripts/lib/doc-freshness.sh
+  . "$NIGHT_SHIFT_LIB/doc-freshness.sh" 2>/dev/null || return 1
+  mkdir -p "$proj/docs"
+  git -C "$proj" init -q
+  git -C "$proj" config user.email fixture@test
+  git -C "$proj" config user.name fixture
+  printf '# CLAUDE.md\nRoot instructions, mentions nothing relevant.\n' >"$proj/CLAUDE.md"
+  printf '# AGENTS.md\nRoot agent doc, mentions nothing relevant.\n' >"$proj/AGENTS.md"
+  printf '# README\nTop-level readme, mentions nothing relevant.\n' >"$proj/README.md"
+  printf '{"name":"thing"}\n' >"$proj/package.json"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm setup >/dev/null 2>&1 || return 1
+  base="$(git -C "$proj" rev-parse HEAD)"
+  # Candidate: edit a root-level source file AND update one root doc (compliance).
+  printf '{"name":"thing","version":"2"}\n' >"$proj/package.json"
+  printf '# CLAUDE.md\nRoot instructions, now updated for the change.\n' >"$proj/CLAUDE.md"
+  git -C "$proj" add -A >/dev/null 2>&1
+  git -C "$proj" commit -qm "bump + update CLAUDE.md" >/dev/null 2>&1 || return 1
+  out="$proj/out.json"
+  doc_freshness_candidates "$proj" "$base" "$out" || return 1
+  fx "output is valid JSON" jq empty "$out"
+  fx "no root-'.' same-dir flood: AGENTS.md/README.md not flagged score 3" bash -c '
+    jq -e "[.docs[] | select((.path==\"AGENTS.md\" or .path==\"README.md\") and .score==3)] | length==0" "$1" >/dev/null
+  ' _ "$out"
+  fx "the just-updated CLAUDE.md is not re-flagged as its own stale candidate" bash -c '
+    jq -e "[.docs[] | select(.path==\"CLAUDE.md\")] | length==0" "$1" >/dev/null
+  ' _ "$out"
+  return 0
+}
+
 # doc_freshness_prompt_block / doc_freshness_section (agentic-gaps tranche §B,
 # Task 6): the implement-stage prompt injection + observer-evidence surface
 # built atop doc_freshness_candidates above. Both live in night-shift.sh
@@ -7396,14 +7495,18 @@ _fixture_doc_freshness_prompt_run() {
     bash -c 'printf "%s" "$1" | grep -q "Doc-freshness candidates"' _ "$block"
   fx "prompt block: lists src/mod/CLAUDE.md with its dir reason" \
     bash -c 'printf "%s" "$1" | grep -qF "src/mod/CLAUDE.md (dir:src/mod)"' _ "$block"
-  fx "prompt block: instructs update-or-declare unaffected" \
-    bash -c 'printf "%s" "$1" | grep -q "unaffected:"' _ "$block"
+  fx "prompt block: anchors the gate on the actual diff, not a declaration channel" \
+    bash -c 'printf "%s" "$1" | grep -q "against your actual diff"' _ "$block"
+  fx "prompt block: does NOT reference the removed unaffected: completion-summary channel" \
+    bash -c '! printf "%s" "$1" | grep -q "unaffected:"' _ "$block"
 
   section="$(doc_freshness_section)"
   fx "observer section: DOC FRESHNESS heading present" \
     bash -c 'printf "%s" "$1" | grep -q "DOC FRESHNESS"' _ "$section"
   fx "observer section: same doc entry surfaced to the observer" \
     bash -c 'printf "%s" "$1" | grep -q "src/mod/CLAUDE.md"' _ "$section"
+  fx "observer section: judges docs against the diff, no unaffected declaration" \
+    bash -c '! printf "%s" "$1" | grep -q "unaffected:"' _ "$section"
 
   # Knob off -> empty block, regardless of the file already on disk.
   DOC_FRESHNESS=0
@@ -7613,6 +7716,64 @@ _fixture_test_audit_static_run() {
     bash -c "jq -e '[.findings[] | select(.file | endswith(\"clean.test.js\"))] | length == 0' '$out' >/dev/null"
   fx "every finding names the vacuous fixture file" \
     bash -c "jq -e '[.findings[] | select(.file | endswith(\"vacuous.test.js\") | not)] | length == 0' '$out' >/dev/null"
+
+  # Regression: the WIRED path passes --src at the project ROOT, so the audited
+  # test file sits inside the source walk. collectSourceWords must exclude test
+  # files, or the asserted property is always "known" and the rule goes inert.
+  # Point --src at the parent dir (which CONTAINS vacuous.test.js) and require
+  # the bogus-property finding to survive.
+  local rootout="$TEST_AUDIT_STATIC_OUT_DIR/root.json"
+  node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$fixture_dir/vacuous.test.js" --src "$fixture_dir" --out "$rootout" >/dev/null 2>&1
+  fx "assert-on-unknown-property survives --src at project root (test files excluded from source words)" \
+    bash -c "jq -e '.counts[\"assert-on-unknown-property\"] == 1' '$rootout' >/dev/null"
+
+  # node:assert style (the engine's own `node` track: node:test + node:assert).
+  # assert.equal(...)/assert.throws(...) are real assertions — the scanner must
+  # NOT flag them expectless. Written to a temp dir so the corpus-wide scan above
+  # is unaffected.
+  local na="$TEST_AUDIT_STATIC_OUT_DIR/node-assert.test.js" naout="$TEST_AUDIT_STATIC_OUT_DIR/na.json"
+  cat >"$na" <<'NODEASSERT'
+const assert = require('node:assert');
+const { test } = require('node:test');
+test('adds two numbers', () => {
+  const sum = 1 + 1;
+  assert.equal(sum, 2);
+});
+test('throws on bad input', () => {
+  assert.throws(() => { throw new Error('bad'); });
+});
+NODEASSERT
+  node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$na" --out "$naout" >/dev/null 2>&1
+  fx "node:assert style (assert.equal/assert.throws) yields zero findings — no expectless false positive" \
+    bash -c "jq -e '(.findings | length) == 0' '$naout' >/dev/null"
+
+  # it.each curried form + a .skip() method call that is NOT a skipped test +
+  # xtest (a skip alias the old regex missed). Expect exactly one skipped-test
+  # (the xtest), and zero empty/expectless (the it.each callback IS found).
+  local pat="$TEST_AUDIT_STATIC_OUT_DIR/patterns.test.js" patout="$TEST_AUDIT_STATIC_OUT_DIR/pat.json"
+  cat >"$pat" <<'PATTERNS'
+describe('pattern fixtures', () => {
+  it.each([[1, 2, 3], [2, 3, 5]])('adds %i + %i', (a, b, expected) => {
+    expect(a + b).toBe(expected);
+  });
+  it('paginates without being a skipped test', () => {
+    const query = { skip: () => query, limit: () => query, run: () => [] };
+    query.skip(10).limit(5);
+    expect(query.run()).toHaveLength(0);
+  });
+  xtest('a disabled alias test', () => {
+    expect(loadValue()).toHaveLength(3);
+  });
+});
+PATTERNS
+  node "$WORKSPACE_ROOT/scripts/lib/test-audit-static.js" \
+    --tests "$pat" --out "$patout" >/dev/null 2>&1
+  fx "it.each callback is found (no empty/expectless) and .skip() method call is not a skipped test" \
+    bash -c "jq -e '(.counts[\"empty-test-body\"] // 0) == 0 and (.counts[\"expectless-test\"] // 0) == 0' '$patout' >/dev/null"
+  fx "xtest alias flagged as skipped-test exactly once" \
+    bash -c "jq -e '.counts[\"skipped-test\"] == 1' '$patout' >/dev/null"
   return 0
 }
 

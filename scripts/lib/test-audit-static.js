@@ -316,9 +316,23 @@ function findTestBlocks(content) {
   TEST_CALL_RE.lastIndex = 0;
   let m;
   while ((m = TEST_CALL_RE.exec(content))) {
-    const openParenIndex = m.index + m[0].length - 1;
-    const closeParenIndex = findBalancedEnd(content, openParenIndex, '(', ')');
+    let openParenIndex = m.index + m[0].length - 1;
+    let closeParenIndex = findBalancedEnd(content, openParenIndex, '(', ')');
     if (closeParenIndex === -1) continue; // malformed — skip, don't crash
+
+    // Curried parameterized form: `it.each([...])('desc', fn)`. The first call
+    // is the each-table; the real test callback lives in the SECOND call. Without
+    // this, findBalancedEnd stops at the table's `)` and the callback (outside
+    // that extent) is never seen — flagging every it.each as empty/expectless.
+    let after = closeParenIndex + 1;
+    while (after < content.length && /\s/.test(content[after])) after += 1;
+    if (content[after] === '(') {
+      const secondClose = findBalancedEnd(content, after, '(', ')');
+      if (secondClose !== -1) {
+        openParenIndex = after;
+        closeParenIndex = secondClose;
+      }
+    }
     const callText = content.slice(openParenIndex, closeParenIndex + 1);
 
     let bodyStart = -1;
@@ -349,7 +363,11 @@ function findTestBlocks(content) {
 // Rule scans.
 // ---------------------------------------------------------------------------
 
-const EXPECT_ASSERT_CALL_RE = /\b(?:expect|assert)\s*\(/;
+// Matches expect(...) and both node:assert styles: bare assert(...) and the
+// method forms assert.equal(...) / assert.strictEqual(...) / assert.throws(...)
+// etc. Without the optional `.member`, the engine's own `node` track (node:test
+// + node:assert) false-positived every well-asserted test as expectless-test.
+const EXPECT_ASSERT_CALL_RE = /\b(?:expect|assert)(?:\.\w+)?\s*\(/;
 
 const NOT_TOBE_LINE_RE = /expect\(([\w$]+(?:\.[\w$]+)+)\)\.not\.toBe\(\s*([^)]*)\)/;
 const LITERAL_ARG_RE = /^(['"`][^'"`]*['"`]|-?\d+(?:\.\d+)?|true|false|null|undefined)$/;
@@ -402,7 +420,10 @@ function scanTobeTrueConstant(relFile, lines, findings) {
   });
 }
 
-const SKIPPED_TEST_RE = /\.skip\(|\bxit\(|\bxdescribe\(/;
+// Anchor `.skip` to the test constructors — a bare `\.skip\(` false-positived
+// unrelated method calls (e.g. `cursor.skip(10)` pagination). Cover the `x`
+// aliases including xtest (a jest-supported alias the old pattern missed).
+const SKIPPED_TEST_RE = /\b(?:it|test|describe|context)\.skip\(|\bx(?:it|test|describe)\(/;
 
 function scanSkippedTest(relFile, lines, findings) {
   lines.forEach((line, idx) => {
@@ -465,9 +486,21 @@ function scanAssertOnUnknownProperty(relFile, lines, srcWords, findings) {
 // genuinely absent from the source tree, never subtler mismatches.
 const IDENTIFIER_RE = /[A-Za-z_$][\w$]*/g;
 
+// Only real source is "source under test" — the test files themselves must be
+// excluded from the word set, or the property a test asserts on is always
+// "known" (it appears in the very file being audited) and the
+// assert-on-unknown-property rule goes inert. This is the wired-path bug: the
+// engine passes --src="${WORKDIR:-.}" (the project root), so the audited test
+// file sits INSIDE the walk unless filtered here. Also skip non-code files
+// (JSON/markdown/lockfiles) whose identifier-shaped tokens are noise.
+const SOURCE_EXT_RE = /\.(?:[cm]?[jt]sx?)$/;
+
 function collectSourceWords(srcDir) {
   const words = new Set();
   for (const file of walkAllFiles(srcDir)) {
+    const norm = file.split(path.sep).join('/');
+    if (TEST_FILE_RE.test(norm)) continue;
+    if (!SOURCE_EXT_RE.test(norm)) continue;
     let content;
     try { content = fs.readFileSync(file, 'utf8'); } catch { continue; }
     let m;
