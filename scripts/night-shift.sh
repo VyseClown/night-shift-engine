@@ -992,10 +992,29 @@ recover_run() {
     # Operator-initiated --resume of a logic-blocked run: clear the block and rebase
     # the clocks. plan/implementation approvals and the recorded stage are kept, so
     # the primary re-enters that stage and retries only the step that blocked.
+    #
+    # Per-model-cap blocks need one extra step. The blocked stage's session was
+    # created on the now-exhausted model, and run_primary's --resume deliberately
+    # re-attaches that session WITHOUT re-passing --model. So an operator who
+    # follows the block message's own advice — "set the affected NIGHT_SHIFT_*_MODEL
+    # knob to another model (e.g. opus) and re-run with --resume" — would have the
+    # new knob silently ignored: the resumed session stays pinned to the capped
+    # model and re-blocks identically (the API's model-limit text, not the knob, is
+    # ground truth). Null the session on these blocks so the stage restarts FRESH
+    # and re-pins --model from the (now-changed) knob. Safe: stage sessions are
+    # restartable from plan.md + the working tree, exactly as a scope boundary's
+    # own session-null does.
+    prior_block_reason="$(jq -r '.block_reason // empty' "$STATE")"
     log "resuming blocked run $RUN_ID at stage $(jq -r '.stage' "$STATE") (--resume); clearing block_reason"
     state_set '.status="running" | del(.block_reason) |
       .stage_started_at=$now | .task_started_at=$now | .stage_started[.stage]=$now | .updated_at=$iso' \
       --argjson now "$(now_epoch)" --arg iso "$(now_iso)"
+    case "$prior_block_reason" in
+      *"per-model usage cap"*)
+        log "  per-model-cap block: nulling the stage session so it restarts fresh and re-pins --model from the knob"
+        state_set '.session_id=null | .updated_at=$iso' --arg iso "$(now_iso)"
+        ;;
+    esac
   elif [ "$status" != "running" ]; then
     # Journal BEFORE sleeping: a recovery waiting an hour on a 429 must not be
     # invisible until it wakes (the in-loop wait already journals; this is the
