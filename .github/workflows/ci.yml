@@ -84,6 +84,9 @@ jobs:
       - name: Adverse paths (blocked run + observer-BLOCK recovery)
         run: bash scripts/test/integration-adverse.sh
 
+      - name: Gherkin scenarios (executable QA procedures)
+        run: bash scripts/test/scenario-run.sh --all
+
   # ── Job D: Mutation sample ──────────────────────────────────────────────────
   # A bounded, seeded sample of mutants per push (larger bounded sample via
   # workflow_dispatch). The seed is pinned so "green locally" == "green in CI";
