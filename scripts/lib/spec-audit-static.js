@@ -21,7 +21,8 @@
 // Both flags are required; missing either throws. Writes the report to
 // `--out` (parent dirs created as needed).
 //
-// Report shape: { spec, findings: [ { rule, line, excerpt }, ... ],
+// Report shape: { schema: "night-shift-spec-audit-static/1", spec,
+//                 findings: [ { rule, line, excerpt }, ... ],
 //                 counts: { <rule>: n, ..., total: n } }
 // `findings` is sorted by line then rule. `counts` always lists every one of
 // the 7 rules (0 included) plus `total`, so the report shape is stable even
@@ -357,7 +358,9 @@ function buildReport(specPath, content) {
   for (const f of findings) counts[f.rule] = (counts[f.rule] || 0) + 1;
   counts.total = findings.length;
 
-  return { spec: specPath, findings, counts };
+  // `schema` makes the on-disk artifact self-describing and matches the
+  // identifier the agent-layer wrapper (scripts/spec-audit.sh) names for it.
+  return { schema: 'night-shift-spec-audit-static/1', spec: specPath, findings, counts };
 }
 
 function run(args) {
