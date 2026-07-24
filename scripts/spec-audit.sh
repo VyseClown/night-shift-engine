@@ -121,7 +121,7 @@ while [ "$#" -gt 0 ]; do
     --model)   MODEL="${2:-}"; shift 2 ;;
     --out)     OUT="${2:-}"; shift 2 ;;
     --offline) OFFLINE=1; shift ;;
-    -h|--help) sed -n '3,75p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,76p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -247,6 +247,15 @@ spec_audit_assemble() {
       ] | reduce .[] as $a ([]; if any(.[]; . == $a) then . else . + [$a] end)
     ) as $additional |
 
+    # Known boundary (same property test-audit.sh documents for its own
+    # recompute): this arithmetic is trustworthy regardless of what the
+    # agent CLAIMS about totals, but it still trusts the per-finding
+    # JUDGMENT CALL the agent makes (confirm vs. refute) — a parseable,
+    # well-formed reply that refutes every real static finding legitimately
+    # drives final_total to 0 by design. The recompute guards against
+    # hostile or sloppy ARITHMETIC from the agent (e.g. a bogus top-level
+    # "summary" block, or a miscounted array); it is not a check on whether
+    # the individual verdicts the agent reached were correct.
     ($findings | length) as $static_total |
     ($judged | map(select(.verdict == "confirm")) | length) as $confirmed |
     ($judged | map(select(.verdict == "refute")) | length) as $refuted |

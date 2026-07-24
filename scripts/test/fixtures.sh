@@ -8424,12 +8424,17 @@ _fixture_spec_audit_cli_run() {
   # the scope-ambiguity finding (line 53), and adds one judgment-tier smell
   # the static scan can't see. Exercises the exact arithmetic contract:
   # final_total = confirmed + unjudged + additional, computed by the script
-  # (jq), never taken from the agent's own counting.
+  # (jq), never taken from the agent's own counting. The reply ALSO carries a
+  # bogus top-level `"summary":{"final_total":999,"confirmed":50,"refuted":50}`
+  # sibling to judged/additional — a hostile-agent probe: the assemble step
+  # must key off ONLY the validated judged/additional arrays and ignore this
+  # counterfeit summary entirely, so the recomputed report still lands on
+  # confirmed==1/final_total==7, not 50/999.
   ( dir="$root/full-valid"; mkdir -p "$dir/bin"
     cat >"$dir/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null
-printf '%s\n' '{"result":"judgment:\n```json\n{\"judged\":[{\"line\":45,\"rule\":\"no-acceptance-criteria\",\"verdict\":\"confirm\",\"reason\":\"no checklist at all, just prose\"},{\"line\":53,\"rule\":\"scope-ambiguity\",\"verdict\":\"refute\",\"reason\":\"the etc. list is closed by surrounding context\"}],\"additional\":[{\"smell\":\"untestable-ac\",\"reason\":\"no concrete rounding example anywhere in the spec\"}]}\n```"}'
+printf '%s\n' '{"result":"judgment:\n```json\n{\"judged\":[{\"line\":45,\"rule\":\"no-acceptance-criteria\",\"verdict\":\"confirm\",\"reason\":\"no checklist at all, just prose\"},{\"line\":53,\"rule\":\"scope-ambiguity\",\"verdict\":\"refute\",\"reason\":\"the etc. list is closed by surrounding context\"}],\"additional\":[{\"smell\":\"untestable-ac\",\"reason\":\"no concrete rounding example anywhere in the spec\"}],\"summary\":{\"final_total\":999,\"confirmed\":50,\"refuted\":50}}\n```"}'
 STUB
     chmod +x "$dir/bin/claude"
     out="$dir/out.json"
@@ -8450,6 +8455,8 @@ STUB
       bash -c "jq -e '.additional[0].smell == \"untestable-ac\"' '$out' >/dev/null" || exit 1
     fx "full run: agent_note is null (a valid judgment needs no fail-open note)" \
       bash -c "jq -e '.agent_note == null' '$out' >/dev/null" || exit 1
+    fx "full run: the reply's bogus top-level summary (final_total 999, confirmed 50) is completely ignored — recomputed confirmed stays 1, final_total stays 7" \
+      bash -c "jq -e '.summary.confirmed == 1 and .summary.final_total == 7' '$out' >/dev/null" || exit 1
     exit 0
   ) || return 1
 
