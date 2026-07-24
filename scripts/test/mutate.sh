@@ -81,6 +81,10 @@ while [ "$#" -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+if [ -n "$ONLY_FILE" ] && [ ! -f "$ENGINE_DIR/$ONLY_FILE" ]; then
+  echo "--file: no such file: $ONLY_FILE" >&2
+  exit 2
+fi
 case "$MODE" in
   list) list_mutants "$ONLY_FILE" ;;
   *) echo "usage: mutate.sh --list [--file <relpath>]" >&2; exit 2 ;;
