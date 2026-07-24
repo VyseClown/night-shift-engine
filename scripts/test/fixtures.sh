@@ -166,6 +166,8 @@ run_dry_fixtures() {
   fixture_assert "fx names the failing sub-check (fixture diagnostics)" fixture_fx_helper "$root"
   fixture_assert "coverage ratchet: new functions cannot be silently untested" fixture_coverage_ratchet "$root"
   fixture_assert "mutate.sh enumerates deterministic mutants" fixture_mutate_list
+  fixture_assert "mutate.sh --run: killed vs unratcheted-survived mutants" fixture_mutate_kill
+  fixture_assert "mutate.sh --run: shrink-only survivors ratchet (stale entries fail)" fixture_mutate_ratchet
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
   fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
@@ -1518,6 +1520,50 @@ fixture_mutate_list() {
   fx_not "no eq_ne ordinal 3" grep -q "^$sample#eq_ne#3	" <<<"$out1"
   fx "guard-deletion rule fires" grep -q "#ret_true#" <<<"$out1"
   fx "tab-separated 5 fields" awk -F'\t' 'NF!=5{exit 1}' <<<"$out1"
+}
+
+fixture_mutate_kill() {
+  # Runner semantics: a mutant the "suite" detects is killed; one it does
+  # not detect survives and, unratcheted, fails the run. Wrapped in a
+  # subshell so an fx failure inside reports `not ok` for THIS fixture
+  # instead of `exit 1`-ing the whole fixture run (reviewer finding on
+  # fixture_mutate_list, Task 1).
+  (
+    local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+    local sample="scripts/test/fixtures/mutate-sample.sh" out rc=0
+    out="$(bash "$m" --run --file "$sample" \
+          --suite-cmd "grep -q -- '-eq 0' scripts/test/fixtures/mutate-sample.sh" \
+          --timeout 30 2>&1)" || rc=$?
+    fx "run exits nonzero (unratcheted survivors exist)" test "$rc" -ne 0
+    fx "eq_ne#1 killed (grep suite catches it)" \
+      grep -q "ok - killed $sample#eq_ne#1" <<<"$out"
+    fx "a mutant the suite cannot see survives" \
+      grep -q "not ok - SURVIVED $sample#" <<<"$out"
+    fx "summary line present" grep -q "^# mutants: " <<<"$out"
+  )
+}
+
+fixture_mutate_ratchet() {
+  # Ratcheted survivors pass; a stale (now-killed) entry fails shrink-only.
+  # Subshell-wrapped for the same reason as fixture_mutate_kill above.
+  (
+    local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+    local sample="scripts/test/fixtures/mutate-sample.sh" allow out rc=0
+    allow="$FIXTURE_ROOT/mutants-allow.txt"
+    bash "$m" --list --file "$sample" | cut -f1 | grep -v "#eq_ne#1$" >"$allow"
+    out="$(MUTATE_ALLOWLIST="$allow" bash "$m" --run --file "$sample" \
+          --suite-cmd "grep -q -- '-eq 0' scripts/test/fixtures/mutate-sample.sh" \
+          --timeout 30 2>&1)" || rc=$?
+    fx "fully ratcheted run passes" test "$rc" -eq 0
+    fx "survivors reported as ratcheted" grep -q "ok - survived (ratcheted) " <<<"$out"
+    printf '%s#eq_ne#1\n' "$sample" >>"$allow"
+    rc=0
+    out="$(MUTATE_ALLOWLIST="$allow" bash "$m" --run --file "$sample" \
+          --suite-cmd "grep -q -- '-eq 0' scripts/test/fixtures/mutate-sample.sh" \
+          --timeout 30 2>&1)" || rc=$?
+    fx "stale entry fails the run" test "$rc" -ne 0
+    fx "stale entry named" grep -q "stale ratchet entry (now killed): $sample#eq_ne#1" <<<"$out"
+  )
 }
 
 fixture_coverage_ratchet() {

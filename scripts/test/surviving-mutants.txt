@@ -1,0 +1,4 @@
+# Surviving mutants — a RATCHET, not a parking lot (mirror of
+# untested-allowlist.txt): each id is a mutant the fixture suite does NOT
+# kill, i.e. a named fixture gap. Remove lines as fixtures improve; adding
+# one is a reviewed decision with a trailing " # reason".
