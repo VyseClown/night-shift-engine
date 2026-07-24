@@ -192,6 +192,12 @@ run_mutants() {
     fi
     rc=0
     ( cd "$scratch" && run_with_timeout "$TIMEOUT_SECS" bash -c "$SUITE_CMD" ) >/dev/null 2>&1 || rc=$?
+    # Restore immediately, not "before applying the next mutant": mutants
+    # are processed one at a time but do not all target the same file, so
+    # a restore-before-next-apply would leave THIS mutant's edit sitting in
+    # $scratch indefinitely once a later mutant targets a different file —
+    # restoring right after the run keeps $scratch pristine at every
+    # loop boundary regardless of file-touch order.
     cp "$pristine/$f" "$scratch/$f"
     total_run=$((total_run + 1))
     if [ "$rc" -ne 0 ]; then
@@ -250,5 +256,6 @@ case "$MODE" in
   list) list_mutants "$ONLY_FILE" ;;
   run) run_mutants "$ONLY_FILE" ;;
   *) echo "usage: mutate.sh --list [--file <relpath>] | mutate.sh --run [--full] [--sample N] [--seed S] [--file <relpath>] [--suite-cmd <cmd>] [--timeout <secs>]" >&2
+     echo "  env: MUTATE_ALLOWLIST=<path>  override the survivors-ratchet file (default: scripts/test/surviving-mutants.txt)" >&2
      exit 2 ;;
 esac
