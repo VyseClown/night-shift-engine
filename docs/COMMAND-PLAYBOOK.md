@@ -30,6 +30,7 @@ workspace container (`<workspace>/<app>`).
 | Audit how faithfully a port implements its design manifest | `scripts/port-audit.sh --project <app> --screen <s> --manifest <m>` | §9 |
 | Review a whole branch before merge (verdict-only by default) | `scripts/night-shift.sh --sweep-only --project <path>` | §10 |
 | Audit tests for false confidence (vacuous assertions, tautological round-trips) | `scripts/test-audit.sh --project <app> --tests <path...>` | §11 |
+| Audit a spec's quality before launching a run (vague ACs, non-biting validation) | `scripts/spec-audit.sh --spec <spec> [--offline]` | §12 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -299,6 +300,49 @@ disk is attached — indented, advisory, never authoritative — to the
 implementation-review bundle and the observer's evidence, and a `test_audit`
 event (`{files, final_total}`) is journaled. A failed or missing report is a
 `WARN` log only — this never blocks a candidate or fails a run.
+
+## §12 — Audit a spec's quality before launching → `scripts/spec-audit.sh …`
+
+A zero-dep-static + one-agent-pass CLI that catches a weak spec **before** it
+burns a run — the pre-run analog of §11's test-audit. The engine executes a
+spec literally, so an ambiguous or underspecified spec produces mediocre work
+at full cost; run this while drafting and iterate until it's clean.
+`validate_spec` answers "is this spec *valid*?" (structural); spec-audit
+answers "is this spec *good*?" (quality). A deterministic static scan
+(`scripts/lib/spec-audit-static.js`) flags mechanical smells (unfilled
+placeholders, missing/empty acceptance criteria, vague weasel-worded ACs,
+open-ended scope markers, a Test Plan with no test-runner in its validation,
+missing final-validation, visual-intent language with no Design Contract);
+ONE bounded `claude -p` pass then judges each static finding confirm/refute
+with a reason and hunts judgment-tier smells the scan can't see (acceptance
+criteria that aren't actually testable, validation commands that wouldn't
+exercise the described change, edge cases the spec implies but omits, scope
+under-specified for the goal). The agent's reply is never trusted for
+arithmetic — every count is recomputed by the script (jq) from the static
+findings + the agent's validated `{rule,line}` mapping.
+
+```bash
+scripts/spec-audit.sh --spec <spec> [--project <dir>] \
+  [--model <name>] [--offline] [--out <json>]
+```
+
+Schema `night-shift-spec-audit/1`:
+`summary.final_total = confirmed + unjudged + additional`. Exit `0` when
+`final_total == 0` (a clean spec), `2` when it's `> 0` (findings — the common,
+non-error outcome), `3` only on an infra/usage error (bad args, missing spec,
+static-scanner failure — nothing written). `--offline` skips the paid call
+entirely (static-only; every finding stays unjudged) for a fully
+deterministic, zero-cost author-time pass — iterate `--offline` until the
+static layer is clean, then run once without it for the judgment pass. An
+agent-pass failure (missing `claude`, non-zero exit, an unparseable reply
+after one retry) is NEVER an exit-3 condition either — it degrades to "every
+finding stays unjudged" (noted in `agent_note`), the same fail-open-on-evidence
+posture as `test-audit.sh`.
+
+**Not engine-wired (by design):** this is a standalone author-time tool. A
+subjective spec-quality call should not silently block a launch, so spec-audit
+does not gate a run — wiring it into preflight as an advisory warning is a
+deliberate follow-up.
 
 ## Prerequisites & environment
 

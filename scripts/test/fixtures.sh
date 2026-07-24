@@ -338,6 +338,8 @@ run_dry_fixtures() {
   fixture_test_audit_static
   fixture_test_audit_cli
   fixture_test_audit_wiring
+  fixture_spec_audit_static
+  fixture_spec_audit_cli
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -8236,6 +8238,268 @@ fixture_test_audit_static() {
     printf 'ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n'
   else
     printf 'not ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/lib/spec-audit-static.js (spec-audit design,
+# docs/superpowers/specs/2026-07-24-spec-audit-design.md): the pre-run
+# spec-quality deterministic layer — a zero-dep line scan of ONE spec
+# markdown file for authoring-time smells (placeholder markers, missing/empty
+# Acceptance Criteria, vague ACs, open-ended scope, no biting test command,
+# no final validation, visual-fidelity language with no Design Contract).
+# Exercises the CLI directly against scripts/test/fixtures/spec-audit/
+# (vague-spec.md: one instance of every one of the 7 rules, documented
+# line-by-line in that file's own header comment; clean-spec.md: a
+# well-formed spec that scores zero) — no chrome/network/claude CLI, runs
+# unconditionally everywhere incl. CI, same pattern as
+# fixture_test_audit_static above.
+_fixture_spec_audit_static_run() {
+  local fixture_dir vague clean vout cout status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/spec-audit"
+  vague="$fixture_dir/vague-spec.md"
+  clean="$fixture_dir/clean-spec.md"
+  # DELIBERATELY NOT local, same reasoning as _fixture_test_audit_static_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  SPEC_AUDIT_STATIC_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-spec-audit-static.$$"
+  mkdir -p "$SPEC_AUDIT_STATIC_OUT_DIR" || return 1
+  trap 'rm -rf "${SPEC_AUDIT_STATIC_OUT_DIR:-}"' EXIT
+
+  vout="$SPEC_AUDIT_STATIC_OUT_DIR/vague.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" \
+    --spec "$vague" --out "$vout" >"$vout.log" 2>&1; then
+    status=$?
+    printf 'spec-audit-static.js dispatch failed on vague-spec.md (exit %s): %s\n' "$status" "$(cat "$vout.log")"
+    return 1
+  fi
+  [ -s "$vout" ] || { printf 'report missing/empty: %s\n' "$vout"; return 1; }
+
+  cout="$SPEC_AUDIT_STATIC_OUT_DIR/clean.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" \
+    --spec "$clean" --out "$cout" >"$cout.log" 2>&1; then
+    status=$?
+    printf 'spec-audit-static.js dispatch failed on clean-spec.md (exit %s): %s\n' "$status" "$(cat "$cout.log")"
+    return 1
+  fi
+  [ -s "$cout" ] || { printf 'report missing/empty: %s\n' "$cout"; return 1; }
+
+  fx "vague-spec: findings + counts keys present" \
+    bash -c "jq -e 'has(\"findings\") and has(\"counts\")' '$vout' >/dev/null"
+  fx "vague-spec: placeholder flagged exactly once" \
+    bash -c "jq -e '.counts[\"placeholder\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: no-acceptance-criteria flagged exactly once" \
+    bash -c "jq -e '.counts[\"no-acceptance-criteria\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: vague-ac flagged exactly once" \
+    bash -c "jq -e '.counts[\"vague-ac\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: scope-ambiguity flagged exactly once" \
+    bash -c "jq -e '.counts[\"scope-ambiguity\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: no-test-command flagged exactly once" \
+    bash -c "jq -e '.counts[\"no-test-command\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: no-final-validation flagged exactly once" \
+    bash -c "jq -e '.counts[\"no-final-validation\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: missing-design-contract flagged exactly once" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: total == 7 (one per rule)" \
+    bash -c "jq -e '.counts.total == 7' '$vout' >/dev/null"
+
+  fx "clean-spec: findings + counts keys present" \
+    bash -c "jq -e 'has(\"findings\") and has(\"counts\")' '$cout' >/dev/null"
+  fx "clean-spec: every rule stays at zero" \
+    bash -c "jq -e '[.counts | del(.total) | to_entries[] | select(.value != 0)] | length == 0' '$cout' >/dev/null"
+  fx "clean-spec: total == 0" \
+    bash -c "jq -e '.counts.total == 0' '$cout' >/dev/null"
+  fx "clean-spec: findings array is empty" \
+    bash -c "jq -e '.findings | length == 0' '$cout' >/dev/null"
+
+  # Anti-false-positive sub-checks (review round 2 on the rn track, the
+  # default): each proves one of the 3 precision fixes on a tiny scratch
+  # spec, not just that the curated fixtures still pass.
+  local jsx_spec test_setup_spec design_word_spec jsx_out test_setup_out design_word_out
+
+  # (a) inline JSX in backtick code must NOT read as an unfilled
+  # angle-placeholder (rn specs routinely document components this way).
+  jsx_spec="$SPEC_AUDIT_STATIC_OUT_DIR/jsx-inline-code.md"
+  cat >"$jsx_spec" <<'EOF'
+# Spec: Scratch — inline JSX in code
+
+## Summary
+
+Wrap it in a `<ScrollView>` for the scrollable layout.
+EOF
+  jsx_out="$SPEC_AUDIT_STATIC_OUT_DIR/jsx-inline-code.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$jsx_spec" --out "$jsx_out" >/dev/null 2>&1
+  fx "anti-false-positive: inline-code JSX tag does not read as an unfilled placeholder" \
+    bash -c "jq -e '.counts[\"placeholder\"] == 0' '$jsx_out' >/dev/null"
+
+  # (b) a hyphenated "test-*" filename must not be misread as a real
+  # test-runner invocation — the rule must still FIRE here.
+  test_setup_spec="$SPEC_AUDIT_STATIC_OUT_DIR/test-setup-filename.md"
+  cat >"$test_setup_spec" <<'EOF'
+# Spec: Scratch — hyphenated test- filename
+
+## Test Plan
+
+- First failing test or executable check: `pnpm exec eslint . --config test-setup.js`
+EOF
+  test_setup_out="$SPEC_AUDIT_STATIC_OUT_DIR/test-setup-filename.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$test_setup_spec" --out "$test_setup_out" >/dev/null 2>&1
+  fx "anti-false-positive: a test-setup.js filename does not count as a test-runner invocation (rule still fires)" \
+    bash -c "jq -e '.counts[\"no-test-command\"] == 1' '$test_setup_out' >/dev/null"
+
+  # (c) incidental prose use of the word "design" (not a Figma/pixel/
+  # screenshot signal) must not fire the design-contract rule.
+  design_word_spec="$SPEC_AUDIT_STATIC_OUT_DIR/incidental-design-word.md"
+  cat >"$design_word_spec" <<'EOF'
+# Spec: Scratch — incidental "design" word
+
+## Review
+
+- Track: rn
+
+## Summary
+
+We made a clean design decision for the retry backoff curve.
+EOF
+  design_word_out="$SPEC_AUDIT_STATIC_OUT_DIR/incidental-design-word.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$design_word_spec" --out "$design_word_out" >/dev/null 2>&1
+  fx "anti-false-positive: incidental 'design' prose (not pixel/figma/screenshot) does not fire missing-design-contract" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 0' '$design_word_out' >/dev/null"
+
+  return 0
+}
+
+fixture_spec_audit_static() {
+  local err status
+  err="$(_fixture_spec_audit_static_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - spec-audit-static: flags placeholder/no-acceptance-criteria/vague-ac/scope-ambiguity/no-test-command/no-final-validation/missing-design-contract exactly once each; clean fixture stays at zero\n'
+  else
+    printf 'not ok - spec-audit-static: flags placeholder/no-acceptance-criteria/vague-ac/scope-ambiguity/no-test-command/no-final-validation/missing-design-contract exactly once each; clean fixture stays at zero\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/spec-audit.sh (spec-audit design, docs/superpowers/specs/
+# 2026-07-24-spec-audit-design.md, "Agent layer"): the agent-layer wrapper
+# around the static scanner above. A plain external-script invocation (no
+# engine globals touched, same as fixture_test_audit_cli), exercised against
+# scripts/test/fixtures/spec-audit/vague-spec.md (7 static findings, one per
+# rule, real line numbers pinned in that file's own header comment) with a
+# PATH-stubbed `claude` for the judged/garbage cases — no chrome/network/real
+# claude CLI involved.
+_fixture_spec_audit_cli_run() {
+  local root="$FIXTURE_ROOT/spec-audit-cli"
+  local spec="$WORKSPACE_ROOT/scripts/test/fixtures/spec-audit/vague-spec.md"
+  mkdir -p "$root"
+
+  # (a) --offline: static-only, zero cost. Exit 2 iff static findings, and
+  # summary.final_total == the static count exactly (nothing to judge, so
+  # every static finding is "unjudged", and unjudged alone drives final_total).
+  ( dir="$root/offline"; mkdir -p "$dir"
+    out="$dir/out.json"
+    "$WORKSPACE_ROOT/scripts/spec-audit.sh" --spec "$spec" --offline --out "$out" \
+      >"$dir/run.log" 2>&1
+    rc=$?
+    fx "offline: exits 2 (findings present)" [ "$rc" -eq 2 ] || exit 1
+    fx "offline: schema id" bash -c "jq -e '.schema == \"night-shift-spec-audit/1\"' '$out' >/dev/null" || exit 1
+    fx "offline: static_total is 7 (one per rule)" \
+      bash -c "jq -e '.summary.static_total == 7' '$out' >/dev/null" || exit 1
+    fx "offline: final_total equals the static count exactly (nothing judged, no additional)" \
+      bash -c "jq -e '.summary.final_total == .summary.static_total and .summary.confirmed == 0 and .summary.refuted == 0 and .summary.additional == 0' '$out' >/dev/null" || exit 1
+    fx "offline: judged/additional are both empty" \
+      bash -c "jq -e '(.judged == []) and (.additional == [])' '$out' >/dev/null" || exit 1
+    fx "offline: agent_note explains the skip" \
+      bash -c "jq -e '.agent_note | test(\"offline\"; \"i\")' '$out' >/dev/null" || exit 1
+    fx "offline: sibling .md written" [ -s "$dir/out.md" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # (b) full run, a PATH-stubbed `claude` emitting a VALID fenced-json
+  # judgment: confirms the no-acceptance-criteria finding (line 45), refutes
+  # the scope-ambiguity finding (line 53), and adds one judgment-tier smell
+  # the static scan can't see. Exercises the exact arithmetic contract:
+  # final_total = confirmed + unjudged + additional, computed by the script
+  # (jq), never taken from the agent's own counting. The reply ALSO carries a
+  # bogus top-level `"summary":{"final_total":999,"confirmed":50,"refuted":50}`
+  # sibling to judged/additional — a hostile-agent probe: the assemble step
+  # must key off ONLY the validated judged/additional arrays and ignore this
+  # counterfeit summary entirely, so the recomputed report still lands on
+  # confirmed==1/final_total==7, not 50/999.
+  ( dir="$root/full-valid"; mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"judgment:\n```json\n{\"judged\":[{\"line\":45,\"rule\":\"no-acceptance-criteria\",\"verdict\":\"confirm\",\"reason\":\"no checklist at all, just prose\"},{\"line\":53,\"rule\":\"scope-ambiguity\",\"verdict\":\"refute\",\"reason\":\"the etc. list is closed by surrounding context\"}],\"additional\":[{\"smell\":\"untestable-ac\",\"reason\":\"no concrete rounding example anywhere in the spec\"}],\"summary\":{\"final_total\":999,\"confirmed\":50,\"refuted\":50}}\n```"}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/spec-audit.sh" --spec "$spec" --out "$out" \
+        >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "full run: exits 2 (findings remain: unjudged + additional)" [ "$rc" -eq 2 ] || exit 1
+    fx "full run: exactly one confirmed" bash -c "jq -e '.summary.confirmed == 1' '$out' >/dev/null" || exit 1
+    fx "full run: exactly one refuted" bash -c "jq -e '.summary.refuted == 1' '$out' >/dev/null" || exit 1
+    fx "full run: exactly one additional" bash -c "jq -e '.summary.additional == 1' '$out' >/dev/null" || exit 1
+    fx "full run: final_total arithmetic exact (confirmed 1 + unjudged 5 + additional 1 = 7)" \
+      bash -c "jq -e '.summary.final_total == 7' '$out' >/dev/null" || exit 1
+    fx "full run: judged carries both the confirm and the refute verdicts" \
+      bash -c "jq -e '([.judged[].verdict] | sort) == [\"confirm\",\"refute\"]' '$out' >/dev/null" || exit 1
+    fx "full run: additional carries the untestable-ac smell" \
+      bash -c "jq -e '.additional[0].smell == \"untestable-ac\"' '$out' >/dev/null" || exit 1
+    fx "full run: agent_note is null (a valid judgment needs no fail-open note)" \
+      bash -c "jq -e '.agent_note == null' '$out' >/dev/null" || exit 1
+    fx "full run: the reply's bogus top-level summary (final_total 999, confirmed 50) is completely ignored — recomputed confirmed stays 1, final_total stays 7" \
+      bash -c "jq -e '.summary.confirmed == 1 and .summary.final_total == 7' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  # (c) full run, a PATH-stubbed `claude` emitting GARBAGE (no judged/
+  # additional keys at all, twice — the retry budget is exhausted): every
+  # static finding must be kept unjudged (fail-open on evidence), the report
+  # must still validate and note the failure, and the exit code still
+  # follows final_total (2, NOT 3 — an agent-pass failure is never treated as
+  # this script's own infra error).
+  ( dir="$root/full-garbage"; mkdir -p "$dir/bin"
+    cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"result":"I have opinions about your spec but no JSON for you."}'
+STUB
+    chmod +x "$dir/bin/claude"
+    out="$dir/out.json"
+    ( export PATH="$dir/bin:$PATH"
+      "$WORKSPACE_ROOT/scripts/spec-audit.sh" --spec "$spec" --out "$out" \
+        >"$dir/run.log" 2>&1
+    )
+    rc=$?
+    fx "garbage: exits 2, not 3 (fail-open, not an infra error)" [ "$rc" -eq 2 ] || exit 1
+    fx "garbage: judged/additional both empty" \
+      bash -c "jq -e '(.judged == []) and (.additional == [])' '$out' >/dev/null" || exit 1
+    fx "garbage: final_total equals the full static count (every finding kept unjudged)" \
+      bash -c "jq -e '.summary.final_total == .summary.static_total and .summary.static_total == 7' '$out' >/dev/null" || exit 1
+    fx "garbage: agent_note records the failure" \
+      bash -c "jq -e '.agent_note | test(\"fail\"; \"i\")' '$out' >/dev/null" || exit 1
+    exit 0
+  ) || return 1
+
+  return 0
+}
+
+fixture_spec_audit_cli() {
+  local err status
+  err="$(_fixture_spec_audit_cli_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - spec-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n'
+  else
+    printf 'not ok - spec-audit.sh: --offline is static-only (final_total == static count); a valid stubbed judgment recomputes confirmed/refuted/additional/final_total exactly; a garbage reply keeps every finding unjudged and still exits on final_total (never 3)\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
