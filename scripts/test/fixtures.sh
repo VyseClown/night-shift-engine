@@ -165,6 +165,7 @@ run_dry_fixtures() {
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
   fixture_assert "fx names the failing sub-check (fixture diagnostics)" fixture_fx_helper "$root"
   fixture_assert "coverage ratchet: new functions cannot be silently untested" fixture_coverage_ratchet "$root"
+  fixture_assert "mutate.sh enumerates deterministic mutants" fixture_mutate_list
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
   fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
@@ -1502,6 +1503,21 @@ fixture_rate_limit_contract_canary() {
     exit 0 ) || return 1
   case "$(declare -f main_run)" in *rate_limit_contract_canary*) ;; *) return 1 ;; esac
   return 0
+}
+
+fixture_mutate_list() {
+  # The mutation harness enumerates a STABLE, deterministic mutant list:
+  # same tree → byte-identical --list output; ids are file#rule#ordinal.
+  local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+  local sample="scripts/test/fixtures/mutate-sample.sh" out1 out2
+  out1="$(bash "$m" --list --file "$sample")" || return 1
+  out2="$(bash "$m" --list --file "$sample")" || return 1
+  fx "deterministic output" test "$out1" = "$out2"
+  fx "eq_ne ordinal 1 present" grep -q "^$sample#eq_ne#1	" <<<"$out1"
+  fx "eq_ne ordinal 2 present" grep -q "^$sample#eq_ne#2	" <<<"$out1"
+  fx_not "no eq_ne ordinal 3" grep -q "^$sample#eq_ne#3	" <<<"$out1"
+  fx "guard-deletion rule fires" grep -q "#ret_true#" <<<"$out1"
+  fx "tab-separated 5 fields" awk -F'\t' 'NF!=5{exit 1}' <<<"$out1"
 }
 
 fixture_coverage_ratchet() {
