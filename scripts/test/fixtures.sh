@@ -234,6 +234,10 @@ run_dry_fixtures() {
   fixture_assert "acquire_lock reclaims a dead holder's lock atomically" fixture_lock_stale_reclaim
   fixture_assert "run_validation_commands: per-command JSON, empty set fails, missing workdir -> 127" fixture_run_validation_commands
   fixture_assert "run_test_command: wraps one command as evidence JSON (exit status + output)" fixture_run_test_command
+  fixture_assert "spec-dialect readers: Track/Review Profile normalize + default, Design Contract heading, optional/explicit personas, validation-command extraction" fixture_spec_field_helpers "$root"
+  fixture_assert "persona resolvers: persona_set/persona_floor per track (unknown rejected), persona_doc's web/node/fullstack vs rn split" fixture_persona_resolvers
+  fixture_assert "clock/path helpers: canonical_file, integrity_key, now_iso, epoch_clock_fields, file_mtime_epoch" fixture_clock_path_helpers "$root"
+  fixture_assert "evidence_rejection_reason: invalid JSON / wrong keys / task mismatch / malformed test_first, in check order" fixture_evidence_rejection_reason "$root"
   fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int
   fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
   fixture_assert "malformed-signal cap predicate blocks only at/over the cap" fixture_malformed_cap "$root"
@@ -4083,6 +4087,153 @@ fixture_run_test_command() {
     run_test_command passing 'echo green' "$root/green.json" "$root/proj" || exit 1
     fx "passing exit recorded" jq -e '.exit_status==0' "$root/green.json"
     fx "output captured" jq -e '.output | test("green")' "$root/green.json"
+  )
+}
+
+fixture_spec_field_helpers() {
+  # Spec-dialect readers: Track/Review Profile are case/space-insensitive,
+  # Track defaults to rn when absent; spec_has_design_contract is a heading
+  # grep; spec_optional_personas combines an explicit `- Optional reviewers:`
+  # field with section-presence auto-activation (either path alone is
+  # sufficient, an unknown name is rejected); spec_explicit_personas is the
+  # per-spec `- Personas:` override (unknown name rejected, absent -> empty);
+  # extract_validation_commands returns the backticked numbered commands under
+  # one heading and stops at the next top-level field or heading.
+  local root="$1" d="$root/specfx" s
+  s="$d/spec-helpers.md"
+  ( mkdir -p "$d"
+    cat >"$s" <<'MD'
+# Spec: x
+## Review
+- Track:  WEB
+- Review Profile: Frontend
+- Optional reviewers: Security Reviewer
+- Personas: Performance Expert
+## Test Plan
+- Baseline validation commands (run before edits):
+  1. `node --version`
+  2. `node --test x.test.js`
+- First failing test or executable check: `node --test x.test.js`
+MD
+    fx "track normalized" test "$(spec_track "$s")" = "web"
+    fx "review profile normalized" test "$(spec_review_profile "$s")" = "frontend"
+    fx_not "design contract absent" spec_has_design_contract "$s"
+    fx "two baseline commands" test "$(extract_validation_commands "$s" 'Baseline validation commands' | grep -c .)" -eq 2
+    fx_not "stops at next field" \
+      grep -q 'failing test' <<<"$(extract_validation_commands "$s" 'Baseline validation commands')"
+    fx "optional reviewers: explicit field alone activates" \
+      test "$(spec_optional_personas "$s")" = "Security Reviewer"
+    fx "explicit personas: field override" \
+      test "$(spec_explicit_personas "$s")" = "Performance Expert"
+
+    printf '# Spec: y\n## Design Contract\n- x\n' >"$s"
+    fx "track defaults to rn when absent" test "$(spec_track "$s")" = "rn"
+    fx "review profile absent -> empty" test -z "$(spec_review_profile "$s")"
+    fx "design contract present" spec_has_design_contract "$s"
+    fx "optional reviewers: section-presence alone activates" \
+      test "$(spec_optional_personas "$s")" = "Design Fidelity Reviewer"
+    fx "explicit personas: absent field -> empty" test -z "$(spec_explicit_personas "$s")"
+
+    printf -- '- Optional reviewers: Bogus Reviewer\n' >"$d/bad-opt.md"
+    fx_not "unknown optional reviewer rejected" spec_optional_personas "$d/bad-opt.md"
+    printf -- '- Personas: Bogus Name\n' >"$d/bad-personas.md"
+    fx_not "unknown persona name rejected" spec_explicit_personas "$d/bad-personas.md"
+  )
+}
+
+fixture_persona_resolvers() {
+  # persona_set/persona_floor map a track name to its full/mandatory persona
+  # list (an unknown track is rejected, non-zero); persona_doc picks the
+  # review-lens doc — web/node/fullstack share the web doc (node/fullstack
+  # reuse backend-flavored personas), everything else (rn, unknown) falls
+  # back to the rn doc.
+  ( fx "rn persona set is the full RN bench" \
+      test "$(persona_set rn)" = "$PERSONAS_RN"
+    fx "web floor is the mandatory subset" \
+      test "$(persona_floor web)" = "$PERSONA_FLOOR_WEB"
+    fx "fullstack floor adds Backend & Data Expert onto the web floor" \
+      test "$(persona_floor fullstack)" = "$PERSONA_FLOOR_WEB|Backend & Data Expert"
+    fx_not "unknown track rejected by persona_set" persona_set bogus
+    fx_not "unknown track rejected by persona_floor" persona_floor bogus
+    fx "web track -> web persona doc" \
+      test "$(persona_doc web)" = "$WORKSPACE_ROOT/docs/review-personas-web.md"
+    fx "node track -> web persona doc (reuses backend personas)" \
+      test "$(persona_doc node)" = "$WORKSPACE_ROOT/docs/review-personas-web.md"
+    fx "rn track -> rn persona doc" \
+      test "$(persona_doc rn)" = "$WORKSPACE_ROOT/docs/review-personas.md"
+    fx "unknown track defaults to rn persona doc" \
+      test "$(persona_doc bogus)" = "$WORKSPACE_ROOT/docs/review-personas.md"
+  )
+}
+
+fixture_clock_path_helpers() {
+  # Misc clock/path primitives: canonical_file resolves a relative/dotted path
+  # to an absolute, symlink-free one and fails on a missing file; integrity_key
+  # strips the RUN_ROOT prefix for a file inside the run, else falls back to
+  # basename; now_iso is a strict UTC ISO8601 stamp; epoch_clock_fields decodes
+  # an epoch+timezone to HH|MM|SS and fails on a non-numeric epoch;
+  # file_mtime_epoch reads a real mtime and fails on a missing file.
+  local root="$1" d="$root/miscfx"
+  ( mkdir -p "$d/sub"
+    printf x >"$d/sub/f.txt"
+    fx "canonical_file resolves a dotted relative path to an absolute one" \
+      test "$(canonical_file "$d/sub/../sub/f.txt")" = "$(cd "$d/sub" && pwd -P)/f.txt"
+    fx_not "canonical_file fails on a missing file" canonical_file "$d/sub/missing.txt"
+
+    RUN_ROOT="$d/run1"
+    mkdir -p "$RUN_ROOT/control"
+    fx "integrity_key strips the RUN_ROOT prefix" \
+      test "$(integrity_key "$RUN_ROOT/control/state.json")" = "control/state.json"
+    fx "integrity_key falls back to basename outside RUN_ROOT" \
+      test "$(integrity_key "/some/other/place/state.json")" = "state.json"
+
+    fx "now_iso matches strict UTC ISO8601" \
+      grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<<"$(now_iso)"
+
+    fx "epoch_clock_fields decodes epoch 0 UTC" test "$(epoch_clock_fields 0 UTC)" = "00|00|00"
+    fx "epoch_clock_fields decodes epoch 3600 UTC" test "$(epoch_clock_fields 3600 UTC)" = "01|00|00"
+    fx_not "epoch_clock_fields fails on a non-numeric epoch" epoch_clock_fields notanumber UTC
+
+    touch "$d/mt.txt"
+    fx "file_mtime_epoch reads a real mtime" test -n "$(file_mtime_epoch "$d/mt.txt")"
+    fx_not "file_mtime_epoch fails on a missing file" file_mtime_epoch "$d/missing-mt.txt"
+  )
+}
+
+fixture_evidence_rejection_reason() {
+  # Mirrors validate_signal's execution-evidence gate in check order: invalid
+  # JSON, wrong top-level keys, task mismatch, malformed test_first — each
+  # with its own human-readable reason fed back into the primary's correction
+  # turn. A well-formed evidence file falls through to the generic
+  # array/exit-status contract line (nothing earlier fires).
+  local root="$1" d="$root/evreason"
+  ( mkdir -p "$d"
+    SPEC="specs/target.md"
+    printf 'not json' >"$d/bad.json"
+    fx "invalid JSON reason" \
+      grep -q 'not valid JSON' <<<"$(evidence_rejection_reason "$d/bad.json")"
+
+    printf '{"task":"specs/target.md"}' >"$d/wrongkeys.json"
+    fx "wrong top-level keys reason names EXACTLY + the actual keys" \
+      grep -q 'top-level keys must be EXACTLY .*the file has \["task"\]' <<<"$(evidence_rejection_reason "$d/wrongkeys.json")"
+
+    cat >"$d/wrongtask.json" <<'JSON'
+{"baseline":[],"final_validation":[],"task":"specs/other.md","test_first":{}}
+JSON
+    fx "task mismatch reason names the expected task" \
+      grep -q 'must equal specs/target.md exactly' <<<"$(evidence_rejection_reason "$d/wrongtask.json")"
+
+    cat >"$d/wrongtf.json" <<'JSON'
+{"baseline":[],"final_validation":[],"task":"specs/target.md","test_first":{"command":"x"}}
+JSON
+    fx "malformed test_first reason names EXACTLY the failing/passing key set" \
+      grep -q 'test_first. keys must be EXACTLY' <<<"$(evidence_rejection_reason "$d/wrongtf.json")"
+
+    cat >"$d/good.json" <<'JSON'
+{"baseline":[],"final_validation":[],"task":"specs/target.md","test_first":{"command":"x","failing_exit_status":1,"failing_output":"x","passing_exit_status":0,"passing_output":"x"}}
+JSON
+    fx "well-formed evidence falls through to the generic array/exit-status line" \
+      grep -q 'must be non-empty arrays' <<<"$(evidence_rejection_reason "$d/good.json")"
   )
 }
 
