@@ -130,9 +130,24 @@ function hasConcretePredicate(line) {
 // or EOL that follows) — that alternative gets its own boundary-free tail.
 const SCOPE_AMBIGUITY_RE = /\betc\.|\b(?:and more|among others|similar things|and so forth)\b/i;
 
-const TEST_RUNNER_RE = /\b(?:vitest|jest|node --test|pnpm[^\n]*\btest\b|pytest|go test|mocha)\b/i;
+// The bare "test" alternative (a `pnpm ... test` invocation, e.g. `pnpm
+// test` / `pnpm --filter x test` / `pnpm run test`) needs a negative
+// lookahead after its own `\btest\b` — otherwise "test-setup.js" false-
+// matches too: `\b` only checks a word/non-word transition, and "-" is a
+// non-word char, so `\btest\b` alone is satisfied by "test-setup" (bounded
+// by the space before "test" and the hyphen after it). `(?![-\w])` rejects
+// that hyphenated-compound case while still matching "test" followed by
+// whitespace, punctuation-that-isn't-a-word-char, or end of line.
+const TEST_RUNNER_RE =
+  /\b(?:vitest|jest|node --test|pytest|go test|mocha)\b|\bpnpm[^\n]*\btest\b(?![-\w])/i;
 
-const VISUAL_INTENT_RE = /\b(?:pixel|figma|screenshot|visual parity|looks like)\b|\bdesign\b/i;
+// Deliberately conservative keyword set — this is an advisory static pass,
+// not a design-fidelity judge, so it only fires on strong, low-noise
+// visual-intent signals. A bare "design" keyword was tried and dropped: it
+// false-fired on ordinary prose like "a clean design decision" that has
+// nothing to do with pixel/Figma parity. The agent layer (scripts/spec-audit.sh)
+// is where subtler design-fidelity gaps get judged.
+const VISUAL_INTENT_RE = /\b(?:pixel|figma|screenshot)\b|\bvisual parity\b|\blooks like\b/i;
 
 // ---------------------------------------------------------------------------
 // Markdown structure helpers (local, minimal — see file header).
@@ -196,11 +211,23 @@ function trackField(content) {
 // Rule scans.
 // ---------------------------------------------------------------------------
 
+// Strips inline backtick-delimited code spans (`` `...` ``) before the
+// placeholder scan — same spirit as the fenced-block skip, one level down.
+// rn specs routinely write inline JSX like `<ScrollView>` or `<Text>` as
+// prose-documentation; without this, every such mention false-fires as an
+// "unfilled angle-placeholder". A literal TODO written inside inline code
+// (documenting the marker itself, not authoring an unfilled one) is exempt
+// for the same reason.
+function stripInlineCode(line) {
+  return line.replace(/`[^`]*`/g, '');
+}
+
 function scanPlaceholder(lines, fenced, findings) {
   lines.forEach((line, idx) => {
     const lineNum = idx + 1;
     if (fenced.has(lineNum)) return;
-    if (TODO_RE.test(line) || ANGLE_PLACEHOLDER_RE.test(line)) {
+    const scanned = stripInlineCode(line);
+    if (TODO_RE.test(scanned) || ANGLE_PLACEHOLDER_RE.test(scanned)) {
       findings.push({ rule: 'placeholder', line: lineNum, excerpt: line.trim() });
     }
   });

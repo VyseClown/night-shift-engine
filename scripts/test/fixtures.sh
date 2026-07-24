@@ -8312,6 +8312,61 @@ _fixture_spec_audit_static_run() {
     bash -c "jq -e '.counts.total == 0' '$cout' >/dev/null"
   fx "clean-spec: findings array is empty" \
     bash -c "jq -e '.findings | length == 0' '$cout' >/dev/null"
+
+  # Anti-false-positive sub-checks (review round 2 on the rn track, the
+  # default): each proves one of the 3 precision fixes on a tiny scratch
+  # spec, not just that the curated fixtures still pass.
+  local jsx_spec test_setup_spec design_word_spec jsx_out test_setup_out design_word_out
+
+  # (a) inline JSX in backtick code must NOT read as an unfilled
+  # angle-placeholder (rn specs routinely document components this way).
+  jsx_spec="$SPEC_AUDIT_STATIC_OUT_DIR/jsx-inline-code.md"
+  cat >"$jsx_spec" <<'EOF'
+# Spec: Scratch — inline JSX in code
+
+## Summary
+
+Wrap it in a `<ScrollView>` for the scrollable layout.
+EOF
+  jsx_out="$SPEC_AUDIT_STATIC_OUT_DIR/jsx-inline-code.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$jsx_spec" --out "$jsx_out" >/dev/null 2>&1
+  fx "anti-false-positive: inline-code JSX tag does not read as an unfilled placeholder" \
+    bash -c "jq -e '.counts[\"placeholder\"] == 0' '$jsx_out' >/dev/null"
+
+  # (b) a hyphenated "test-*" filename must not be misread as a real
+  # test-runner invocation — the rule must still FIRE here.
+  test_setup_spec="$SPEC_AUDIT_STATIC_OUT_DIR/test-setup-filename.md"
+  cat >"$test_setup_spec" <<'EOF'
+# Spec: Scratch — hyphenated test- filename
+
+## Test Plan
+
+- First failing test or executable check: `pnpm exec eslint . --config test-setup.js`
+EOF
+  test_setup_out="$SPEC_AUDIT_STATIC_OUT_DIR/test-setup-filename.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$test_setup_spec" --out "$test_setup_out" >/dev/null 2>&1
+  fx "anti-false-positive: a test-setup.js filename does not count as a test-runner invocation (rule still fires)" \
+    bash -c "jq -e '.counts[\"no-test-command\"] == 1' '$test_setup_out' >/dev/null"
+
+  # (c) incidental prose use of the word "design" (not a Figma/pixel/
+  # screenshot signal) must not fire the design-contract rule.
+  design_word_spec="$SPEC_AUDIT_STATIC_OUT_DIR/incidental-design-word.md"
+  cat >"$design_word_spec" <<'EOF'
+# Spec: Scratch — incidental "design" word
+
+## Review
+
+- Track: rn
+
+## Summary
+
+We made a clean design decision for the retry backoff curve.
+EOF
+  design_word_out="$SPEC_AUDIT_STATIC_OUT_DIR/incidental-design-word.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$design_word_spec" --out "$design_word_out" >/dev/null 2>&1
+  fx "anti-false-positive: incidental 'design' prose (not pixel/figma/screenshot) does not fire missing-design-contract" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 0' '$design_word_out' >/dev/null"
+
   return 0
 }
 

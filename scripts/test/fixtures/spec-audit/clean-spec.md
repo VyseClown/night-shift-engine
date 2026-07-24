@@ -3,8 +3,10 @@
 > Well-formed spec fixture for scripts/lib/spec-audit-static.js — must score
 > ZERO findings on all 7 static rules (concrete grep-able ACs, a biting
 > vitest command, a real Final validation list, no placeholders, no weasel or
-> open-ended-scope wording, Track: node so the design-contract rule doesn't
-> apply).
+> open-ended-scope wording). Track is `rn` — the default track — and the body
+> below carries no fidelity-related trigger wording and no Design Contract
+> section, so the missing-contract rule scores zero because it genuinely has
+> nothing to fire on, not because the node-track early-return dodged it.
 
 ---
 
@@ -24,7 +26,7 @@
 
 ## Review
 
-- Track: node
+- Track: rn
 - Review Profile: logic
 
 ---
