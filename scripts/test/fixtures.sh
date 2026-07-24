@@ -1537,6 +1537,15 @@ fixture_mutate_kill() {
   # subshell so an fx failure inside reports `not ok` for THIS fixture
   # instead of `exit 1`-ing the whole fixture run (reviewer finding on
   # fixture_mutate_list, Task 1).
+  #
+  # skip: not a git repo (mutate.sh --run needs one). mutate.sh's own
+  # baseline sanity gate runs this ENTIRE fixture suite inside a non-git
+  # tar checkout of the engine — without this guard, this fixture's nested
+  # `mutate.sh --run` fails its own `git ls-files` there and drags the
+  # baseline down with it, breaking the mutation CI job every time. The
+  # fixture still runs for real wherever the suite runs inside an actual
+  # git checkout (top-level `fixtures` CI job, local dev).
+  git -C "$WORKSPACE_ROOT" rev-parse --show-toplevel >/dev/null 2>&1 || return 0
   (
     local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
     local sample="scripts/test/fixtures/mutate-sample.sh" out rc=0
@@ -1555,6 +1564,10 @@ fixture_mutate_kill() {
 fixture_mutate_ratchet() {
   # Ratcheted survivors pass; a stale (now-killed) entry fails shrink-only.
   # Subshell-wrapped for the same reason as fixture_mutate_kill above.
+  #
+  # skip: not a git repo (mutate.sh --run needs one) — see fixture_mutate_kill
+  # above for the nested-non-git-checkout mechanism this guards against.
+  git -C "$WORKSPACE_ROOT" rev-parse --show-toplevel >/dev/null 2>&1 || return 0
   (
     local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
     local sample="scripts/test/fixtures/mutate-sample.sh" allow out rc=0
