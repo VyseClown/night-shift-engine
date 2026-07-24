@@ -6,3 +6,4 @@ Scenario: a candidate failing final smoke blocks instead of completing
   And the claude stub in mode "happy"
   When the engine runs with the spec, expected to fail
   Then the live run status is "blocked"
+  And the live state field ".block_reason" contains "smoke"
