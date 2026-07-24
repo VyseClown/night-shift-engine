@@ -51,8 +51,16 @@ jobs:
       # node --check is a pure syntax gate for the zero-dep JS libs — the
       # repo deliberately has no package.json, so no eslint; runtime behavior
       # is covered by the fixture suite + mutation harness.
+      # NOTE: `find -exec node --check {} \;` looked right but is inert —
+      # find's own exit status reflects only traversal errors, never the
+      # exec'd command's, so a syntax error would print to stderr and still
+      # exit 0. `-exec … {} +` is no better: node --check validates only its
+      # first argument and silently ignores the rest when batched. xargs -n1
+      # runs node once per file AND propagates a nonzero exit if any file
+      # fails (bash -eo pipefail, GitHub Actions' run: default, then fails
+      # the step).
       - name: JS syntax check
-        run: find scripts/lib -name '*.js' -type f -exec node --check {} \;
+        run: find scripts/lib -name '*.js' -type f -print0 | xargs -0 -n1 node --check
 
   # ── Job B: Deterministic fixture suite ─────────────────────────────────────
   fixtures:
