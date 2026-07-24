@@ -5,6 +5,7 @@
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd -P)"
 FAILS=0
+EXECUTED=0
 run_scenario_file() {
   local file="$1" name="" lineno=0 rc
   # shellcheck disable=SC2094  # $file is only ever read: redirected as this
@@ -41,6 +42,7 @@ finish_scenario() {
     . "$DIR/scenario-steps.sh"
     for s in "${STEPS[@]}"; do run_step "$s"; done
   ) || rc=$?
+  EXECUTED=$((EXECUTED + 1))
   if [ "$rc" -eq 0 ]; then printf 'ok - scenario: %s\n' "$name"
   else printf 'not ok - scenario: %s (%s)\n' "$name" "$file" >&2; FAILS=$((FAILS + 1)); fi
   name=""
@@ -48,4 +50,5 @@ finish_scenario() {
 if [ "${1:-}" = "--all" ]; then set -- "$DIR"/scenarios/*.feature; fi
 [ "$#" -ge 1 ] || { echo "usage: scenario-run.sh --all | <file...>" >&2; exit 2; }
 for f in "$@"; do run_scenario_file "$f"; done
+[ "$EXECUTED" -gt 0 ] || { echo "not ok - no scenarios executed (empty or scenario-less feature set)" >&2; FAILS=$((FAILS + 1)); }
 exit "$((FAILS > 0 ? 1 : 0))"

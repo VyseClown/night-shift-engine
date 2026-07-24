@@ -109,6 +109,10 @@ jobs:
   # (shrink-only ratchet, same contract as untested-allowlist.txt). The truly
   # exhaustive run (`mutate.sh --full`, all mutants) is local/overnight-only —
   # it exceeds both this job's timeout and GitHub-hosted runners' 6h cap.
+  # The workflow_dispatch deep_sample path (--sample 40) is a DISCOVERY run,
+  # not baselined green like the pinned per-push --sample 10 — it may
+  # legitimately surface unratcheted survivors and go red; triage any new
+  # survivors into surviving-mutants.txt rather than treating red as a bug.
   mutation:
     name: Mutation sample
     runs-on: ubuntu-latest
