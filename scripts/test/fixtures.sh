@@ -165,6 +165,10 @@ run_dry_fixtures() {
   fixture_assert "one untracked walk per bundle; material_token constant-process yet content-sensitive" fixture_untracked_single_walk "$root"
   fixture_assert "fx names the failing sub-check (fixture diagnostics)" fixture_fx_helper "$root"
   fixture_assert "coverage ratchet: new functions cannot be silently untested" fixture_coverage_ratchet "$root"
+  fixture_assert "mutate.sh enumerates deterministic mutants" fixture_mutate_list
+  fixture_assert "mutate.sh --run: killed vs unratcheted-survived mutants" fixture_mutate_kill
+  fixture_assert "mutate.sh --run: shrink-only survivors ratchet (stale entries fail)" fixture_mutate_ratchet
+  fixture_assert "mutate.sh --run: baseline sanity guard (broken suite-cmd never self-disables)" fixture_mutate_baseline_guard
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
   fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
@@ -226,7 +230,15 @@ run_dry_fixtures() {
   fixture_assert "recovery-subagent: observer 429 waits without consuming a contract-retry attempt" fixture_recovery_observer_session_wait "$root"
   fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
   fixture_assert "atomic lock: O_EXCL pid gate, no mkdir-write window, reclaims dead/pid-less" fixture_atomic_lock "$root"
-  fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
+  fixture_assert "acquire_lock/release_lock: die on a live holder, release only removes an owned lock" fixture_acquire_release_lock
+  fixture_assert "acquire_lock reclaims a dead holder's lock atomically" fixture_lock_stale_reclaim
+  fixture_assert "run_validation_commands: per-command JSON, empty set fails, missing workdir -> 127" fixture_run_validation_commands
+  fixture_assert "run_test_command: wraps one command as evidence JSON (exit status + output)" fixture_run_test_command
+  fixture_assert "spec-dialect readers: Track/Review Profile normalize + default, Design Contract heading, optional/explicit personas, validation-command extraction" fixture_spec_field_helpers "$root"
+  fixture_assert "persona resolvers: persona_set/persona_floor per track (unknown rejected), persona_doc's web/node/fullstack vs rn split" fixture_persona_resolvers
+  fixture_assert "clock/path helpers: canonical_file, integrity_key, now_iso, epoch_clock_fields, file_mtime_epoch" fixture_clock_path_helpers "$root"
+  fixture_assert "evidence_rejection_reason: invalid JSON / wrong keys / task mismatch / malformed test_first, in check order" fixture_evidence_rejection_reason "$root"
+  fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int
   fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
   fixture_assert "malformed-signal cap predicate blocks only at/over the cap" fixture_malformed_cap "$root"
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
@@ -1502,6 +1514,95 @@ fixture_rate_limit_contract_canary() {
     exit 0 ) || return 1
   case "$(declare -f main_run)" in *rate_limit_contract_canary*) ;; *) return 1 ;; esac
   return 0
+}
+
+fixture_mutate_list() {
+  # The mutation harness enumerates a STABLE, deterministic mutant list:
+  # same tree → byte-identical --list output; ids are file#rule#ordinal.
+  local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+  local sample="scripts/test/fixtures/mutate-sample.sh" out1 out2
+  out1="$(bash "$m" --list --file "$sample")" || return 1
+  out2="$(bash "$m" --list --file "$sample")" || return 1
+  fx "deterministic output" test "$out1" = "$out2"
+  fx "eq_ne ordinal 1 present" grep -q "^$sample#eq_ne#1	" <<<"$out1"
+  fx "eq_ne ordinal 2 present" grep -q "^$sample#eq_ne#2	" <<<"$out1"
+  fx_not "no eq_ne ordinal 3" grep -q "^$sample#eq_ne#3	" <<<"$out1"
+  fx "guard-deletion rule fires" grep -q "#ret_true#" <<<"$out1"
+  fx "tab-separated 5 fields" awk -F'\t' 'NF!=5{exit 1}' <<<"$out1"
+}
+
+fixture_mutate_kill() {
+  # Runner semantics: a mutant the "suite" detects is killed; one it does
+  # not detect survives and, unratcheted, fails the run. Wrapped in a
+  # subshell so an fx failure inside reports `not ok` for THIS fixture
+  # instead of `exit 1`-ing the whole fixture run (reviewer finding on
+  # fixture_mutate_list, Task 1).
+  #
+  # skip: not a git repo (mutate.sh --run needs one). mutate.sh's own
+  # baseline sanity gate runs this ENTIRE fixture suite inside a non-git
+  # tar checkout of the engine — without this guard, this fixture's nested
+  # `mutate.sh --run` fails its own `git ls-files` there and drags the
+  # baseline down with it, breaking the mutation CI job every time. The
+  # fixture still runs for real wherever the suite runs inside an actual
+  # git checkout (top-level `fixtures` CI job, local dev).
+  git -C "$WORKSPACE_ROOT" rev-parse --show-toplevel >/dev/null 2>&1 || return 0
+  (
+    local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+    local sample="scripts/test/fixtures/mutate-sample.sh" out rc=0
+    out="$(bash "$m" --run --file "$sample" \
+          --suite-cmd "grep -q -- '-eq 0' scripts/test/fixtures/mutate-sample.sh" \
+          --timeout 30 2>&1)" || rc=$?
+    fx "run exits nonzero (unratcheted survivors exist)" test "$rc" -ne 0
+    fx "eq_ne#1 killed (grep suite catches it)" \
+      grep -q "ok - killed $sample#eq_ne#1" <<<"$out"
+    fx "a mutant the suite cannot see survives" \
+      grep -q "not ok - SURVIVED $sample#" <<<"$out"
+    fx "summary line present" grep -q "^# mutants: " <<<"$out"
+  )
+}
+
+fixture_mutate_ratchet() {
+  # Ratcheted survivors pass; a stale (now-killed) entry fails shrink-only.
+  # Subshell-wrapped for the same reason as fixture_mutate_kill above.
+  #
+  # skip: not a git repo (mutate.sh --run needs one) — see fixture_mutate_kill
+  # above for the nested-non-git-checkout mechanism this guards against.
+  git -C "$WORKSPACE_ROOT" rev-parse --show-toplevel >/dev/null 2>&1 || return 0
+  (
+    local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+    local sample="scripts/test/fixtures/mutate-sample.sh" allow out rc=0
+    allow="$FIXTURE_ROOT/mutants-allow.txt"
+    bash "$m" --list --file "$sample" | cut -f1 | grep -v "#eq_ne#1$" >"$allow"
+    out="$(MUTATE_ALLOWLIST="$allow" bash "$m" --run --file "$sample" \
+          --suite-cmd "grep -q -- '-eq 0' scripts/test/fixtures/mutate-sample.sh" \
+          --timeout 30 2>&1)" || rc=$?
+    fx "fully ratcheted run passes" test "$rc" -eq 0
+    fx "survivors reported as ratcheted" grep -q "ok - survived (ratcheted) " <<<"$out"
+    printf '%s#eq_ne#1\n' "$sample" >>"$allow"
+    rc=0
+    out="$(MUTATE_ALLOWLIST="$allow" bash "$m" --run --file "$sample" \
+          --suite-cmd "grep -q -- '-eq 0' scripts/test/fixtures/mutate-sample.sh" \
+          --timeout 30 2>&1)" || rc=$?
+    fx "stale entry fails the run" test "$rc" -ne 0
+    fx "stale entry named" grep -q "stale ratchet entry (now killed): $sample#eq_ne#1" <<<"$out"
+  )
+}
+
+fixture_mutate_baseline_guard() {
+  # A broken --suite-cmd (or a corrupted checkout) must not self-disable the
+  # gate by making every mutant look "killed" — the runner checks the suite
+  # on the UNMUTATED checkout first and refuses to run any mutant if that
+  # check itself fails. Subshell-wrapped for the same reason as the other
+  # mutate.sh fixtures above.
+  (
+    local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+    local sample="scripts/test/fixtures/mutate-sample.sh" out rc=0
+    out="$(bash "$m" --run --file "$sample" --suite-cmd false --timeout 30 2>&1)" || rc=$?
+    fx "baseline failure exits with the distinct code 3" test "$rc" -eq 3
+    fx "distinct baseline error printed" \
+      grep -q "not ok - baseline suite failed on unmutated checkout" <<<"$out"
+    fx_not "zero mutants actually run" grep -q "^ok - killed " <<<"$out"
+  )
 }
 
 fixture_coverage_ratchet() {
@@ -3906,6 +4007,247 @@ fixture_atomic_lock() {
   atomic_lock_acquire "$lock" || return 1
   [ "$(cat "$lock/pid")" = "$$" ] || return 1
   return 0
+}
+
+# acquire_lock/release_lock: the higher-level wrappers around
+# atomic_lock_acquire/lock_is_stale (already covered above), adding the
+# die-on-live-holder and owned-vs-foreign release semantics.
+fixture_acquire_release_lock() {
+  # acquire_lock dies when a LIVE process holds the lock; release_lock only
+  # removes a lock this process owns (never a foreign one).
+  #
+  # Reconciled vs the task brief: the brief simulated "a foreign LIVE pid" by
+  # writing PID 1 (init/launchd) into the lock file, reasoning PID 1 is always
+  # alive. But `kill -0 1` as a non-root user fails with EPERM — the same exit
+  # code lock_is_stale sees for ESRCH (no such process) — so it would
+  # misjudge PID 1 as DEAD (stale) rather than live, defeating the intent of
+  # the check. The house pattern already used for a live holder
+  # (fixture_atomic_lock above) is simply the test's own $$: acquiring twice
+  # in a row against our own just-taken lock already IS a live-holder
+  # collision, no foreign-pid fake required. A genuinely foreign pid is only
+  # needed for the release-refusal check, where liveness is irrelevant
+  # (release_lock only compares the stored pid to $$), so that step reuses
+  # the house's 99998 dead-pid convention.
+  local root="$FIXTURE_ROOT/lockfx"
+  ( mkdir -p "$root/.night-shift"
+    PROJECT="$root"
+    die() { printf 'DIE:%s\n' "$1"; exit 9; }
+    lockdir="$root/.night-shift/run.lock"
+    acquire_lock || exit 1
+    fx "lock owned by us" test "$(cat "$lockdir/pid")" = "$$"
+    out="$( acquire_lock 2>&1 )"; rc=$?
+    fx "second acquire dies (live holder = us)" test "$rc" -eq 9
+    fx "die names the holder" grep -q "DIE:another run is already active for this project (PID $$)" <<<"$out"
+    fx "lock survives the failed second acquire" test -f "$lockdir/pid"
+    # release refuses a lock we do not own (foreign pid, house convention)…
+    printf '99998\n' >"$lockdir/pid"
+    release_lock "$lockdir"
+    fx "foreign lock survives release" test -f "$lockdir/pid"
+    # …and removes one we do own
+    printf '%s\n' "$$" >"$lockdir/pid"
+    release_lock "$lockdir"
+    fx "owned lock removed" test ! -d "$lockdir"
+  )
+}
+
+fixture_lock_stale_reclaim() {
+  # A DEAD holder's lock is reclaimed atomically by the next acquire_lock.
+  #
+  # Reconciled vs the brief: swapped the fork-a-subshell-then-wait dead-pid
+  # trick for the house convention already established by fixture_run_lock
+  # above (a fixed high PID, 99998, virtually certain not to exist) — equally
+  # dead, without spawning and reaping an extra process per fixture run.
+  local root="$FIXTURE_ROOT/lockstale"
+  ( mkdir -p "$root/.night-shift/run.lock"
+    PROJECT="$root"; die() { printf 'DIE:%s\n' "$1"; exit 9; }
+    printf '99998\n' >"$root/.night-shift/run.lock/pid"
+    acquire_lock || exit 1
+    fx "reclaimed by us" test "$(cat "$root/.night-shift/run.lock/pid")" = "$$"
+  )
+}
+
+fixture_run_validation_commands() {
+  # Emits one {command,exit_status,output} JSON per newline-listed command;
+  # an empty command set returns 1; a missing exec dir reports 127 (infra),
+  # never masquerading as a command failure.
+  #
+  # Reconciled vs the brief: dropped the `workdir_path` stub. With
+  # WORKDIR="nope" the REAL workdir_path (preflight.sh:263) already computes
+  # "$run_dir/nope" — a subdir we never create — so the missing-workdir->127
+  # branch is exercised by the genuine helper; no stubbing needed.
+  local root="$FIXTURE_ROOT/valcmds"
+  ( mkdir -p "$root/raw" "$root/proj"
+    RUN_ROOT="$root"; PROJECT="$root/proj"; WORKDIR=""
+    tgt="$root/final.json"
+    run_validation_commands final "$tgt" 'true
+false' "$root/proj" || exit 1
+    fx "two entries" jq -e 'length==2' "$tgt"
+    fx "exit statuses 0 and 1" jq -e '.[0].exit_status==0 and .[1].exit_status==1' "$tgt"
+    fx_not "empty command set fails" run_validation_commands final "$root/e.json" '' "$root/proj"
+    WORKDIR="nope"
+    run_validation_commands final "$root/m.json" 'true' "$root/proj" || exit 1
+    fx "missing workdir -> 127" jq -e '.[0].exit_status==127' "$root/m.json"
+  )
+}
+
+fixture_run_test_command() {
+  # Wraps one command run as {command,exit_status,output} evidence JSON.
+  local root="$FIXTURE_ROOT/testcmd"
+  ( mkdir -p "$root/raw" "$root/proj"
+    RUN_ROOT="$root"; PROJECT="$root/proj"; WORKDIR=""
+    run_test_command failing 'exit 3' "$root/red.json" "$root/proj" || exit 1
+    fx "failing exit recorded" jq -e '.exit_status==3' "$root/red.json"
+    run_test_command passing 'echo green' "$root/green.json" "$root/proj" || exit 1
+    fx "passing exit recorded" jq -e '.exit_status==0' "$root/green.json"
+    fx "output captured" jq -e '.output | test("green")' "$root/green.json"
+  )
+}
+
+fixture_spec_field_helpers() {
+  # Spec-dialect readers: Track/Review Profile are case/space-insensitive,
+  # Track defaults to rn when absent; spec_has_design_contract is a heading
+  # grep; spec_optional_personas combines an explicit `- Optional reviewers:`
+  # field with section-presence auto-activation (either path alone is
+  # sufficient, an unknown name is rejected); spec_explicit_personas is the
+  # per-spec `- Personas:` override (unknown name rejected, absent -> empty);
+  # extract_validation_commands returns the backticked numbered commands under
+  # one heading and stops at the next top-level field or heading.
+  local root="$1" d="$root/specfx" s
+  s="$d/spec-helpers.md"
+  ( mkdir -p "$d"
+    cat >"$s" <<'MD'
+# Spec: x
+## Review
+- Track:  WEB
+- Review Profile: Frontend
+- Optional reviewers: Security Reviewer
+- Personas: Performance Expert
+## Test Plan
+- Baseline validation commands (run before edits):
+  1. `node --version`
+  2. `node --test x.test.js`
+- First failing test or executable check: `node --test x.test.js`
+MD
+    fx "track normalized" test "$(spec_track "$s")" = "web"
+    fx "review profile normalized" test "$(spec_review_profile "$s")" = "frontend"
+    fx_not "design contract absent" spec_has_design_contract "$s"
+    fx "two baseline commands" test "$(extract_validation_commands "$s" 'Baseline validation commands' | grep -c .)" -eq 2
+    fx_not "stops at next field" \
+      grep -q 'failing test' <<<"$(extract_validation_commands "$s" 'Baseline validation commands')"
+    fx "optional reviewers: explicit field alone activates" \
+      test "$(spec_optional_personas "$s")" = "Security Reviewer"
+    fx "explicit personas: field override" \
+      test "$(spec_explicit_personas "$s")" = "Performance Expert"
+
+    printf '# Spec: y\n## Design Contract\n- x\n' >"$s"
+    fx "track defaults to rn when absent" test "$(spec_track "$s")" = "rn"
+    fx "review profile absent -> empty" test -z "$(spec_review_profile "$s")"
+    fx "design contract present" spec_has_design_contract "$s"
+    fx "optional reviewers: section-presence alone activates" \
+      test "$(spec_optional_personas "$s")" = "Design Fidelity Reviewer"
+    fx "explicit personas: absent field -> empty" test -z "$(spec_explicit_personas "$s")"
+
+    printf -- '- Optional reviewers: Bogus Reviewer\n' >"$d/bad-opt.md"
+    fx_not "unknown optional reviewer rejected" spec_optional_personas "$d/bad-opt.md"
+    printf -- '- Personas: Bogus Name\n' >"$d/bad-personas.md"
+    fx_not "unknown persona name rejected" spec_explicit_personas "$d/bad-personas.md"
+  )
+}
+
+fixture_persona_resolvers() {
+  # persona_set/persona_floor map a track name to its full/mandatory persona
+  # list (an unknown track is rejected, non-zero); persona_doc picks the
+  # review-lens doc — web/node/fullstack share the web doc (node/fullstack
+  # reuse backend-flavored personas), everything else (rn, unknown) falls
+  # back to the rn doc.
+  ( fx "rn persona set is the full RN bench" \
+      test "$(persona_set rn)" = "$PERSONAS_RN"
+    fx "web floor is the mandatory subset" \
+      test "$(persona_floor web)" = "$PERSONA_FLOOR_WEB"
+    fx "fullstack floor adds Backend & Data Expert onto the web floor" \
+      test "$(persona_floor fullstack)" = "$PERSONA_FLOOR_WEB|Backend & Data Expert"
+    fx_not "unknown track rejected by persona_set" persona_set bogus
+    fx_not "unknown track rejected by persona_floor" persona_floor bogus
+    fx "web track -> web persona doc" \
+      test "$(persona_doc web)" = "$WORKSPACE_ROOT/docs/review-personas-web.md"
+    fx "node track -> web persona doc (reuses backend personas)" \
+      test "$(persona_doc node)" = "$WORKSPACE_ROOT/docs/review-personas-web.md"
+    fx "rn track -> rn persona doc" \
+      test "$(persona_doc rn)" = "$WORKSPACE_ROOT/docs/review-personas.md"
+    fx "unknown track defaults to rn persona doc" \
+      test "$(persona_doc bogus)" = "$WORKSPACE_ROOT/docs/review-personas.md"
+  )
+}
+
+fixture_clock_path_helpers() {
+  # Misc clock/path primitives: canonical_file resolves a relative/dotted path
+  # to an absolute, symlink-free one and fails on a missing file; integrity_key
+  # strips the RUN_ROOT prefix for a file inside the run, else falls back to
+  # basename; now_iso is a strict UTC ISO8601 stamp; epoch_clock_fields decodes
+  # an epoch+timezone to HH|MM|SS and fails on a non-numeric epoch;
+  # file_mtime_epoch reads a real mtime and fails on a missing file.
+  local root="$1" d="$root/miscfx"
+  ( mkdir -p "$d/sub"
+    printf x >"$d/sub/f.txt"
+    fx "canonical_file resolves a dotted relative path to an absolute one" \
+      test "$(canonical_file "$d/sub/../sub/f.txt")" = "$(cd "$d/sub" && pwd -P)/f.txt"
+    fx_not "canonical_file fails on a missing file" canonical_file "$d/sub/missing.txt"
+
+    RUN_ROOT="$d/run1"
+    mkdir -p "$RUN_ROOT/control"
+    fx "integrity_key strips the RUN_ROOT prefix" \
+      test "$(integrity_key "$RUN_ROOT/control/state.json")" = "control/state.json"
+    fx "integrity_key falls back to basename outside RUN_ROOT" \
+      test "$(integrity_key "/some/other/place/state.json")" = "state.json"
+
+    fx "now_iso matches strict UTC ISO8601" \
+      grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<<"$(now_iso)"
+
+    fx "epoch_clock_fields decodes epoch 0 UTC" test "$(epoch_clock_fields 0 UTC)" = "00|00|00"
+    fx "epoch_clock_fields decodes epoch 3600 UTC" test "$(epoch_clock_fields 3600 UTC)" = "01|00|00"
+    fx_not "epoch_clock_fields fails on a non-numeric epoch" epoch_clock_fields notanumber UTC
+
+    touch "$d/mt.txt"
+    fx "file_mtime_epoch reads a real mtime" test -n "$(file_mtime_epoch "$d/mt.txt")"
+    fx_not "file_mtime_epoch fails on a missing file" file_mtime_epoch "$d/missing-mt.txt"
+  )
+}
+
+fixture_evidence_rejection_reason() {
+  # Mirrors validate_signal's execution-evidence gate in check order: invalid
+  # JSON, wrong top-level keys, task mismatch, malformed test_first — each
+  # with its own human-readable reason fed back into the primary's correction
+  # turn. A well-formed evidence file falls through to the generic
+  # array/exit-status contract line (nothing earlier fires).
+  local root="$1" d="$root/evreason"
+  ( mkdir -p "$d"
+    SPEC="specs/target.md"
+    printf 'not json' >"$d/bad.json"
+    fx "invalid JSON reason" \
+      grep -q 'not valid JSON' <<<"$(evidence_rejection_reason "$d/bad.json")"
+
+    printf '{"task":"specs/target.md"}' >"$d/wrongkeys.json"
+    fx "wrong top-level keys reason names EXACTLY + the actual keys" \
+      grep -q 'top-level keys must be EXACTLY .*the file has \["task"\]' <<<"$(evidence_rejection_reason "$d/wrongkeys.json")"
+
+    cat >"$d/wrongtask.json" <<'JSON'
+{"baseline":[],"final_validation":[],"task":"specs/other.md","test_first":{}}
+JSON
+    fx "task mismatch reason names the expected task" \
+      grep -q 'must equal specs/target.md exactly' <<<"$(evidence_rejection_reason "$d/wrongtask.json")"
+
+    cat >"$d/wrongtf.json" <<'JSON'
+{"baseline":[],"final_validation":[],"task":"specs/target.md","test_first":{"command":"x"}}
+JSON
+    fx "malformed test_first reason names EXACTLY the failing/passing key set" \
+      grep -q 'test_first. keys must be EXACTLY' <<<"$(evidence_rejection_reason "$d/wrongtf.json")"
+
+    cat >"$d/good.json" <<'JSON'
+{"baseline":[],"final_validation":[],"task":"specs/target.md","test_first":{"command":"x","failing_exit_status":1,"failing_output":"x","passing_exit_status":0,"passing_output":"x"}}
+JSON
+    fx "well-formed evidence falls through to the generic array/exit-status line" \
+      grep -q 'must be non-empty arrays' <<<"$(evidence_rejection_reason "$d/good.json")"
+  )
 }
 
 # ---------------------------------------------------------------------------

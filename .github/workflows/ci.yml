@@ -5,6 +5,12 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+    inputs:
+      deep_sample:
+        description: "run a larger mutation sample (bounded; a truly exhaustive run is local-only: mutate.sh --full)"
+        type: boolean
+        default: false
 
 jobs:
   # ── Job A: Shell lint ───────────────────────────────────────────────────────
@@ -42,6 +48,20 @@ jobs:
       - name: Doc summaries
         run: scripts/doc-summaries.sh --check
 
+      # node --check is a pure syntax gate for the zero-dep JS libs — the
+      # repo deliberately has no package.json, so no eslint; runtime behavior
+      # is covered by the fixture suite + mutation harness.
+      # NOTE: `find -exec node --check {} \;` looked right but is inert —
+      # find's own exit status reflects only traversal errors, never the
+      # exec'd command's, so a syntax error would print to stderr and still
+      # exit 0. `-exec … {} +` is no better: node --check validates only its
+      # first argument and silently ignores the rest when batched. xargs -n1
+      # runs node once per file AND propagates a nonzero exit if any file
+      # fails (bash -eo pipefail, GitHub Actions' run: default, then fails
+      # the step).
+      - name: JS syntax check
+        run: find scripts/lib -name '*.js' -type f -print0 | xargs -0 -n1 node --check
+
   # ── Job B: Deterministic fixture suite ─────────────────────────────────────
   fixtures:
     name: Fixture tests
@@ -77,3 +97,37 @@ jobs:
 
       - name: Adverse paths (blocked run + observer-BLOCK recovery)
         run: bash scripts/test/integration-adverse.sh
+
+      - name: Gherkin scenarios (executable QA procedures)
+        run: bash scripts/test/scenario-run.sh --all
+
+  # ── Job D: Mutation sample ──────────────────────────────────────────────────
+  # A bounded, seeded sample of mutants per push (larger bounded sample via
+  # workflow_dispatch). The seed is pinned so "green locally" == "green in CI";
+  # bump MUTATE_SEED deliberately to rotate the sample. Kill signal = the
+  # fixture suite; survivors are governed by scripts/test/surviving-mutants.txt
+  # (shrink-only ratchet, same contract as untested-allowlist.txt). The truly
+  # exhaustive run (`mutate.sh --full`, all mutants) is local/overnight-only —
+  # it exceeds both this job's timeout and GitHub-hosted runners' 6h cap.
+  # The workflow_dispatch deep_sample path (--sample 40) is a DISCOVERY run,
+  # not baselined green like the pinned per-push --sample 10 — it may
+  # legitimately surface unratcheted survivors and go red; triage any new
+  # survivors into surviving-mutants.txt rather than treating red as a bug.
+  mutation:
+    name: Mutation sample
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure jq is available
+        run: command -v jq || { sudo apt-get update && sudo apt-get install -y jq; }
+      - name: Mutation run
+        env:
+          MUTATE_SEED: "20260724"
+          DEEP_SAMPLE: ${{ github.event.inputs.deep_sample }}
+        run: |
+          if [ "$DEEP_SAMPLE" = "true" ]; then
+            bash scripts/test/mutate.sh --run --sample 40 --seed "$MUTATE_SEED"
+          else
+            bash scripts/test/mutate.sh --run --sample 10 --seed "$MUTATE_SEED"
+          fi

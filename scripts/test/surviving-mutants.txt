@@ -1,0 +1,13 @@
+# Surviving mutants — a RATCHET, not a parking lot (mirror of
+# untested-allowlist.txt): each id is a mutant the fixture suite does NOT
+# kill, i.e. a named fixture gap. Remove lines as fixtures improve; adding
+# one is a reviewed decision with a trailing " # reason".
+
+# Baselined from the deterministic CI sample (--sample 10 --seed 20260724),
+# 2026-07-24: 8/10 killed. Both survivors are in the design-fidelity visual
+# pipeline, which is inert offline (needs iOS simulator + Metro + Figma MCP +
+# odiff), so the --fixture-test suite structurally cannot exercise these lines.
+# gap: add a visual prompt/guard fixture (or a live design-fidelity harness run)
+# to kill these — see docs COMMAND-PLAYBOOK visual-review.
+scripts/lib/visual-repair.sh#eq_ne#1 # gap: REPAIR_SHARED allow-string toggle (line ~354) — repair-prompt build not offline-testable
+scripts/lib/visual-capture.sh#n_z#26 # gap: visual-capture guard — capture pipeline not offline-testable (no simulator)

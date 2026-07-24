@@ -39,12 +39,26 @@ write a spec  →  list it in TODO.md  →  launch the script  →  review in th
    cost down).
 3. **Test Plan is the engine.** Baseline commands run before any edit, the first
    failing test must fail then pass, and final commands run in an isolated
-   validation worktree and must not regress vs baseline.
+   validation worktree and must not regress vs baseline. An optional `- Smoke:`
+   field adds a gated boot-proof phase (exit mode or, with `- Smoke URL:`,
+   server mode) right alongside baseline/final — proof the app actually
+   *starts*, not just that its checks pass.
 4. **Review.** The spec's Track + Review Profile select the persona set that
    reviews the plan and the implementation. Every finding is a blocker; progress
-   needs an approval from each active persona.
+   needs an approval from each active persona. A doc-freshness gate (default
+   on) hands the observer a list of docs the diff may have made stale, for it
+   to judge case-by-case — advisory, never blocking.
 5. **Observer gate.** A fresh, independent observer session reviews the candidate
    commit. A BLOCK returns the task to a fresh implement session.
+6. **Wrap-up.** On completion a short session distills the run's journal into
+   feedback for whoever writes specs, appended to `<project>/.night-shift/feedback.md`
+   (default on). Optionally, `NIGHT_SHIFT_BRANCH_SWEEP=1` (or `=advisory`) adds
+   one whole-branch strong-model review at the very end — the full merge-base
+   diff, for cross-task interactions a per-task review can't see — and `=1`
+   additionally runs one capped fix cycle on findings. Run it standalone anytime
+   with `scripts/night-shift.sh --sweep-only --project <path>`. Optionally,
+   `NIGHT_SHIFT_TEST_AUDIT=1` runs a false-confidence pass over only the test
+   files the candidate touched, hunting vacuous assertions and self-testing mocks.
 
 ## Tracks
 
@@ -139,7 +153,7 @@ scripts/lib/visual-capture.sh    opt-in design-fidelity scaffold (inert without 
 scripts/lib/device-registry.sh   opt-in device registry for parallel rn visual_review
 scripts/test/fixtures.sh         the deterministic + live fixture suite (sourced under --fixture-test)
 scripts/parallel-worktrees.sh    wrapper for fan-out night-shift runs across worktrees
-.github/workflows/ci.yml         CI: shellcheck (pinned) + the fixture suite
+.github/workflows/ci.yml         CI: shellcheck + doc summaries + JS syntax + fixtures + integration + mutation sample
 .shellcheckrc                    repo-wide shellcheck config (categorical false positives only)
 schemas/                         machine-readable coordination / review contracts
 specs/                           one markdown file per feature (the contract)
@@ -148,25 +162,39 @@ TODO.md  CHANGELOG.md  NIGHT_SHIFT_REVIEW.md   work queue / log / observer ledge
 night-shift-viewer/              dashboard + gated launcher (own repo, git-ignored here)
 ```
 
-## Tests & CI
+## Testing the engine itself
 
-The engine self-tests with a large **deterministic fixture suite** (no model
-calls, no network) plus a smaller **live** suite that does make paid calls:
+The engine tests itself with four free, deterministic layers — no model calls,
+no network, run all of them before any engine commit:
 
-```sh
-scripts/night-shift.sh --fixture-test --dry-run                    # deterministic only — free
-NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --fixture-test # also runs the live (paid) fixtures
-```
-
-Fixtures live in [`scripts/test/fixtures.sh`](./scripts/test/fixtures.sh),
-sourced by the orchestrator only under `--fixture-test`.
+1. **Fixture suite** — `NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --fixture-test --dry-run`.
+   Behavioral where possible, structural only where behavior is unfakeable.
+2. **Integration + gherkin scenarios** — `bash scripts/test/integration-run.sh`,
+   `bash scripts/test/integration-adverse.sh` (the real engine end-to-end
+   against a scripted `claude` stub, happy-path and adverse-path), plus
+   `bash scripts/test/scenario-run.sh --all` (executable QA procedures in
+   `scripts/test/scenarios/*.feature`).
+3. **Mutation harness** — `bash scripts/test/mutate.sh --run --sample <n>`:
+   enumerates deterministic single-edit mutants of `scripts/lib/*.sh` and the
+   static-scan `.js` libs, runs the fixture suite per mutant, and requires
+   each to be killed (caught by the suite going red).
+4. **Coverage + survivors ratchets** — shrink-only guardrails, both enforced
+   automatically: `scripts/test/untested-allowlist.txt` fails the fixture
+   suite if a new function has zero test references, and
+   `scripts/test/surviving-mutants.txt` fails the mutation run if a mutant
+   survives that isn't already on the (shrinking) allowlist.
 
 CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) runs on every push
-to `main` and every PR: a **Shellcheck** job (pinned shellcheck `0.11.0`, linting
-all `scripts/**/*.sh` at default severity, honoring [`.shellcheckrc`](./.shellcheckrc))
-and a **Fixture tests** job (the deterministic suite). The version is pinned so a
-green local lint matches CI; `.shellcheckrc` disables only categorical false
-positives, and intentional cases carry visible inline pragmas.
+to `main` and every PR across four jobs: **Shellcheck** (pinned shellcheck
+`0.11.0` over every `scripts/**/*.sh`, honoring [`.shellcheckrc`](./.shellcheckrc))
+plus doc-summary and JS-syntax (`node --check`) checks in the same job;
+**Fixture tests** (the deterministic suite); **Integration smoke** (both
+integration scripts + the gherkin scenarios); and a **Mutation sample** (a
+bounded, seeded slice per push; a larger sample via `workflow_dispatch`, the
+truly exhaustive `mutate.sh --full` local/overnight-only). Shellcheck is
+version-pinned so a green local lint matches CI; `.shellcheckrc` disables only
+categorical false positives, and intentional cases carry visible inline
+pragmas.
 
 ## Visual fidelity (opt-in)
 
