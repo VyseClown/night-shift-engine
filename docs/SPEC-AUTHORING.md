@@ -299,6 +299,10 @@ Before you launch a real run:
 
 - [ ] Copied the right **template** for the track and filled *every* section.
 - [ ] Acceptance Criteria are binary; Out of Scope and Open Questions are done.
+- [ ] Ran the **spec-quality audit** and iterated until it's clean:
+      `scripts/spec-audit.sh --spec specs/<name>.md --offline` (zero-cost static
+      pass — flags vague ACs, non-biting validation, unfilled placeholders; run
+      once without `--offline` for the judgment pass). See COMMAND-PLAYBOOK §12.
 - [ ] Final validation includes a test that **asserts the new behavior's output**,
       and the first-failing test is genuinely RED at baseline.
 - [ ] Considered a `- Smoke:` field if a broken boot could pass static checks.
