@@ -15,6 +15,8 @@ run_step() {
   case "$phrase" in
     "a throwaway node project with a red test")
       integration_setup ;;
+    "the spec declares a smoke command that fails only on the candidate")
+      printf '\n## Smoke\n- Smoke: `test ! -f add.js`\n' >> "$SPEC" ;;
     "the claude stub in mode \""*"\"")
       write_stub "$(quoted "$phrase")" ;;
     "the engine runs with the spec")
