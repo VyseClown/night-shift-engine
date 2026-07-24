@@ -48,6 +48,12 @@ jobs:
       - name: Doc summaries
         run: scripts/doc-summaries.sh --check
 
+      # node --check is a pure syntax gate for the zero-dep JS libs — the
+      # repo deliberately has no package.json, so no eslint; runtime behavior
+      # is covered by the fixture suite + mutation harness.
+      - name: JS syntax check
+        run: find scripts/lib -name '*.js' -type f -exec node --check {} \;
+
   # ── Job B: Deterministic fixture suite ─────────────────────────────────────
   fixtures:
     name: Fixture tests

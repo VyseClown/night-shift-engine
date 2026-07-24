@@ -127,19 +127,36 @@ Add one line pointing at the spec. Bugs are selected before features:
 
 
 1. Validate spec → resolve **Track + Review Profile** → active persona set.
-2. Baseline validation; run the first-failing test (must fail).
+2. Baseline validation; run the first-failing test (must fail). If the spec has
+   a `- Smoke:` field, a smoke phase runs alongside baseline — proof the app
+   actually *boots* (exits 0, or, with `- Smoke URL:`, answers HTTP 200),
+   recorded here and judged for regression at final validation.
 3. Plan → **plan-stage persona review** (every finding is a blocker; needs an
    APPROVE from each active persona).
-4. Implement test-first, one acceptance criterion at a time.
+4. Implement test-first, one acceptance criterion at a time. A doc-freshness
+   gate (default on) hands the implementer and, later, the observer a list of
+   docs the diff may have made stale — advisory context, never a blocker.
 5. **Implementation-stage persona review** (loop until all APPROVE).
 6. Create a local **candidate commit** — only run-owned files, never your
    pre-existing dirty work.
 7. Validate the candidate in an **isolated git worktree**: first-failing test now
-   passes, final commands pass, no regression vs baseline.
+   passes, final commands (and the smoke phase, if declared) pass with no
+   regression vs baseline.
 8. **Independent Claude observer** (fresh session, neutral cwd, can't see the
    repo) reviews the candidate → APPROVE or BLOCK.
 9. On APPROVE: write `CHANGELOG.md`, append the verdict to
    `NIGHT_SHIFT_REVIEW.md`, check off the TODO entry → next task or COMPLETE.
+10. On run completion, a short session distills the journal into feedback for
+    whoever writes specs, appended to `<project>/.night-shift/feedback.md`
+    (default on, `NIGHT_SHIFT_RUN_FEEDBACK=0` to skip). Set
+    `NIGHT_SHIFT_BRANCH_SWEEP=1` (or `=advisory`) to also run one whole-branch
+    strong-model review at the very end, for cross-task interactions a
+    per-task review can't see — `=1` additionally runs one capped fix cycle on
+    findings; run the same review standalone anytime with
+    `scripts/night-shift.sh --sweep-only --project <path>`. Set
+    `NIGHT_SHIFT_TEST_AUDIT=1` to add a false-confidence pass over only the
+    test files the candidate touched, hunting vacuous assertions and
+    self-testing mocks — non-gating, attached to the observer's evidence.
 
 It runs unattended: it never asks questions. If it can't proceed safely it emits
 a `BLOCKED` next-action and stops for you. It **never** pushes, merges, resets, or
