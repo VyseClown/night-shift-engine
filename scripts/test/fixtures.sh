@@ -338,6 +338,7 @@ run_dry_fixtures() {
   fixture_test_audit_static
   fixture_test_audit_cli
   fixture_test_audit_wiring
+  fixture_spec_audit_static
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -8236,6 +8237,92 @@ fixture_test_audit_static() {
     printf 'ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n'
   else
     printf 'not ok - test-audit-static: flags not-tobe-literal/assert-on-unknown-property/tobe-true-constant/empty-test-body/expectless-test/skipped-test exactly once each; clean fixture stays at zero\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
+# scripts/lib/spec-audit-static.js (spec-audit design,
+# docs/superpowers/specs/2026-07-24-spec-audit-design.md): the pre-run
+# spec-quality deterministic layer — a zero-dep line scan of ONE spec
+# markdown file for authoring-time smells (placeholder markers, missing/empty
+# Acceptance Criteria, vague ACs, open-ended scope, no biting test command,
+# no final validation, visual-fidelity language with no Design Contract).
+# Exercises the CLI directly against scripts/test/fixtures/spec-audit/
+# (vague-spec.md: one instance of every one of the 7 rules, documented
+# line-by-line in that file's own header comment; clean-spec.md: a
+# well-formed spec that scores zero) — no chrome/network/claude CLI, runs
+# unconditionally everywhere incl. CI, same pattern as
+# fixture_test_audit_static above.
+_fixture_spec_audit_static_run() {
+  local fixture_dir vague clean vout cout status
+  fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/spec-audit"
+  vague="$fixture_dir/vague-spec.md"
+  clean="$fixture_dir/clean-spec.md"
+  # DELIBERATELY NOT local, same reasoning as _fixture_test_audit_static_run
+  # above: the EXIT trap fires in the surrounding command-substitution
+  # subshell after this function has returned, when a `local` would already
+  # be out of scope.
+  SPEC_AUDIT_STATIC_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-spec-audit-static.$$"
+  mkdir -p "$SPEC_AUDIT_STATIC_OUT_DIR" || return 1
+  trap 'rm -rf "${SPEC_AUDIT_STATIC_OUT_DIR:-}"' EXIT
+
+  vout="$SPEC_AUDIT_STATIC_OUT_DIR/vague.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" \
+    --spec "$vague" --out "$vout" >"$vout.log" 2>&1; then
+    status=$?
+    printf 'spec-audit-static.js dispatch failed on vague-spec.md (exit %s): %s\n' "$status" "$(cat "$vout.log")"
+    return 1
+  fi
+  [ -s "$vout" ] || { printf 'report missing/empty: %s\n' "$vout"; return 1; }
+
+  cout="$SPEC_AUDIT_STATIC_OUT_DIR/clean.json"
+  if ! node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" \
+    --spec "$clean" --out "$cout" >"$cout.log" 2>&1; then
+    status=$?
+    printf 'spec-audit-static.js dispatch failed on clean-spec.md (exit %s): %s\n' "$status" "$(cat "$cout.log")"
+    return 1
+  fi
+  [ -s "$cout" ] || { printf 'report missing/empty: %s\n' "$cout"; return 1; }
+
+  fx "vague-spec: findings + counts keys present" \
+    bash -c "jq -e 'has(\"findings\") and has(\"counts\")' '$vout' >/dev/null"
+  fx "vague-spec: placeholder flagged exactly once" \
+    bash -c "jq -e '.counts[\"placeholder\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: no-acceptance-criteria flagged exactly once" \
+    bash -c "jq -e '.counts[\"no-acceptance-criteria\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: vague-ac flagged exactly once" \
+    bash -c "jq -e '.counts[\"vague-ac\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: scope-ambiguity flagged exactly once" \
+    bash -c "jq -e '.counts[\"scope-ambiguity\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: no-test-command flagged exactly once" \
+    bash -c "jq -e '.counts[\"no-test-command\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: no-final-validation flagged exactly once" \
+    bash -c "jq -e '.counts[\"no-final-validation\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: missing-design-contract flagged exactly once" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 1' '$vout' >/dev/null"
+  fx "vague-spec: total == 7 (one per rule)" \
+    bash -c "jq -e '.counts.total == 7' '$vout' >/dev/null"
+
+  fx "clean-spec: findings + counts keys present" \
+    bash -c "jq -e 'has(\"findings\") and has(\"counts\")' '$cout' >/dev/null"
+  fx "clean-spec: every rule stays at zero" \
+    bash -c "jq -e '[.counts | del(.total) | to_entries[] | select(.value != 0)] | length == 0' '$cout' >/dev/null"
+  fx "clean-spec: total == 0" \
+    bash -c "jq -e '.counts.total == 0' '$cout' >/dev/null"
+  fx "clean-spec: findings array is empty" \
+    bash -c "jq -e '.findings | length == 0' '$cout' >/dev/null"
+  return 0
+}
+
+fixture_spec_audit_static() {
+  local err status
+  err="$(_fixture_spec_audit_static_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - spec-audit-static: flags placeholder/no-acceptance-criteria/vague-ac/scope-ambiguity/no-test-command/no-final-validation/missing-design-contract exactly once each; clean fixture stays at zero\n'
+  else
+    printf 'not ok - spec-audit-static: flags placeholder/no-acceptance-criteria/vague-ac/scope-ambiguity/no-test-command/no-final-validation/missing-design-contract exactly once each; clean fixture stays at zero\n' >&2
     printf '%s\n' "$err" >&2
     FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
   fi
