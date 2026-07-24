@@ -168,6 +168,7 @@ run_dry_fixtures() {
   fixture_assert "mutate.sh enumerates deterministic mutants" fixture_mutate_list
   fixture_assert "mutate.sh --run: killed vs unratcheted-survived mutants" fixture_mutate_kill
   fixture_assert "mutate.sh --run: shrink-only survivors ratchet (stale entries fail)" fixture_mutate_ratchet
+  fixture_assert "mutate.sh --run: baseline sanity guard (broken suite-cmd never self-disables)" fixture_mutate_baseline_guard
   fixture_assert "events.jsonl journals every decision point (and survives compaction)" fixture_event_stream "$root"
   fixture_assert "run.log persists the human log to disk (and survives compaction)" fixture_run_log "$root"
   fixture_assert "journal hardening: anchored after append; guard quarantines before it journals; both persona retry reasons survive" fixture_journal_hardening "$root"
@@ -1563,6 +1564,23 @@ fixture_mutate_ratchet() {
           --timeout 30 2>&1)" || rc=$?
     fx "stale entry fails the run" test "$rc" -ne 0
     fx "stale entry named" grep -q "stale ratchet entry (now killed): $sample#eq_ne#1" <<<"$out"
+  )
+}
+
+fixture_mutate_baseline_guard() {
+  # A broken --suite-cmd (or a corrupted checkout) must not self-disable the
+  # gate by making every mutant look "killed" — the runner checks the suite
+  # on the UNMUTATED checkout first and refuses to run any mutant if that
+  # check itself fails. Subshell-wrapped for the same reason as the other
+  # mutate.sh fixtures above.
+  (
+    local m="$WORKSPACE_ROOT/scripts/test/mutate.sh"
+    local sample="scripts/test/fixtures/mutate-sample.sh" out rc=0
+    out="$(bash "$m" --run --file "$sample" --suite-cmd false --timeout 30 2>&1)" || rc=$?
+    fx "baseline failure exits with the distinct code 3" test "$rc" -eq 3
+    fx "distinct baseline error printed" \
+      grep -q "not ok - baseline suite failed on unmutated checkout" <<<"$out"
+    fx_not "zero mutants actually run" grep -q "^ok - killed " <<<"$out"
   )
 }
 

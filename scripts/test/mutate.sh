@@ -32,6 +32,15 @@ EOF
 # whole-codebase run (no --file) caps its default sample at 10 mutants.
 DEFAULT_SAMPLE=10
 
+# is_pos_int <value> — true iff value is a base-10 integer >= 1. Portable
+# case-pattern digit check (no [[ ]] / regex) for --sample/--timeout
+# argument validation: a non-numeric value must fail loudly at parse time
+# rather than silently producing "score 0/0, exit 0" (a false green).
+is_pos_int() {
+  case "$1" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ]
+}
+
 mutation_targets() {
   ( cd "$ENGINE_DIR" &&
     ls scripts/lib/*.sh &&
@@ -80,8 +89,10 @@ list_mutants() {
 
 # apply_mutant <scratchdir> <id> — id = file#rule#ordinal. awk performs a
 # fixed-string replace of the id's ordinal occurrence of the rule's needle.
+# On any failure (awk or the mv) the partial "$f.mut" is removed so a failed
+# apply never leaves stray mutated-scratch garbage behind.
 apply_mutant() {
-  local scratch="$1" id="$2" f rule k needle repl
+  local scratch="$1" id="$2" f rule k needle repl rc
   f="${id%%#*}"; rule="${id#*#}"; rule="${rule%%#*}"; k="${id##*#}"
   needle="$(awk -F"$SEP" -v r="$rule" '$1==r{print $2; exit}' <<<"$RULE_TABLE")"
   repl="$(awk -F"$SEP" -v r="$rule" '$1==r{print $3; exit}' <<<"$RULE_TABLE")"
@@ -93,8 +104,10 @@ apply_mutant() {
         } else {
           out = out substr(line,1,i-1) needle; line=substr(line,i+length(needle))
         } }
-      print out line }' "$scratch/$f" >"$scratch/$f.mut" &&
-  mv "$scratch/$f.mut" "$scratch/$f"
+      print out line }' "$scratch/$f" >"$scratch/$f.mut" && mv "$scratch/$f.mut" "$scratch/$f"
+  rc=$?
+  [ "$rc" -eq 0 ] || rm -f "$scratch/$f.mut"
+  return "$rc"
 }
 
 # macOS has no GNU `timeout`; verbatim from scripts/test/integration-lib.sh:22-26.
@@ -146,7 +159,7 @@ sample_mutants() {
 # unscoped whole-codebase run, unless --sample/--full say otherwise.
 run_mutants() {
   local only="$1" full sample_n run_list row id f rc fail=0 allow_list
-  local total_run=0 killed=0 survived=0 ratcheted=0
+  local total_run=0 killed=0 survived=0 ratcheted=0 baseline_rc=0
   # NOT local: the EXIT trap below fires at script exit, after this function
   # has already returned — a `local` scratch/pristine would be unbound by
   # then under `set -u`. run_mutants runs at most once per invocation, so
@@ -178,6 +191,19 @@ run_mutants() {
   # recursive copy FROM $scratch is safe as the second, per-mutant-restore
   # baseline.
   cp -R "$scratch/." "$pristine/"
+
+  # Baseline sanity: the suite must pass on the UNMUTATED checkout before any
+  # mutant is applied. Without this, a broken --suite-cmd (typo, missing
+  # binary) or a corrupted/partial scratch checkout makes EVERY mutant look
+  # "killed" — every invocation fails for a reason that has nothing to do
+  # with the mutation, so the gate self-disables while reporting its best
+  # possible score. Same invocation shape as the per-mutant run below (same
+  # run_with_timeout, same >/dev/null 2>&1 redirection, never a pipe).
+  ( cd "$scratch" && run_with_timeout "$TIMEOUT_SECS" bash -c "$SUITE_CMD" ) >/dev/null 2>&1 || baseline_rc=$?
+  if [ "$baseline_rc" -ne 0 ]; then
+    printf 'not ok - baseline suite failed on unmutated checkout (suite-cmd or checkout broken)\n' >&2
+    return 3
+  fi
 
   allow_list="$(ratchet_ids "$ALLOWLIST")"
 
@@ -233,12 +259,14 @@ while [ "$#" -gt 0 ]; do
     --file) [ "$#" -ge 2 ] || { echo "--file requires a value" >&2; exit 2; }
             ONLY_FILE="$2"; shift 2 ;;
     --sample) [ "$#" -ge 2 ] || { echo "--sample requires a value" >&2; exit 2; }
+              is_pos_int "$2" || { echo "--sample must be an integer >= 1: $2" >&2; exit 2; }
               SAMPLE="$2"; shift 2 ;;
     --seed) [ "$#" -ge 2 ] || { echo "--seed requires a value" >&2; exit 2; }
             SEED="$2"; shift 2 ;;
     --suite-cmd) [ "$#" -ge 2 ] || { echo "--suite-cmd requires a value" >&2; exit 2; }
                  SUITE_CMD="$2"; shift 2 ;;
     --timeout) [ "$#" -ge 2 ] || { echo "--timeout requires a value" >&2; exit 2; }
+               is_pos_int "$2" || { echo "--timeout must be an integer >= 1 (in seconds): $2" >&2; exit 2; }
                TIMEOUT_SECS="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
