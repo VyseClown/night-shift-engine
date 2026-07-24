@@ -5,6 +5,12 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+    inputs:
+      full_mutation:
+        description: "run the FULL mutation suite"
+        type: boolean
+        default: false
 
 jobs:
   # ── Job A: Shell lint ───────────────────────────────────────────────────────
@@ -77,3 +83,27 @@ jobs:
 
       - name: Adverse paths (blocked run + observer-BLOCK recovery)
         run: bash scripts/test/integration-adverse.sh
+
+  # ── Job D: Mutation sample ──────────────────────────────────────────────────
+  # A bounded, seeded sample of mutants per push (full run via
+  # workflow_dispatch). The seed is pinned so "green locally" == "green in CI";
+  # bump MUTATE_SEED deliberately to rotate the sample. Kill signal = the
+  # fixture suite; survivors are governed by scripts/test/surviving-mutants.txt
+  # (shrink-only ratchet, same contract as untested-allowlist.txt).
+  mutation:
+    name: Mutation sample
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure jq is available
+        run: command -v jq || { sudo apt-get update && sudo apt-get install -y jq; }
+      - name: Mutation run
+        env:
+          MUTATE_SEED: "20260724"
+        run: |
+          if [ "${{ github.event.inputs.full_mutation }}" = "true" ]; then
+            bash scripts/test/mutate.sh --full
+          else
+            bash scripts/test/mutate.sh --run --sample 10 --seed "$MUTATE_SEED"
+          fi
