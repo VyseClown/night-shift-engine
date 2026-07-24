@@ -230,7 +230,11 @@ run_dry_fixtures() {
   fixture_assert "recovery-subagent: observer 429 waits without consuming a contract-retry attempt" fixture_recovery_observer_session_wait "$root"
   fixture_assert "run lock: stale PID is reclaimable, live PID is not" fixture_run_lock "$root"
   fixture_assert "atomic lock: O_EXCL pid gate, no mkdir-write window, reclaims dead/pid-less" fixture_atomic_lock "$root"
-  fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int "$root"
+  fixture_assert "acquire_lock/release_lock: die on a live holder, release only removes an owned lock" fixture_acquire_release_lock
+  fixture_assert "acquire_lock reclaims a dead holder's lock atomically" fixture_lock_stale_reclaim
+  fixture_assert "run_validation_commands: per-command JSON, empty set fails, missing workdir -> 127" fixture_run_validation_commands
+  fixture_assert "run_test_command: wraps one command as evidence JSON (exit status + output)" fixture_run_test_command
+  fixture_assert "state_int: valid integer passes, null/garbage blocks" fixture_state_int
   fixture_assert "rate-limit consecutive counter threshold predicate" fixture_rate_limit_consecutive "$root"
   fixture_assert "malformed-signal cap predicate blocks only at/over the cap" fixture_malformed_cap "$root"
   fixture_assert "observer cost recorded on both attempts (no double-count on success)" fixture_observer_cost_both_attempts "$root"
@@ -3986,6 +3990,100 @@ fixture_atomic_lock() {
   atomic_lock_acquire "$lock" || return 1
   [ "$(cat "$lock/pid")" = "$$" ] || return 1
   return 0
+}
+
+# acquire_lock/release_lock: the higher-level wrappers around
+# atomic_lock_acquire/lock_is_stale (already covered above), adding the
+# die-on-live-holder and owned-vs-foreign release semantics.
+fixture_acquire_release_lock() {
+  # acquire_lock dies when a LIVE process holds the lock; release_lock only
+  # removes a lock this process owns (never a foreign one).
+  #
+  # Reconciled vs the task brief: the brief simulated "a foreign LIVE pid" by
+  # writing PID 1 (init/launchd) into the lock file, reasoning PID 1 is always
+  # alive. But `kill -0 1` as a non-root user fails with EPERM — the same exit
+  # code lock_is_stale sees for ESRCH (no such process) — so it would
+  # misjudge PID 1 as DEAD (stale) rather than live, defeating the intent of
+  # the check. The house pattern already used for a live holder
+  # (fixture_atomic_lock above) is simply the test's own $$: acquiring twice
+  # in a row against our own just-taken lock already IS a live-holder
+  # collision, no foreign-pid fake required. A genuinely foreign pid is only
+  # needed for the release-refusal check, where liveness is irrelevant
+  # (release_lock only compares the stored pid to $$), so that step reuses
+  # the house's 99998 dead-pid convention.
+  local root="$FIXTURE_ROOT/lockfx"
+  ( mkdir -p "$root/.night-shift"
+    PROJECT="$root"
+    die() { printf 'DIE:%s\n' "$1"; exit 9; }
+    lockdir="$root/.night-shift/run.lock"
+    acquire_lock || exit 1
+    fx "lock owned by us" test "$(cat "$lockdir/pid")" = "$$"
+    out="$( acquire_lock 2>&1 )"; rc=$?
+    fx "second acquire dies (live holder = us)" test "$rc" -eq 9
+    fx "die names the holder" grep -q "DIE:another run is already active for this project (PID $$)" <<<"$out"
+    fx "lock survives the failed second acquire" test -f "$lockdir/pid"
+    # release refuses a lock we do not own (foreign pid, house convention)…
+    printf '99998\n' >"$lockdir/pid"
+    release_lock "$lockdir"
+    fx "foreign lock survives release" test -f "$lockdir/pid"
+    # …and removes one we do own
+    printf '%s\n' "$$" >"$lockdir/pid"
+    release_lock "$lockdir"
+    fx "owned lock removed" test ! -d "$lockdir"
+  )
+}
+
+fixture_lock_stale_reclaim() {
+  # A DEAD holder's lock is reclaimed atomically by the next acquire_lock.
+  #
+  # Reconciled vs the brief: swapped the fork-a-subshell-then-wait dead-pid
+  # trick for the house convention already established by fixture_run_lock
+  # above (a fixed high PID, 99998, virtually certain not to exist) — equally
+  # dead, without spawning and reaping an extra process per fixture run.
+  local root="$FIXTURE_ROOT/lockstale"
+  ( mkdir -p "$root/.night-shift/run.lock"
+    PROJECT="$root"; die() { printf 'DIE:%s\n' "$1"; exit 9; }
+    printf '99998\n' >"$root/.night-shift/run.lock/pid"
+    acquire_lock || exit 1
+    fx "reclaimed by us" test "$(cat "$root/.night-shift/run.lock/pid")" = "$$"
+  )
+}
+
+fixture_run_validation_commands() {
+  # Emits one {command,exit_status,output} JSON per newline-listed command;
+  # an empty command set returns 1; a missing exec dir reports 127 (infra),
+  # never masquerading as a command failure.
+  #
+  # Reconciled vs the brief: dropped the `workdir_path` stub. With
+  # WORKDIR="nope" the REAL workdir_path (preflight.sh:263) already computes
+  # "$run_dir/nope" — a subdir we never create — so the missing-workdir->127
+  # branch is exercised by the genuine helper; no stubbing needed.
+  local root="$FIXTURE_ROOT/valcmds"
+  ( mkdir -p "$root/raw" "$root/proj"
+    RUN_ROOT="$root"; PROJECT="$root/proj"; WORKDIR=""
+    tgt="$root/final.json"
+    run_validation_commands final "$tgt" 'true
+false' "$root/proj" || exit 1
+    fx "two entries" jq -e 'length==2' "$tgt"
+    fx "exit statuses 0 and 1" jq -e '.[0].exit_status==0 and .[1].exit_status==1' "$tgt"
+    fx_not "empty command set fails" run_validation_commands final "$root/e.json" '' "$root/proj"
+    WORKDIR="nope"
+    run_validation_commands final "$root/m.json" 'true' "$root/proj" || exit 1
+    fx "missing workdir -> 127" jq -e '.[0].exit_status==127' "$root/m.json"
+  )
+}
+
+fixture_run_test_command() {
+  # Wraps one command run as {command,exit_status,output} evidence JSON.
+  local root="$FIXTURE_ROOT/testcmd"
+  ( mkdir -p "$root/raw" "$root/proj"
+    RUN_ROOT="$root"; PROJECT="$root/proj"; WORKDIR=""
+    run_test_command failing 'exit 3' "$root/red.json" "$root/proj" || exit 1
+    fx "failing exit recorded" jq -e '.exit_status==3' "$root/red.json"
+    run_test_command passing 'echo green' "$root/green.json" "$root/proj" || exit 1
+    fx "passing exit recorded" jq -e '.exit_status==0' "$root/green.json"
+    fx "output captured" jq -e '.output | test("green")' "$root/green.json"
+  )
 }
 
 # ---------------------------------------------------------------------------

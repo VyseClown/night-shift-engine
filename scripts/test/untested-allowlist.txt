@@ -1,7 +1,6 @@
 # Functions with zero test references — a RATCHET, not a parking lot:
 # remove lines as coverage grows; adding a line is a reviewed decision.
 __visual_run_timeout
-acquire_lock
 append_observer_review
 archive_old_signal
 assert_tools_available
@@ -23,13 +22,10 @@ persona_floor
 persona_set
 rate_limit_reset_fields
 recover_run
-release_lock
 repair_validate
 resolve_artifact
 run_observer
 run_personas
-run_test_command
-run_validation_commands
 signal_has_valid_evidence
 spec_explicit_personas
 spec_has_design_contract
