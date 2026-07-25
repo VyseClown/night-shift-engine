@@ -8349,6 +8349,28 @@ EOF
   fx "anti-false-positive: a test-setup.js filename does not count as a test-runner invocation (rule still fires)" \
     bash -c "jq -e '.counts[\"no-test-command\"] == 1' '$test_setup_out' >/dev/null"
 
+  # (b2) a test runner present ONLY in the First-failing-test field (Final
+  # validation is lint/typecheck-only) must NOT fire no-test-command — the
+  # first-failing line has to be included in the runner search. This pins the
+  # firstFailingTestLine capture (=== null) + haystack-push (!== null) logic;
+  # without it a mutation to either comparison survives (the clean fixture
+  # can't catch it because its runner appears in both fields).
+  ff_only_spec="$SPEC_AUDIT_STATIC_OUT_DIR/runner-in-first-failing-only.md"
+  cat >"$ff_only_spec" <<'EOF'
+# Spec: Scratch — runner only in the first-failing-test field
+
+## Test Plan
+
+- First failing test or executable check: `pnpm exec vitest run src/x.spec.ts`
+- Final validation commands (run in this order):
+  1. `pnpm exec eslint .`
+  2. `pnpm exec tsc --noEmit`
+EOF
+  ff_only_out="$SPEC_AUDIT_STATIC_OUT_DIR/runner-in-first-failing-only.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$ff_only_spec" --out "$ff_only_out" >/dev/null 2>&1
+  fx "anti-false-positive: a runner in the first-failing-test field alone satisfies no-test-command (rule stays 0)" \
+    bash -c "jq -e '.counts[\"no-test-command\"] == 0' '$ff_only_out' >/dev/null"
+
   # (c) incidental prose use of the word "design" (not a Figma/pixel/
   # screenshot signal) must not fire the design-contract rule.
   design_word_spec="$SPEC_AUDIT_STATIC_OUT_DIR/incidental-design-word.md"
