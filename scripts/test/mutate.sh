@@ -44,7 +44,7 @@ is_pos_int() {
 mutation_targets() {
   ( cd "$ENGINE_DIR" &&
     ls scripts/lib/*.sh &&
-    printf '%s\n' scripts/lib/test-audit-static.js scripts/lib/port-audit-static.js )
+    printf '%s\n' scripts/lib/test-audit-static.js scripts/lib/port-audit-static.js scripts/lib/spec-audit-static.js )
 }
 
 # count_occurrences <file> <needle> — total fixed-string occurrences.
