@@ -58,7 +58,7 @@ No formal checklist yet; see the Summary above for the expected behavior.
 ## Technical Approach
 
 - Add a `roundHalfEven` helper to `src/math/invoice.ts`.
-- TODO pick the exact rounding mode for negative subtotals.
+- TBD: pick the exact rounding mode for negative subtotals.
 - The final summary screen should be pixel-perfect against the reference.
 
 ---
