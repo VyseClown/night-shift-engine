@@ -29,9 +29,11 @@
 // when nothing fired.
 //
 // Rules (see the design doc for the authoritative definition of each):
-//   1. placeholder              — literal TODO/TBD/FIXME/XXX, or an unfilled
-//      `<...>` angle-placeholder, in PROSE (fenced code blocks are exempt —
-//      one finding per offending line).
+//   1. placeholder              — an unfilled stub marker (TBD/FIXME/XXX, or an
+//      unfilled `<...>` angle-placeholder) in PROSE (fenced/inline code exempt;
+//      one finding per offending line). `TODO` is intentionally NOT flagged —
+//      TODO.md is a first-class tracked file here and specs reference it in
+//      prose; a genuine unfilled TODO is the agent layer's judgment.
 //   2. no-acceptance-criteria   — no `## Acceptance Criteria` section, or the
 //      section has zero `- [ ]`/`- [x]` items (whole-spec, max one finding).
 //   3. vague-ac                 — a Summary/Scope/Acceptance line carrying a
@@ -44,9 +46,13 @@
 //      test-runner invocation (whole-spec, max one finding).
 //   6. no-final-validation      — the Test Plan's "Final validation
 //      commands" list is missing or empty (whole-spec, max one finding).
-//   7. missing-design-contract  — the spec mentions visual-fidelity intent
-//      but has no `## Design Contract` section and Track isn't `node`
-//      (whole-spec, max one finding).
+//   7. missing-design-contract  — the spec uses STRONG design-fidelity language
+//      (pixel-perfect/-accurate, design fidelity, visual parity, "match the
+//      figma/design", "1:1 with …") yet grounds no target: no `## Design
+//      Contract`/`## Design source` section and no `Design manifest:` /
+//      `Manifest source:` / `Visual target:` field, Track isn't `node`
+//      (whole-spec, max one finding). Incidental "figma"/"pixel" mentions and
+//      grounded specs are intentionally NOT flagged.
 //
 // Exit 0 whenever scanning completed — findings are DATA, not errors, so a
 // spec riddled with placeholders still exits 0. Exit 3 only on unusable args
@@ -103,7 +109,13 @@ function parseArgs(argv) {
 // Line-level trigger patterns.
 // ---------------------------------------------------------------------------
 
-const TODO_RE = /\b(?:TODO|TBD|FIXME|XXX)\b/;
+// `TODO` is deliberately NOT in this set. In this engine TODO.md is a
+// first-class tracked file, and real specs legitimately reference it in prose
+// ("add a TODO.md entry", "tracked by its TODO") — flagging those as unfilled
+// placeholders is pure noise (verified against 15 shipped specs, 2026-07-25).
+// TBD/FIXME/XXX are near-always genuine stubs; a real unfilled `TODO` is left
+// to the agent layer's judgment.
+const STUB_MARKER_RE = /\b(?:TBD|FIXME|XXX)\b/;
 // An unfilled `<...>` angle-placeholder: excludes HTML/markdown comments
 // (`<!-- ... -->`) and multi-line-unfriendly noise by capping length and
 // disallowing a leading `!`.
@@ -148,7 +160,30 @@ const TEST_RUNNER_RE =
 // false-fired on ordinary prose like "a clean design decision" that has
 // nothing to do with pixel/Figma parity. The agent layer (scripts/spec-audit.sh)
 // is where subtler design-fidelity gaps get judged.
-const VISUAL_INTENT_RE = /\b(?:pixel|figma|screenshot)\b|\bvisual parity\b|\blooks like\b/i;
+// STRONG design-fidelity intent only — not a bare "figma"/"pixel"/"screenshot"
+// mention (a mechanical port that references its Figma primitives or web source
+// once is not doing pixel-fidelity work). Verified against 15 shipped specs
+// (2026-07-25): the broad form false-fired on incidental prose in specs that
+// were properly grounded by a manifest / web source. A spec that genuinely
+// demands pixel fidelity says so.
+// NB: `pixel-diff` is deliberately excluded — it names the odiff tooling
+// technique, not a fidelity demand, and appears in specs that explicitly note
+// they are NOT doing it ("no pixel-diff reference exists"). Only phrases that
+// genuinely demand fidelity remain.
+const VISUAL_INTENT_RE =
+  /\bpixel[- ]?(?:perfect|accurate)\b|\bpixel[- ]for[- ]pixel\b|\bdesign fidelity\b|\bvisual parity\b|\bfaithful to the\s+(?:figma|design|mockup)\b|\bmatch(?:es|ing)?\s+the\s+(?:figma|design|mockup)\b|\b1:1\s+with\s+(?:the\s+)?(?:figma|design)\b/i;
+
+// A spec that grounds its design intent — via a `## Design Contract` /
+// `## Design source` section, or a `Design manifest:` / `Manifest source:` /
+// `Visual target:` field — has pinned a target and must not be flagged, even
+// when it uses strong fidelity language. These are the engine's own documented
+// design-spec conventions (see the _template and the port-fidelity fields).
+// The `\S` after the colon is load-bearing: an EMPTY grounding field
+// (`- Visual target:` with no value) does NOT count as grounding — a spec
+// that demands fidelity but leaves the target blank is exactly the
+// half-authored spec the rule should still flag.
+const DESIGN_GROUNDING_FIELD_RE =
+  /^\s*(?:[-*]\s*)?(?:design manifest|manifest source|visual target)\s*:\s*\S/i;
 
 // ---------------------------------------------------------------------------
 // Markdown structure helpers (local, minimal — see file header).
@@ -228,7 +263,7 @@ function scanPlaceholder(lines, fenced, findings) {
     const lineNum = idx + 1;
     if (fenced.has(lineNum)) return;
     const scanned = stripInlineCode(line);
-    if (TODO_RE.test(scanned) || ANGLE_PLACEHOLDER_RE.test(scanned)) {
+    if (STUB_MARKER_RE.test(scanned) || ANGLE_PLACEHOLDER_RE.test(scanned)) {
       findings.push({ rule: 'placeholder', line: lineNum, excerpt: line.trim() });
     }
   });
@@ -315,10 +350,27 @@ function scanNoFinalValidation(lines, testPlan, findings) {
   findings.push({ rule: 'no-final-validation', line: anchorLine, excerpt: lines[anchorLine - 1].trim() });
 }
 
+// A section counts as grounding only if it has at least one non-blank line
+// between its heading and the next (an empty `## Design source` is not a target).
+function sectionHasContent(heading, lines) {
+  for (let n = heading.contentStart; n <= heading.contentEnd; n++) {
+    if ((lines[n - 1] || '').trim() !== '') return true;
+  }
+  return false;
+}
+
 function scanMissingDesignContract(lines, fenced, headings, track, findings) {
   if (track === 'node') return;
-  const hasDesignContract = headings.some((h) => h.nameLower === 'design contract');
-  if (hasDesignContract) return;
+  // Grounded if it pins a real target: a NON-EMPTY `## Design Contract` section
+  // (prose describing the target), or a FILLED grounding field (`Manifest
+  // source: web`, `Visual target: <x>`). `## Design source` is only a container
+  // heading — its grounding comes from the fields inside it, which the field
+  // regex already catches; an empty field under it is NOT grounding, so a
+  // fidelity spec with a blank target still gets flagged.
+  const grounded =
+    headings.some((h) => h.nameLower === 'design contract' && sectionHasContent(h, lines)) ||
+    lines.some((line) => DESIGN_GROUNDING_FIELD_RE.test(line));
+  if (grounded) return;
 
   for (let i = 0; i < lines.length; i++) {
     const lineNum = i + 1;

@@ -340,6 +340,7 @@ run_dry_fixtures() {
   fixture_test_audit_wiring
   fixture_spec_audit_static
   fixture_spec_audit_cli
+  fixture_spec_audit_corpus
   if [ "$FIXTURE_FAILURES" -ne 0 ]; then
     die "$FIXTURE_FAILURES deterministic fixture(s) failed"
   fi
@@ -8255,6 +8256,54 @@ fixture_test_audit_static() {
 # well-formed spec that scores zero) — no chrome/network/claude CLI, runs
 # unconditionally everywhere incl. CI, same pattern as
 # fixture_test_audit_static above.
+# A diverse precision+recall corpus (2026-07-25): the vague/clean fixtures pin
+# individual rules, but the real risk in a spec-quality gate is CALIBRATION —
+# false-flagging good specs of varied shapes, or missing weak ones. This corpus
+# asserts precision (4 well-formed specs across node/web/rn + a grounded visual
+# port all score ZERO) and recall (6 deliberately-weak specs, one per failure
+# mode, each trip their intended rule). Retires the "tuned only against one
+# uniform spec family" overfitting risk with tracked, generic cases.
+_fixture_spec_audit_corpus_run() {
+  local dir weak_rules pair f b j rule
+  dir="$WORKSPACE_ROOT/scripts/test/fixtures/spec-audit/corpus"
+  SPEC_AUDIT_CORPUS_OUT_DIR="$WORKSPACE_ROOT/.night-shift-fixture-spec-audit-corpus.$$"
+  mkdir -p "$SPEC_AUDIT_CORPUS_OUT_DIR"
+  trap 'rm -rf "$SPEC_AUDIT_CORPUS_OUT_DIR"' EXIT
+
+  # PRECISION: every well-formed spec (varied track/shape) scores zero.
+  for f in "$dir"/good/*.md; do
+    b="$(basename "$f" .md)"
+    j="$SPEC_AUDIT_CORPUS_OUT_DIR/good-$b.json"
+    node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$f" --out "$j" >/dev/null 2>&1
+    fx "corpus precision: good/$b (well-formed, varied shape) scores zero findings" \
+      bash -c "jq -e '.counts.total == 0' '$j' >/dev/null"
+  done
+
+  # RECALL: each weak spec trips its one intended rule (basename:expected-rule).
+  weak_rules="vague-acs:vague-ac no-test:no-test-command placeholders:placeholder scope-creep:scope-ambiguity ungrounded-visual:missing-design-contract no-acs:no-acceptance-criteria"
+  for pair in $weak_rules; do
+    b="${pair%%:*}"; rule="${pair##*:}"
+    j="$SPEC_AUDIT_CORPUS_OUT_DIR/weak-$b.json"
+    node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$dir/weak/$b.md" --out "$j" >/dev/null 2>&1
+    fx "corpus recall: weak/$b trips $rule" \
+      bash -c "jq -e '.counts[\"$rule\"] >= 1' '$j' >/dev/null"
+  done
+  return 0
+}
+
+fixture_spec_audit_corpus() {
+  local err status
+  err="$(_fixture_spec_audit_corpus_run 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'ok - spec-audit corpus: 4 varied well-formed specs score zero (precision); 6 weak specs each trip their intended rule (recall)\n'
+  else
+    printf 'not ok - spec-audit corpus: 4 varied well-formed specs score zero (precision); 6 weak specs each trip their intended rule (recall)\n' >&2
+    printf '%s\n' "$err" >&2
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+  fi
+}
+
 _fixture_spec_audit_static_run() {
   local fixture_dir vague clean vout cout status
   fixture_dir="$WORKSPACE_ROOT/scripts/test/fixtures/spec-audit"
@@ -8318,6 +8367,9 @@ _fixture_spec_audit_static_run() {
   # default): each proves one of the 3 precision fixes on a tiny scratch
   # spec, not just that the curated fixtures still pass.
   local jsx_spec test_setup_spec design_word_spec jsx_out test_setup_out design_word_out
+  local todo_ref_spec todo_ref_out figma_prose_spec figma_prose_out
+  local grounded_spec grounded_out pixeldiff_spec pixeldiff_out
+  local empty_ground_spec empty_ground_out pfp_spec pfp_out empty_dc_spec empty_dc_out
 
   # (a) inline JSX in backtick code must NOT read as an unfilled
   # angle-placeholder (rn specs routinely document components this way).
@@ -8389,6 +8441,128 @@ EOF
   node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$design_word_spec" --out "$design_word_out" >/dev/null 2>&1
   fx "anti-false-positive: incidental 'design' prose (not pixel/figma/screenshot) does not fire missing-design-contract" \
     bash -c "jq -e '.counts[\"missing-design-contract\"] == 0' '$design_word_out' >/dev/null"
+
+  # Calibration cases (verified 2026-07-25 against 15 shipped specs — these are
+  # the exact false-positive shapes those specs exhibited, now generic).
+  # (d) a prose reference to the TODO.md tracking file is not an unfilled stub.
+  todo_ref_spec="$SPEC_AUDIT_STATIC_OUT_DIR/todo-file-reference.md"
+  cat >"$todo_ref_spec" <<'EOF'
+# Spec: Scratch — TODO.md references in prose
+
+## Acceptance Criteria
+
+- [ ] AC1: add a `TODO.md` entry for this feature (same known limitation as web, tracked by its TODO).
+EOF
+  todo_ref_out="$SPEC_AUDIT_STATIC_OUT_DIR/todo-file-reference.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$todo_ref_spec" --out "$todo_ref_out" >/dev/null 2>&1
+  fx "anti-false-positive: a prose reference to TODO.md / its TODO is not an unfilled placeholder" \
+    bash -c "jq -e '.counts[\"placeholder\"] == 0' '$todo_ref_out' >/dev/null"
+
+  # (e) an incidental 'Figma' mention (not strong fidelity language) does not fire.
+  figma_prose_spec="$SPEC_AUDIT_STATIC_OUT_DIR/incidental-figma.md"
+  cat >"$figma_prose_spec" <<'EOF'
+# Spec: Scratch — incidental Figma mention
+
+- Track: rn
+
+## Summary
+Mechanical port. The gradient stops are the Figma primitives; the web source is the reference.
+EOF
+  figma_prose_out="$SPEC_AUDIT_STATIC_OUT_DIR/incidental-figma.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$figma_prose_spec" --out "$figma_prose_out" >/dev/null 2>&1
+  fx "anti-false-positive: an incidental 'Figma' mention (no strong-fidelity phrase) does not fire missing-design-contract" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 0' '$figma_prose_out' >/dev/null"
+
+  # (f) STRONG fidelity language is fine when the spec grounds a target.
+  grounded_spec="$SPEC_AUDIT_STATIC_OUT_DIR/grounded-fidelity.md"
+  cat >"$grounded_spec" <<'EOF'
+# Spec: Scratch — pixel-perfect but grounded
+
+- Track: rn
+
+## Summary
+The sheet must be pixel-perfect against the reference.
+
+## Design source
+- Manifest source: web
+EOF
+  grounded_out="$SPEC_AUDIT_STATIC_OUT_DIR/grounded-fidelity.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$grounded_spec" --out "$grounded_out" >/dev/null 2>&1
+  fx "anti-false-positive: strong fidelity language WITH a grounding field/section does not fire missing-design-contract" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 0' '$grounded_out' >/dev/null"
+
+  # (g) 'pixel-diff' names the tooling technique, not a fidelity demand —
+  # a spec noting one does NOT exist must not fire.
+  pixeldiff_spec="$SPEC_AUDIT_STATIC_OUT_DIR/pixeldiff-negation.md"
+  cat >"$pixeldiff_spec" <<'EOF'
+# Spec: Scratch — pixel-diff negation
+
+- Track: rn
+
+## Summary
+No pixel-diff reference exists — no committed Figma export, so verification is by unit tests.
+EOF
+  pixeldiff_out="$SPEC_AUDIT_STATIC_OUT_DIR/pixeldiff-negation.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$pixeldiff_spec" --out "$pixeldiff_out" >/dev/null 2>&1
+  fx "anti-false-positive: 'no pixel-diff reference exists' (tooling term, negated) does not fire missing-design-contract" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 0' '$pixeldiff_out' >/dev/null"
+
+  # (h) RECALL: strong fidelity + an EMPTY grounding field (blank Visual target
+  # under a Design source heading) is NOT grounded — it must still fire. Guards
+  # the empty-grounding escape the review caught.
+  empty_ground_spec="$SPEC_AUDIT_STATIC_OUT_DIR/empty-grounding.md"
+  cat >"$empty_ground_spec" <<'EOF'
+# Spec: Scratch — pixel-perfect but empty grounding
+
+- Track: rn
+
+## Summary
+The screen must be pixel-perfect against the Figma.
+
+## Design source
+- Visual target:
+EOF
+  empty_ground_out="$SPEC_AUDIT_STATIC_OUT_DIR/empty-grounding.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$empty_ground_spec" --out "$empty_ground_out" >/dev/null 2>&1
+  fx "recall: strong fidelity with a BLANK grounding field still fires missing-design-contract" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 1' '$empty_ground_out' >/dev/null"
+
+  # (i) RECALL: 'pixel for pixel' phrasing (ungrounded) fires.
+  pfp_spec="$SPEC_AUDIT_STATIC_OUT_DIR/pixel-for-pixel.md"
+  cat >"$pfp_spec" <<'EOF'
+# Spec: Scratch — pixel for pixel
+
+- Track: rn
+
+## Summary
+Match the mockup pixel for pixel.
+EOF
+  pfp_out="$SPEC_AUDIT_STATIC_OUT_DIR/pixel-for-pixel.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$pfp_spec" --out "$pfp_out" >/dev/null 2>&1
+  fx "recall: 'pixel for pixel' (ungrounded) fires missing-design-contract" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 1' '$pfp_out' >/dev/null"
+
+  # (j) RECALL: an EMPTY `## Design Contract` section (heading, no prose) is not
+  # a pinned target — strong fidelity language must still fire. Also pins
+  # sectionHasContent's non-blank check (a blank line is not content).
+  empty_dc_spec="$SPEC_AUDIT_STATIC_OUT_DIR/empty-design-contract.md"
+  cat >"$empty_dc_spec" <<'EOF'
+# Spec: Scratch — pixel-perfect but empty Design Contract
+
+- Track: rn
+
+## Summary
+The screen must be pixel-perfect against the Figma.
+
+## Design Contract
+
+## Test Plan
+- First failing test or executable check: `pnpm exec jest x.test.tsx`
+EOF
+  empty_dc_out="$SPEC_AUDIT_STATIC_OUT_DIR/empty-design-contract.json"
+  node "$WORKSPACE_ROOT/scripts/lib/spec-audit-static.js" --spec "$empty_dc_spec" --out "$empty_dc_out" >/dev/null 2>&1
+  fx "recall: an empty ## Design Contract section does not ground; strong fidelity still fires" \
+    bash -c "jq -e '.counts[\"missing-design-contract\"] == 1' '$empty_dc_out' >/dev/null"
 
   return 0
 }
