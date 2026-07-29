@@ -344,7 +344,14 @@ validate_spec_engines() {
   local file="$1" raw pair role vendor seen_implement=0 seen_review=0
   ENGINE_IMPLEMENT="claude"
   ENGINE_REVIEW=""
-  grep -Eq '^- Engines:' "$file" || return 0
+  # Presence check scoped exactly like the extractor (spec_engines uses
+  # spec_field_scope internally) — Engines lives in the `## Review` section,
+  # the same dialect as Track/Personas, NOT the whole-file dialect Workdir/
+  # Smoke use. An unscoped grep here would treat a stray "- Engines:" mention
+  # elsewhere in the spec (e.g. prose under Related Files) as a malformed
+  # field, exactly the bug fixture_review_fields_scoped guards against for
+  # Personas.
+  spec_field_scope "$file" | grep -Eq '^- Engines:' || return 0
   raw="$(spec_engines "$file")"
   if [ -z "$raw" ]; then
     printf 'malformed Engines field — use: - Engines: implement=claude|codex review=codex|off (space-separated role=vendor pairs)\n' >&2

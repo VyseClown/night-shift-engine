@@ -2476,6 +2476,18 @@ fixture_engines_field() {
     fx "absent field resets review to empty (inherit env)" [ -z "$ENGINE_REVIEW" ] || exit 1
     fx "absent field: spec_engines is empty" [ -z "$(spec_engines "$spec")" ] || exit 1
 
+    # An `- Engines:` line OUTSIDE the ## Review section (e.g. mentioned in
+    # prose under Related, or — as caught by a real integration run during
+    # this feature's own build — appended after ## Test Plan) must NOT be
+    # read as the field: same scoping bug class fixture_review_fields_scoped
+    # guards for `- Personas:`. Both the presence check AND the extractor
+    # must agree it's absent, or a stray mention elsewhere in the spec would
+    # wrongly fail spec selection with "malformed Engines field".
+    printf '# spec\n\n## Review\n- Track: node\n\n## Related\n- Engines: implement=codex\n' >"$spec"
+    ENGINE_IMPLEMENT="codex"; ENGINE_REVIEW="codex"
+    fx "out-of-section Engines line validates as absent" validate_spec_engines "$spec" || exit 1
+    fx "out-of-section Engines line does not set implement=codex" [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+
     # Valid field, codex CLI present: both roles resolve.
     printf '# spec\n\n## Review\n- Track: node\n- Engines: implement=codex review=codex\n' >"$spec"
     codex_available() { return 0; }
