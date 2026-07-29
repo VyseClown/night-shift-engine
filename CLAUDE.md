@@ -195,6 +195,15 @@ directory; run engine/workflow git inside the engine directory.
   repair agent honors the spec's `## Design Contract` + `## Design source` sections — so
   design details a flat image misses (e.g. a ring built from two layered wave nodes) are
   stated in the spec you edit and backed by the complete node tree.
+- **Ad-hoc visual comparison (no capture):** `scripts/visual-compare.sh --manifest
+  <pairs.json> --run-dir <runDir> [--name <report>]` pixel-diffs EXISTING image pairs
+  (e.g. responsive-web screenshots vs native sim captures for a design review) and
+  writes a standard `visual-diff-<name>.json` + assets into the run's `validated/`,
+  so the viewer's Visual-validation panel renders reference|candidate|diff + diff%
+  with zero viewer changes. Reuses `__visual_pixel_diff` (odiff parsing + resize
+  edge cases); `diff_pct` is the contract's 0–1 fraction; per-pair
+  `tolerance`/`device`/`analysis` overrides in the manifest (see the script header
+  for the manifest shape). Requires `odiff` + `jq`; no simulator, no Figma.
 
 > For **parallel** visual_review across worktrees, set `NIGHT_SHIFT_DEVICE_REGISTRY=1`
 > (the `scripts/parallel-worktrees.sh` wrapper sets it automatically for `--jobs>1`). Each
