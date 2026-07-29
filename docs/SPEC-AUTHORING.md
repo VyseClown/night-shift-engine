@@ -197,6 +197,38 @@ final-validation gate. Default timeout is `NIGHT_SHIFT_SMOKE_TIMEOUT` (120s).
 
 ---
 
+## Running the implement stage on Codex instead of Claude
+
+Default: nothing. Every spec runs claude-only unless you opt in. To run this
+task's implement-stage grind on the Codex CLI, and/or opt the existing
+`NIGHT_SHIFT_CODEX_REVIEW` advisory review in/out just for this spec, add one
+field to the `## Review` section (same bare-token dialect as `- Track:` — no
+backticks):
+
+```
+- Engines: implement=codex review=codex
+```
+
+- `implement` ∈ `claude` (default, may be omitted) | `codex`.
+- `review` ∈ `codex` | `off` — overrides the env knob `NIGHT_SHIFT_CODEX_REVIEW`
+  in BOTH directions for this spec only. Omit the role to leave the env knob
+  alone.
+- `plan=codex` / `observer=codex` are rejected at spec selection — those two
+  roles are Claude-only, on purpose: they're the judgment gates that make a
+  second vendor safe at all. The independent Claude observer reviews a
+  codex-implemented candidate exactly like a Claude-implemented one.
+- `implement=codex` with no `codex` CLI on PATH fails LOUDLY at spec
+  selection, not partway through an overnight run.
+
+When to reach for this: a task whose implement grind is cheap/mechanical
+enough that a second vendor's per-token cost or throughput is worth it, and
+where you're comfortable trusting the (still-mandatory) Claude observer as the
+only judgment gate on that work. See `docs/COMMAND-PLAYBOOK.md` §13 for the
+knobs (`NIGHT_SHIFT_CODEX_SANDBOX`, `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL`,
+`NIGHT_SHIFT_CODEX_MAX_RETRY`) and the full contract.
+
+---
+
 ## Design-fidelity specs
 
 If the work must match a Figma design pixel-for-pixel, add a `## Design Contract`
@@ -306,6 +338,8 @@ Before you launch a real run:
 - [ ] Final validation includes a test that **asserts the new behavior's output**,
       and the first-failing test is genuinely RED at baseline.
 - [ ] Considered a `- Smoke:` field if a broken boot could pass static checks.
+- [ ] Considered `- Engines: implement=codex` if this task's implement grind
+      is a good fit for a second vendor (`codex` must be on PATH).
 - [ ] Permissions list every approved dependency/native/migration change explicitly.
 - [ ] Read `<project>/.night-shift/feedback.md` from the last run.
 - [ ] Target repo **gitignores `.night-shift/`** and is on the spec's **feature

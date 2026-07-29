@@ -144,6 +144,28 @@ The engine spends the strong model only where judgment matters. All knobs accept
 The model changes only at stage-scope boundaries (which already start a fresh
 session), so it is constant within a scope and resumes never re-pass it.
 
+## Codex as an implement-stage vendor (opt-in)
+
+A spec can declare `- Engines: implement=codex review=codex` to run its
+implement-stage grind on the Codex CLI instead of Claude, and/or opt the
+advisory per-candidate codex review in/out per spec (overrides
+`NIGHT_SHIFT_CODEX_REVIEW` in both directions — the spec wins). Default (no
+field): claude-only, codex dormant, byte-for-byte today's behavior. Only the
+`implement` role may be `codex`; `plan`/`observer` are Claude-only judgment
+gates and are rejected outright — the independent Claude observer always gates
+the candidate, whichever vendor implemented it.
+
+| Knob | Default | Role |
+|---|---|---|
+| `NIGHT_SHIFT_CODEX_SANDBOX` | `workspace-write` | Sandbox for the codex primary (`-s` fresh / `-c sandbox_mode=...` resume); `danger-full-access` also accepted |
+| `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` | *(empty)* | Codex model override; empty = codex's own configured default |
+| `NIGHT_SHIFT_CODEX_MAX_RETRY` | `2` | Extra attempts (60s apart) on a nonzero codex exit before `block_run` — no Claude-shaped 429 handling for codex in v1 |
+
+`implement=codex` with no `codex` CLI on PATH fails at spec selection, not
+mid-run. A codex turn's usage is journaled on a `codex_primary` event rather
+than the Claude-JSON-shaped cost ledger (`record_cost`), so the viewer's cost
+panel reflects Claude spend only.
+
 ## Layout
 
 ```

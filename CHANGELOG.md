@@ -6,6 +6,38 @@ observer approval.
 
 ## Unreleased
 
+### Codex + Claude engine split (opt-in)
+
+- A spec can now declare `- Engines: implement=codex review=codex` to run its
+  implement-stage grind on the Codex CLI instead of Claude, and/or opt the
+  existing advisory per-candidate codex review in/out per spec (overriding
+  `NIGHT_SHIFT_CODEX_REVIEW` in both directions — the spec always wins). Default
+  (no field) is byte-for-byte today's behavior: Claude-only, codex dormant. This
+  is a narrower, deliberate return of a second vendor than the Codex primary path
+  removed below ("Claude-only flow & observer") — only the implement stage scope
+  can ever be codex; `plan`/`observer` are rejected outright as Claude-only (the
+  judgment gates that make a second vendor safe), so the independent Claude
+  observer still gates every codex-implemented candidate.
+- `invoke_primary` branches to a codex adapter on the implement scope only:
+  fresh turns run `codex exec -s <sandbox> ... --json`, resumes run
+  `codex exec resume <thread> -c sandbox_mode=... --json` (resume rejects `-s`
+  — verified live against codex-cli 0.144.3), and the session id is the
+  `thread.started` thread_id from the captured JSONL stream. No Claude-shaped
+  429 handling for codex in v1: a nonzero exit is retried up to
+  `NIGHT_SHIFT_CODEX_MAX_RETRY` (default 2, 60s apart) before blocking the run.
+  A codex turn's usage is journaled on its own `codex_primary` event rather than
+  the Claude-JSON-shaped cost ledger.
+- The observer prompt, the observer-review wire contract, and
+  `NIGHT_SHIFT_REVIEW.md` now show the TRUE implement vendor in the `primary`
+  field (`"codex"` when a task's spec opted in) instead of always `"claude"`;
+  `observer` stays `"claude"` always. The `--primary` CLI flag is unchanged
+  (still an explicit claude-only flag) — the spec field, not the flag, is the
+  codex opt-in.
+- New knobs: `NIGHT_SHIFT_CODEX_SANDBOX` (default `workspace-write`; the other
+  accepted value is `danger-full-access`), `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL`
+  (default empty — codex's own configured default), `NIGHT_SHIFT_CODEX_MAX_RETRY`
+  (default `2`).
+
 ### Cost & model tiering
 
 - **Per-role model tiering.** The primary plans on `NIGHT_SHIFT_PLAN_MODEL`
