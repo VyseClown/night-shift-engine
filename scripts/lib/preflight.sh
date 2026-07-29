@@ -314,6 +314,98 @@ validate_spec_smoke() {
   return 0
 }
 
+# Optional `- Engines: role=vendor role=vendor` spec field (Codex+Claude engine
+# split): opts the implement stage and/or the advisory codex review into codex.
+# Same bare-token dialect as `- Track:` — no backticks — validated LOUDLY at
+# spec selection (initial select, resume, NEXT_TASK chain), mirroring
+# set_spec_workdir/validate_spec_smoke above. Absent field -> both roles at
+# their default (ENGINE_IMPLEMENT=claude, ENGINE_REVIEW="" — inherit whatever
+# NIGHT_SHIFT_CODEX_REVIEW says), byte-for-byte today's behavior.
+#
+# Grammar: space-separated `role=vendor` pairs, each role at most once.
+#   implement ∈ {claude (default), codex} — the implement STAGE SCOPE vendor
+#     only; plan, observe-request, and completion always stay claude (stage_engine
+#     enforces this regardless of what this field says).
+#   review    ∈ {codex, off} — per-spec override of NIGHT_SHIFT_CODEX_REVIEW;
+#     the spec wins over the env knob in BOTH directions (codex_review_active
+#     below is what actually applies the override — this function only
+#     records which override, if any, the spec asked for, so a later spec in
+#     the same run's NEXT_TASK chain that omits the field is not left with a
+#     stale override from an earlier task).
+#   plan / observer are rejected outright: those are the judgment gates that
+#     make a second vendor safe, and are Claude-only in v1.
+#
+# Side effects on success: sets ENGINE_IMPLEMENT (claude|codex) and ENGINE_REVIEW
+# ("", "codex", or "off") — mirrors set_spec_workdir's WORKDIR side effect. Both
+# are reset unconditionally on every call (never carries over from a previous
+# spec/call), which is what keeps a NEXT_TASK chain from leaking one task's
+# Engines field onto the next task's defaults.
+validate_spec_engines() {
+  local file="$1" raw pair role vendor seen_implement=0 seen_review=0
+  ENGINE_IMPLEMENT="claude"
+  ENGINE_REVIEW=""
+  grep -Eq '^- Engines:' "$file" || return 0
+  raw="$(spec_engines "$file")"
+  if [ -z "$raw" ]; then
+    printf 'malformed Engines field — use: - Engines: implement=claude|codex review=codex|off (space-separated role=vendor pairs)\n' >&2
+    return 1
+  fi
+  for pair in $raw; do
+    case "$pair" in
+      *=*) role="${pair%%=*}"; vendor="${pair#*=}" ;;
+      *) printf 'malformed Engines pair "%s" — use role=vendor (e.g. implement=codex)\n' "$pair" >&2; return 1 ;;
+    esac
+    if [ -z "$role" ] || [ -z "$vendor" ]; then
+      printf 'malformed Engines pair "%s" — use role=vendor (e.g. implement=codex)\n' "$pair" >&2
+      return 1
+    fi
+    case "$role" in
+      plan|observer)
+        printf 'plan and observer are Claude-only (the judgment gates that make a second vendor safe)\n' >&2
+        return 1 ;;
+      implement)
+        if [ "$seen_implement" -ne 0 ]; then
+          printf 'duplicate Engines role: implement\n' >&2; return 1
+        fi
+        seen_implement=1
+        case "$vendor" in
+          claude|codex) ENGINE_IMPLEMENT="$vendor" ;;
+          *) printf 'unknown Engines vendor for implement: %s (valid: claude, codex)\n' "$vendor" >&2; return 1 ;;
+        esac ;;
+      review)
+        if [ "$seen_review" -ne 0 ]; then
+          printf 'duplicate Engines role: review\n' >&2; return 1
+        fi
+        seen_review=1
+        case "$vendor" in
+          codex|off) ENGINE_REVIEW="$vendor" ;;
+          *) printf 'unknown Engines vendor for review: %s (valid: codex, off)\n' "$vendor" >&2; return 1 ;;
+        esac ;;
+      *) printf 'unknown Engines role: %s (valid: implement, review)\n' "$role" >&2; return 1 ;;
+    esac
+  done
+  if [ "$ENGINE_IMPLEMENT" = "codex" ] && ! codex_available; then
+    printf 'Engines implement=codex requires the codex CLI on PATH\n' >&2
+    return 1
+  fi
+  return 0
+}
+
+# Whether the advisory codex review (codex_review_candidate) should run for
+# THIS spec: the spec's own `- Engines: review=...` wins over the env knob in
+# BOTH directions (review=codex turns it on even if NIGHT_SHIFT_CODEX_REVIEW=0;
+# review=off turns it off even if =1); an absent field falls through to the
+# env-configured CODEX_REVIEW exactly as before. ENGINE_REVIEW is reset by
+# validate_spec_engines on every spec selection, so this can never read a
+# stale override from an earlier task in a NEXT_TASK chain.
+codex_review_active() {
+  case "$ENGINE_REVIEW" in
+    codex) return 0 ;;
+    off) return 1 ;;
+    *) [ "$CODEX_REVIEW" = "1" ] ;;
+  esac
+}
+
 run_test_command() {
   local phase="$1" command="$2" target="$3" run_dir="${4:-$PROJECT}" output rc=0 exec_dir
   output="$RUN_ROOT/raw/test-first-$phase.log"

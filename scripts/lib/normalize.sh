@@ -103,6 +103,13 @@ normalize_persona_result() {
 # keeps APPROVE<->findings consistent. This stops a well-meaning verdict from
 # wedging the run on a format nit.
 #
+# $4 (primary), optional, defaults to "claude": the ACTUAL implement vendor for
+# this task (the caller passes stage_engine's answer). Defaulting to "claude"
+# keeps every pre-existing 3-arg call site (fixtures included) byte-for-byte —
+# this field is forced regardless of what the model wrote, so a codex-implement
+# task's observer output must be normalized to "codex" here, not left at
+# whatever normalize_observer_output would otherwise hardcode.
+#
 # TRADEOFF (deliberate): when a finding omits `evidence`/`required_change`, or a
 # BLOCK arrives with no structured finding at all, this fills generic placeholders
 # ("see observer notes", "observer requested changes without a structured
@@ -114,15 +121,15 @@ normalize_persona_result() {
 # --json-schema to force a clean shape: in this CLI it waits on stdin and hangs
 # (see run_observer). Bias: fail-closed on BLOCK, never fabricate an APPROVE.
 normalize_observer_output() {
-  local file="$1" task="$2" candidate="$3" tmp="$1.norm.$$"
-  jq --arg task "$task" --arg candidate "$candidate" "${JQ_VERDICT_PRELUDE}"'
+  local file="$1" task="$2" candidate="$3" primary="${4:-claude}" tmp="$1.norm.$$"
+  jq --arg task "$task" --arg candidate "$candidate" --arg primary "$primary" "${JQ_VERDICT_PRELUDE}"'
     # Prefer the first NON-EMPTY STRING among candidates: a live model (observer
     # included — verified) often sets required_change to a BOOLEAN true, and a plain
     # `//` keeps it -> "true". nonempty() skips non-strings so we fall through to real
     # text (required_change falls back to the finding evidence when no change text).
     {
       observer: "claude",
-      primary: "claude",
+      primary: $primary,
       task: $task,
       candidate_commit: $candidate,
       status: (.status | norm_status),

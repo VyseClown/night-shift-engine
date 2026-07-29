@@ -148,6 +148,22 @@ spec_review_profile() {
     tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
 }
 
+# Extracts the `- Engines: <value>` field from a spec (the Codex+Claude engine
+# split): space-separated `role=vendor` pairs, e.g. `implement=codex
+# review=codex`. Same bare-token dialect as `- Track:` (no backticks) — but
+# UNLIKE spec_track, internal whitespace between pairs is collapsed to single
+# spaces rather than stripped entirely (spec_track's field is one token; this
+# field is several). Normalized to lowercase; trimmed of leading/trailing
+# whitespace; empty when the field is absent. Grammar/vendor/role validation
+# (unknown role, unknown vendor, duplicate role, plan/observer rejection,
+# missing-CLI-for-codex) is validate_spec_engines's job (scripts/lib/
+# preflight.sh) — this function is a bare extractor, like spec_workdir/
+# spec_smoke_field, so a malformed value is never silently swallowed here.
+spec_engines() {
+  spec_field_scope "$1" | sed -nE 's/^- Engines: ?(.*)/\1/p' | head -n 1 |
+    tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g'
+}
+
 # Maps an optional persona to the `## <heading>` whose presence in a spec
 # auto-activates it. The single source of truth for section-based activation;
 # adding an optional persona means adding one line here (and to PERSONAS_OPTIONAL,

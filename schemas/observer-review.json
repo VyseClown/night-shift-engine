@@ -14,7 +14,7 @@
   ],
   "properties": {
     "observer": { "const": "claude" },
-    "primary": { "const": "claude" },
+    "primary": { "enum": ["claude", "codex"] },
     "task": { "type": "string", "minLength": 1 },
     "candidate_commit": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
     "status": { "enum": ["APPROVE", "BLOCK"] },
