@@ -11,6 +11,14 @@ SPEC=""
 # WORKDIR (a common CI variable name) can never leak into workdir_path on
 # paths that skip set_spec_workdir (e.g. --fixture-test).
 WORKDIR=""
+# Engine-owned resolution of the spec's `- Engines:` field (validate_spec_engines,
+# scripts/lib/preflight.sh): the implement-stage vendor and any per-spec review
+# override. Explicitly initialized (same reasoning as WORKDIR above) so a spec
+# with no Engines field — the overwhelming default — behaves byte-for-byte like
+# today: implement stays claude, and the review override is absent (env knob
+# NIGHT_SHIFT_CODEX_REVIEW decides, unmodified).
+ENGINE_IMPLEMENT="claude"
+ENGINE_REVIEW=""
 EXPLICIT_SPEC=0
 FIXTURE_TEST=0
 DRY_RUN=0
@@ -132,6 +140,33 @@ SWEEP_MAX_WAIT="${NIGHT_SHIFT_SWEEP_MAX_WAIT:-900}"
 # pipeline and wire contracts are untouched either way.
 CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
 CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
+# Codex as an IMPLEMENT-stage primary vendor (engine + Codex split design,
+# 2026-07-29): opt-in per spec via `- Engines: implement=codex`, validated at
+# spec selection (validate_spec_engines). These three knobs configure that
+# vendor; they are inert whenever no spec on this run opts in.
+#   CODEX_SANDBOX: the `codex exec -s` sandbox for the fresh turn / the
+#     `-c sandbox_mode=...` override on resume (resume rejects -s — verified
+#     live against codex-cli 0.144.3/0.146.0). Defaults to danger-full-access:
+#     proven LIVE that workspace-write keeps .git read-only under codex's own
+#     policy with no config escape hatch, so a workspace-write implement run
+#     can never `git commit` a candidate — it would fail every time, not just
+#     under stricter validation. danger-full-access is parity with the Claude
+#     primary's own `--permission-mode bypassPermissions`: the engine's real
+#     safety layer is vendor-agnostic (feature-branch confinement, the
+#     wrapper-forbidden git ops, integrity_guard, and the independent observer
+#     gate), not the sandbox flag. workspace-write remains an accepted value
+#     for a future codex version that lifts the .git restriction, but
+#     validate_spec_engines rejects it TODAY for implement=codex (see below)
+#     rather than let a run discover the dead end mid-implementation. Validated
+#     at startup (main_run) against the two values codex actually accepts.
+#   CODEX_IMPLEMENT_MODEL: empty (default) lets codex pick its own configured
+#     model — there is no Claude-shaped model tiering for a second vendor.
+#   CODEX_MAX_RETRY: bounded retries (60s apart, codex_retry_backoff) on a
+#     nonzero exit before block_run. No Claude-shaped 429 parsing in v1 (see
+#     the design doc) — a codex failure is just a failure, retried blindly.
+CODEX_SANDBOX="${NIGHT_SHIFT_CODEX_SANDBOX:-danger-full-access}"
+CODEX_IMPLEMENT_MODEL="${NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL:-}"
+CODEX_MAX_RETRY="${NIGHT_SHIFT_CODEX_MAX_RETRY:-2}"
 # Timeout (seconds) for the spec-declared smoke-run validation phase
 # (run_smoke_phase, scripts/lib/preflight.sh) — how long a server-mode smoke
 # command gets to answer HTTP 200, or an exit-mode smoke command gets to exit.
@@ -431,10 +466,17 @@ json_schema_basic() {
       ' "$file" >/dev/null 2>&1
       ;;
     observer-review)
-      jq -e --argjson okeys "$OBSERVER_REVIEW_KEYS" '
+      # .primary is templated against the ACTUAL implement vendor for this
+      # task (stage_engine implement) rather than hardcoded "claude" — claude
+      # in every fixture/unit-test context that never calls
+      # validate_spec_engines (ENGINE_IMPLEMENT defaults to claude), and
+      # "codex" only for a task whose spec opted implement into codex. This
+      # keeps every pre-existing fixture's literal "claude" expectation
+      # unchanged while making the check truthful for the split-engine case.
+      jq -e --argjson okeys "$OBSERVER_REVIEW_KEYS" --arg primary_vendor "$(stage_engine implement)" '
         type == "object" and
         ((keys | sort) == $okeys) and
-        (.observer == "claude") and (.primary == "claude") and
+        (.observer == "claude") and (.primary == $primary_vendor) and
         (.task | type == "string" and length > 0) and
         (.candidate_commit | type == "string" and test("^[0-9a-f]{7,64}$")) and
         (.status | IN("APPROVE","BLOCK")) and
@@ -929,6 +971,7 @@ initialize_run() {
   [ ! -s "$RUN_ROOT/control/conventions.md" ] || integrity_put "$RUN_ROOT/control/conventions.md"
   write_json_atomic "$STATE" '{
       run_id:$run_id,status:"running",primary:$primary,observer:$observer,
+      engines:{implement:$engine_implement,review:($engine_review|if .=="" then null else . end)},
       session_id:null,task:$task,stage:"planning",stage_turns:0,
       primary_turns:0,task_turns:0,stage_started_at:$epoch,
       task_started_at:$epoch,started_at:$iso,updated_at:$iso,
@@ -940,6 +983,7 @@ initialize_run() {
       malformed_signal_consecutive:0
     }' \
     --arg run_id "$RUN_ID" --arg primary "$PRIMARY" --arg observer "$OBSERVER" \
+    --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" \
     --arg task "$SPEC" --argjson epoch "$(now_epoch)" --arg iso "$(now_iso)" \
     --arg base "$BASE_COMMIT" --arg branch "$BASE_BRANCH" \
     --arg baseline_status "$BASE_STATUS" ||
@@ -986,7 +1030,9 @@ initialize_run() {
   state_set '.baseline_complete=true'
   emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
     --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
-    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs}}')"
+    --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" \
+    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs},
+      engines:{implement:$engine_implement, review:($engine_review|if .=="" then null else . end)}}')"
 }
 
 recover_run() {
@@ -1028,6 +1074,7 @@ recover_run() {
   SPEC="$(jq -r '.task' "$STATE")"
   set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
   validate_spec_smoke "$SPEC" || die "resumed spec Smoke field is invalid"
+  validate_spec_engines "$SPEC" || die "resumed spec Engines field is invalid"
   OBSERVER="$(jq -r '.observer' "$STATE")"
   BASE_COMMIT="$(jq -r '.base_commit' "$STATE")"
   BASE_BRANCH="$(jq -r '.base_branch' "$STATE")"
@@ -1372,13 +1419,35 @@ stage_model() {
   esac
 }
 
+# Pure (reads ENGINE_IMPLEMENT, set by validate_spec_engines at spec selection):
+# the vendor that runs a given session scope's primary turn. Only the implement
+# scope can ever be codex — plan, observe, and complete stay claude even when a
+# spec opts implement into codex, because those are the low-token judgment/
+# wire-contract turns (plan quality bounds the whole run; the observer gating a
+# codex implement is the entire point of the split — a second vendor is only
+# safe because a strong Claude observer independently re-checks its work).
+# Unset ENGINE_IMPLEMENT (any fixture/unit-test context that never calls
+# validate_spec_engines) defaults to claude via the parameter expansion below,
+# so every pre-existing call site keeps behaving exactly as before.
+stage_engine() {
+  case "$1" in
+    implement) printf '%s' "${ENGINE_IMPLEMENT:-claude}" ;;
+    *) printf 'claude' ;;
+  esac
+}
+
 primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
-  local rejection_note malformed_prev doc_freshness_note
+  local rejection_note malformed_prev doc_freshness_note turn_vendor
   stage="$(jq -r '.stage' "$STATE")"
   expected="$(expected_action "$stage")"
+  # The vendor actually running THIS turn — claude for every scope except an
+  # implement scope a spec opted into codex (stage_engine). Told to the model
+  # honestly rather than always saying "claude", which would be wrong (and
+  # confusing) for a codex implement session.
+  turn_vendor="$(stage_engine "$(stage_session_scope "$stage")")"
   turns="$(jq -r '.stage_turns' "$STATE")"
   remaining=$((MAX_STAGE_TURNS - turns))
   active="$(resolve_active_personas "$SPEC")" || block_run "cannot resolve review profile for $SPEC"
@@ -1486,7 +1555,7 @@ screen to match its Figma design. Before/while implementing:
   [ -z "${WORKDIR:-}" ] ||
     workdir_note="Workdir: run ALL spec validation/test commands from $PROJECT/$WORKDIR (the engine runs its own copies there too)."
   cat >"$prompt" <<EOF
-You are the fixed $PRIMARY primary for night-shift run $RUN_ID.
+You are the fixed $turn_vendor primary for night-shift run $RUN_ID.
 Project: $PROJECT
 Task spec: $SPEC
 Current stage: $stage
@@ -1572,11 +1641,148 @@ autonomously for anything else.
 EOF
 }
 
+# Pure: print the "--model NAME" argument for codex_exec's model flag, or
+# nothing when CODEX_IMPLEMENT_MODEL is empty/inherit (codex picks its own
+# configured default — there is no Claude-shaped model tiering for a second
+# vendor). Same word-splitting contract as model_flag above: unquoted at the
+# call site so it either expands to `--model X` or vanishes entirely.
+codex_model_flag() {
+  case "${CODEX_IMPLEMENT_MODEL:-}" in
+    ""|inherit) ;;
+    *) printf -- '--model %s' "$CODEX_IMPLEMENT_MODEL" ;;
+  esac
+}
+
+# One codex primary turn: fresh (`codex exec -s ...`) when $session is empty,
+# resume (`codex exec resume $session ...`) otherwise. Captures the whole
+# `--json` JSONL stream to $raw (thread.started/turn.started/item.*/
+# turn.completed — the exact shape captured live against codex-cli 0.144.3,
+# also verified against 0.146.0; see the codex-capture/ scratchpad fixtures
+# this shim was built from) and the last agent message to $raw.last (codex's
+# own -o flag); stderr is noisy even on rc=0 (model-cache/MCP warnings) so it
+# is kept SEPARATELY in $raw.err and never parsed. Returns codex's own exit
+# status; the caller (invoke_primary_codex) owns retry policy. Mirrors
+# invoke_observer_once's contract: side effects on disk, a plain return code,
+# no stdout payload.
+#
+# NOTE (verified live): `codex exec resume` REJECTS -s outright, so the
+# sandbox must be re-asserted via the `-c sandbox_mode=...` config override on
+# resume — and that value must track $CODEX_SANDBOX, never be hardcoded to
+# "workspace-write", so a danger-full-access run stays consistent across a
+# resume. The `sandbox_workspace_write.network_access=true` override is
+# carried on both paths for the same reason: it is scoped under the
+# sandbox_workspace_write config table, so it is simply inert whenever the
+# active sandbox is danger-full-access.
+#
+# NOTE (verified live, UNLIKE the Claude primary): codex re-resolves the model
+# per invocation instead of carrying it from the session that created a
+# thread — `claude --resume` carries its creation model forward (see the
+# comment in invoke_primary), but `codex exec resume` does not, so a resume
+# call that omits --model silently reverts to codex's configured default after
+# turn 1 even when NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL is set. codex_model_flag
+# is therefore passed on BOTH the fresh and the resume invocation below
+# (`codex exec resume` accepts -m/--model — verified in its --help).
+invoke_primary_codex_once() {
+  local prompt="$1" raw="$2" session="${3:-}" rc=0
+  if [ -z "$session" ]; then
+    # codex_model_flag must word-split into `--model X` (or vanish when empty).
+    # shellcheck disable=SC2046
+    (cd "$PROJECT" && codex exec -s "$CODEX_SANDBOX" \
+        -c sandbox_workspace_write.network_access=true \
+        --json -o "$raw.last" $(codex_model_flag) - <"$prompt") \
+      >"$raw" 2>"$raw.err" || rc=$?
+  else
+    # shellcheck disable=SC2046
+    (cd "$PROJECT" && codex exec resume "$session" \
+        -c "sandbox_mode=\"$CODEX_SANDBOX\"" \
+        -c sandbox_workspace_write.network_access=true \
+        --json -o "$raw.last" $(codex_model_flag) - <"$prompt") \
+      >"$raw" 2>"$raw.err" || rc=$?
+  fi
+  return "$rc"
+}
+
+# Pure(ish; reads $1 off disk): the codex thread id from a captured --json
+# stream — always the FIRST thread.started line (a resume re-emits the SAME
+# thread_id as its own first line, which is exactly what the session-drift
+# check below relies on). Empty when absent/unparseable (a nonzero-rc turn may
+# emit no thread.started at all).
+codex_thread_id() {
+  jq -r 'select(.type=="thread.started") | .thread_id' "$1" 2>/dev/null | head -1
+}
+
+# Pure(ish; reads $1 off disk): the turn.completed usage object as compact
+# JSON, or the literal string "null" when absent/unparseable — never empty, so
+# callers can always splice it straight into a jq --argjson.
+codex_turn_usage() {
+  local u
+  u="$(jq -c 'select(.type=="turn.completed") | .usage' "$1" 2>/dev/null | tail -1)"
+  [ -n "$u" ] && [ "$u" != "null" ] || u="null"
+  printf '%s' "$u"
+}
+
+# The codex bounded-retry backoff (60s between attempts). Extracted to its own
+# seam — exactly like wait_for_rate_limit_reset/handle_rate_limit_wait already
+# do for the Claude rate-limit path — so fixtures can override it to a no-op
+# instead of a live sleep.
+codex_retry_backoff() { sleep 60; }
+
+# Bounded-retry codex primary turn (the codex counterpart of the Claude while
+# loop inside invoke_primary): NIGHT_SHIFT_CODEX_MAX_RETRY (default 2) extra
+# attempts, 60s apart via codex_retry_backoff. No Claude-shaped 429 parsing in
+# v1 (see the design note) — codex has no structured session-limit response to
+# detect, so a nonzero rc is retried blindly up to the cap. Journals one
+# codex_primary event per attempt ({outcome, rc, attempt, usage}); usage is
+# only meaningful on a successful attempt (a failed attempt may have no
+# turn.completed at all, hence "null"). On success prints the emitted thread
+# id on stdout (the caller command-substitutes it, the same out/return split
+# invoke_observer_once uses) and returns 0.
+#
+# On exhausting the retry budget this function does NOT call block_run itself
+# — it writes the informative reason to "$raw.block-reason" and returns 1.
+# This function is always invoked as `emitted="$(invoke_primary_codex ...)"`
+# (a command substitution): calling block_run FROM INSIDE that subshell would
+# only unwind the subshell (block_run ends in `die`, i.e. `exit`), so the
+# journal + state.json block_reason it writes would be discarded once the
+# subshell exits — the parent shell would then continue past the assignment
+# with an empty $emitted, fall through to invoke_primary's own
+# "primary emitted no resumable session ID" check, and call block_run a SECOND
+# time with a generic reason that clobbers the real one (empirically
+# reproduced: two review agents independently hit this — a double-journaled
+# run_blocked event and a useless block_reason in state.json). The single call
+# site that matters is the PARENT (invoke_primary's codex branch), which reads
+# this file back on a nonzero return.
+invoke_primary_codex() {
+  local prompt="$1" raw="$2" session="${3:-}" attempt=0 rc emitted usage reason
+  while :; do
+    rc=0
+    invoke_primary_codex_once "$prompt" "$raw" "$session" || rc=$?
+    emitted="$(codex_thread_id "$raw")"
+    usage="$(codex_turn_usage "$raw")"
+    if [ "$rc" -eq 0 ] && [ -n "$emitted" ]; then
+      emit_event codex_primary "$(jq -cn --arg o "success" --argjson rc "$rc" --argjson a "$attempt" --argjson u "$usage" \
+        '{outcome:$o, rc:$rc, attempt:$a, usage:$u}')"
+      printf '%s' "$emitted"
+      return 0
+    fi
+    emit_event codex_primary "$(jq -cn --arg o "error" --argjson rc "$rc" --argjson a "$attempt" --argjson u "$usage" \
+      '{outcome:$o, rc:$rc, attempt:$a, usage:$u}')"
+    if [ "$attempt" -ge "$CODEX_MAX_RETRY" ]; then
+      reason="codex primary failed after $((attempt + 1)) attempt(s) (rc=$rc); see $raw.err"
+      printf '%s' "$reason" >"$raw.block-reason"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    log "codex primary turn failed (rc=$rc); retry $attempt/$CODEX_MAX_RETRY in 60s"
+    codex_retry_backoff
+  done
+}
+
 invoke_primary() {
   # Declare then assign separately so a jq failure on $STATE is not masked by
   # local's own (always-zero) exit status — the discipline used in enforce_limits
   # and state_int.
-  local turn prompt raw
+  local turn prompt raw engine
   turn="$(jq -r '.primary_turns + 1' "$STATE")" ||
     block_run "could not read .primary_turns from state; state may be corrupt"
   prompt="$RUN_ROOT/prompts/primary-$turn.txt"
@@ -1590,57 +1796,73 @@ invoke_primary() {
   session="$(jq -r '.session_id // empty' "$STATE")"
   session="$(maybe_refresh_session "$session")"
   primary_prompt "$prompt"
-  # Model for this stage's scope, pinned only on a FRESH start. A session is born
-  # inside one scope and the model is constant within a scope (a scope boundary
-  # already nulls .session_id and starts a fresh session), so a --resume — whether
-  # a turn-to-turn continue, a rate-limit retry, or recovery of a blocked run —
-  # already carries its creation model and must NOT re-pass --model. This keeps
-  # resume robust regardless of whether the CLI accepts --model alongside --resume.
-  # resolve_effective_model maps the knob through state's .model_fallbacks (a
-  # per-model 429 fallback recorded earlier in the run under
-  # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
-  model="$(resolve_effective_model "$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")")"
+  engine="$(stage_engine "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
-  while :; do
-    rc=0
-    # The primary must edit files and run commands unattended, so it runs in a
-    # non-interactive permission mode. Safe because the run is confined to a
-    # feature branch and the wrapper forbids push/merge/destructive Git ops and
-    # excludes pre-existing dirt from candidate commits.
-    if [ -z "$session" ]; then
-      # model_flag must word-split into `--model X` (or vanish when empty).
-      # shellcheck disable=SC2046
-      (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
-        --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
-    else
-      (cd "$PROJECT" && claude -p --resume "$session" --permission-mode bypassPermissions \
-        --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
-    fi
-    emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
-    [ "$rc" -ne 0 ] || break
-    if is_rate_limit_response "$raw" &&
-      [ -n "$emitted" ] &&
-      { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then
-      # Session limit with a parseable reset: count, cap, journal, and sleep it
-      # out (handle_rate_limit_wait, lib/recovery.sh — the extracted, unchanged
-      # production wait path), then retry pinned to the emitted session.
-      handle_rate_limit_wait "$raw"
-      session="$emitted"
-      continue
-    fi
-    if is_per_model_limit_response "$raw"; then
-      # Per-model usage cap: no reset time exists, so waiting cannot clear it.
-      # Default → block_run (inside the handler) with an actionable reason.
-      # NIGHT_SHIFT_MODEL_FALLBACK=1 → the handler records the fallback in
-      # state's .model_fallbacks, nulls the session, journals model_fallback,
-      # and returns: retry FRESH on the successor model.
-      handle_per_model_limit "$raw" "$model"
-      session=""
-      model="$(resolve_effective_model "$model")"
-      continue
-    fi
-    block_run "primary command failed with status $rc"
-  done
+  if [ "$engine" = "codex" ]; then
+    # Bounded retry lives inside invoke_primary_codex; a successful call
+    # prints a non-empty thread id, so the only thing left to check below is
+    # the drift guard. On retry exhaustion invoke_primary_codex returns 1
+    # WITHOUT calling block_run itself (see its own comment for why: block_run
+    # from inside this command substitution's subshell would only unwind the
+    # subshell) — the single, authoritative block_run call for that path lives
+    # HERE, in the parent shell, reading back the informative reason it left
+    # at "$raw.block-reason". This is the ONLY block_run call on the codex
+    # exhaustion path; a missing reason file (should not happen, but fails
+    # safe) falls back to a generic message naming $raw for forensics.
+    emitted="$(invoke_primary_codex "$prompt" "$raw" "$session")" ||
+      block_run "$(cat "$raw.block-reason" 2>/dev/null || printf 'codex primary failed; see %s.err' "$raw")"
+  else
+    # Model for this stage's scope, pinned only on a FRESH start. A session is born
+    # inside one scope and the model is constant within a scope (a scope boundary
+    # already nulls .session_id and starts a fresh session), so a --resume — whether
+    # a turn-to-turn continue, a rate-limit retry, or recovery of a blocked run —
+    # already carries its creation model and must NOT re-pass --model. This keeps
+    # resume robust regardless of whether the CLI accepts --model alongside --resume.
+    # resolve_effective_model maps the knob through state's .model_fallbacks (a
+    # per-model 429 fallback recorded earlier in the run under
+    # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
+    model="$(resolve_effective_model "$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")")"
+    while :; do
+      rc=0
+      # The primary must edit files and run commands unattended, so it runs in a
+      # non-interactive permission mode. Safe because the run is confined to a
+      # feature branch and the wrapper forbids push/merge/destructive Git ops and
+      # excludes pre-existing dirt from candidate commits.
+      if [ -z "$session" ]; then
+        # model_flag must word-split into `--model X` (or vanish when empty).
+        # shellcheck disable=SC2046
+        (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
+          --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+      else
+        (cd "$PROJECT" && claude -p --resume "$session" --permission-mode bypassPermissions \
+          --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+      fi
+      emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
+      [ "$rc" -ne 0 ] || break
+      if is_rate_limit_response "$raw" &&
+        [ -n "$emitted" ] &&
+        { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then
+        # Session limit with a parseable reset: count, cap, journal, and sleep it
+        # out (handle_rate_limit_wait, lib/recovery.sh — the extracted, unchanged
+        # production wait path), then retry pinned to the emitted session.
+        handle_rate_limit_wait "$raw"
+        session="$emitted"
+        continue
+      fi
+      if is_per_model_limit_response "$raw"; then
+        # Per-model usage cap: no reset time exists, so waiting cannot clear it.
+        # Default → block_run (inside the handler) with an actionable reason.
+        # NIGHT_SHIFT_MODEL_FALLBACK=1 → the handler records the fallback in
+        # state's .model_fallbacks, nulls the session, journals model_fallback,
+        # and returns: retry FRESH on the successor model.
+        handle_per_model_limit "$raw" "$model"
+        session=""
+        model="$(resolve_effective_model "$model")"
+        continue
+      fi
+      block_run "primary command failed with status $rc"
+    done
+  fi
   [ -n "$emitted" ] || block_run "primary emitted no resumable session ID"
   if [ -n "$session" ] && [ "$emitted" != "$session" ]; then
     block_run "primary session ID changed from $session to $emitted"
@@ -1655,7 +1877,11 @@ invoke_primary() {
     .rate_limit_consecutive=0 |
     .updated_at=$now
   ' --arg session "$emitted" --arg now "$(now_iso)"
-  record_cost "$raw" "$(basename "$raw")"
+  # record_cost is Claude-JSON-shaped (.total_cost_usd/.usage from `claude
+  # --output-format json`); a codex turn's cost was already journaled as
+  # usage on the codex_primary event inside invoke_primary_codex, so skip it
+  # here rather than feed record_cost a JSONL stream it cannot parse.
+  [ "$engine" = "codex" ] || record_cost "$raw" "$(basename "$raw")"
   enforce_elapsed_limits
 }
 
@@ -3027,14 +3253,16 @@ doc_freshness_section() {
 # the missing-CLI path untestable on machines that have codex installed.)
 codex_available() { command -v codex >/dev/null 2>&1; }
 
-# One advisory external review per candidate (NIGHT_SHIFT_CODEX_REVIEW=1; see
-# the knob comment). Runs `codex exec -s read-only` on spec + committed-range
-# diff with a portable watchdog (macOS has no coreutils `timeout`), captures
-# to validated/, integrity-anchors, and journals the outcome. EVERY failure
-# mode returns 0 — this must never gate or block a run.
+# One advisory external review per candidate, gated by codex_review_active
+# (NIGHT_SHIFT_CODEX_REVIEW, overridable per spec by `- Engines: review=codex|off`
+# — see the knob comment and validate_spec_engines). Runs `codex exec -s
+# read-only` on spec + committed-range diff with a portable watchdog (macOS has
+# no coreutils `timeout`), captures to validated/, integrity-anchors, and
+# journals the outcome. EVERY failure mode returns 0 — this must never gate or
+# block a run.
 codex_review_candidate() {
   local candidate="$1" out prompt rc=0 pid wd
-  [ "$CODEX_REVIEW" = "1" ] || return 0
+  codex_review_active || return 0
   out="$RUN_ROOT/validated/codex-review-$candidate.md"
   [ ! -s "$out" ] || return 0
   if ! codex_available; then
@@ -3085,11 +3313,18 @@ codex_review_section() {
 }
 
 observer_prompt() {
-  local context="$1" candidate="$2" retry_note="${3:-}"
+  local context="$1" candidate="$2" retry_note="${3:-}" primary_vendor
   retry_note="$(rejection_preamble "$retry_note")"
+  # The observer is ALWAYS claude (the judgment gate that makes any primary
+  # vendor safe); the implementer is whichever vendor actually ran this task's
+  # implement stage (stage_engine) — claude by default, codex only when the
+  # spec's `- Engines:` field opted in. Templated here instead of hardcoded so
+  # the observer is told the truth rather than always "claude".
+  primary_vendor="$(stage_engine implement)"
   cat <<EOF
-You are an independent Claude observer reviewing another Claude session's work.
-You share no context with the implementer; judge only the supplied evidence.
+You are an independent Claude observer reviewing another session's work
+(implementer vendor: $primary_vendor). You share no context with the
+implementer; judge only the supplied evidence.
 $retry_note
 The sections marked "authoritative" (the engine-computed base..candidate diff and
 the engine-run validation) are ground truth produced by the wrapper, not the
@@ -3103,11 +3338,12 @@ Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:
 
 \`\`\`json
-{"observer":"claude","primary":"claude","task":"$SPEC","candidate_commit":"$candidate","status":"APPROVE","findings":[],"documentation_changes":[]}
+{"observer":"claude","primary":"$primary_vendor","task":"$SPEC","candidate_commit":"$candidate","status":"APPROVE","findings":[],"documentation_changes":[]}
 \`\`\`
 
 Rules for that JSON object:
-- "observer" and "primary" are both "claude"; "task" and "candidate_commit" are
+- "observer" is "claude"; "primary" is exactly "$primary_vendor" (the vendor
+  that ran this task's implement stage); "task" and "candidate_commit" are
   exactly the values above.
 - "status" is EXACTLY "APPROVE" or "BLOCK" — there is no other value. To request
   changes, use "BLOCK" (not "REQUEST_CHANGES"). Use ONLY the seven keys shown
@@ -3379,11 +3615,15 @@ validated_observer_retry() {
     # the success path we return 0 below WITHOUT a second record_cost call,
     # so there is no double-counting.
     record_cost "$raw.$attempt" "$(basename "$raw")"
-    normalize_observer_output "$out" "$SPEC" "$candidate"
+    normalize_observer_output "$out" "$SPEC" "$candidate" "$(stage_engine implement)"
     enforce_elapsed_limits
+    # .primary is checked against the task's ACTUAL implement vendor
+    # (stage_engine implement), not the CLI's $PRIMARY flag — $PRIMARY stays
+    # "claude" always (the flag's semantics are unchanged), but the implement
+    # vendor is "codex" when this task's spec opted in via `- Engines:`.
     if json_schema_basic observer-review "$out" &&
       [ "$(jq -r '.observer' "$out")" = "$OBSERVER" ] &&
-      [ "$(jq -r '.primary' "$out")" = "$PRIMARY" ] &&
+      [ "$(jq -r '.primary' "$out")" = "$(stage_engine implement)" ] &&
       { [ "$(jq -r '.task' "$out")" = "$SPEC" ] ||
         [ "$(basename "$(jq -r '.task' "$out")")" = "$(basename "$SPEC")" ]; } &&
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
@@ -3475,7 +3715,7 @@ complete_run() {
   integrity_guard "$RUN_ROOT/events.jsonl" events "the decision journal"
   emit_event run_complete null
   state_set '.status="complete" | .completed_at=$now | .updated_at=$now' --arg now "$(now_iso)"
-  jq '{run_id,status,primary,observer,task,base_commit,candidate_commits,
+  jq '{run_id,status,primary,observer,engines,task,base_commit,candidate_commits,
     primary_turns,review_round,finding_ids,started_at,completed_at}' "$STATE" >"$summary"
   # Log completion BEFORE compacting so the line reaches the archived run.log;
   # afterwards drop RUN_ROOT so no late log line can recreate files inside the
@@ -3548,6 +3788,13 @@ EOF
   # re-surfaces the real problem instead of re-driving the completed task.
   set_spec_workdir "$SPEC" || block_run "next TODO spec has an invalid Workdir"
   validate_spec_smoke "$SPEC" || block_run "next TODO spec has an invalid Smoke field"
+  validate_spec_engines "$SPEC" || block_run "next TODO spec has an invalid Engines field"
+  # Refresh the recorded .engines for the NEW spec — the state_set above (run
+  # BEFORE this spec's own validate_spec_engines call) still carried whichever
+  # task ran last, so this task's own resolved engines are persisted here
+  # instead, once ENGINE_IMPLEMENT/ENGINE_REVIEW reflect the new spec.
+  state_set '.engines={implement:$engine_implement,review:($engine_review|if .=="" then null else . end)} | .updated_at=$now' \
+    --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" --arg now "$(now_iso)"
   check_branch_and_worktree "$SPEC" ||
     block_run "next task branch or worktree routing is unsafe"
   baseline_commands="$(extract_validation_commands "$SPEC" "Baseline validation commands")"
@@ -3605,6 +3852,16 @@ main_run() {
   case "$SMOKE_TIMEOUT" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_SMOKE_TIMEOUT must be a non-negative integer" ;;
   esac
+  # Validated at startup regardless of whether any spec on this run actually
+  # opts a stage into codex — same posture as the two checks above: fail loud
+  # and early, never mid-run inside invoke_primary_codex.
+  case "$CODEX_SANDBOX" in
+    workspace-write|danger-full-access) ;;
+    *) die "NIGHT_SHIFT_CODEX_SANDBOX must be workspace-write or danger-full-access" ;;
+  esac
+  case "$CODEX_MAX_RETRY" in
+    ''|*[!0-9]*) die "NIGHT_SHIFT_CODEX_MAX_RETRY must be a non-negative integer" ;;
+  esac
 
   # Acquire a per-project lock BEFORE touching state.json; two concurrent runs
   # on the same --project would otherwise corrupt the shared state. The lock
@@ -3635,6 +3892,7 @@ main_run() {
       die "spec Project path does not match --project"
     set_spec_workdir "$SPEC" || die "spec Workdir is invalid"
     validate_spec_smoke "$SPEC" || die "spec Smoke field is invalid"
+    validate_spec_engines "$SPEC" || die "spec Engines field is invalid"
     check_branch_and_worktree "$SPEC" ||
       die "current branch or worktree does not safely match the spec"
     initialize_run

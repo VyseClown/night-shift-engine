@@ -144,6 +144,36 @@ The engine spends the strong model only where judgment matters. All knobs accept
 The model changes only at stage-scope boundaries (which already start a fresh
 session), so it is constant within a scope and resumes never re-pass it.
 
+## Codex as an implement-stage vendor (opt-in)
+
+A spec can declare `- Engines: implement=codex review=codex` to run its
+implement-stage grind on the Codex CLI instead of Claude, and/or opt the
+advisory per-candidate codex review in/out per spec (overrides
+`NIGHT_SHIFT_CODEX_REVIEW` in both directions — the spec wins). Default (no
+field): claude-only, codex dormant, byte-for-byte today's behavior. Only the
+`implement` role may be `codex`; `plan`/`observer` are Claude-only judgment
+gates and are rejected outright — the independent Claude observer always gates
+the candidate, whichever vendor implemented it.
+
+| Knob | Default | Role |
+|---|---|---|
+| `NIGHT_SHIFT_CODEX_SANDBOX` | `danger-full-access` | Sandbox for the codex primary (`-s` fresh / `-c sandbox_mode=...` resume); `workspace-write` also accepted but cannot complete the implement pipeline today (see below) |
+| `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` | *(empty)* | Codex model override; empty = codex's own configured default; passed on both the fresh AND the resume invocation |
+| `NIGHT_SHIFT_CODEX_MAX_RETRY` | `2` | Extra attempts (60s apart) on a nonzero codex exit before `block_run` — no Claude-shaped 429 handling for codex in v1 |
+
+`implement=codex` with no `codex` CLI on PATH fails at spec selection, not
+mid-run. `danger-full-access` is the default because codex keeps `.git`
+read-only under `workspace-write`, with no config escape hatch — a
+workspace-write implement run could never `git commit` a candidate. It is
+parity with the Claude primary's own `--permission-mode bypassPermissions`:
+the engine's real safety layer (feature-branch confinement, wrapper-forbidden
+git ops, `integrity_guard`, the independent observer gate) is vendor-agnostic.
+`implement=codex` also requires `NIGHT_SHIFT_SESSION_SCOPE=stage` (the
+default) — vendor-specific session ids never cross vendors. Both are validated
+loudly at spec selection. A codex turn's usage is journaled on a
+`codex_primary` event rather than the Claude-JSON-shaped cost ledger
+(`record_cost`), so the viewer's cost panel reflects Claude spend only.
+
 ## Layout
 
 ```

@@ -49,6 +49,19 @@ plan AND observer on the strongest available even when implement stays
 `sonnet`. Fixture/dry runs (`--fixture-test`, `--dry-run`) never need a model
 choice at all. The global per-project defaults live in `~/.claude/CLAUDE.md`.
 
+**Codex sits outside this tiering entirely.** A spec's `- Engines:
+implement=codex` field opts ONLY the implement session scope onto the Codex
+CLI (`NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL`, no relation to `NIGHT_SHIFT_PLAN_MODEL`/
+`NIGHT_SHIFT_IMPLEMENT_MODEL` — those are Claude `--model` names and codex has its
+own model namespace). Nothing else in this table changes: `plan`/`observer` stay
+Claude and stay on their own knobs regardless of what a task's `implement` role
+says, and `NIGHT_SHIFT_OBSERVER_MODEL`'s "never weaker than the implement model"
+ruling still holds — it just means "never weaker than whichever Claude model
+would have run implement," since a codex implement has no Claude-model tier to
+compare against. The Claude observer is what makes a codex implement safe at
+all: it independently re-reviews the candidate exactly like a Claude-implemented
+one, so this split never trades away the strong final gate.
+
 ## Workspace Map
 
 The **night-shift engine repo** (`night-shift-engine/` — the orchestrator
@@ -153,7 +166,34 @@ directory; run engine/workflow git inside the engine directory.
   NON-gating evidence (`NIGHT_SHIFT_CODEX_TIMEOUT`, default 300s). Missing
   CLI / failure / timeout skip cleanly and are journaled (`codex_review`
   events). The verdict pipeline stays Claude-only either way — leave this off
-  unless you deliberately want a second vendor's perspective.
+  unless you deliberately want a second vendor's perspective. A spec's own
+  `- Engines: review=codex|off` field overrides this env knob per task, in
+  either direction (see the next bullet).
+- **Codex as the implement-stage vendor (opt-in, default OFF):** a spec
+  declares `- Engines: implement=codex review=codex` in its `## Review`
+  section (same bare-token dialect as `- Track:`) to run ONLY its implement
+  stage grind on the Codex CLI instead of Claude; `plan`/`observer` are
+  rejected outright as Claude-only roles (`stage_engine` enforces this
+  regardless of the field), so the independent Claude observer still gates
+  every candidate. Absent field: byte-for-byte today's behavior. Knobs:
+  `NIGHT_SHIFT_CODEX_SANDBOX` (default `danger-full-access`; also accepts
+  `workspace-write` — the `codex exec -s` sandbox for a fresh turn, or the
+  `-c sandbox_mode=...` override on resume, since resume rejects `-s` —
+  `workspace-write` is REJECTED at spec selection for `implement=codex`:
+  codex keeps `.git` read-only under it with no escape hatch, so an implement
+  run could never commit a candidate; `danger-full-access` is parity with the
+  Claude primary's own `--permission-mode bypassPermissions`, the engine's real
+  safety layer being vendor-agnostic either way),
+  `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` (default empty = codex's own configured
+  default; passed on BOTH the fresh and the resume invocation, since codex
+  re-resolves its model per call unlike `claude --resume`),
+  `NIGHT_SHIFT_CODEX_MAX_RETRY` (default `2` extra attempts, 60s apart, before
+  `block_run` — no Claude-shaped 429 handling for codex in v1).
+  `implement=codex` with no `codex` CLI on PATH, under
+  `NIGHT_SHIFT_CODEX_SANDBOX=workspace-write`, or under
+  `NIGHT_SHIFT_SESSION_SCOPE` other than the default `stage` (vendor-specific
+  session ids never cross vendors) all fail at spec selection, not mid-run.
+  See `docs/COMMAND-PLAYBOOK.md` §13 for the full contract.
 - **Run feedback (default ON):** at every run's completion (before the branch
   sweep block below, and regardless of `NIGHT_SHIFT_BRANCH_SWEEP`), a short
   fresh session distills the run's journal into 5-15 bullets for the human who

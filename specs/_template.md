@@ -92,6 +92,20 @@ any other active persona.
        - Personas: Performance Expert, Security Reviewer
 -->
 
+<!-- OPTIONAL: run this task's implement stage on Codex instead of Claude,
+     and/or override the NIGHT_SHIFT_CODEX_REVIEW advisory-review knob for
+     just this spec. Absent (the default): claude-only, codex dormant — same
+     as leaving this out entirely. `implement=codex` requires the codex CLI on
+     PATH, NIGHT_SHIFT_CODEX_SANDBOX=danger-full-access (the default — codex
+     keeps .git read-only under workspace-write, so it could never commit a
+     candidate), and NIGHT_SHIFT_SESSION_SCOPE=stage (the default — vendor
+     session ids never cross vendors); all checked at spec selection, not
+     mid-run. `plan`/`observer` are
+     Claude-only and rejected if named here — the independent Claude observer
+     always gates the candidate. Example (indented so it is not parsed):
+       - Engines: implement=codex review=codex
+-->
+
 Every persona that ends up active (whether via profile, explicit `- Personas:`,
 or an optional reviewer) must own a line under "Documentation owned by each
 review persona" below.

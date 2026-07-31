@@ -150,6 +150,10 @@ run_dry_fixtures() {
   fixture_assert "conventions are snapshot-frozen, indented (no section forgery), provenance-labeled" fixture_conventions_hardening "$root"
   fixture_assert "truncate_to_budget: marker survives a cut landing on newline bytes" fixture_truncate_budget "$root"
   fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
+  fixture_assert "Engines field: parse/validate grammar, stage_engine scope restriction, review override" fixture_engines_field "$root"
+  fixture_assert "codex primary: fresh/resume invocation shape + thread id/usage parsing (shim + real capture)" fixture_codex_primary_invoke "$root"
+  fixture_assert "codex primary: bounded retry journals per attempt, blocks on exhaustion, succeeds on retry" fixture_codex_primary_retry "$root"
+  fixture_assert "codex primary dispatch: invoke_primary routes to codex, tracks session/turns, drift guard, single-block contract" fixture_codex_primary_dispatch "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
   fixture_assert "Smoke phase: field parsing/validation, exit + server modes, timeout/abort leave no zombie" fixture_smoke_phase "$root"
@@ -733,6 +737,19 @@ fixture_review_fields_scoped() {
 - Personas: Web Architect'
   active="$(resolve_active_personas "$spec")" || return 1
   [ "$(printf '%s' "$active" | tr '|' '\n' | grep -c .)" -eq 6 ] || return 1
+  printf '%s' "$active" | grep -q "Web Architect" && return 1
+  printf '%s' "$active" | grep -q "Mobile UX Designer" || return 1
+
+  # Blast radius of spec_field_scope's fence-skipping (added for the Engines
+  # field): Track/Personas/Review Profile share the same function, so a
+  # fenced EXAMPLE line inside ## Review must not override the real field for
+  # them either.
+  fixture_write_min_spec "$spec" 'Example:
+```
+- Personas: Web Architect
+```
+- Personas: Mobile UX Designer'
+  active="$(resolve_active_personas "$spec")" || return 1
   printf '%s' "$active" | grep -q "Web Architect" && return 1
   printf '%s' "$active" | grep -q "Mobile UX Designer" || return 1
   return 0
@@ -1675,7 +1692,7 @@ fixture_event_stream() {
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
     stage_transition codex_review model_fallback reuse_violation port_audit smoke \
-    sweep sweep_fix sweep_fix_reverted run_feedback test_audit; do
+    sweep sweep_fix sweep_fix_reverted run_feedback test_audit codex_primary; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -2458,6 +2475,579 @@ STUB
       jq -e 'select(.type=="codex_review") | .payload.outcome=="error"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
     fx_not "failing codex leaves no artifact" [ -e "$RUN_ROOT/validated/codex-review-$cand.md" ] || exit 1
     fx_not "no artifact -> no observer section" [ -n "$(codex_review_section "$cand")" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# Shared fake codex CLI for the engine+codex split (invoke_primary_codex*):
+# writes $1/bin/codex emitting the EXACT --json JSONL shape captured live
+# against codex-cli 0.144.3, also verified against 0.146.0 (the CLI
+# auto-updates; the usage object gained a cache_write_input_tokens key between
+# the two, hence the 5-key shape below) — thread.started/turn.started/
+# item.completed agent_message/turn.completed usage; see the design's
+# codex-capture/ scratchpad. Deterministic ids: a FRESH call (`codex exec -s ...`, no
+# `resume`) mints "fake-thread-NNNN" from a counter file that persists across
+# calls in $1; a RESUME call (`codex exec resume <id> ...`) echoes back the
+# SAME id it was given, matching codex's real resume behavior. Records the
+# full argv of the last invocation to $1/last-argv.txt (one arg per line) so
+# callers can assert exact flag shape (fresh has -s and no `resume`; resume has
+# `resume <id>` and no -s). Honors -o/--output-last-message. Optional
+# $1/fail-count (a positive integer): decremented and exits 1 with no JSON at
+# all on each call while positive — for retry-then-succeed/retry-then-block
+# fixtures.
+write_fake_codex_primary() {
+  local dir="$1"
+  mkdir -p "$dir"
+  cat >"$dir/codex" <<'STUB'
+#!/bin/bash
+stubdir="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\n' "$@" >"$stubdir/last-argv.txt"
+cat >/dev/null
+if [ -f "$stubdir/fail-count" ]; then
+  n="$(cat "$stubdir/fail-count" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  if [ "$n" -gt 0 ]; then
+    n=$((n - 1)); printf '%s' "$n" >"$stubdir/fail-count"
+    printf 'stub-codex: forced failure\n' >&2
+    exit 1
+  fi
+fi
+tid=""
+if [ "$1" = "exec" ] && [ "$2" = "resume" ]; then
+  tid="$3"
+else
+  n=0
+  [ -f "$stubdir/fresh-count" ] && n="$(cat "$stubdir/fresh-count" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); printf '%s' "$n" >"$stubdir/fresh-count"
+  tid="$(printf 'fake-thread-%04d' "$n")"
+fi
+last=""; prev=""
+for a in "$@"; do
+  [ "$prev" != "-o" ] || last="$a"
+  prev="$a"
+done
+printf '{"type":"thread.started","thread_id":"%s"}\n' "$tid"
+printf '{"type":"turn.started"}\n'
+printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}\n'
+printf '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}\n'
+[ -z "$last" ] || printf 'OK\n' >"$last"
+exit 0
+STUB
+  chmod +x "$dir/codex"
+}
+
+fixture_engines_field() {
+  # `- Engines: role=vendor role=vendor` (the codex+claude engine split):
+  # spec_engines is a bare extractor (Track's dialect, no backticks);
+  # validate_spec_engines is the loud spec-selection gate (mirrors
+  # set_spec_workdir/validate_spec_smoke) that installs ENGINE_IMPLEMENT/
+  # ENGINE_REVIEW; stage_engine restricts codex to the implement scope ONLY;
+  # codex_review_active is the per-spec review override (spec wins both
+  # directions over the env knob, and never leaks across a re-validation).
+  local root="$1" dir="$root/engines" spec
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/bin"
+  spec="$dir/spec.md"
+
+  ( codex_available() { return 1; }
+    # Absent field: today's exact defaults, both globals reset even if a
+    # PRIOR call (simulating an earlier NEXT_TASK spec) left them dirty.
+    printf '# spec\n\n## Review\n- Track: node\n' >"$spec"
+    ENGINE_IMPLEMENT="codex"; ENGINE_REVIEW="codex"
+    fx "absent field validates" validate_spec_engines "$spec" || exit 1
+    fx "absent field resets implement to claude" [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+    fx "absent field resets review to empty (inherit env)" [ -z "$ENGINE_REVIEW" ] || exit 1
+    fx "absent field: spec_engines is empty" [ -z "$(spec_engines "$spec")" ] || exit 1
+
+    # An `- Engines:` line OUTSIDE the ## Review section (e.g. mentioned in
+    # prose under Related, or — as caught by a real integration run during
+    # this feature's own build — appended after ## Test Plan) must NOT be
+    # read as the field: same scoping bug class fixture_review_fields_scoped
+    # guards for `- Personas:`. Both the presence check AND the extractor
+    # must agree it's absent, or a stray mention elsewhere in the spec would
+    # wrongly fail spec selection with "malformed Engines field".
+    printf '# spec\n\n## Review\n- Track: node\n\n## Related\n- Engines: implement=codex\n' >"$spec"
+    ENGINE_IMPLEMENT="codex"; ENGINE_REVIEW="codex"
+    fx "out-of-section Engines line validates as absent" validate_spec_engines "$spec" || exit 1
+    fx "out-of-section Engines line does not set implement=codex" [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+
+    # Valid field, codex CLI present: both roles resolve.
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: implement=codex review=codex\n' >"$spec"
+    codex_available() { return 0; }
+    fx "valid field with codex on PATH validates" validate_spec_engines "$spec" || exit 1
+    fx "implement=codex resolved" [ "$ENGINE_IMPLEMENT" = "codex" ] || exit 1
+    fx "review=codex resolved" [ "$ENGINE_REVIEW" = "codex" ] || exit 1
+    fx "spec_engines normalizes case + spacing" \
+      [ "$(spec_engines "$spec")" = "implement=codex review=codex" ] || exit 1
+
+    # implement=codex with NO codex CLI on PATH: fails at spec selection.
+    codex_available() { return 1; }
+    fx_not "implement=codex with no codex CLI fails selection" validate_spec_engines "$spec" || exit 1
+    codex_available() { return 0; }
+
+    # implement=codex under NIGHT_SHIFT_CODEX_SANDBOX=workspace-write is
+    # rejected at spec selection: codex keeps .git read-only under that
+    # sandbox with no config escape hatch, so a workspace-write implement run
+    # could never `git commit` a candidate.
+    CODEX_SANDBOX="workspace-write"
+    out="$(validate_spec_engines "$spec" 2>&1)"; rc=$?
+    fx "implement=codex under workspace-write sandbox is rejected" test "$rc" -ne 0 || exit 1
+    fx "workspace-write rejection names the read-only .git reason" \
+      grep -q "codex keeps .git read-only" <<<"$out" || exit 1
+    CODEX_SANDBOX="danger-full-access"
+    fx "implement=codex under danger-full-access (the default) validates" \
+      validate_spec_engines "$spec" || exit 1
+
+    # implement=codex requires NIGHT_SHIFT_SESSION_SCOPE=stage: run-scoped
+    # sessions never null at a scope boundary, so a Claude/codex session id
+    # could cross vendors (`codex exec resume <claude-uuid>`).
+    SESSION_SCOPE="run"
+    out="$(validate_spec_engines "$spec" 2>&1)"; rc=$?
+    fx "implement=codex under SESSION_SCOPE=run is rejected" test "$rc" -ne 0 || exit 1
+    fx "SESSION_SCOPE rejection names the stage requirement" \
+      grep -q "SESSION_SCOPE=stage" <<<"$out" || exit 1
+    SESSION_SCOPE="stage"
+    fx "implement=codex under SESSION_SCOPE=stage (the default) validates" \
+      validate_spec_engines "$spec" || exit 1
+
+    # Malformed pair (no '=').
+    printf -- '- Engines: implement\n' >"$dir/frag.md"
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: implementcodex\n' >"$spec"
+    fx_not "malformed pair (no =) rejected" validate_spec_engines "$spec" || exit 1
+
+    # Unknown role.
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: build=codex\n' >"$spec"
+    fx_not "unknown role rejected" validate_spec_engines "$spec" || exit 1
+
+    # Unknown vendor.
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: implement=gpt\n' >"$spec"
+    fx_not "unknown vendor rejected" validate_spec_engines "$spec" || exit 1
+
+    # Duplicate role.
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: implement=claude implement=codex\n' >"$spec"
+    fx_not "duplicate role rejected" validate_spec_engines "$spec" || exit 1
+
+    # plan/observer are explicitly Claude-only, with the documented message.
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: plan=codex\n' >"$spec"
+    out="$(validate_spec_engines "$spec" 2>&1)"; rc=$?
+    fx "plan=codex rejected" test "$rc" -ne 0 || exit 1
+    fx "plan=codex message names the judgment-gate reason" \
+      grep -q "judgment gates that make a second vendor safe" <<<"$out" || exit 1
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: observer=codex\n' >"$spec"
+    fx_not "observer=codex rejected" validate_spec_engines "$spec" || exit 1
+
+    # review=off is a valid vendor value for the review role only.
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: review=off\n' >"$spec"
+    fx "review=off validates" validate_spec_engines "$spec" || exit 1
+    fx "review=off resolved" [ "$ENGINE_REVIEW" = "off" ] || exit 1
+    fx "implement stays default claude when only review= is given" \
+      [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # stage_engine: only the implement scope can ever be codex.
+  ( ENGINE_IMPLEMENT="codex"
+    fx "implement scope honors codex" [ "$(stage_engine implement)" = "codex" ] || exit 1
+    fx "plan scope stays claude" [ "$(stage_engine plan)" = "claude" ] || exit 1
+    fx "observe scope stays claude" [ "$(stage_engine observe)" = "claude" ] || exit 1
+    fx "complete scope stays claude" [ "$(stage_engine complete)" = "claude" ] || exit 1
+    unset ENGINE_IMPLEMENT
+    fx "unset ENGINE_IMPLEMENT defaults to claude (every pre-existing call site)" \
+      [ "$(stage_engine implement)" = "claude" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # codex_review_active: the spec's `- Engines: review=` wins over the env
+  # knob in BOTH directions; an absent field falls through to the env exactly
+  # as before (today's behavior, byte for byte).
+  ( CODEX_REVIEW=0; ENGINE_REVIEW=""
+    fx_not "env=0, no override -> inactive" codex_review_active || exit 1
+    CODEX_REVIEW=1; ENGINE_REVIEW=""
+    fx "env=1, no override -> active (today's behavior)" codex_review_active || exit 1
+    CODEX_REVIEW=0; ENGINE_REVIEW="codex"
+    fx "env=0, review=codex -> active (spec wins)" codex_review_active || exit 1
+    CODEX_REVIEW=1; ENGINE_REVIEW="off"
+    fx_not "env=1, review=off -> inactive (spec wins)" codex_review_active || exit 1
+    exit 0
+  ) || return 1
+
+  # Duplicate `- Engines:` field (two separate lines, both matching the strict
+  # dialect) is rejected loudly, replacing the old silent head -1 behavior
+  # that dropped the second line without a trace.
+  ( codex_available() { return 0; }
+    printf '# spec\n\n## Review\n- Track: node\n- Engines: implement=codex\n- Engines: review=codex\n' >"$spec"
+    out="$(validate_spec_engines "$spec" 2>&1)"; rc=$?
+    fx "duplicate Engines field is rejected" test "$rc" -ne 0 || exit 1
+    fx "duplicate Engines field message" grep -q "duplicate Engines field" <<<"$out" || exit 1
+    exit 0
+  ) || return 1
+
+  # Near-miss spellings must never be silently treated as absent: the
+  # presence check is widened (case-insensitive, optional space before the
+  # colon, colon optional) so each of these hits the loud malformed-field
+  # error instead of resolving to today's silent defaults.
+  ( for near in '- Engines :' '- engines:' '- Engines implement=codex'; do
+      printf '# spec\n\n## Review\n- Track: node\n%s\n' "$near" >"$spec"
+      out="$(validate_spec_engines "$spec" 2>&1)"; rc=$?
+      fx "near-miss '$near' is rejected, not silently absent" test "$rc" -ne 0 || exit 1
+      fx "near-miss '$near' gets the malformed-field message" \
+        grep -q "malformed Engines field" <<<"$out" || exit 1
+    done
+    exit 0
+  ) || return 1
+
+  # CRLF specs: a fully-CRLF file must still open the `## Review` scope. The
+  # awk scope-opener matched only [ \t] (deliberately excluding \r, to avoid
+  # cross-matching unrelated text), while the presence grep's [[:space:]]
+  # class treats \r as whitespace — the two used to disagree, so a CRLF
+  # spec's `- Engines:` field silently read as absent (ran claude with no
+  # error). spec_field_scope now strips \r once, up front, before either
+  # check runs.
+  ( codex_available() { return 0; }
+    printf '# spec\r\n\r\n## Review\r\n- Track: node\r\n- Engines: implement=codex\r\n' >"$spec"
+    fx "CRLF spec validates" validate_spec_engines "$spec" || exit 1
+    fx "CRLF spec resolves implement=codex" [ "$ENGINE_IMPLEMENT" = "codex" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # A fenced code block inside `## Review` must never be read as a real
+  # field — only to have a quoted EXAMPLE silently switch the vendor.
+  ( codex_available() { return 0; }
+    printf '# spec\n\n## Review\n- Track: node\n\nExample:\n```\n- Engines: implement=codex\n```\n\n- Engines: implement=claude\n' >"$spec"
+    fx "fenced example does not override the real field" validate_spec_engines "$spec" || exit 1
+    fx "real field outside the fence wins" [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+
+    # A fence-only mention (no real field outside it) validates as ABSENT,
+    # even though the literal string "- Engines: implement=codex" appears
+    # verbatim in the scoped section's raw text.
+    ENGINE_IMPLEMENT="codex"
+    printf '# spec\n\n## Review\n- Track: node\n\nExample:\n```\n- Engines: implement=codex\n```\n' >"$spec"
+    fx "fence-only mention validates as absent" validate_spec_engines "$spec" || exit 1
+    fx "fence-only mention leaves implement at the default claude" \
+      [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # Fence-skipping hardenings (re-review regressions): an UNCLOSED fence must
+  # not swallow the rest of the spec (odd marker count disables fence
+  # interpretation entirely — the long-standing behavior — instead of
+  # silently blanking every field after the orphan marker); a fenced example
+  # QUOTING "## Review" must not open the scope (fence rule runs before the
+  # heading rules); and markers indented up to 3 spaces still toggle.
+  ( codex_available() { return 0; }
+    printf '# spec\n\nNote:\n```text\nan example fence nobody closed\n\n## Review\n- Track: node\n- Engines: implement=codex\n' >"$spec"
+    fx "unclosed fence does not swallow the Review section" validate_spec_engines "$spec" || exit 1
+    fx "unclosed fence: implement=codex still resolves" [ "$ENGINE_IMPLEMENT" = "codex" ] || exit 1
+
+    printf '# spec\n\n## Context\n```\n## Review\n```\n- Engines: implement=codex\n\n## Review\n- Track: node\n' >"$spec"
+    fx "fenced '## Review' heading does not open the scope" validate_spec_engines "$spec" || exit 1
+    fx "field after the fenced heading (outside ## Review) stays unparsed" \
+      [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+
+    printf '# spec\n\n## Review\n- Track: node\n\n   ```\n   - Engines: implement=codex\n   ```\n' >"$spec"
+    fx "3-space-indented fence markers still toggle (example stays quoted)" \
+      validate_spec_engines "$spec" || exit 1
+    fx "indented fenced example leaves implement at claude" [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # The widened near-miss presence check must stay SHAPE-constrained: prose
+  # bullets that merely start with the word are not field attempts and must
+  # keep validating (especially on legacy specs with no ## Review, where the
+  # scope is the whole file).
+  ( codex_available() { return 0; }
+    printf '# spec\n\n- engines overview lives in docs/\n- EnginesRoom: 3\n- Engines are configured via env\n' >"$spec"
+    fx "prose bullets starting with 'engines' are not field attempts" \
+      validate_spec_engines "$spec" || exit 1
+    fx "prose-bullet spec stays at default claude" [ "$ENGINE_IMPLEMENT" = "claude" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_codex_primary_invoke() {
+  # invoke_primary_codex_once builds the right codex_exec invocation for a
+  # FRESH turn vs a RESUME, and codex_thread_id/codex_turn_usage parse the
+  # --json JSONL stream exactly (verified against both the fake shim's output
+  # AND the byte-identical REAL capture from a live codex-cli 0.144.3 run,
+  # also re-verified against 0.146.0 (the CLI auto-updates; usage gained a
+  # cache_write_input_tokens key between the two, reflected in the 5-key
+  # shape below) — the design's own codex-capture/ scratchpad fixtures this
+  # shim was built from, embedded here so a parser regression against the
+  # real shape is caught even if the shim itself silently drifted).
+  local root="$1" dir="$root/codexinvoke" raw
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/bin" "$dir/proj"
+  write_fake_codex_primary "$dir/bin"
+
+  ( PATH="$dir/bin:$PATH"; PROJECT="$dir/proj"
+    CODEX_SANDBOX="workspace-write"; CODEX_IMPLEMENT_MODEL=""
+    printf 'hello\n' >"$dir/prompt.txt"
+    raw="$dir/fresh.raw"
+    invoke_primary_codex_once "$dir/prompt.txt" "$raw" "" || exit 1
+    fx "fresh turn parses a thread id" [ "$(codex_thread_id "$raw")" = "fake-thread-0001" ] || exit 1
+    fx "fresh turn parses usage" \
+      [ "$(codex_turn_usage "$raw")" = '{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}' ] || exit 1
+    fx "fresh turn passes -s <sandbox>" grep -qx -- "$CODEX_SANDBOX" "$dir/bin/last-argv.txt" || exit 1
+    fx "fresh turn passes --json" grep -qx -- "--json" "$dir/bin/last-argv.txt" || exit 1
+    fx_not "fresh turn does NOT resume" grep -qx -- "resume" "$dir/bin/last-argv.txt" || exit 1
+
+    CODEX_IMPLEMENT_MODEL="gpt-6-codex"
+    raw="$dir/fresh-model.raw"
+    invoke_primary_codex_once "$dir/prompt.txt" "$raw" "" || exit 1
+    fx "codex_model_flag word-splits --model X onto argv" \
+      grep -qx -- "gpt-6-codex" "$dir/bin/last-argv.txt" || exit 1
+    CODEX_IMPLEMENT_MODEL=""
+
+    raw="$dir/resume.raw"
+    invoke_primary_codex_once "$dir/prompt.txt" "$raw" "fake-thread-0001" || exit 1
+    fx "resume re-emits the SAME thread id" [ "$(codex_thread_id "$raw")" = "fake-thread-0001" ] || exit 1
+    fx "resume passes resume <session>" grep -qx -- "fake-thread-0001" "$dir/bin/last-argv.txt" || exit 1
+    fx_not "resume never passes bare -s" grep -qx -- "-s" "$dir/bin/last-argv.txt" || exit 1
+    fx "resume tracks CODEX_SANDBOX via -c sandbox_mode (never hardcoded)" \
+      grep -qx -- 'sandbox_mode="workspace-write"' "$dir/bin/last-argv.txt" || exit 1
+    fx_not "resume with an empty model passes no --model flag" \
+      grep -qx -- "--model" "$dir/bin/last-argv.txt" || exit 1
+
+    # codex re-resolves the model PER INVOCATION (unlike `claude --resume`,
+    # which carries its creation model), so a resume call must also pass
+    # codex_model_flag or a set NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL silently
+    # reverts to codex's config default after turn 1.
+    CODEX_IMPLEMENT_MODEL="gpt-6-codex"
+    raw="$dir/resume-model.raw"
+    invoke_primary_codex_once "$dir/prompt.txt" "$raw" "fake-thread-0001" || exit 1
+    fx "resume passes --model when set (drops-model fix)" \
+      grep -qx -- "gpt-6-codex" "$dir/bin/last-argv.txt" || exit 1
+    fx "resume still passes resume <session> alongside --model" \
+      grep -qx -- "fake-thread-0001" "$dir/bin/last-argv.txt" || exit 1
+    CODEX_IMPLEMENT_MODEL=""
+
+    CODEX_SANDBOX="danger-full-access"
+    raw="$dir/resume2.raw"
+    invoke_primary_codex_once "$dir/prompt.txt" "$raw" "fake-thread-0001" || exit 1
+    fx "resume's sandbox_mode override tracks a CHANGED CODEX_SANDBOX" \
+      grep -qx -- 'sandbox_mode="danger-full-access"' "$dir/bin/last-argv.txt" || exit 1
+    exit 0
+  ) || return 1
+
+  # codex_thread_id/codex_turn_usage against the REAL captured shape (0.146.0:
+  # usage carries the cache_write_input_tokens key alongside the original
+  # four).
+  ( d="$root/codexinvoke/capture"; mkdir -p "$d"
+    cat >"$d/fresh.jsonl" <<'JSONL'
+{"type":"thread.started","thread_id":"019fae53-3dab-7481-a9fd-0c487540f050"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest."}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"OK"}}
+{"type":"turn.completed","usage":{"input_tokens":22374,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+JSONL
+    cat >"$d/resume.jsonl" <<'JSONL'
+{"type":"thread.started","thread_id":"019fae53-3dab-7481-a9fd-0c487540f050"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"AGAIN"}}
+{"type":"turn.completed","usage":{"input_tokens":44766,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":11,"reasoning_output_tokens":0}}
+JSONL
+    fx "real capture: fresh thread id" \
+      [ "$(codex_thread_id "$d/fresh.jsonl")" = "019fae53-3dab-7481-a9fd-0c487540f050" ] || exit 1
+    fx "real capture: fresh usage" \
+      [ "$(codex_turn_usage "$d/fresh.jsonl")" = '{"input_tokens":22374,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}' ] || exit 1
+    fx "real capture: resume re-emits the same thread id" \
+      [ "$(codex_thread_id "$d/resume.jsonl")" = "019fae53-3dab-7481-a9fd-0c487540f050" ] || exit 1
+    fx "real capture: resume usage" \
+      [ "$(codex_turn_usage "$d/resume.jsonl")" = '{"input_tokens":44766,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":11,"reasoning_output_tokens":0}' ] || exit 1
+    printf 'not json\n' >"$d/garbage.txt"
+    fx "garbage input -> empty thread id, not a crash" [ -z "$(codex_thread_id "$d/garbage.txt")" ] || exit 1
+    fx "garbage input -> usage falls back to null" [ "$(codex_turn_usage "$d/garbage.txt")" = "null" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_codex_primary_retry() {
+  # invoke_primary_codex: bounded retry (NIGHT_SHIFT_CODEX_MAX_RETRY) on a
+  # nonzero rc, journaling one codex_primary event per attempt, backing off
+  # via the codex_retry_backoff seam (overridden here to a no-op instead of a
+  # live 60s sleep — the same technique wait_for_rate_limit_reset already
+  # uses); exhausting the budget returns 1 and leaves the informative reason
+  # at $raw.block-reason — invoke_primary_codex itself never calls block_run
+  # (see its own comment / the single-block-contract fix: block_run from
+  # inside this function's command-substitution subshell would only unwind
+  # the subshell, so the parent — invoke_primary — owns the one real
+  # block_run call and is covered separately by fixture_codex_primary_dispatch).
+  # A later success prints the thread id and journals outcome:"success".
+  local root="$1" dir="$root/codexretry"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/bin" "$dir/proj" "$dir/rs"
+  write_fake_codex_primary "$dir/bin"
+
+  ( log() { :; }
+    codex_retry_backoff() { :; }
+    PATH="$dir/bin:$PATH"; PROJECT="$dir/proj"
+    RUN_ROOT="$dir/rs"; RUN_ID="cxpfx"
+    CODEX_SANDBOX="workspace-write"; CODEX_IMPLEMENT_MODEL=""
+    CODEX_MAX_RETRY=2
+    printf 'hello\n' >"$dir/prompt.txt"
+
+    # Retry-then-exhaust: fail 3 times (> the retry budget of 2).
+    printf '3' >"$dir/bin/fresh-count"  # never consulted on failure; harmless
+    printf '3' >"$dir/bin/fail-count"
+    emitted=""; rc=0
+    emitted="$(invoke_primary_codex "$dir/prompt.txt" "$dir/block.raw" "")" || rc=$?
+    fx "retry budget exhausted -> returns 1 (never calls block_run itself)" \
+      test "$rc" -eq 1 || exit 1
+    fx "no thread id printed on exhaustion" [ -z "$emitted" ] || exit 1
+    fx "informative reason written to raw.block-reason" \
+      grep -q "rc=1" "$dir/block.raw.block-reason" || exit 1
+    fx "block-reason names the attempt count" \
+      grep -q "after 3 attempt(s)" "$dir/block.raw.block-reason" || exit 1
+    fx "three attempts recorded (initial + 2 retries)" \
+      test "$(jq -c 'select(.type=="codex_primary")' "$RUN_ROOT/events.jsonl" | grep -c .)" -eq 3 || exit 1
+    fx "every attempt journaled as an error" \
+      test "$(jq -e 'select(.type=="codex_primary") | .payload.outcome=="error"' "$RUN_ROOT/events.jsonl" | grep -c true)" -eq 3 || exit 1
+    fx "attempts are numbered 0,1,2" \
+      [ "$(jq -c 'select(.type=="codex_primary") | .payload.attempt' "$RUN_ROOT/events.jsonl" | tr '\n' ',')" = "0,1,2," ] || exit 1
+
+    # Retry-then-succeed: fail once, then succeed on the retry.
+    rm -f "$RUN_ROOT/events.jsonl"
+    printf '1' >"$dir/bin/fail-count"
+    tid="$(invoke_primary_codex "$dir/prompt.txt" "$dir/ok.raw" "")"
+    fx "eventual success prints the emitted thread id" [ -n "$tid" ] || exit 1
+    fx "eventual success journals one error + one success" \
+      [ "$(jq -c 'select(.type=="codex_primary") | .payload.outcome' "$RUN_ROOT/events.jsonl" | tr '\n' ',')" = '"error","success",' ] || exit 1
+    fx "success event carries usage from turn.completed" \
+      jq -e 'select(.type=="codex_primary" and .payload.outcome=="success") | .payload.usage.input_tokens==100' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+fixture_codex_primary_dispatch() {
+  # invoke_primary's codex dispatch branch (ENGINE_IMPLEMENT=codex) previously
+  # had ZERO fixture coverage — a hand-mutant making the codex branch also run
+  # record_cost SURVIVED. Drives the REAL invoke_primary end to end with the
+  # fake codex shim, stubbing only enforce_limits/enforce_elapsed_limits/
+  # primary_prompt/integrity_guard/record_cost (the pieces that need a live
+  # model, a real project, or a wrapper-owned anchor this fixture does not
+  # set up). Asserts: (a) routing to the codex shim, (b) .session_id
+  # bookkeeping, (c) the session-drift guard, and (d) the single-block
+  # contract from the retry-exhaustion fix (parent block_run called EXACTLY
+  # once, carrying the informative reason).
+  local root="$1" dir="$root/codexdispatch"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/bin" "$dir/proj"
+  write_fake_codex_primary "$dir/bin"
+
+  # (a) + (b): a fresh dispatch routes to the codex shim (never claude) and
+  # updates .session_id to the emitted thread id; the turn counters advance;
+  # record_cost is never called (a codex turn's cost is journaled inside
+  # invoke_primary_codex, on the codex_primary event, not via record_cost).
+  ( log() { :; }
+    PATH="$dir/bin:$PATH"; PROJECT="$dir/proj"
+    RUN_ROOT="$dir/rs"; RUN_ID="cxpd"; STATE="$RUN_ROOT/state.json"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/prompts" "$RUN_ROOT/raw"
+    ENGINE_IMPLEMENT="codex"
+    CODEX_SANDBOX="workspace-write"; CODEX_IMPLEMENT_MODEL=""; CODEX_MAX_RETRY=1
+    enforce_limits() { :; }
+    enforce_elapsed_limits() { :; }
+    primary_prompt() { : >"$1"; }
+    integrity_guard() { :; }
+    record_cost() { touch "$dir/record_cost.marker"; }
+    printf '{"stage":"implementation","stage_turns":0,"primary_turns":0,"task_turns":0,"session_id":null}' >"$STATE"
+    invoke_primary
+    fx "codex dispatch routes to the codex shim" \
+      grep -qx -- "exec" "$dir/bin/last-argv.txt" || exit 1
+    fx_not "codex dispatch never invokes claude" [ -e "$dir/bin/claude" ] || exit 1
+    fx ".session_id updated to the emitted thread id" \
+      [ "$(jq -r '.session_id' "$STATE")" = "fake-thread-0001" ] || exit 1
+    fx "primary_turns/task_turns/stage_turns all incremented" \
+      [ "$(jq -c '[.primary_turns,.task_turns,.stage_turns]' "$STATE")" = "[1,1,1]" ] || exit 1
+    fx_not "codex turn never calls record_cost (its cost is journaled inside invoke_primary_codex)" \
+      [ -e "$dir/record_cost.marker" ] || exit 1
+    exit 0
+  ) || return 1
+
+  # (c): a resume whose emitted thread id does not match the session already
+  # recorded in state must block_run with the drift reason — exactly like the
+  # Claude path. A dedicated stub (not the shared shim, which always echoes
+  # back what it was given) forces the mismatch.
+  ( log() { :; }
+    dir2="$dir/bin-drift"; mkdir -p "$dir2" "$dir/rs-drift/control" "$dir/rs-drift/prompts" "$dir/rs-drift/raw"
+    cat >"$dir2/codex" <<'STUB'
+#!/bin/bash
+cat >/dev/null
+printf '{"type":"thread.started","thread_id":"drifted-thread-9999"}\n'
+printf '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}\n'
+exit 0
+STUB
+    chmod +x "$dir2/codex"
+    PATH="$dir2:$PATH"; PROJECT="$dir/proj"
+    RUN_ROOT="$dir/rs-drift"; RUN_ID="cxpd-drift"; STATE="$RUN_ROOT/state.json"
+    ENGINE_IMPLEMENT="codex"
+    CODEX_SANDBOX="workspace-write"; CODEX_IMPLEMENT_MODEL=""; CODEX_MAX_RETRY=1
+    enforce_limits() { :; }
+    enforce_elapsed_limits() { :; }
+    primary_prompt() { : >"$1"; }
+    integrity_guard() { :; }
+    record_cost() { :; }
+    block_run() { printf 'BLOCKED:%s\n' "$1" >"$dir/drift-blocked.txt"; exit 9; }
+    printf '{"stage":"implementation","stage_turns":0,"primary_turns":0,"task_turns":0,"session_id":"stale-session-id"}' >"$STATE"
+    ( invoke_primary ) >/dev/null 2>&1
+    rc=$?
+    fx "session drift on a codex resume blocks the run" test "$rc" -eq 9 || exit 1
+    fx "drift reason names old and new session ids" \
+      grep -q "primary session ID changed from stale-session-id to drifted-thread-9999" "$dir/drift-blocked.txt" || exit 1
+    exit 0
+  ) || return 1
+
+  # (d): the single-block contract. On retry exhaustion, invoke_primary_codex
+  # returns 1 (see the retry fixture) and the PARENT's block_run must be
+  # called EXACTLY ONCE, carrying the informative reason — never the generic
+  # "primary emitted no resumable session ID" and never twice. A production
+  # block_run replaced by a recording stub proves both.
+  ( log() { :; }
+    codex_retry_backoff() { :; }
+    PATH="$dir/bin:$PATH"; PROJECT="$dir/proj"
+    RUN_ROOT="$dir/rs-block"; RUN_ID="cxpd-block"; STATE="$RUN_ROOT/state.json"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/prompts" "$RUN_ROOT/raw"
+    ENGINE_IMPLEMENT="codex"
+    CODEX_SANDBOX="danger-full-access"; CODEX_IMPLEMENT_MODEL=""; CODEX_MAX_RETRY=0
+    enforce_limits() { :; }
+    enforce_elapsed_limits() { :; }
+    primary_prompt() { : >"$1"; }
+    integrity_guard() { :; }
+    record_cost() { :; }
+    printf '1' >"$dir/bin/fail-count"
+    # APPEND (>>) is load-bearing: a counter variable (or an overwriting >)
+    # cannot see across the command-substitution subshell boundary, so a
+    # reintroduced subshell block_run would still read as "called once" — the
+    # exact vacuous assertion a re-review caught. Appended lines survive the
+    # boundary; the line count below is the real exactly-once proof.
+    block_run() {
+      printf 'BLOCKED:%s\n' "$1" >>"$dir/exhaustion-blocked.txt"; exit 9
+    }
+    printf '{"stage":"implementation","stage_turns":0,"primary_turns":0,"task_turns":0,"session_id":null}' >"$STATE"
+    ( invoke_primary ) >/dev/null 2>&1
+    rc=$?
+    fx "exhaustion path exits via the parent's block_run" test "$rc" -eq 9 || exit 1
+    fx "block_run called EXACTLY once (appended line count)" \
+      [ "$(grep -c '^BLOCKED:' "$dir/exhaustion-blocked.txt" 2>/dev/null)" = "1" ] || exit 1
+    fx "block_run carries the INFORMATIVE reason, not a generic one" \
+      grep -q "codex primary failed after 1 attempt(s) (rc=1)" "$dir/exhaustion-blocked.txt" || exit 1
+    fx_not "the generic 'no resumable session ID' reason never appears" \
+      grep -q "no resumable session ID" "$dir/exhaustion-blocked.txt" || exit 1
+    exit 0
+  ) || return 1
+
+  # Cheap survivor: codex_thread_id must return the FIRST thread.started id
+  # from a two-entry stream (guards against a `tail` where `head` is
+  # required — a resume re-emits the SAME thread_id as its own first line,
+  # which is exactly what the drift guard above relies on).
+  ( f="$dir/two-threads.jsonl"
+    printf '{"type":"thread.started","thread_id":"first-thread"}\n{"type":"thread.started","thread_id":"second-thread"}\n' >"$f"
+    fx "codex_thread_id returns the FIRST thread.started id" \
+      [ "$(codex_thread_id "$f")" = "first-thread" ] || exit 1
     exit 0
   ) || return 1
   return 0

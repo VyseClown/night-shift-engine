@@ -244,6 +244,19 @@ command to a clean exit, or starts it and polls a loopback URL for HTTP 200 —
 instead of trusting that green tsc/lint/tests mean it runs. See any template's
 Repository section for the field syntax.
 
+An optional `- Engines: implement=claude|codex review=codex|off` spec field
+(in the `## Review` section, same bare-token dialect as `- Track:`) opts the
+implement stage and/or the advisory codex review into the Codex CLI instead
+of Claude; `plan`/`observer` always stay Claude — the independent Claude
+observer gates a codex-implemented candidate exactly like a Claude-implemented
+one. Absent field: today's behavior, Claude everywhere. `implement=codex`
+requires the `codex` CLI on PATH, `NIGHT_SHIFT_CODEX_SANDBOX=danger-full-access`
+(the default — `workspace-write` keeps `.git` read-only under codex's own
+sandbox, so it cannot commit a candidate), and `NIGHT_SHIFT_SESSION_SCOPE=stage`
+(the default — vendor-specific session ids never cross vendors); all three are
+validated LOUDLY at spec selection, never mid-run. See
+`docs/COMMAND-PLAYBOOK.md` §13 for the full contract.
+
 ---
 
 ## Commit Rules

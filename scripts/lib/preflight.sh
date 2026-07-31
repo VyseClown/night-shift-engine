@@ -314,6 +314,152 @@ validate_spec_smoke() {
   return 0
 }
 
+# Optional `- Engines: role=vendor role=vendor` spec field (Codex+Claude engine
+# split): opts the implement stage and/or the advisory codex review into codex.
+# Same bare-token dialect as `- Track:` — no backticks — validated LOUDLY at
+# spec selection (initial select, resume, NEXT_TASK chain), mirroring
+# set_spec_workdir/validate_spec_smoke above. Absent field -> both roles at
+# their default (ENGINE_IMPLEMENT=claude, ENGINE_REVIEW="" — inherit whatever
+# NIGHT_SHIFT_CODEX_REVIEW says), byte-for-byte today's behavior.
+#
+# Grammar: space-separated `role=vendor` pairs, each role at most once.
+#   implement ∈ {claude (default), codex} — the implement STAGE SCOPE vendor
+#     only; plan, observe-request, and completion always stay claude (stage_engine
+#     enforces this regardless of what this field says).
+#   review    ∈ {codex, off} — per-spec override of NIGHT_SHIFT_CODEX_REVIEW;
+#     the spec wins over the env knob in BOTH directions (codex_review_active
+#     below is what actually applies the override — this function only
+#     records which override, if any, the spec asked for, so a later spec in
+#     the same run's NEXT_TASK chain that omits the field is not left with a
+#     stale override from an earlier task).
+#   plan / observer are rejected outright: those are the judgment gates that
+#     make a second vendor safe, and are Claude-only in v1.
+#
+# Side effects on success: sets ENGINE_IMPLEMENT (claude|codex) and ENGINE_REVIEW
+# ("", "codex", or "off") — mirrors set_spec_workdir's WORKDIR side effect. Both
+# are reset unconditionally on every call (never carries over from a previous
+# spec/call), which is what keeps a NEXT_TASK chain from leaking one task's
+# Engines field onto the next task's defaults.
+validate_spec_engines() {
+  local file="$1" raw pair role vendor seen_implement=0 seen_review=0
+  local scoped_text engines_line_count
+  ENGINE_IMPLEMENT="claude"
+  ENGINE_REVIEW=""
+  # Presence check scoped exactly like the extractor (spec_engines uses
+  # spec_field_scope internally) — Engines lives in the `## Review` section,
+  # the same dialect as Track/Personas, NOT the whole-file dialect Workdir/
+  # Smoke use. An unscoped grep here would treat a stray "- Engines:" mention
+  # elsewhere in the spec (e.g. prose under Related Files) as a malformed
+  # field, exactly the bug fixture_review_fields_scoped guards against for
+  # Personas. Captured once into a var (spec_field_scope now also strips CRLF
+  # and skips fenced code blocks — see its own comment) so the presence count,
+  # the near-miss check, and the strict extractor all see the same text.
+  scoped_text="$(spec_field_scope "$file")"
+  engines_line_count="$(printf '%s\n' "$scoped_text" | grep -Ec '^- Engines:')"
+  if [ "$engines_line_count" -gt 1 ]; then
+    printf 'duplicate Engines field\n' >&2
+    return 1
+  fi
+  if [ "$engines_line_count" -eq 0 ]; then
+    # Near-miss spellings must never be silently treated as absent: widen ONLY
+    # this presence check so near-miss ATTEMPTS at the field — `- Engines :`,
+    # `- engines:`, colon-less `- Engines implement=codex` — hit the loud
+    # malformed-field error below instead of resolving to today's silent
+    # claude/inherit-env defaults. The match is shape-constrained (the word
+    # "engines" must be followed by a colon, or by a role=vendor-looking
+    # token), NOT a bare prefix: prose bullets like "- engines overview lives
+    # in docs/" or "- EnginesRoom: 3" must stay valid non-fields, especially
+    # on legacy no-## Review specs where the scope is the whole file. The
+    # strict extractor (spec_engines) is unchanged — only detection of
+    # "something was attempted here" widens.
+    if printf '%s\n' "$scoped_text" | grep -Eiq '^-[[:space:]]?engines([[:space:]]*:|[[:space:]]+[a-z]+=)'; then
+      printf 'malformed Engines field — use: - Engines: implement=claude|codex review=codex|off (space-separated role=vendor pairs)\n' >&2
+      return 1
+    fi
+    return 0
+  fi
+  raw="$(spec_engines "$file")"
+  if [ -z "$raw" ]; then
+    printf 'malformed Engines field — use: - Engines: implement=claude|codex review=codex|off (space-separated role=vendor pairs)\n' >&2
+    return 1
+  fi
+  for pair in $raw; do
+    case "$pair" in
+      *=*) role="${pair%%=*}"; vendor="${pair#*=}" ;;
+      *) printf 'malformed Engines pair "%s" — use role=vendor (e.g. implement=codex)\n' "$pair" >&2; return 1 ;;
+    esac
+    if [ -z "$role" ] || [ -z "$vendor" ]; then
+      printf 'malformed Engines pair "%s" — use role=vendor (e.g. implement=codex)\n' "$pair" >&2
+      return 1
+    fi
+    case "$role" in
+      plan|observer)
+        printf 'plan and observer are Claude-only (the judgment gates that make a second vendor safe)\n' >&2
+        return 1 ;;
+      implement)
+        if [ "$seen_implement" -ne 0 ]; then
+          printf 'duplicate Engines role: implement\n' >&2; return 1
+        fi
+        seen_implement=1
+        case "$vendor" in
+          claude|codex) ENGINE_IMPLEMENT="$vendor" ;;
+          *) printf 'unknown Engines vendor for implement: %s (valid: claude, codex)\n' "$vendor" >&2; return 1 ;;
+        esac ;;
+      review)
+        if [ "$seen_review" -ne 0 ]; then
+          printf 'duplicate Engines role: review\n' >&2; return 1
+        fi
+        seen_review=1
+        case "$vendor" in
+          codex|off) ENGINE_REVIEW="$vendor" ;;
+          *) printf 'unknown Engines vendor for review: %s (valid: codex, off)\n' "$vendor" >&2; return 1 ;;
+        esac ;;
+      *) printf 'unknown Engines role: %s (valid: implement, review)\n' "$role" >&2; return 1 ;;
+    esac
+  done
+  if [ "$ENGINE_IMPLEMENT" = "codex" ] && ! codex_available; then
+    printf 'Engines implement=codex requires the codex CLI on PATH\n' >&2
+    return 1
+  fi
+  # Proven live: codex keeps .git READ-ONLY under its workspace-write sandbox
+  # policy, with no config escape hatch — a workspace-write implement run can
+  # never `git commit` a candidate, so it would fail every time, not just
+  # occasionally. Reject at spec selection rather than let a run discover the
+  # dead end hours into implementation. danger-full-access (the default) is
+  # the only sandbox that lets a codex primary create a candidate today.
+  if [ "$ENGINE_IMPLEMENT" = "codex" ] && [ "$CODEX_SANDBOX" = "workspace-write" ]; then
+    printf 'implement=codex cannot run under NIGHT_SHIFT_CODEX_SANDBOX=workspace-write — codex keeps .git read-only so the primary can never commit a candidate; use danger-full-access (the default)\n' >&2
+    return 1
+  fi
+  # Session ids are vendor-specific and never cross vendors (`codex exec
+  # resume <claude-uuid>` is meaningless). SESSION_SCOPE=run pins ONE session
+  # for the whole run and only nulls it at scope boundaries the run may never
+  # reach in a single-task invocation, so a codex implement stage under
+  # SESSION_SCOPE=run risks resuming a Claude session id (or vice versa).
+  # SESSION_SCOPE=stage (the default) always starts implement fresh, which is
+  # the only shape codex's per-vendor session ids are safe under.
+  if [ "$ENGINE_IMPLEMENT" = "codex" ] && [ "${SESSION_SCOPE:-stage}" != "stage" ]; then
+    printf 'Engines implement=codex requires NIGHT_SHIFT_SESSION_SCOPE=stage (run-scoped sessions never null at scope boundaries, so Claude/codex session ids would cross vendors)\n' >&2
+    return 1
+  fi
+  return 0
+}
+
+# Whether the advisory codex review (codex_review_candidate) should run for
+# THIS spec: the spec's own `- Engines: review=...` wins over the env knob in
+# BOTH directions (review=codex turns it on even if NIGHT_SHIFT_CODEX_REVIEW=0;
+# review=off turns it off even if =1); an absent field falls through to the
+# env-configured CODEX_REVIEW exactly as before. ENGINE_REVIEW is reset by
+# validate_spec_engines on every spec selection, so this can never read a
+# stale override from an earlier task in a NEXT_TASK chain.
+codex_review_active() {
+  case "$ENGINE_REVIEW" in
+    codex) return 0 ;;
+    off) return 1 ;;
+    *) [ "$CODEX_REVIEW" = "1" ] ;;
+  esac
+}
+
 run_test_command() {
   local phase="$1" command="$2" target="$3" run_dir="${4:-$PROJECT}" output rc=0 exec_dir
   output="$RUN_ROOT/raw/test-first-$phase.log"

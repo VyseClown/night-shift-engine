@@ -60,6 +60,11 @@ jq -e 'select(.type=="run_init") | .payload.branch != null and .payload.branch !
   "$events" >/dev/null                                        || fail "run_init does not record the feature branch"
 jq -e 'select(.type=="observer_verdict") | .payload | has("finding_ids")' \
   "$events" >/dev/null                                        || fail "observer_verdict lacks finding_ids"
+# run_started records which vendor implemented the run (engine+Codex split):
+# this run never opts into codex, so implement must read "claude", not be
+# silently absent.
+jq -e 'select(.type=="run_started") | .payload.engines.implement=="claude"' \
+  "$events" >/dev/null                                        || fail "run_started does not record engines.implement"
 [ "$(jq -r 'select(.type=="run_init") | .ts' "$events" | head -1)" \
   = "$(jq -r .ts "$events" | sort | head -1)" ]               || fail "run_init is not the earliest journal entry"
 # run.log is archived and mirrors the stderr log (same completion line).

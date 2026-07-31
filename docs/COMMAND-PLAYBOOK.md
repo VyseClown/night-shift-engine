@@ -2,8 +2,9 @@
 
 > Summary: Task → command index for Figma export, RN
 > visual-review/repair/Maestro capture, running a night-shift, the
-> design-extract/port-audit/test-audit CLIs, and `--sweep-only`. Start at the
-> "Quick chooser" table; each row links to its `§N` section for the full command.
+> design-extract/port-audit/test-audit CLIs, `--sweep-only`, and the opt-in
+> Codex implement-stage engine. Start at the "Quick chooser" table; each row
+> links to its `§N` section for the full command.
 
 A task → command index for the visual-fidelity / Figma / night-shift capabilities in
 this repo. Written for both humans and a fresh Claude instance: **match the task to a
@@ -31,6 +32,7 @@ workspace container (`<workspace>/<app>`).
 | Review a whole branch before merge (verdict-only by default) | `scripts/night-shift.sh --sweep-only --project <path>` | §10 |
 | Audit tests for false confidence (vacuous assertions, tautological round-trips) | `scripts/test-audit.sh --project <app> --tests <path...>` | §11 |
 | Audit a spec's quality before launching a run (vague ACs, non-biting validation) | `scripts/spec-audit.sh --spec <spec> [--offline]` | §12 |
+| Run a task's implement stage on Codex instead of Claude | `- Engines: implement=codex` in the spec's `## Review` section | §13 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -344,6 +346,60 @@ subjective spec-quality call should not silently block a launch, so spec-audit
 does not gate a run — wiring it into preflight as an advisory warning is a
 deliberate follow-up.
 
+## §13 — Run a task's implement stage on Codex instead of Claude → `- Engines:` spec field
+
+Opt-in, per spec, narrower than the old (removed) Codex-everywhere path: only
+the `implement` stage scope may run on codex; `plan`/`observer`/personas always
+stay Claude — the independent Claude observer gates a codex-implemented
+candidate exactly like a Claude-implemented one. Add one line to the spec's
+`## Review` section (same bare-token dialect as `- Track:` — no backticks):
+
+```
+- Engines: implement=codex review=codex
+```
+
+- `implement` ∈ `claude` (default) | `codex` — the vendor for the implement
+  stage grind only.
+- `review` ∈ `codex` | `off` — per-spec override of the existing
+  `NIGHT_SHIFT_CODEX_REVIEW` advisory-review knob; the spec wins over the env
+  var in BOTH directions. Omit the role entirely to leave the env knob as-is.
+- `plan=codex` / `observer=codex` are rejected outright at spec selection
+  ("plan and observer are Claude-only (the judgment gates that make a second
+  vendor safe)").
+- `implement=codex` with no `codex` CLI on PATH fails at spec selection, not
+  mid-run (same fail-loud posture as an invalid `- Workdir:`/`- Smoke:`).
+- `implement=codex` under `NIGHT_SHIFT_CODEX_SANDBOX=workspace-write` fails at
+  spec selection too: codex keeps `.git` read-only under that sandbox with no
+  config escape hatch, so a workspace-write implement run could never `git
+  commit` a candidate — proven live, not a theoretical stricter posture.
+  `danger-full-access` (the default) is the only sandbox that works today;
+  `workspace-write` is kept as an accepted value for a future codex version
+  that lifts the restriction.
+- `implement=codex` also requires `NIGHT_SHIFT_SESSION_SCOPE=stage` (the
+  default): session ids are vendor-specific and never cross vendors (`codex
+  exec resume <claude-uuid>` is meaningless), and `SESSION_SCOPE=run` only
+  nulls the session at scope boundaries a single-task run may never reach.
+
+Run exactly like any other night-shift task — nothing else about the command
+changes:
+
+```bash
+NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project <app> --spec <spec-with-Engines-field>
+```
+
+Knobs: `NIGHT_SHIFT_CODEX_SANDBOX` (default `danger-full-access` — parity with
+the Claude primary's own `--permission-mode bypassPermissions`; the engine's
+real safety layer — feature-branch confinement, wrapper-forbidden git ops,
+`integrity_guard`, the independent observer gate — is vendor-agnostic, not the
+sandbox flag; `workspace-write` is also accepted but CANNOT complete the
+implement pipeline today, see above), `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL`
+(default empty = codex's own configured default, passed on both the fresh AND
+the resume invocation — codex re-resolves its model per call, unlike `claude
+--resume`), `NIGHT_SHIFT_CODEX_MAX_RETRY` (default `2` extra attempts, 60s
+apart, before `block_run` — no Claude-shaped 429 handling for codex in v1).
+`NIGHT_SHIFT_REVIEW.md` and the observer's own verdict then honestly show
+`"primary": "codex"` for that task instead of always `"claude"`.
+
 ## Prerequisites & environment
 
 | Need | For | Install / set |
@@ -353,6 +409,7 @@ deliberate follow-up.
 | Figma MCP configured | every Figma read | the Figma MCP server (NOT a token) |
 | Java (JRE) | `--drive maestro` only | `export JAVA_HOME=/opt/homebrew/opt/openjdk@17` |
 | `NIGHT_SHIFT_ACCEPT_COSTS=YES` | any paid run | env on the command |
+| `codex` CLI on PATH | `- Engines: implement=codex` only | see the Codex CLI's own install docs |
 
 > iOS-26 gotcha (already fixed in the engine, but if you script `simctl` yourself):
 > `status_bar override --time` wants a plain `09:41`, **not** an ISO datetime — iOS 26
