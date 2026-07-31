@@ -155,4 +155,8 @@ observer approval.
   (COMPLETE and NEXT_TASK) copy `control/plan.md` into
   `validated/plan-<spec>.md` before `control/` is deleted, so archived runs
   keep the plan a human reviews the diff against (the viewer's Plan panel
-  renders it). Best-effort: fixture/dry runs without a plan are a clean no-op.
+  renders it). The spec name is sanitized to the viewer's filename regex and
+  never clobbers a differing same-name plan (suffixed instead), and a copy also
+  lands at `validated/plan.md` (last-writer-wins) — the viewer's preferred
+  fixed logical-plan name. Best-effort: fixture/dry runs without a plan are a
+  clean no-op, and a failed mkdir/cp WARNs rather than failing the task.

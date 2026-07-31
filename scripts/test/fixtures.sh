@@ -1700,9 +1700,52 @@ fixture_archive_task_plan() {
     RUN_ROOT="$dir/empty"; mkdir -p "$RUN_ROOT"
     fx "no plan is a clean no-op" archive_task_plan
     exit 0 ) || return 1
-  # Wiring: both completion paths call the helper (deleting either fails here).
-  case "$(declare -f complete_run)" in *archive_task_plan*) ;; *) return 1 ;; esac
-  case "$(declare -f start_next_task)" in *archive_task_plan*) ;; *) return 1 ;; esac
+  # Sanitization: a spec basename with a space (or other char outside the
+  # viewer's ^plan(-[A-Za-z0-9._-]{1,120})?\.md$ regex) must still land on a
+  # viewer-legal filename.
+  ( RUN_ROOT="$dir/sanitize"; SPEC="$dir/specs/demo task.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '# spaced plan\n' >"$RUN_ROOT/control/plan.md"
+    archive_task_plan
+    fx "a space in the spec name is sanitized to '-'" test -s "$RUN_ROOT/validated/plan-demo-task.md"
+    exit 0 ) || return 1
+  # Collision safety: two DIFFERENT plans landing on the same sanitized
+  # basename (e.g. a re-run after recovery) must never clobber — the first
+  # write keeps plan-<name>.md, the second survives at a suffixed name, and
+  # an identical re-write is a silent no-op (not exercised as a distinct
+  # branch here, but the epoch-suffix path below proves cmp -s is consulted).
+  ( RUN_ROOT="$dir/collision"; SPEC="$dir/specs/dup.md"
+    mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/validated"
+    printf '# plan A\n' >"$RUN_ROOT/control/plan.md"
+    archive_task_plan
+    fx "first plan lands at plan-dup.md" test -s "$RUN_ROOT/validated/plan-dup.md"
+    printf '# plan B (different content)\n' >"$RUN_ROOT/control/plan.md"
+    archive_task_plan
+    fx "original plan-dup.md is not clobbered" grep -q "plan A" "$RUN_ROOT/validated/plan-dup.md"
+    fx "both the base and the suffixed file survive" bash -c \
+      '[ "$(find "$1" -maxdepth 1 -name "plan-dup*.md" | wc -l)" -eq 2 ]' _ "$RUN_ROOT/validated"
+    fx "the second (different) plan survives at a suffixed name" bash -c \
+      'f=$(find "$1" -maxdepth 1 -name "plan-dup-*.md" | head -1); [ -n "$f" ] && grep -q "plan B" "$f"' \
+      _ "$RUN_ROOT/validated"
+    # plan.md (last-writer-wins): the viewer's preferred fixed logical-plan
+    # name always mirrors the most recent archive_task_plan call.
+    fx "validated/plan.md mirrors the last write (last-writer-wins)" grep -q "plan B" "$RUN_ROOT/validated/plan.md"
+    exit 0 ) || return 1
+  # Wiring + ordering: both completion paths call the helper, and a proven
+  # surviving mutant moves the complete_run call to AFTER compact_success (the
+  # plan would then archive into a directory compact_success already deleted)
+  # — a presence-only check can't catch that, so assert textual order too.
+  case "$(declare -f complete_run)" in
+    *archive_task_plan*compact_success*) ;;
+    *) return 1 ;;
+  esac
+  # start_next_task must preserve the finishing task's plan BEFORE $SPEC is
+  # reassigned to the next task (after which control/plan.md would belong to
+  # the wrong spec).
+  case "$(declare -f start_next_task)" in
+    *"archive_task_plan"*'SPEC="$next_spec"'*) ;;
+    *) return 1 ;;
+  esac
   return 0
 }
 
