@@ -157,14 +157,22 @@ the candidate, whichever vendor implemented it.
 
 | Knob | Default | Role |
 |---|---|---|
-| `NIGHT_SHIFT_CODEX_SANDBOX` | `workspace-write` | Sandbox for the codex primary (`-s` fresh / `-c sandbox_mode=...` resume); `danger-full-access` also accepted |
-| `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` | *(empty)* | Codex model override; empty = codex's own configured default |
+| `NIGHT_SHIFT_CODEX_SANDBOX` | `danger-full-access` | Sandbox for the codex primary (`-s` fresh / `-c sandbox_mode=...` resume); `workspace-write` also accepted but cannot complete the implement pipeline today (see below) |
+| `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` | *(empty)* | Codex model override; empty = codex's own configured default; passed on both the fresh AND the resume invocation |
 | `NIGHT_SHIFT_CODEX_MAX_RETRY` | `2` | Extra attempts (60s apart) on a nonzero codex exit before `block_run` — no Claude-shaped 429 handling for codex in v1 |
 
 `implement=codex` with no `codex` CLI on PATH fails at spec selection, not
-mid-run. A codex turn's usage is journaled on a `codex_primary` event rather
-than the Claude-JSON-shaped cost ledger (`record_cost`), so the viewer's cost
-panel reflects Claude spend only.
+mid-run. `danger-full-access` is the default because codex keeps `.git`
+read-only under `workspace-write`, with no config escape hatch — a
+workspace-write implement run could never `git commit` a candidate. It is
+parity with the Claude primary's own `--permission-mode bypassPermissions`:
+the engine's real safety layer (feature-branch confinement, wrapper-forbidden
+git ops, `integrity_guard`, the independent observer gate) is vendor-agnostic.
+`implement=codex` also requires `NIGHT_SHIFT_SESSION_SCOPE=stage` (the
+default) — vendor-specific session ids never cross vendors. Both are validated
+loudly at spec selection. A codex turn's usage is journaled on a
+`codex_primary` event rather than the Claude-JSON-shaped cost ledger
+(`record_cost`), so the viewer's cost panel reflects Claude spend only.
 
 ## Layout
 

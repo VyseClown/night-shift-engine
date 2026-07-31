@@ -111,23 +111,51 @@ profile_personas() {
   esac
 }
 
-# The text the review fields (Track, Review Profile, Optional reviewers, Personas)
-# are read from. When the spec has a `## Review` heading, only that section (up to
-# the next `## ` heading) is used, so a prose line elsewhere (e.g. a "- Personas:"
-# reference under Related) is never mis-read as a field. A spec with no `## Review`
-# heading falls back to the whole file (backward compatible for terse/legacy
-# specs). The section-presence checks for optional contract headings still scan
-# the whole file separately.
+# The text the review fields (Track, Review Profile, Optional reviewers, Personas,
+# Engines) are read from. When the spec has a `## Review` heading, only that
+# section (up to the next `## ` heading) is used, so a prose line elsewhere (e.g.
+# a "- Personas:" reference under Related) is never mis-read as a field. A spec
+# with no `## Review` heading falls back to the whole file (backward compatible
+# for terse/legacy specs). The section-presence checks for optional contract
+# headings still scan the whole file separately.
+#
+# Two edge-case hardenings share this one seam (every field above reads through
+# it, so fixing it here fixes all of them at once):
+#   - CRLF: a spec authored/saved on Windows has every line end in \r\n. grep's
+#     [[:space:]] class treats \r as whitespace, so the presence check above used
+#     to match "## Review\r" — but the awk scope-opener below matched only
+#     `[ \t]` (deliberately excluding \r, to keep the heading from cross-matching
+#     unrelated text), so it never saw the heading as terminated and `inrev` never
+#     went true: the presence check said yes, the scope silently stayed CLOSED,
+#     and every field inside `## Review` read as absent (a `- Engines:
+#     implement=codex` spec silently ran claude). Stripping \r once, up front,
+#     makes both checks agree.
+#   - Fenced code blocks: a spec that quotes an EXAMPLE value inside a ``` block
+#     under `## Review` (e.g. showing `- Engines: implement=codex` as sample
+#     syntax in prose) used to have that example parsed as the real field. Fence
+#     lines toggle a skip state so anything between ``` markers is never read as
+#     a field, in-scope or out. Three hardenings on the toggle itself:
+#     the fence rule runs BEFORE the heading rules (a fenced example quoting
+#     "## Review" must not open/close the scope); markers may be indented up to
+#     3 spaces (valid markdown); and fence skipping engages ONLY when the file's
+#     fence markers are balanced — an UNCLOSED fence would otherwise swallow
+#     everything after it (silently blanking Engines/Track/Personas, the exact
+#     silent-fallback class this seam exists to kill), so an odd marker count
+#     falls back to the long-standing no-fence-interpretation behavior.
 spec_field_scope() {
-  if grep -Eq '^## Review([[:space:]]|$)' "$1"; then
-    awk '
-      /^## Review([ \t]|$)/ { inrev=1; next }
-      /^## / { inrev=0 }
-      inrev { print }
-    ' "$1"
-  else
-    cat "$1"
-  fi
+  local file="$1" stripped has_heading=0 fence_count balanced=1
+  stripped="$(sed 's/\r$//' "$file")"
+  printf '%s\n' "$stripped" | grep -Eq '^## Review([[:space:]]|$)' && has_heading=1
+  fence_count="$(printf '%s\n' "$stripped" | grep -Ec '^ {0,3}```' || true)"
+  [ $((fence_count % 2)) -eq 0 ] || balanced=0
+  printf '%s\n' "$stripped" | awk -v scoped="$has_heading" -v fences="$balanced" '
+    fences && /^ {0,3}```/ { fence = !fence; next }
+    fences && fence { next }
+    scoped && /^## Review([ \t]|$)/ { inrev=1; next }
+    scoped && /^## / { inrev=0; next }
+    scoped && !inrev { next }
+    { print }
+  '
 }
 
 # Extracts the `- Track: <value>` field from a spec, normalized to a lowercase,

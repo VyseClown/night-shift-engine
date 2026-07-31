@@ -219,6 +219,12 @@ backticks):
   codex-implemented candidate exactly like a Claude-implemented one.
 - `implement=codex` with no `codex` CLI on PATH fails LOUDLY at spec
   selection, not partway through an overnight run.
+- `implement=codex` also fails LOUDLY at spec selection under
+  `NIGHT_SHIFT_CODEX_SANDBOX=workspace-write` (codex keeps `.git` read-only
+  under it, so an implement run could never commit a candidate —
+  `danger-full-access` is the default and the only sandbox that works today)
+  and under any `NIGHT_SHIFT_SESSION_SCOPE` other than the default `stage`
+  (vendor-specific session ids never cross vendors).
 
 When to reach for this: a task whose implement grind is cheap/mechanical
 enough that a second vendor's per-token cost or throughput is worth it, and

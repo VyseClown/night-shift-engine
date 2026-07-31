@@ -176,14 +176,24 @@ directory; run engine/workflow git inside the engine directory.
   rejected outright as Claude-only roles (`stage_engine` enforces this
   regardless of the field), so the independent Claude observer still gates
   every candidate. Absent field: byte-for-byte today's behavior. Knobs:
-  `NIGHT_SHIFT_CODEX_SANDBOX` (default `workspace-write`; also accepts
-  `danger-full-access` — the `codex exec -s` sandbox for a fresh turn, or the
-  `-c sandbox_mode=...` override on resume, since resume rejects `-s`),
+  `NIGHT_SHIFT_CODEX_SANDBOX` (default `danger-full-access`; also accepts
+  `workspace-write` — the `codex exec -s` sandbox for a fresh turn, or the
+  `-c sandbox_mode=...` override on resume, since resume rejects `-s` —
+  `workspace-write` is REJECTED at spec selection for `implement=codex`:
+  codex keeps `.git` read-only under it with no escape hatch, so an implement
+  run could never commit a candidate; `danger-full-access` is parity with the
+  Claude primary's own `--permission-mode bypassPermissions`, the engine's real
+  safety layer being vendor-agnostic either way),
   `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` (default empty = codex's own configured
-  default), `NIGHT_SHIFT_CODEX_MAX_RETRY` (default `2` extra attempts, 60s
-  apart, before `block_run` — no Claude-shaped 429 handling for codex in v1).
-  `implement=codex` with no `codex` CLI on PATH fails at spec selection, not
-  mid-run. See `docs/COMMAND-PLAYBOOK.md` §13 for the full contract.
+  default; passed on BOTH the fresh and the resume invocation, since codex
+  re-resolves its model per call unlike `claude --resume`),
+  `NIGHT_SHIFT_CODEX_MAX_RETRY` (default `2` extra attempts, 60s apart, before
+  `block_run` — no Claude-shaped 429 handling for codex in v1).
+  `implement=codex` with no `codex` CLI on PATH, under
+  `NIGHT_SHIFT_CODEX_SANDBOX=workspace-write`, or under
+  `NIGHT_SHIFT_SESSION_SCOPE` other than the default `stage` (vendor-specific
+  session ids never cross vendors) all fail at spec selection, not mid-run.
+  See `docs/COMMAND-PLAYBOOK.md` §13 for the full contract.
 - **Run feedback (default ON):** at every run's completion (before the branch
   sweep block below, and regardless of `NIGHT_SHIFT_BRANCH_SWEEP`), a short
   fresh session distills the run's journal into 5-15 bullets for the human who

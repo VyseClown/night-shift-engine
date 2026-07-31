@@ -146,16 +146,25 @@ CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
 # vendor; they are inert whenever no spec on this run opts in.
 #   CODEX_SANDBOX: the `codex exec -s` sandbox for the fresh turn / the
 #     `-c sandbox_mode=...` override on resume (resume rejects -s — verified
-#     live against codex-cli 0.144.3). Stricter than the Claude primary's
-#     bypassPermissions by default; danger-full-access is for projects whose
-#     validation needs to escape the sandbox. Validated at startup (main_run)
-#     against the two values codex actually accepts.
+#     live against codex-cli 0.144.3/0.146.0). Defaults to danger-full-access:
+#     proven LIVE that workspace-write keeps .git read-only under codex's own
+#     policy with no config escape hatch, so a workspace-write implement run
+#     can never `git commit` a candidate — it would fail every time, not just
+#     under stricter validation. danger-full-access is parity with the Claude
+#     primary's own `--permission-mode bypassPermissions`: the engine's real
+#     safety layer is vendor-agnostic (feature-branch confinement, the
+#     wrapper-forbidden git ops, integrity_guard, and the independent observer
+#     gate), not the sandbox flag. workspace-write remains an accepted value
+#     for a future codex version that lifts the .git restriction, but
+#     validate_spec_engines rejects it TODAY for implement=codex (see below)
+#     rather than let a run discover the dead end mid-implementation. Validated
+#     at startup (main_run) against the two values codex actually accepts.
 #   CODEX_IMPLEMENT_MODEL: empty (default) lets codex pick its own configured
 #     model — there is no Claude-shaped model tiering for a second vendor.
 #   CODEX_MAX_RETRY: bounded retries (60s apart, codex_retry_backoff) on a
 #     nonzero exit before block_run. No Claude-shaped 429 parsing in v1 (see
 #     the design doc) — a codex failure is just a failure, retried blindly.
-CODEX_SANDBOX="${NIGHT_SHIFT_CODEX_SANDBOX:-workspace-write}"
+CODEX_SANDBOX="${NIGHT_SHIFT_CODEX_SANDBOX:-danger-full-access}"
 CODEX_IMPLEMENT_MODEL="${NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL:-}"
 CODEX_MAX_RETRY="${NIGHT_SHIFT_CODEX_MAX_RETRY:-2}"
 # Timeout (seconds) for the spec-declared smoke-run validation phase
@@ -973,7 +982,9 @@ initialize_run() {
   state_set '.baseline_complete=true'
   emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
     --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
-    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs}}')"
+    --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" \
+    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs},
+      engines:{implement:$engine_implement, review:($engine_review|if .=="" then null else . end)}}')"
 }
 
 recover_run() {
@@ -1597,13 +1608,14 @@ codex_model_flag() {
 # One codex primary turn: fresh (`codex exec -s ...`) when $session is empty,
 # resume (`codex exec resume $session ...`) otherwise. Captures the whole
 # `--json` JSONL stream to $raw (thread.started/turn.started/item.*/
-# turn.completed — the exact shape captured live against codex-cli 0.144.3;
-# see the codex-capture/ scratchpad fixtures this shim was built from) and the
-# last agent message to $raw.last (codex's own -o flag); stderr is noisy even
-# on rc=0 (model-cache/MCP warnings) so it is kept SEPARATELY in $raw.err and
-# never parsed. Returns codex's own exit status; the caller (invoke_primary_codex)
-# owns retry policy. Mirrors invoke_observer_once's contract: side effects on
-# disk, a plain return code, no stdout payload.
+# turn.completed — the exact shape captured live against codex-cli 0.144.3,
+# also verified against 0.146.0; see the codex-capture/ scratchpad fixtures
+# this shim was built from) and the last agent message to $raw.last (codex's
+# own -o flag); stderr is noisy even on rc=0 (model-cache/MCP warnings) so it
+# is kept SEPARATELY in $raw.err and never parsed. Returns codex's own exit
+# status; the caller (invoke_primary_codex) owns retry policy. Mirrors
+# invoke_observer_once's contract: side effects on disk, a plain return code,
+# no stdout payload.
 #
 # NOTE (verified live): `codex exec resume` REJECTS -s outright, so the
 # sandbox must be re-asserted via the `-c sandbox_mode=...` config override on
@@ -1613,6 +1625,15 @@ codex_model_flag() {
 # carried on both paths for the same reason: it is scoped under the
 # sandbox_workspace_write config table, so it is simply inert whenever the
 # active sandbox is danger-full-access.
+#
+# NOTE (verified live, UNLIKE the Claude primary): codex re-resolves the model
+# per invocation instead of carrying it from the session that created a
+# thread — `claude --resume` carries its creation model forward (see the
+# comment in invoke_primary), but `codex exec resume` does not, so a resume
+# call that omits --model silently reverts to codex's configured default after
+# turn 1 even when NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL is set. codex_model_flag
+# is therefore passed on BOTH the fresh and the resume invocation below
+# (`codex exec resume` accepts -m/--model — verified in its --help).
 invoke_primary_codex_once() {
   local prompt="$1" raw="$2" session="${3:-}" rc=0
   if [ -z "$session" ]; then
@@ -1623,10 +1644,11 @@ invoke_primary_codex_once() {
         --json -o "$raw.last" $(codex_model_flag) - <"$prompt") \
       >"$raw" 2>"$raw.err" || rc=$?
   else
+    # shellcheck disable=SC2046
     (cd "$PROJECT" && codex exec resume "$session" \
         -c "sandbox_mode=\"$CODEX_SANDBOX\"" \
         -c sandbox_workspace_write.network_access=true \
-        --json -o "$raw.last" - <"$prompt") \
+        --json -o "$raw.last" $(codex_model_flag) - <"$prompt") \
       >"$raw" 2>"$raw.err" || rc=$?
   fi
   return "$rc"
@@ -1659,17 +1681,31 @@ codex_retry_backoff() { sleep 60; }
 
 # Bounded-retry codex primary turn (the codex counterpart of the Claude while
 # loop inside invoke_primary): NIGHT_SHIFT_CODEX_MAX_RETRY (default 2) extra
-# attempts, 60s apart via codex_retry_backoff, before block_run. No Claude-
-# shaped 429 parsing in v1 (see the design note) — codex has no structured
-# session-limit response to detect, so a nonzero rc is retried blindly up to
-# the cap. Journals one codex_primary event per attempt ({outcome, rc,
-# attempt, usage}); usage is only meaningful on a successful attempt (a failed
-# attempt may have no turn.completed at all, hence "null"). On success prints
-# the emitted thread id on stdout (the caller command-substitutes it, the same
-# out/return split invoke_observer_once uses) and returns 0; on exhausting the
-# retry budget it block_runs and never returns.
+# attempts, 60s apart via codex_retry_backoff. No Claude-shaped 429 parsing in
+# v1 (see the design note) — codex has no structured session-limit response to
+# detect, so a nonzero rc is retried blindly up to the cap. Journals one
+# codex_primary event per attempt ({outcome, rc, attempt, usage}); usage is
+# only meaningful on a successful attempt (a failed attempt may have no
+# turn.completed at all, hence "null"). On success prints the emitted thread
+# id on stdout (the caller command-substitutes it, the same out/return split
+# invoke_observer_once uses) and returns 0.
+#
+# On exhausting the retry budget this function does NOT call block_run itself
+# — it writes the informative reason to "$raw.block-reason" and returns 1.
+# This function is always invoked as `emitted="$(invoke_primary_codex ...)"`
+# (a command substitution): calling block_run FROM INSIDE that subshell would
+# only unwind the subshell (block_run ends in `die`, i.e. `exit`), so the
+# journal + state.json block_reason it writes would be discarded once the
+# subshell exits — the parent shell would then continue past the assignment
+# with an empty $emitted, fall through to invoke_primary's own
+# "primary emitted no resumable session ID" check, and call block_run a SECOND
+# time with a generic reason that clobbers the real one (empirically
+# reproduced: two review agents independently hit this — a double-journaled
+# run_blocked event and a useless block_reason in state.json). The single call
+# site that matters is the PARENT (invoke_primary's codex branch), which reads
+# this file back on a nonzero return.
 invoke_primary_codex() {
-  local prompt="$1" raw="$2" session="${3:-}" attempt=0 rc emitted usage
+  local prompt="$1" raw="$2" session="${3:-}" attempt=0 rc emitted usage reason
   while :; do
     rc=0
     invoke_primary_codex_once "$prompt" "$raw" "$session" || rc=$?
@@ -1683,8 +1719,11 @@ invoke_primary_codex() {
     fi
     emit_event codex_primary "$(jq -cn --arg o "error" --argjson rc "$rc" --argjson a "$attempt" --argjson u "$usage" \
       '{outcome:$o, rc:$rc, attempt:$a, usage:$u}')"
-    [ "$attempt" -lt "$CODEX_MAX_RETRY" ] ||
-      block_run "codex primary failed after $((attempt + 1)) attempt(s) (rc=$rc); see $raw.err"
+    if [ "$attempt" -ge "$CODEX_MAX_RETRY" ]; then
+      reason="codex primary failed after $((attempt + 1)) attempt(s) (rc=$rc); see $raw.err"
+      printf '%s' "$reason" >"$raw.block-reason"
+      return 1
+    fi
     attempt=$((attempt + 1))
     log "codex primary turn failed (rc=$rc); retry $attempt/$CODEX_MAX_RETRY in 60s"
     codex_retry_backoff
@@ -1712,10 +1751,18 @@ invoke_primary() {
   engine="$(stage_engine "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
   if [ "$engine" = "codex" ]; then
-    # Bounded retry + block_run all live inside invoke_primary_codex; a
-    # successful call always prints a non-empty thread id (block_run never
-    # returns), so the only thing left to check below is the drift guard.
-    emitted="$(invoke_primary_codex "$prompt" "$raw" "$session")"
+    # Bounded retry lives inside invoke_primary_codex; a successful call
+    # prints a non-empty thread id, so the only thing left to check below is
+    # the drift guard. On retry exhaustion invoke_primary_codex returns 1
+    # WITHOUT calling block_run itself (see its own comment for why: block_run
+    # from inside this command substitution's subshell would only unwind the
+    # subshell) — the single, authoritative block_run call for that path lives
+    # HERE, in the parent shell, reading back the informative reason it left
+    # at "$raw.block-reason". This is the ONLY block_run call on the codex
+    # exhaustion path; a missing reason file (should not happen, but fails
+    # safe) falls back to a generic message naming $raw for forensics.
+    emitted="$(invoke_primary_codex "$prompt" "$raw" "$session")" ||
+      block_run "$(cat "$raw.block-reason" 2>/dev/null || printf 'codex primary failed; see %s.err' "$raw")"
   else
     # Model for this stage's scope, pinned only on a FRESH start. A session is born
     # inside one scope and the model is constant within a scope (a scope boundary

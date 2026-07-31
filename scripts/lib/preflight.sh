@@ -342,6 +342,7 @@ validate_spec_smoke() {
 # Engines field onto the next task's defaults.
 validate_spec_engines() {
   local file="$1" raw pair role vendor seen_implement=0 seen_review=0
+  local scoped_text engines_line_count
   ENGINE_IMPLEMENT="claude"
   ENGINE_REVIEW=""
   # Presence check scoped exactly like the extractor (spec_engines uses
@@ -350,8 +351,33 @@ validate_spec_engines() {
   # Smoke use. An unscoped grep here would treat a stray "- Engines:" mention
   # elsewhere in the spec (e.g. prose under Related Files) as a malformed
   # field, exactly the bug fixture_review_fields_scoped guards against for
-  # Personas.
-  spec_field_scope "$file" | grep -Eq '^- Engines:' || return 0
+  # Personas. Captured once into a var (spec_field_scope now also strips CRLF
+  # and skips fenced code blocks — see its own comment) so the presence count,
+  # the near-miss check, and the strict extractor all see the same text.
+  scoped_text="$(spec_field_scope "$file")"
+  engines_line_count="$(printf '%s\n' "$scoped_text" | grep -Ec '^- Engines:')"
+  if [ "$engines_line_count" -gt 1 ]; then
+    printf 'duplicate Engines field\n' >&2
+    return 1
+  fi
+  if [ "$engines_line_count" -eq 0 ]; then
+    # Near-miss spellings must never be silently treated as absent: widen ONLY
+    # this presence check so near-miss ATTEMPTS at the field — `- Engines :`,
+    # `- engines:`, colon-less `- Engines implement=codex` — hit the loud
+    # malformed-field error below instead of resolving to today's silent
+    # claude/inherit-env defaults. The match is shape-constrained (the word
+    # "engines" must be followed by a colon, or by a role=vendor-looking
+    # token), NOT a bare prefix: prose bullets like "- engines overview lives
+    # in docs/" or "- EnginesRoom: 3" must stay valid non-fields, especially
+    # on legacy no-## Review specs where the scope is the whole file. The
+    # strict extractor (spec_engines) is unchanged — only detection of
+    # "something was attempted here" widens.
+    if printf '%s\n' "$scoped_text" | grep -Eiq '^-[[:space:]]?engines([[:space:]]*:|[[:space:]]+[a-z]+=)'; then
+      printf 'malformed Engines field — use: - Engines: implement=claude|codex review=codex|off (space-separated role=vendor pairs)\n' >&2
+      return 1
+    fi
+    return 0
+  fi
   raw="$(spec_engines "$file")"
   if [ -z "$raw" ]; then
     printf 'malformed Engines field — use: - Engines: implement=claude|codex review=codex|off (space-separated role=vendor pairs)\n' >&2
@@ -393,6 +419,27 @@ validate_spec_engines() {
   done
   if [ "$ENGINE_IMPLEMENT" = "codex" ] && ! codex_available; then
     printf 'Engines implement=codex requires the codex CLI on PATH\n' >&2
+    return 1
+  fi
+  # Proven live: codex keeps .git READ-ONLY under its workspace-write sandbox
+  # policy, with no config escape hatch — a workspace-write implement run can
+  # never `git commit` a candidate, so it would fail every time, not just
+  # occasionally. Reject at spec selection rather than let a run discover the
+  # dead end hours into implementation. danger-full-access (the default) is
+  # the only sandbox that lets a codex primary create a candidate today.
+  if [ "$ENGINE_IMPLEMENT" = "codex" ] && [ "$CODEX_SANDBOX" = "workspace-write" ]; then
+    printf 'implement=codex cannot run under NIGHT_SHIFT_CODEX_SANDBOX=workspace-write — codex keeps .git read-only so the primary can never commit a candidate; use danger-full-access (the default)\n' >&2
+    return 1
+  fi
+  # Session ids are vendor-specific and never cross vendors (`codex exec
+  # resume <claude-uuid>` is meaningless). SESSION_SCOPE=run pins ONE session
+  # for the whole run and only nulls it at scope boundaries the run may never
+  # reach in a single-task invocation, so a codex implement stage under
+  # SESSION_SCOPE=run risks resuming a Claude session id (or vice versa).
+  # SESSION_SCOPE=stage (the default) always starts implement fresh, which is
+  # the only shape codex's per-vendor session ids are safe under.
+  if [ "$ENGINE_IMPLEMENT" = "codex" ] && [ "${SESSION_SCOPE:-stage}" != "stage" ]; then
+    printf 'Engines implement=codex requires NIGHT_SHIFT_SESSION_SCOPE=stage (run-scoped sessions never null at scope boundaries, so Claude/codex session ids would cross vendors)\n' >&2
     return 1
   fi
   return 0

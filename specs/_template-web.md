@@ -93,7 +93,11 @@ profile blocks the run.
      and/or override the NIGHT_SHIFT_CODEX_REVIEW advisory-review knob for
      just this spec. Absent (the default): claude-only, codex dormant — same
      as leaving this out entirely. `implement=codex` requires the codex CLI on
-     PATH (checked at spec selection, not mid-run). `plan`/`observer` are
+     PATH, NIGHT_SHIFT_CODEX_SANDBOX=danger-full-access (the default — codex
+     keeps .git read-only under workspace-write, so it could never commit a
+     candidate), and NIGHT_SHIFT_SESSION_SCOPE=stage (the default — vendor
+     session ids never cross vendors); all checked at spec selection, not
+     mid-run. `plan`/`observer` are
      Claude-only and rejected if named here — the independent Claude observer
      always gates the candidate. Example (indented so it is not parsed):
        - Engines: implement=codex review=codex
