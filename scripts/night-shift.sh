@@ -802,6 +802,54 @@ compact_success() {
   done
 }
 
+# The approved plan (control/plan.md) is the context a human reviews the
+# archived diff against, but control/ is deleted on success compaction. Copy
+# the finishing task's plan into validated/ (which IS archived) under the
+# task's spec name, at both task-completion paths (COMPLETE and NEXT_TASK —
+# the next task overwrites control/plan.md during its planning stage). Also
+# mirrors to validated/plan.md (last-writer-wins) — the viewer prefers that
+# fixed name as the logical "plan" artifact. Best-effort: fixture/dry runs may
+# have no plan, and a failed mkdir/cp must never fail a completed task (WARN
+# and move on, same advisory convention as run_feedback/sweep).
+archive_task_plan() {
+  [ -n "${RUN_ROOT:-}" ] && [ -s "$RUN_ROOT/control/plan.md" ] || return 0
+  mkdir -p "$RUN_ROOT/validated" 2>/dev/null || {
+    log "WARN: archive_task_plan could not create $RUN_ROOT/validated"
+    return 0
+  }
+
+  local name dest
+  # Sanitize to the viewer's archived-plan filename regex
+  # (^plan(-[A-Za-z0-9._-]{1,120})?\.md$): replace anything outside
+  # A-Za-z0-9._- with '-', strip a leading dot (regex-legal but keeps the
+  # name from reading like a hidden file), truncate to 100 chars — NOT the
+  # regex's full 120, so the collision path's "-<epoch>" suffix (11 chars)
+  # still fits inside the viewer's {1,120} group — and fall back to a fixed
+  # token if sanitization empties the name entirely.
+  name="$(basename "$SPEC" .md)"
+  name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '-')"
+  name="${name#.}"
+  name="${name:0:100}"
+  [ -n "$name" ] || name="task"
+  dest="$RUN_ROOT/validated/plan-$name.md"
+
+  if [ -e "$dest" ] && ! cmp -s "$RUN_ROOT/control/plan.md" "$dest"; then
+    # Collision: a different plan already sits at this name (e.g. a spec
+    # re-run after recovery). Never clobber — suffix with the current epoch
+    # second, still viewer-regex-safe, and try the copy at that path instead.
+    dest="$RUN_ROOT/validated/plan-$name-$(now_epoch).md"
+  fi
+  if [ -e "$dest" ] && cmp -s "$RUN_ROOT/control/plan.md" "$dest"; then
+    : # identical content already archived (recovery double-archive) — skip
+  else
+    cp "$RUN_ROOT/control/plan.md" "$dest" 2>/dev/null ||
+      log "WARN: archive_task_plan failed to copy plan.md to $dest"
+  fi
+
+  cp "$RUN_ROOT/control/plan.md" "$RUN_ROOT/validated/plan.md" 2>/dev/null ||
+    log "WARN: archive_task_plan failed to copy plan.md to validated/plan.md"
+}
+
 # Spec validation + path canonicalization + launch-readiness preflight + validation-
 # command execution/evidence (canonical_dir, validate_spec, emit_preflight,
 # validate_spec_project, run_validation_commands, …) now live in scripts/lib/preflight.sh.
@@ -3399,6 +3447,7 @@ detect_stalled_personas() {
 
 complete_run() {
   local summary="$RUN_ROOT/summary.json"
+  archive_task_plan
   # Run feedback (Task 3, agentic-gaps tranche): a short fresh session
   # distills this run's journal into <project>/.night-shift/feedback.md for
   # the human who authors specs. Deliberately BEFORE the BRANCH_SWEEP block
@@ -3443,6 +3492,9 @@ complete_run() {
 
 start_next_task() {
   local next_spec="" epoch cand canon
+  # $SPEC still names the task that just completed; preserve its plan before
+  # anything moves on (the next task rewrites control/plan.md).
+  archive_task_plan
   # Walk the unchecked queue and pick the first spec that belongs to THIS run's
   # project. Specs for other projects are skipped (a run is pinned to one
   # --project and cannot switch). If none remain for this project, the run is

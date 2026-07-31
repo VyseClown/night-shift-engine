@@ -151,3 +151,12 @@ observer approval.
   the viewer renders it as a checklist.
 - `scripts/parallel-worktrees.sh` wrapper for fan-out runs across worktrees;
   design + plan docs are kept local-only (gitignored, same policy as specs).
+- **Approved plan survives success compaction.** Both task-completion paths
+  (COMPLETE and NEXT_TASK) copy `control/plan.md` into
+  `validated/plan-<spec>.md` before `control/` is deleted, so archived runs
+  keep the plan a human reviews the diff against (the viewer's Plan panel
+  renders it). The spec name is sanitized to the viewer's filename regex and
+  never clobbers a differing same-name plan (suffixed instead), and a copy also
+  lands at `validated/plan.md` (last-writer-wins) — the viewer's preferred
+  fixed logical-plan name. Best-effort: fixture/dry runs without a plan are a
+  clean no-op, and a failed mkdir/cp WARNs rather than failing the task.
