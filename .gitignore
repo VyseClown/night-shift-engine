@@ -19,6 +19,14 @@
 /docs/superpowers/specs/
 /docs/superpowers/plans/
 
+# The observer ledger is written AUTOMATICALLY by the engine at the end of every
+# run (append_observer_review), and each entry embeds the run's spec PATH — which
+# on a company-target run carries company names straight into a tracked file.
+# An automated writer must never target a publishable file, so the ledger stays
+# LOCAL ONLY. The engine creates it on first append; every doc that references it
+# describes a local ledger, not a repo artifact.
+/NIGHT_SHIFT_REVIEW.md
+
 # Independent project repos that live alongside the engine (each has its own git).
 /rn-sandbox/
 /web-app/
