@@ -151,6 +151,7 @@ run_dry_fixtures() {
   fixture_assert "truncate_to_budget: marker survives a cut landing on newline bytes" fixture_truncate_budget "$root"
   fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
   fixture_assert "implementer backend: plan pinned to claude, post-plan scopes follow the knob, design/fallback overrides, sticky fallback_set" fixture_implementer_backend "$root"
+  fixture_assert "invoke_primary dispatches on implement_scope_backend, cursor branch redirects stderr, structural guarantees intact, backend knob defaults claude" fixture_cursor_primary_dispatch "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
   fixture_assert "Smoke phase: field parsing/validation, exit + server modes, timeout/abort leave no zombie" fixture_smoke_phase "$root"
@@ -2462,6 +2463,35 @@ fixture_implementer_backend() {
         "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
     exit 0
   ) || return 1
+  return 0
+}
+
+fixture_cursor_primary_dispatch() {
+  # Structural: invoke_primary must dispatch through implement_scope_backend
+  # (specs/cursor-implementer-backend.md Task 2), the cursor exec branch must
+  # redirect stderr to a file (cursor errors are stderr-only prose with no
+  # JSON on stdout), and the refactor must not disturb the two pre-existing
+  # structural guarantees pinned elsewhere in this file (session-refresh
+  # wiring, resolve_effective_model consumers) — cheap belt-and-suspenders
+  # re-checks right where the dispatch itself is being asserted. declare -f
+  # (not grep -q pipes): the pipefail flake documented next to those fixtures.
+  local body line
+  body="$(declare -f invoke_primary)"
+  case "$body" in *implement_scope_backend*) ;; *) return 1 ;; esac
+  # declare -f re-serializes the function (bash inserts a space after a
+  # redirection operator: `2> "$raw.err"`, not the source's `2>"$raw.err"`),
+  # so the pin targets the operand only — still unambiguous for "did the
+  # cursor branch redirect stderr to a file".
+  case "$body" in *'"$raw.err"'*) ;; *) return 1 ;; esac
+  case "$body" in *maybe_refresh_session*) ;; *) return 1 ;; esac
+  case "$body" in *resolve_effective_model*) ;; *) return 1 ;; esac
+  # "Inert when unset" pin: the engine's own --list-config surface (grep-
+  # derived straight from the `${NIGHT_SHIFT_IMPLEMENT_BACKEND:-claude}`
+  # source line, so this also catches an accidental default-value edit) must
+  # report claude as the backend knob's default. Zero regression coverage on
+  # this existed before Task 2.
+  line="$(list_config | grep 'NIGHT_SHIFT_IMPLEMENT_BACKEND')"
+  case "$line" in *'default: claude'*) ;; *) return 1 ;; esac
   return 0
 }
 

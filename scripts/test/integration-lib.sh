@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # integration-lib.sh — shared scaffold for the full-orchestration tests
-# (integration-run.sh = happy path, integration-adverse.sh = blocked/recovery).
-# Everything here is a verbatim extraction from integration-run.sh; the stub
-# gained MODES so adverse scenarios can misbehave deterministically:
+# (integration-run.sh = happy path, integration-adverse.sh = blocked/recovery,
+# integration-cursor.sh = cursor implementer backend). Everything here is a
+# verbatim extraction from integration-run.sh; the stub gained MODES so
+# adverse scenarios can misbehave deterministically:
 #   happy              — the original scripted pipeline (plan -> impl -> candidate
 #                        -> observer APPROVE -> complete)
 #   malformed          — the primary emits an invalid signal every turn (drives
@@ -10,6 +11,11 @@
 #   block-then-approve — the observer BLOCKs the first candidate with OBS-001;
 #                        the re-entered implement turn appends a guard line so
 #                        the SECOND candidate differs; second verdict APPROVEs.
+#   cursor-fail        — write_cursor_stub only: the cursor-agent primary
+#                        exits 1 with the verified stderr-only RetriableError
+#                        shape and nothing on stdout, to drive
+#                        invoke_primary's bounded-retry -> sticky-claude-
+#                        fallback path.
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 ENGINE="$ENGINE_DIR/scripts/night-shift.sh"
@@ -99,6 +105,65 @@ JS
   1. \`node --version\`
   2. \`node --test add.test.js\`
 SPEC
+}
+
+# Scripted `cursor-agent` on PATH (specs/cursor-implementer-backend.md Task 2):
+# the cursor implementer backend. Unlike write_stub's `claude` binary, this is
+# the primary ONLY — no role multiplexing needed, since plan/persona/observer
+# turns stay on the claude stub regardless of the backend knob. --trust is
+# asserted defensively as the expected discriminator (the primary's cursor
+# invocation always passes it; a call missing it is a wiring bug). Appends one
+# line per invocation to $WORK/.cursor-calls (proves cursor actually ran the
+# turns it was supposed to). MODE=cursor-fail exits 1 with the verified
+# stderr-only RetriableError shape and nothing on stdout, to drive the
+# bounded-retry -> sticky-fallback path.
+write_cursor_stub() {
+  local mode="${1:-happy}"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'MODE=%q\n' "$mode"
+    printf 'WORK=%q\n' "$WORK"
+    cat <<'STUB'
+has_trust=0; for a in "$@"; do [ "$a" = "--trust" ] && has_trust=1; done
+[ "$has_trust" = "1" ] || { printf 'Error: expected --trust in argv (not the cursor primary?)\n' >&2; exit 1; }
+emit(){ jq -cn --arg s "$1" --arg r "$2" '{type:"result",subtype:"success",is_error:false,result:$r,session_id:$s,usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'; }
+# Stage-dispatch mirrors write_stub's primary branch above (LOCKSTEP: any stage
+# case added there must be mirrored here too). Planning branches are
+# unreachable in cursor mode (the plan scope always stays on the claude stub)
+# but kept for lockstep/documentation.
+st=.night-shift/state.json; c=.night-shift/control; mkdir -p "$c"; sig="$c/next-action.json"
+stage="$(jq -r '.stage' "$st")"; spec="$(jq -r '.task' "$st")"
+# One line per invocation, keyed on stage (NOT the raw multi-line prompt in
+# "$*" — that would inflate the line count with the prompt's own newlines).
+printf '%s\n' "$stage" >> "$WORK/.cursor-calls"
+if [ "$MODE" = "cursor-fail" ]; then
+  printf 'Error: RetriableError: [resource_exhausted]\n' >&2
+  exit 1
+fi
+case "$stage" in
+  planning|plan_review)
+    printf '# Plan\n- create add.js exporting add(a,b)=>a+b.\n' > "$c/plan.md"
+    jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"planning",reason:"plan",artifacts:[]}' > "$sig" ;;
+  implementation|implementation_review)
+    printf 'module.exports.add = (a, b) => a + b;\n' > add.js
+    jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"implementation",reason:"impl",artifacts:[]}' > "$sig" ;;
+  implementation_ready)
+    git add add.js >/dev/null 2>&1; git commit -qm "feat: add() helper" >/dev/null 2>&1
+    jq -cn --arg t "$spec" '{task:$t,
+      baseline:[{command:"node --version",exit_status:0,output:"v"}],
+      test_first:{command:"node --test add.test.js",failing_exit_status:1,failing_output:"red",passing_exit_status:0,passing_output:"green"},
+      final_validation:[{command:"node --version",exit_status:0,output:"v"},{command:"node --test add.test.js",exit_status:0,output:"green"}]}' > "$c/evidence.json"
+    jq -cn --arg t "$spec" '{action:"CREATE_CANDIDATE",task:$t,stage:"implementation_ready",reason:"cand",artifacts:[".night-shift/control/evidence.json"]}' > "$sig" ;;
+  observer_review)
+    jq -cn --arg t "$spec" '{action:"REQUEST_OBSERVER",task:$t,stage:"observer_review",reason:"obs",artifacts:[]}' > "$sig" ;;
+  completion)
+    jq -cn --arg t "$spec" '{action:"COMPLETE",task:$t,stage:"completion",reason:"done",artifacts:[]}' > "$sig" ;;
+  *) jq -cn --arg t "$spec" --arg s "$stage" '{action:"BLOCKED",task:$t,stage:$s,reason:("stub stage "+$s),artifacts:[]}' > "$sig" ;;
+esac
+emit stubcursor "done"; exit 0
+STUB
+  } > "$BIN/cursor-agent"
+  chmod +x "$BIN/cursor-agent"
 }
 
 # Scripted `claude` on PATH: primary (writes stage files + signal), personas,

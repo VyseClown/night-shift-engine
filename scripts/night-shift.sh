@@ -1551,7 +1551,7 @@ invoke_primary() {
     block_run "could not read .primary_turns from state; state may be corrupt"
   prompt="$RUN_ROOT/prompts/primary-$turn.txt"
   raw="$RUN_ROOT/raw/primary-$turn.json"
-  local session emitted rc model
+  local session emitted rc model backend cursor_attempts=0
   # The consecutive 429-without-success counter now lives entirely in
   # handle_rate_limit_wait (lib/recovery.sh): persisted in state so recovery
   # after a crash picks up the count; reset to 0 on the first clean turn below.
@@ -1570,6 +1570,7 @@ invoke_primary() {
   # per-model 429 fallback recorded earlier in the run under
   # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
   model="$(resolve_effective_model "$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")")"
+  backend="$(implement_scope_backend "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
   while :; do
     rc=0
@@ -1577,7 +1578,21 @@ invoke_primary() {
     # non-interactive permission mode. Safe because the run is confined to a
     # feature branch and the wrapper forbids push/merge/destructive Git ops and
     # excludes pre-existing dirt from candidate commits.
-    if [ -z "$session" ]; then
+    if [ "$backend" = "cursor" ]; then
+      # Cursor implementer (specs/cursor-implementer-backend.md): same prompt,
+      # same session invariants, cursor envelope. stderr MUST go to a file —
+      # cursor errors are stderr-only prose with no JSON on stdout. -f allows
+      # commands (the bypassPermissions analogue); --trust skips the headless
+      # workspace-trust hard-fail. --model only on a fresh start (a --resume
+      # carries its creation model, same rule as the Claude branch).
+      if [ -z "$session" ]; then
+        (cd "$PROJECT" && cursor-agent -p --model "$CURSOR_IMPLEMENT_MODEL" --output-format json \
+          --trust -f "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
+      else
+        (cd "$PROJECT" && cursor-agent -p --resume "$session" --output-format json \
+          --trust -f "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
+      fi
+    elif [ -z "$session" ]; then
       # model_flag must word-split into `--model X` (or vanish when empty).
       # shellcheck disable=SC2046
       (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
@@ -1588,6 +1603,24 @@ invoke_primary() {
     fi
     emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
     [ "$rc" -ne 0 ] || break
+    if [ "$backend" = "cursor" ]; then
+      # Cursor has no parseable 429 contract (stderr prose, no reset time):
+      # bounded retries with linear backoff, then a sticky per-run fallback to
+      # the Claude implement model. The fresh Claude session reorients from the
+      # files on disk via the same handoff note a stage boundary uses.
+      if [ "$cursor_attempts" -lt "$CURSOR_MAX_RETRIES" ]; then
+        cursor_attempts=$((cursor_attempts + 1))
+        emit_event backend_retry "$(jq -cn --argjson a "$cursor_attempts" --argjson rc "$rc" '{backend:"cursor", attempt:$a, rc:$rc}')"
+        log "cursor backend: attempt $cursor_attempts/$CURSOR_MAX_RETRIES failed (rc=$rc; see $raw.err); retrying in $((CURSOR_RETRY_BACKOFF * cursor_attempts))s"
+        sleep $((CURSOR_RETRY_BACKOFF * cursor_attempts))
+        continue
+      fi
+      implement_backend_fallback_set "cursor invocation failed after $cursor_attempts retries" "$rc"
+      backend="claude"
+      session=""
+      state_set '.session_id=null'
+      continue
+    fi
     if is_rate_limit_response "$raw" &&
       [ -n "$emitted" ] &&
       { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then

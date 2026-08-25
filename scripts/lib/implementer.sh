@@ -28,7 +28,7 @@ implement_backend_active() {
 # Pure-ish: the backend for a session scope. Plan is always Claude (planning
 # quality bounds the run); everything post-plan follows the active backend.
 implement_scope_backend() {
-  case "$1" in
+  case "${1:-}" in
     implement|visual|observe|complete)
       if implement_backend_active; then printf 'cursor'; else printf 'claude'; fi ;;
     *) printf 'claude' ;;
@@ -39,7 +39,7 @@ implement_scope_backend() {
 # exhausted: state flag (survives resume; state_set is integrity-guarded by
 # the caller's flow), journal, log. Never fails the run itself.
 implement_backend_fallback_set() {
-  local reason="$1" rc="$2"
+  local reason="${1:-}" rc="${2:-0}"
   state_set '.implement_backend_fallback="claude"'
   emit_event backend_fallback "$(jq -cn --arg r "$reason" --argjson rc "$rc" \
     '{from:"cursor", to:"claude", reason:$r, rc:$rc}')"
