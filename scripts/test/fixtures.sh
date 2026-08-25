@@ -150,6 +150,7 @@ run_dry_fixtures() {
   fixture_assert "conventions are snapshot-frozen, indented (no section forgery), provenance-labeled" fixture_conventions_hardening "$root"
   fixture_assert "truncate_to_budget: marker survives a cut landing on newline bytes" fixture_truncate_budget "$root"
   fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
+  fixture_assert "implementer backend: plan pinned to claude, post-plan scopes follow the knob, design/fallback overrides, sticky fallback_set" fixture_implementer_backend "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
   fixture_assert "Smoke phase: field parsing/validation, exit + server modes, timeout/abort leave no zombie" fixture_smoke_phase "$root"
@@ -1674,7 +1675,7 @@ fixture_event_stream() {
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
     stage_transition codex_review model_fallback reuse_violation port_audit smoke \
-    sweep sweep_fix sweep_fix_reverted run_feedback test_audit; do
+    sweep sweep_fix sweep_fix_reverted run_feedback test_audit backend_fallback; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -2389,6 +2390,76 @@ STUB
       jq -e 'select(.type=="codex_review") | .payload.outcome=="error"' "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
     fx_not "failing codex leaves no artifact" [ -e "$RUN_ROOT/validated/codex-review-$cand.md" ] || exit 1
     fx_not "no artifact -> no observer section" [ -n "$(codex_review_section "$cand")" ] || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# scripts/lib/implementer.sh: the cursor-backend seam (Task 1 — predicate +
+# knobs only, no invocation). implement_scope_backend must (a) always keep the
+# plan scope on claude even when the knob is cursor, (b) route post-plan
+# scopes to cursor once active, (c) fall back to claude with the knob unset,
+# (d) force claude for a ## Design Contract spec regardless of the knob, and
+# (e) force claude once the sticky per-run fallback flag is set in state.
+# implement_backend_fallback_set (f) must persist that flag and journal a
+# backend_fallback event with from/to/reason/rc.
+fixture_implementer_backend() {
+  local root="$1" dir="$root/implbackend"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir"
+  ( IMPLEMENT_BACKEND=cursor
+    unset STATE SPEC 2>/dev/null
+    fx "(a) plan scope stays claude even with cursor active" \
+      test "$(implement_scope_backend plan)" = "claude" || exit 1
+    fx "(b) post-plan scope is cursor once active (no spec/state)" \
+      test "$(implement_scope_backend implement)" = "cursor" || exit 1
+    fx "(b) implement_backend_active itself is 0 in the same conditions" \
+      implement_backend_active || exit 1
+    IMPLEMENT_BACKEND=""
+    fx "(c) knob unset falls back to claude" \
+      test "$(implement_scope_backend observe)" = "claude" || exit 1
+    fx_not "(c) implement_backend_active is 1 with the knob unset" \
+      implement_backend_active || exit 1
+    IMPLEMENT_BACKEND=cursor
+    SPEC="$dir/design-spec.md"
+    printf '# spec\n\n## Design Contract\nsome design text\n' >"$SPEC"
+    fx "(d) Design Contract spec forces claude" \
+      test "$(implement_scope_backend complete)" = "claude" || exit 1
+    unset SPEC
+    STATE="$dir/state.json"
+    printf '{"implement_backend_fallback":"claude"}\n' >"$STATE"
+    fx "(e) sticky state fallback forces claude" \
+      test "$(implement_scope_backend implement)" = "claude" || exit 1
+    printf '{}\n' >"$STATE"
+    fx "no fallback flag restores cursor" \
+      test "$(implement_scope_backend implement)" = "cursor" || exit 1
+    # cursor_available: the seam predicate is a plain `command -v cursor-agent`,
+    # overridable in fixtures just like codex_available. Prove both edges with a
+    # PATH-only stub (no real cursor-agent install needed for the suite to run) —
+    # mutate PATH in-place, this fixture already runs inside its own subshell.
+    mkdir -p "$dir/emptybin" "$dir/bin"
+    printf '#!/bin/bash\ntrue\n' >"$dir/bin/cursor-agent"; chmod +x "$dir/bin/cursor-agent"
+    orig_path="$PATH"
+    # shellcheck disable=SC2123  # deliberate: this machine has a real cursor-agent
+    # on PATH (per the spec's verified ground truth), so proving the "absent" edge
+    # needs an actual empty-dir PATH, not just a prepend; restored 3 lines down.
+    PATH="$dir/emptybin"
+    fx_not "cursor_available is 1 with no cursor-agent on PATH" cursor_available || exit 1
+    PATH="$dir/bin:$orig_path"
+    fx "cursor_available is 0 once cursor-agent is on PATH" cursor_available || exit 1
+    PATH="$orig_path"
+    # (f) implement_backend_fallback_set: state flag + journal.
+    RUN_ROOT="$dir/rs"; RUN_ID="ibfx"; mkdir -p "$RUN_ROOT"
+    STATE="$RUN_ROOT/state.json"; printf '{"stage":"implementation"}\n' >"$STATE"
+    log() { :; }
+    implement_backend_fallback_set "cursor retries exhausted" 1
+    fx "(f) fallback_set persists the state flag" \
+      test "$(jq -r '.implement_backend_fallback' "$STATE")" = "claude" || exit 1
+    fx "(f) fallback_set journals backend_fallback with reason+rc" \
+      jq -e 'select(.type=="backend_fallback") |
+        .payload.from=="cursor" and .payload.to=="claude" and
+        .payload.reason=="cursor retries exhausted" and .payload.rc==1' \
+        "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
     exit 0
   ) || return 1
   return 0

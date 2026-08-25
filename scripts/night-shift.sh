@@ -132,6 +132,17 @@ SWEEP_MAX_WAIT="${NIGHT_SHIFT_SWEEP_MAX_WAIT:-900}"
 # pipeline and wire contracts are untouched either way.
 CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
 CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
+# Opt-in second implementer vendor (scripts/lib/implementer.sh): "cursor" runs
+# the primary's POST-PLAN scopes (implement, observe-request, completion — and
+# the sweep fix + run-feedback sessions) on the Cursor CLI (cursor-agent) with
+# CURSOR_IMPLEMENT_MODEL. Plan, personas, the observer, and any ## Design
+# Contract spec stay Claude. Cursor failures retry CURSOR_MAX_RETRIES times
+# (backoff CURSOR_RETRY_BACKOFF * attempt seconds), then the run falls back to
+# the Claude implement model for the rest of the run (journaled, sticky).
+IMPLEMENT_BACKEND="${NIGHT_SHIFT_IMPLEMENT_BACKEND:-claude}"
+CURSOR_IMPLEMENT_MODEL="${NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL:-cursor-grok-4.6-high}"
+CURSOR_MAX_RETRIES="${NIGHT_SHIFT_CURSOR_MAX_RETRIES:-3}"
+CURSOR_RETRY_BACKOFF="${NIGHT_SHIFT_CURSOR_RETRY_BACKOFF:-30}"
 # Timeout (seconds) for the spec-declared smoke-run validation phase
 # (run_smoke_phase, scripts/lib/preflight.sh) — how long a server-mode smoke
 # command gets to answer HTTP 200, or an exit-mode smoke command gets to exit.
@@ -212,6 +223,11 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # Engine-private integrity anchor for wrapper-owned files. See scripts/lib/integrity.sh.
 # shellcheck source=scripts/lib/integrity.sh
 . "$NIGHT_SHIFT_LIB/integrity.sh"
+# Opt-in second implementer vendor (NIGHT_SHIFT_IMPLEMENT_BACKEND). See
+# scripts/lib/implementer.sh. Sourced BEFORE sweep.sh: sweep_fix_cycle and
+# write_run_feedback dispatch on implement_backend_active.
+# shellcheck source=scripts/lib/implementer.sh
+. "$NIGHT_SHIFT_LIB/implementer.sh"
 # End-of-run whole-branch sweep (NIGHT_SHIFT_BRANCH_SWEEP). See scripts/lib/sweep.sh.
 # shellcheck source=scripts/lib/sweep.sh
 . "$NIGHT_SHIFT_LIB/sweep.sh"
@@ -938,7 +954,9 @@ initialize_run() {
   state_set '.baseline_complete=true'
   emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
     --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
-    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs}}')"
+    --arg backend "$IMPLEMENT_BACKEND" --arg cursor "$CURSOR_IMPLEMENT_MODEL" \
+    '{spec:$spec, base:$base, models: ({plan:$plan, implement:$impl, personas:$pers, observer:$obs,
+      implement_backend:$backend} + (if $backend == "cursor" then {cursor_model:$cursor} else {} end))}')"
 }
 
 recover_run() {
@@ -3533,6 +3551,12 @@ main_run() {
     claude|"") PRIMARY="claude" ;;
     *) die "this workflow runs Claude only; --primary $PRIMARY is not supported" ;;
   esac
+  case "$IMPLEMENT_BACKEND" in
+    claude|cursor) ;;
+    *) die "NIGHT_SHIFT_IMPLEMENT_BACKEND must be claude or cursor (got: $IMPLEMENT_BACKEND)" ;;
+  esac
+  case "$CURSOR_MAX_RETRIES" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_RETRIES must be a non-negative integer" ;; esac
+  case "$CURSOR_RETRY_BACKOFF" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_RETRY_BACKOFF must be a non-negative integer" ;; esac
   [ -n "$PROJECT" ] || die "--project is required"
   PROJECT="$(canonical_dir "$PROJECT")" || die "project directory does not exist"
   git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
@@ -3543,6 +3567,9 @@ main_run() {
   # the pinned primary session), not a second model.
   OBSERVER="claude"
   require_command claude
+  if [ "$IMPLEMENT_BACKEND" = "cursor" ] && ! cursor_available; then
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
+  fi
   case "$RATE_LIMIT_BUFFER_SECONDS" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS must be a non-negative integer" ;;
   esac
