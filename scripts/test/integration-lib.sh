@@ -16,6 +16,11 @@
 #                        shape and nothing on stdout, to drive
 #                        invoke_primary's bounded-retry -> sticky-claude-
 #                        fallback path.
+#   cursor-empty       — write_cursor_stub only: the cursor-agent primary
+#                        exits 0 with a valid JSON envelope but no session_id
+#                        (envelope drift, not a CLI failure), to drive the
+#                        SAME bounded-retry -> sticky-claude-fallback path via
+#                        invoke_primary's rc==0-but-no-session_id guard.
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 ENGINE="$ENGINE_DIR/scripts/night-shift.sh"
@@ -127,10 +132,11 @@ write_cursor_stub() {
 has_trust=0; for a in "$@"; do [ "$a" = "--trust" ] && has_trust=1; done
 [ "$has_trust" = "1" ] || { printf 'Error: expected --trust in argv (not the cursor primary?)\n' >&2; exit 1; }
 emit(){ jq -cn --arg s "$1" --arg r "$2" '{type:"result",subtype:"success",is_error:false,result:$r,session_id:$s,usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'; }
-# Stage-dispatch mirrors write_stub's primary branch above (LOCKSTEP: any stage
-# case added there must be mirrored here too). Planning branches are
-# unreachable in cursor mode (the plan scope always stays on the claude stub)
-# but kept for lockstep/documentation.
+# Stage-dispatch mirrors write_stub's primary branch below (LOCKSTEP: any stage
+# case added there must be mirrored here too, and vice versa — see the
+# reciprocal comment on write_stub's own case statement). Planning branches
+# are unreachable in cursor mode (the plan scope always stays on the claude
+# stub) but kept for lockstep/documentation.
 st=.night-shift/state.json; c=.night-shift/control; mkdir -p "$c"; sig="$c/next-action.json"
 stage="$(jq -r '.stage' "$st")"; spec="$(jq -r '.task' "$st")"
 # One line per invocation, keyed on stage (NOT the raw multi-line prompt in
@@ -139,6 +145,15 @@ printf '%s\n' "$stage" >> "$WORK/.cursor-calls"
 if [ "$MODE" = "cursor-fail" ]; then
   printf 'Error: RetriableError: [resource_exhausted]\n' >&2
   exit 1
+fi
+if [ "$MODE" = "cursor-empty" ]; then
+  # Envelope drift: rc 0 (a clean exit — no stderr, no nonzero status) but the
+  # JSON envelope carries no session_id. invoke_primary must treat this the
+  # same as a cursor invocation failure (routes into the SAME bounded-retry ->
+  # sticky-fallback branch), not the post-loop "primary emitted no resumable
+  # session ID" block_run.
+  jq -cn --arg r "done" '{type:"result",subtype:"success",is_error:false,result:$r,usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'
+  exit 0
 fi
 case "$stage" in
   planning|plan_review)
@@ -190,6 +205,8 @@ if [ "$is_primary" = "1" ]; then
     jq -cn --arg t "$spec" '{action:"FLABBERGAST",task:$t,stage:"planning",reason:"nope",artifacts:[]}' > "$sig"
     emit stubprimary "done"; exit 0
   fi
+  # Stage-dispatch is mirrored in write_cursor_stub's own case above (LOCKSTEP:
+  # any stage case added here must be mirrored there too, and vice versa).
   case "$stage" in
     planning|plan_review)
       printf '# Plan\n- create add.js exporting add(a,b)=>a+b.\n' > "$c/plan.md"

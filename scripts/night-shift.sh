@@ -905,12 +905,12 @@ initialize_run() {
       plan_approved:false,implementation_approved:false,
       candidate_verified:false,baseline_complete:false,
       stage_counters:{planning:0},stage_started:{planning:$epoch},
-      malformed_signal_consecutive:0
+      malformed_signal_consecutive:0,implement_backend:$backend
     }' \
     --arg run_id "$RUN_ID" --arg primary "$PRIMARY" --arg observer "$OBSERVER" \
     --arg task "$SPEC" --argjson epoch "$(now_epoch)" --arg iso "$(now_iso)" \
     --arg base "$BASE_COMMIT" --arg branch "$BASE_BRANCH" \
-    --arg baseline_status "$BASE_STATUS" ||
+    --arg baseline_status "$BASE_STATUS" --arg backend "$IMPLEMENT_BACKEND" ||
     die "could not initialize run state"
   integrity_put "$STATE"
   # Journal the moment the run exists: run_started only fires after the
@@ -994,6 +994,12 @@ recover_run() {
   fi
   [ "$(jq -r '.primary' "$STATE")" = "$PRIMARY" ] ||
     die "existing run belongs to primary $(jq -r '.primary' "$STATE")"
+  # // "claude" default: state written before this field existed (old runs)
+  # stays recoverable as claude, matching the backend that actually ran it.
+  local stored_backend
+  stored_backend="$(jq -r '.implement_backend // "claude"' "$STATE")"
+  [ "$stored_backend" = "$IMPLEMENT_BACKEND" ] ||
+    die "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend; relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend to resume it (got $IMPLEMENT_BACKEND)"
   RUN_ID="$(jq -r '.run_id' "$STATE")"
   SPEC="$(jq -r '.task' "$STATE")"
   set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
@@ -1551,7 +1557,7 @@ invoke_primary() {
     block_run "could not read .primary_turns from state; state may be corrupt"
   prompt="$RUN_ROOT/prompts/primary-$turn.txt"
   raw="$RUN_ROOT/raw/primary-$turn.json"
-  local session emitted rc model backend cursor_attempts=0
+  local session emitted rc model backend scope cursor_attempts=0
   # The consecutive 429-without-success counter now lives entirely in
   # handle_rate_limit_wait (lib/recovery.sh): persisted in state so recovery
   # after a crash picks up the count; reset to 0 on the first clean turn below.
@@ -1569,8 +1575,9 @@ invoke_primary() {
   # resolve_effective_model maps the knob through state's .model_fallbacks (a
   # per-model 429 fallback recorded earlier in the run under
   # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
-  model="$(resolve_effective_model "$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")")"
-  backend="$(implement_scope_backend "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
+  scope="$(stage_session_scope "$(jq -r '.stage' "$STATE")")"
+  model="$(resolve_effective_model "$(stage_model "$scope")")"
+  backend="$(implement_scope_backend "$scope")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
   while :; do
     rc=0
@@ -1602,6 +1609,16 @@ invoke_primary() {
         --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
     fi
     emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
+    # rc==0 is not proof of success for cursor: the envelope's session_id can
+    # still be missing (a real headless-CLI drift, not just a nonzero exit).
+    # Treat that as a synthetic failure so it falls through into the SAME
+    # cursor retry/fallback branch below instead of surviving the loop and
+    # hitting the post-loop "primary emitted no resumable session ID"
+    # block_run. Short-circuits on backend != cursor, so the Claude branch's
+    # rc (and therefore its break/continue behavior) is untouched.
+    if [ "$backend" = "cursor" ] && [ "$rc" -eq 0 ] && [ -z "$emitted" ]; then
+      rc=1
+    fi
     [ "$rc" -ne 0 ] || break
     if [ "$backend" = "cursor" ]; then
       # Cursor has no parseable 429 contract (stderr prose, no reset time):
@@ -1619,6 +1636,13 @@ invoke_primary() {
       backend="claude"
       session=""
       state_set '.session_id=null'
+      # Null'd .session_id above, so primary_prompt (which reads .session_id
+      # fresh from state) now rebuilds $prompt with the "FRESH stage session"
+      # file-handoff reorientation block — the prompt built at the top of THIS
+      # turn still framed a --resume (or an earlier cursor session), and
+      # reusing it unchanged for the fresh Claude session below would silently
+      # drop that reorientation.
+      primary_prompt "$prompt"
       continue
     fi
     if is_rate_limit_response "$raw" &&
@@ -3590,6 +3614,9 @@ main_run() {
   esac
   case "$CURSOR_MAX_RETRIES" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_RETRIES must be a non-negative integer" ;; esac
   case "$CURSOR_RETRY_BACKOFF" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_RETRY_BACKOFF must be a non-negative integer" ;; esac
+  if [ "$IMPLEMENT_BACKEND" = "cursor" ] && [ "$SESSION_SCOPE" != "stage" ]; then
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor requires NIGHT_SHIFT_SESSION_SCOPE=stage (the backend switches vendors at stage-scope session boundaries)"
+  fi
   [ -n "$PROJECT" ] || die "--project is required"
   PROJECT="$(canonical_dir "$PROJECT")" || die "project directory does not exist"
   git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||

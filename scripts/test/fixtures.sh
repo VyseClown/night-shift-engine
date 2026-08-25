@@ -151,7 +151,7 @@ run_dry_fixtures() {
   fixture_assert "truncate_to_budget: marker survives a cut landing on newline bytes" fixture_truncate_budget "$root"
   fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
   fixture_assert "implementer backend: plan pinned to claude, post-plan scopes follow the knob, design/fallback overrides, sticky fallback_set" fixture_implementer_backend "$root"
-  fixture_assert "invoke_primary dispatches on implement_scope_backend, cursor branch redirects stderr, structural guarantees intact, backend knob defaults claude" fixture_cursor_primary_dispatch "$root"
+  fixture_assert "invoke_primary dispatches on implement_scope_backend, cursor branch redirects stderr, structural guarantees intact, backend knob defaults claude, cursor+run-scope dies at startup" fixture_cursor_primary_dispatch "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
   fixture_assert "Smoke phase: field parsing/validation, exit + server modes, timeout/abort leave no zombie" fixture_smoke_phase "$root"
@@ -325,6 +325,8 @@ run_dry_fixtures() {
   fixture_assert "recovery-guard: blocked+dirty bare relaunch dies with the --resume directive" fixture_recovery_guard_blocked_dirty "$root"
   fixture_assert "recovery-guard: blocked+clean proceeds to task selection (guard does not fire)" fixture_recovery_guard_blocked_clean "$root"
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
+  fixture_assert "recovery-guard: resuming under a different NIGHT_SHIFT_IMPLEMENT_BACKEND dies, names the stored backend" fixture_recovery_guard_backend_mismatch "$root"
+  fixture_assert "recovery-guard: resuming under the SAME NIGHT_SHIFT_IMPLEMENT_BACKEND proceeds (guard does not fire)" fixture_recovery_guard_backend_match "$root"
   fixture_assert "doc-freshness: dir hit + mention hit found, unrelated root doc absent, valid JSON" fixture_doc_freshness_basic "$root"
   fixture_assert "doc-freshness: candidate list capped at 10 with truncated:true" fixture_doc_freshness_cap "$root"
   fixture_assert "doc-freshness: empty diff (base==HEAD) yields docs:[] truncated:false" fixture_doc_freshness_empty_diff "$root"
@@ -1676,7 +1678,7 @@ fixture_event_stream() {
     run_started signal_accepted observer_verdict candidate_validated workers_reaped persona_retry \
     run_init observer_retry rate_limit_wait run_recovered next_task session_refresh contract_canary \
     stage_transition codex_review model_fallback reuse_violation port_audit smoke \
-    sweep sweep_fix sweep_fix_reverted run_feedback test_audit backend_fallback; do
+    sweep sweep_fix sweep_fix_reverted run_feedback test_audit backend_fallback backend_retry; do
     grep -q "emit_event $e" "$WORKSPACE_ROOT/scripts/night-shift.sh" "$WORKSPACE_ROOT"/scripts/lib/*.sh || return 1
   done
   return 0
@@ -2474,8 +2476,13 @@ fixture_cursor_primary_dispatch() {
   # structural guarantees pinned elsewhere in this file (session-refresh
   # wiring, resolve_effective_model consumers) — cheap belt-and-suspenders
   # re-checks right where the dispatch itself is being asserted. declare -f
-  # (not grep -q pipes): the pipefail flake documented next to those fixtures.
-  local body line
+  # (not a `grep -q` boolean pipe): the pipefail/SIGPIPE flake documented next
+  # to those fixtures is specifically about `cmd | grep -q` in an `if`/`&&`
+  # context, where grep -q's early exit can race a still-writing upstream
+  # under pipefail. The `list_config | grep` below is a different shape —
+  # captured into a var, not a boolean pipe, so command substitution reads
+  # the whole stream to EOF — and is exempt from that rationale.
+  local body line out rc
   body="$(declare -f invoke_primary)"
   case "$body" in *implement_scope_backend*) ;; *) return 1 ;; esac
   # declare -f re-serializes the function (bash inserts a space after a
@@ -2492,6 +2499,44 @@ fixture_cursor_primary_dispatch() {
   # this existed before Task 2.
   line="$(list_config | grep 'NIGHT_SHIFT_IMPLEMENT_BACKEND')"
   case "$line" in *'default: claude'*) ;; *) return 1 ;; esac
+  # Startup guard: NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor with
+  # NIGHT_SHIFT_SESSION_SCOPE=run must die before any project/git work — a
+  # run-scoped session would try to hand ONE session between cursor-agent and
+  # claude, which neither CLI's --resume contract supports. Drives the REAL
+  # main_run with a die() shim (same idiom as fixture_acquire_release_lock)
+  # so the die is captured without a real "required executable" or
+  # "--project is required" failure masking it.
+  out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=cursor; SESSION_SCOPE=run
+    CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30
+    die() { printf 'DIE:%s\n' "$1"; exit 9; }
+    main_run
+  ) 2>&1 )"
+  rc=$?
+  fx "cursor + SESSION_SCOPE=run dies at startup" test "$rc" -eq 9 || exit 1
+  fx "die message names the incompatible combo" \
+    grep -qF "DIE:NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor requires NIGHT_SHIFT_SESSION_SCOPE=stage" <<<"$out" || exit 1
+  # cursor + the DEFAULT stage scope must NOT trip the new guard — falls
+  # through to the next, unrelated validation ("--project is required").
+  out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=cursor; SESSION_SCOPE=stage
+    CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30; PROJECT=""
+    die() { printf 'DIE:%s\n' "$1"; exit 9; }
+    main_run
+  ) 2>&1 )"
+  rc=$?
+  fx "cursor + SESSION_SCOPE=stage passes the guard" test "$rc" -eq 9 || exit 1
+  fx "fallthrough die is the unrelated --project check, not the new guard" \
+    grep -qF "DIE:--project is required" <<<"$out" || exit 1
+  # claude + SESSION_SCOPE=run must also NOT trip the guard (it is
+  # backend-gated, not scope-gated alone).
+  out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=claude; SESSION_SCOPE=run
+    CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30; PROJECT=""
+    die() { printf 'DIE:%s\n' "$1"; exit 9; }
+    main_run
+  ) 2>&1 )"
+  rc=$?
+  fx "claude backend + SESSION_SCOPE=run is unaffected by the cursor guard" test "$rc" -eq 9 || exit 1
+  fx "claude+run falls straight through to --project" \
+    grep -qF "DIE:--project is required" <<<"$out" || exit 1
   return 0
 }
 
@@ -7022,6 +7067,51 @@ fixture_recovery_guard_ratelimit_dirty() {
   rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
   fx "recover_run completes the auto-recovery path (rc 0), guard never evaluated" test "$rc" = "0"
   fx "the rate-limit wait path was actually taken (not the guard's die)" test -f "$dir/waited.txt"
+  return 0
+}
+
+# Backend-identity guard (cursor-implementer-backend Task 2 fix wave): a run
+# started under one NIGHT_SHIFT_IMPLEMENT_BACKEND must not be resumed under a
+# different one — mid-run vendor drift would silently mix cursor-agent and
+# claude turns inside what the journal records as a single run. Same
+# real-recover_run idiom as the fixtures above; status="running" skips the
+# whole dirty/rate-limit block entirely and reaches the `.primary` guard (and
+# the new `.implement_backend` guard right after it) directly.
+fixture_recovery_guard_backend_mismatch() {
+  local root="$1" proj="$root/rgbm-proj" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  printf '%s\n' '{"status":"running","primary":"claude","implement_backend":"cursor","primary_turns":1}' \
+    >"$proj/.night-shift/state.json"
+  out="$( ( PROJECT="$proj"; PRIMARY="claude"; IMPLEMENT_BACKEND="claude"; RESUME=0
+    recover_run
+  ) 2>&1 )"
+  rc=$?
+  fx "recover_run dies (exit 1) on a backend mismatch" test "$rc" -eq 1
+  fx "die names the stored backend" grep -q "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor" <<<"$out"
+  fx "die tells the operator which knob to relaunch with" \
+    grep -q "relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor" <<<"$out"
+  return 0
+}
+
+fixture_recovery_guard_backend_match() {
+  local root="$1" proj="$root/rgbk-proj" out rc
+  _fixture_recovery_guard_project "$proj" || return 1
+  printf '{}\n' >"$proj/.night-shift/baseline.json"
+  printf '%s\n' '{"status":"running","primary":"claude","implement_backend":"cursor","primary_turns":1,"run_id":"rgbk","task":"spec.md","observer":"claude","base_commit":"deadbeef","base_branch":"main","baseline_status":"'"$proj"'/.night-shift/baseline.json","stage":"implementation","stage_started":{}}' \
+    >"$proj/.night-shift/state.json"
+  out="$( (
+    PROJECT="$proj"; PRIMARY="claude"; IMPLEMENT_BACKEND="cursor"; RESUME=0
+    log() { :; }
+    set_spec_workdir() { SPEC="$1"; return 0; }
+    validate_spec_smoke() { return 0; }
+    cleanup_validation_worktree() { return 0; }
+    recover_run
+    printf 'rc=%s\n' "$?"
+  ) 2>&1 )"
+  rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
+  fx "recover_run completes (rc 0) when the stored backend matches" test "$rc" = "0"
+  fx "no backend-mismatch die leaked into the output" \
+    bash -c '! printf "%s" "$1" | grep -q "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND"' _ "$out"
   return 0
 }
 
