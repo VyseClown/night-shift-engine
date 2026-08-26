@@ -21,6 +21,15 @@
 #                        (envelope drift, not a CLI failure), to drive the
 #                        SAME bounded-retry -> sticky-claude-fallback path via
 #                        invoke_primary's rc==0-but-no-session_id guard.
+#   cursor-is-error    — write_cursor_stub only: the cursor-agent primary
+#                        exits 0 with a COMPLETE, valid envelope — session_id
+#                        included — that carries "is_error":true. cursor-agent
+#                        reports in-band failures this way (rc 0, error in the
+#                        envelope), so this is the one failure shape neither
+#                        the rc!=0 nor the missing-session_id guard can see;
+#                        invoke_primary must still route it into the same
+#                        bounded-retry -> sticky-claude-fallback path instead
+#                        of accepting the turn as a success.
 #   no-session         — write_stub only: the claude primary exits 0 with a
 #                        valid JSON envelope but no session_id key at all, to
 #                        pin the CLAUDE path's OWN "primary emitted no
@@ -210,6 +219,17 @@ case "$stage" in
     jq -cn --arg t "$spec" '{action:"COMPLETE",task:$t,stage:"completion",reason:"done",artifacts:[]}' > "$sig" ;;
   *) jq -cn --arg t "$spec" --arg s "$stage" '{action:"BLOCKED",task:$t,stage:$s,reason:("stub stage "+$s),artifacts:[]}' > "$sig" ;;
 esac
+if [ "$MODE" = "cursor-is-error" ]; then
+  # In-band failure: rc 0 and a COMPLETE envelope (session_id present), but
+  # is_error:true. The stage work and the signal above were done deliberately,
+  # exactly as on the happy path — the is_error flag is then the ONLY thing
+  # separating this turn from a successful one, so a run that ignores it looks
+  # entirely healthy (completes, zero retries, zero fallback) and the scenario
+  # asserting a retry + fallback is what catches the regression.
+  jq -cn --arg r "cursor hit an internal error" \
+    '{type:"result",subtype:"error",is_error:true,result:$r,session_id:"stubcursor",usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'
+  exit 0
+fi
 emit stubcursor "done"; exit 0
 STUB
   } > "$BIN/cursor-agent"

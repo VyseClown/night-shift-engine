@@ -319,7 +319,10 @@ sweep_fix_cycle() {
     # both backends for the same reason as sweep_run: $out sits outside
     # $project, and this session may need to consult other sweep artifacts
     # alongside the findings already piped into its prompt (e.g. package.diff
-    # for fuller context) — cursor-agent supports the same --add-dir flag.
+    # for fuller context) — cursor-agent takes the same --add-dir flag
+    # (verified in `cursor-agent --help`, build 2026.08.25-3e8eec8: "--add-dir
+    # <path>  Add an additional workspace root directory (can be specified
+    # multiple times)").
     fix_prompt="$(
       printf 'Fix ONLY the findings below on the current branch. Commit in\n'
       printf 'logical chunks. Run the covering tests for what you change.\n\n'

@@ -13,13 +13,30 @@
 cursor_available() { command -v cursor-agent >/dev/null 2>&1; }
 
 # 0 iff the cursor backend should currently drive post-plan primary work:
-# knob is "cursor" AND the spec has no ## Design Contract (design-fidelity
-# builds are judgment work pinned to Claude) AND this run has not already
-# fallen back to Claude (.implement_backend_fallback, sticky per run).
-# Tolerates unset STATE/SPEC (standalone --sweep-only has no run state).
+# knob is "cursor" AND no design-contract latch (below) AND this run has not
+# already fallen back to Claude (.implement_backend_fallback, sticky per run).
+# Design-Contract force is RUN-scoped, not per-task: the first activation
+# check that sees a spec with a ## Design Contract latches
+# .implement_backend_design_latch=true in run state, and every later check
+# honors the latch even after NEXT_TASK swaps $SPEC to a contract-free spec —
+# design-fidelity builds are judgment work pinned to Claude, and a mid-run
+# vendor flip-back is exactly the per-scope sandwich the spec rules out.
+# Tolerates unset STATE/SPEC (standalone --sweep-only has no run state; the
+# live spec check still applies there, just without persistence).
 implement_backend_active() {
   [ "${IMPLEMENT_BACKEND:-claude}" = "cursor" ] || return 1
-  ! spec_has_design_contract "${SPEC:-}" || return 1
+  if [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ] &&
+    [ "$(jq -r '.implement_backend_design_latch // empty' "$STATE" 2>/dev/null)" = "true" ]; then
+    return 1
+  fi
+  if spec_has_design_contract "${SPEC:-}"; then
+    # First sighting this run: latch it (run-scoped, survives resume). No
+    # journal event — the latch is a derived fact, not a run occurrence.
+    if [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ]; then
+      state_set '.implement_backend_design_latch=true'
+    fi
+    return 1
+  fi
   [ -z "${STATE:-}" ] || [ ! -f "${STATE:-}" ] ||
     [ "$(jq -r '.implement_backend_fallback // empty' "$STATE" 2>/dev/null)" != "claude" ] || return 1
   return 0
@@ -40,7 +57,9 @@ implement_scope_backend() {
 # (schemas/observer-review.json) so its expected value tracks the ACTIVE
 # backend rather than being hard-coded to claude. Prefers the recorded
 # .implement_backend_used marker (set once by invoke_primary after any turn
-# that actually succeeded on cursor) over the live implement_backend_active
+# that actually succeeded on cursor; TASK-scoped — start_next_task's per-task
+# reset nulls it so a chained task's verdict never inherits the previous
+# task's attribution) over the live implement_backend_active
 # predicate: a candidate that was partly built by cursor before a later turn
 # fell back to claude must still attribute cursor, which the live predicate
 # alone cannot see (it would read the CURRENT — post-fallback — state and
@@ -56,11 +75,16 @@ candidate_primary_vendor() {
 }
 
 # Record the sticky per-run fallback to Claude after cursor retries are
-# exhausted: state flag (survives resume; state_set is integrity-guarded by
-# the caller's flow), journal, log. Never fails the run itself.
+# exhausted: state flag AND session null in ONE atomic state_set (the
+# handle_per_model_limit idiom — a crash between separate writes would leave
+# backend=claude pinned to a CURSOR session id, and every relaunch would then
+# run `claude -p --resume <cursor-uuid>` into the same non-429 failure),
+# journal, log. Survives resume; integrity-guarded like every state write.
+# Never fails the run itself. Callers must not re-null .session_id separately.
 implement_backend_fallback_set() {
   local reason="${1:-}" rc="${2:-0}"
-  state_set '.implement_backend_fallback="claude"'
+  state_set '.implement_backend_fallback="claude" | .session_id=null | .updated_at=$now' \
+    --arg now "$(now_iso)"
   emit_event backend_fallback "$(jq -cn --arg r "$reason" --argjson rc "$rc" \
     '{from:"cursor", to:"claude", reason:$r, rc:$rc}')"
   log "cursor backend: falling back to claude for the rest of the run ($reason, rc=$rc)"

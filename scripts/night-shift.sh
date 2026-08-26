@@ -37,6 +37,14 @@ RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
 # logs a warning (never blocks) reminding to re-verify the capture. Bump this
 # after re-verifying against a real 429 on a newer CLI.
 RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.202"
+# The cursor-agent build the cursor backend's CLI contract was last verified
+# against (headless JSON envelope + --resume live-probed on 2026.08.11-e8db854,
+# specs/cursor-implementer-backend.md; status/--list-models/--help flag
+# surfaces incl. --add-dir re-verified on this build). Envelope drift cannot be
+# re-proven without a paid call, so cursor_contract_canary is a version
+# tripwire: a differing installed CLI logs a warning (never blocks) reminding
+# to re-verify the contract. Bump this after re-verifying on a newer CLI.
+CURSOR_CONTRACT_CLI_VERSION="2026.08.25-3e8eec8"
 # Sanity ceiling on a rate-limit wait. A genuine session limit resets within a
 # few hours; a wait longer than this almost certainly means the reset time was
 # misparsed, so we block for manual resume instead of sleeping for ~a day.
@@ -1362,8 +1370,17 @@ primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
-  local rejection_note malformed_prev doc_freshness_note
+  local rejection_note malformed_prev doc_freshness_note vendor
   stage="$(jq -r '.stage' "$STATE")"
+  # The vendor that executes THIS turn, for the opener below: the live scope
+  # backend, not $PRIMARY (hard-pinned "claude") and not
+  # candidate_primary_vendor (which attributes the CANDIDATE — its sticky
+  # .implement_backend_used marker keeps saying "cursor" after a mid-candidate
+  # fallback, exactly when this prompt is being rebuilt FOR a claude session).
+  # After a fallback the state flag is already set, so the rebuilt prompt
+  # correctly resolves to claude. On the claude backend this equals $PRIMARY,
+  # keeping the prompt byte-identical to the pre-backend engine.
+  vendor="$(implement_scope_backend "$(stage_session_scope "$stage")")"
   expected="$(expected_action "$stage")"
   turns="$(jq -r '.stage_turns' "$STATE")"
   remaining=$((MAX_STAGE_TURNS - turns))
@@ -1472,7 +1489,7 @@ screen to match its Figma design. Before/while implementing:
   [ -z "${WORKDIR:-}" ] ||
     workdir_note="Workdir: run ALL spec validation/test commands from $PROJECT/$WORKDIR (the engine runs its own copies there too)."
   cat >"$prompt" <<EOF
-You are the fixed $PRIMARY primary for night-shift run $RUN_ID.
+You are the fixed $vendor primary for night-shift run $RUN_ID.
 Project: $PROJECT
 Task spec: $SPEC
 Current stage: $stage
@@ -1602,12 +1619,18 @@ invoke_primary() {
       # commands (the bypassPermissions analogue); --trust skips the headless
       # workspace-trust hard-fail. --model only on a fresh start (a --resume
       # carries its creation model, same rule as the Claude branch).
+      # --add-dir "$WORKSPACE_ROOT": primary_prompt orders reads of workspace
+      # files (AGENTS.md, AGENT_LOOP.md, the spec, schemas/) and the TODO.md
+      # edit — all OUTSIDE the --trust'd $PROJECT. sweep_fix_cycle's cursor
+      # branch already passes --add-dir for exactly that out-of-workspace
+      # reason; granting it here too makes those accesses deterministic
+      # instead of depending on cursor's out-of-root behavior.
       if [ -z "$session" ]; then
         (cd "$PROJECT" && cursor-agent -p --model "$CURSOR_IMPLEMENT_MODEL" --output-format json \
-          --trust -f "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
+          --trust -f --add-dir "$WORKSPACE_ROOT" "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
       else
         (cd "$PROJECT" && cursor-agent -p --resume "$session" --output-format json \
-          --trust -f "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
+          --trust -f --add-dir "$WORKSPACE_ROOT" "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
       fi
     elif [ -z "$session" ]; then
       # model_flag must word-split into `--model X` (or vanish when empty).
@@ -1620,13 +1643,19 @@ invoke_primary() {
     fi
     emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
     # rc==0 is not proof of success for cursor: the envelope's session_id can
-    # still be missing (a real headless-CLI drift, not just a nonzero exit).
-    # Treat that as a synthetic failure so it falls through into the SAME
-    # cursor retry/fallback branch below instead of surviving the loop and
-    # hitting the post-loop "primary emitted no resumable session ID"
-    # block_run. Short-circuits on backend != cursor, so the Claude branch's
-    # rc (and therefore its break/continue behavior) is untouched.
-    if [ "$backend" = "cursor" ] && [ "$rc" -eq 0 ] && [ -z "$emitted" ]; then
+    # still be missing (a real headless-CLI drift, not just a nonzero exit),
+    # or the envelope can carry is_error:true alongside a clean exit — the
+    # contract (spec + docs) is rc!=0 OR is_error==true, both retry-then-
+    # fallback. Treat either as a synthetic failure so it falls through into
+    # the SAME cursor retry/fallback branch below instead of surviving the
+    # loop and hitting the post-loop "primary emitted no resumable session
+    # ID" block_run. jq -e fails on unparseable raw (no match — rc stays 0
+    # only if session_id somehow parsed, which it can't from unparseable
+    # JSON, so the empty-$emitted arm already covers that). Short-circuits on
+    # backend != cursor, so the Claude branch's rc (and therefore its
+    # break/continue behavior) is untouched.
+    if [ "$backend" = "cursor" ] && [ "$rc" -eq 0 ] &&
+      { [ -z "$emitted" ] || jq -e '.is_error == true' "$raw" >/dev/null 2>&1; }; then
       rc=1
     fi
     [ "$rc" -ne 0 ] || break
@@ -1649,10 +1678,13 @@ invoke_primary() {
         sleep $((CURSOR_RETRY_BACKOFF * cursor_attempts))
         continue
       fi
+      # implement_backend_fallback_set nulls .session_id in the SAME state
+      # write as the sticky flag (atomic — a crash between two writes would
+      # strand backend=claude with a pinned cursor session id); only the
+      # local mirror needs clearing here.
       implement_backend_fallback_set "cursor invocation failed after $cursor_attempts retries" "$rc"
       backend="claude"
       session=""
-      state_set '.session_id=null'
       # Preserve the pre-fallback prompt for forensics BEFORE primary_prompt
       # overwrites $prompt in place below — best-effort (never blocks the
       # fallback on a cp failure).
@@ -3586,9 +3618,15 @@ EOF
   # -z: NUL-delimited literal paths; matches the format used in verify_candidate.
   git -C "$PROJECT" status --porcelain=v1 -z >"$BASE_STATUS"
   epoch="$(now_epoch)"
+  # .implement_backend_used is TASK-scoped attribution (which vendor built THIS
+  # candidate) — clear it with the rest of the per-task state or a single early
+  # cursor task would stamp every later chained task's observer verdict with
+  # primary:"cursor" (candidate_primary_vendor prefers the marker over the live
+  # predicate). .implement_backend_fallback stays: the fallback is RUN-sticky.
   state_set '
     .task=$task | .stage="planning" | .stage_turns=0 | .task_turns=0 |
     .session_id=null |
+    .implement_backend_used=null |
     .stage_started_at=$epoch | .task_started_at=$epoch |
     .base_commit=$base | .base_branch=$branch | .review_round=0 |
     .baseline_status=$baseline_status | .finding_ids=[] | .candidate_commits=[] |
@@ -3637,6 +3675,106 @@ EOF
 
 # handle_signal lives in lib/signals.sh.
 
+# Portable watchdog runner for the FREE cursor-agent probe commands (status,
+# --list-models, --version — never a paid model call). macOS has no coreutils
+# `timeout`, so this copies codex_review_candidate's background+sleep+kill
+# idiom. stdout+stderr -> $2; returns the probe command's rc (143 on a
+# watchdog kill).
+cursor_probe_exec() {
+  local tmo="$1" out="$2" rc=0 pid wd
+  shift 2
+  cursor-agent "$@" >"$out" 2>&1 &
+  pid=$!
+  ( sleep "$tmo"; kill "$pid" 2>/dev/null ) &
+  wd=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  return "$rc"
+}
+
+# Startup probe for the cursor backend, run only when IMPLEMENT_BACKEND=cursor
+# (a claude-only startup never executes any of this). Guards the two failure
+# modes command -v cannot see: a logged-out CLI and a typo'd
+# NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL — either would otherwise pass startup,
+# burn the retry budget + backoff on the first post-plan turn, and silently
+# stick the whole night on Claude, discarding the operator's vendor choice.
+# Three outcomes per check:
+#   ok            -> proceed silently.
+#   definitive    -> die with an actionable message (the probe completed and
+#                    positively reported logged-out / slug-absent).
+#   inconclusive  -> WARN and proceed (timeout, nonzero rc, unrecognized
+#                    output shape): a transient blip must never block a run
+#                    the in-run retry/fallback machinery could have handled.
+# Seam for fixtures (same rationale as cursor_available): tests may redefine
+# this function, and subprocess-driven integration runs can skip it with
+# NIGHT_SHIFT_CURSOR_SKIP_PROBE=1.
+cursor_startup_probe() {
+  [ "${NIGHT_SHIFT_CURSOR_SKIP_PROBE:-0}" != "1" ] || return 0
+  local tmo="${NIGHT_SHIFT_CURSOR_PROBE_TIMEOUT:-30}" out rc
+  out="$(mktemp "${TMPDIR:-/tmp}/night-shift-cursor-probe.XXXXXX")" ||
+    { log "WARN: cursor probe: mktemp failed; skipping (inconclusive, never blocks)"; return 0; }
+  # (a) Auth: `cursor-agent status` prints "✓ Logged in as <email>" (rc 0)
+  # when authenticated (verified on build 2026.08.25-3e8eec8). The negative
+  # match runs FIRST — "not logged in" contains "logged in".
+  rc=0
+  cursor_probe_exec "$tmo" "$out" status || rc=$?
+  if grep -Eqi 'not logged in|logged out|not authenticated|unauthenticated' "$out"; then
+    rm -f "$out"
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not logged in (\`cursor-agent status\`); run \`cursor-agent login\` or set CURSOR_API_KEY"
+  fi
+  if [ "$rc" -ne 0 ] || ! grep -qi 'logged in' "$out"; then
+    log "WARN: cursor probe: could not confirm cursor-agent auth (rc=$rc, unrecognized \`cursor-agent status\` output); proceeding — a real auth failure is caught by the in-run retry/fallback"
+  fi
+  # (b) Model slug: the configured model must appear in `cursor-agent
+  # --list-models` (lines are "<slug> - <display name>"; exact first-field
+  # match, e.g. cursor-grok-4.6-high). A parameterized override
+  # (--model 'name[k=v,…]') is legitimate but never listed verbatim, so it is
+  # skipped, and a definitive miss requires rc 0 AND recognizable list output.
+  case "$CURSOR_IMPLEMENT_MODEL" in
+    *\[*\]*) rm -f "$out"; return 0 ;;
+  esac
+  rc=0
+  cursor_probe_exec "$tmo" "$out" --list-models || rc=$?
+  if [ "$rc" -eq 0 ] && grep -qi 'available models' "$out"; then
+    if ! awk -v m="$CURSOR_IMPLEMENT_MODEL" '$1 == m && $2 == "-" { f = 1 } END { exit !f }' "$out"; then
+      rm -f "$out"
+      die "NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL=$CURSOR_IMPLEMENT_MODEL is not offered by this cursor-agent (\`cursor-agent --list-models\`); fix the slug (grok 4.6 at high reasoning is exactly cursor-grok-4.6-high)"
+    fi
+  else
+    log "WARN: cursor probe: could not list cursor-agent models (rc=$rc); skipping slug validation — a bad model still fails fast on the first cursor turn"
+  fi
+  rm -f "$out"
+  return 0
+}
+
+# Version tripwire for the cursor CLI contract, the cursor twin of
+# rate_limit_contract_canary: the headless envelope was live-verified against
+# exactly one build (CURSOR_CONTRACT_CLI_VERSION), and silent CLI drift has
+# bitten this engine before. Journals a dedicated contract_canary event (same
+# event name as the claude canary so one grep finds all vendor drift) rather
+# than extending run_started: run_started is emitted only inside
+# initialize_run, so a resumed run — whose CLI may have updated mid-night —
+# would never re-record it, while this runs on EVERY startup; emitting on
+# match too pins the exact build behind each run for later forensics.
+# WARN-only, never blocks; requires RUN_ROOT (emit_event), so called next to
+# rate_limit_contract_canary after init/recovery.
+cursor_contract_canary() {
+  [ "$IMPLEMENT_BACKEND" = "cursor" ] || return 0
+  local out found
+  out="$(mktemp "${TMPDIR:-/tmp}/night-shift-cursor-probe.XXXXXX")" || return 0
+  cursor_probe_exec "${NIGHT_SHIFT_CURSOR_PROBE_TIMEOUT:-30}" "$out" --version ||
+    { rm -f "$out"; return 0; }
+  found="$(awk 'NR == 1 { print $1 }' "$out")"
+  rm -f "$out"
+  [ -n "$found" ] || return 0
+  emit_event contract_canary "$(jq -cn --arg expected "$CURSOR_CONTRACT_CLI_VERSION" --arg found "$found" \
+    '{contract:"cursor-cli", expected:$expected, found:$found}')"
+  [ "$found" != "$CURSOR_CONTRACT_CLI_VERSION" ] || return 0
+  log "WARNING: cursor-agent $found differs from $CURSOR_CONTRACT_CLI_VERSION, the build the cursor headless contract (JSON envelope, --resume, stderr-only errors, --trust/-f/--add-dir) was last verified against; re-verify per specs/cursor-implementer-backend.md and bump CURSOR_CONTRACT_CLI_VERSION"
+  return 0
+}
+
 main_run() {
   require_command jq
   require_command git
@@ -3666,6 +3804,11 @@ main_run() {
   if [ "$IMPLEMENT_BACKEND" = "cursor" ] && ! cursor_available; then
     die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
   fi
+  # Auth + model-slug probe (cursor_startup_probe): command -v alone let a
+  # logged-out CLI or a typo'd cursor model pass startup and silently strand
+  # the night on the Claude fallback. Free, bounded, gated on the backend —
+  # a claude-only startup pays nothing.
+  [ "$IMPLEMENT_BACKEND" != "cursor" ] || cursor_startup_probe
   case "$RATE_LIMIT_BUFFER_SECONDS" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS must be a non-negative integer" ;;
   esac
@@ -3712,6 +3855,7 @@ main_run() {
   fi
   trap 'block_run "run interrupted by signal"' HUP INT TERM
   rate_limit_contract_canary
+  cursor_contract_canary
 
   local malformed_n rc
   while :; do
@@ -3798,6 +3942,11 @@ if [ "$SWEEP_ONLY" -eq 1 ]; then
   if [ "$IMPLEMENT_BACKEND" = "cursor" ] && ! cursor_available; then
     die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
   fi
+  # Same auth/model-slug probe as main_run's startup guard, mirrored here for
+  # the same reason as the two checks above (sweep_fix_cycle can invoke
+  # cursor-agent from this surface). No canary: emit_event needs a RUN_ROOT
+  # this surface never has.
+  [ "$IMPLEMENT_BACKEND" != "cursor" ] || cursor_startup_probe
   # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
   # queued specs, so it never touches --spec/NEXT_TASK task selection. Even
   # with --spec given, sweep_fix_cycle's re-validation branch is a no-op

@@ -5,8 +5,9 @@
 # keeps failing outright, and the same fallback path when cursor exits 0 but
 # the envelope carries no session_id (drift, not a CLI failure). Same
 # scripted-stub approach as integration-run.sh / integration-adverse.sh;
-# nothing inside the engine is mocked.
-# specs/cursor-implementer-backend.md — Task 2 fix wave. Exit 0 + three
+# nothing inside the engine is mocked. A fourth scenario covers cursor's
+# in-band failure shape: rc 0, a complete envelope, "is_error":true.
+# specs/cursor-implementer-backend.md — Task 2 fix wave. Exit 0 + four
 # "ok - cursor: ..." lines on success.
 set -uo pipefail
 FAIL_PREFIX=cursor
@@ -130,3 +131,40 @@ state="$(find "$PROJECT/.night-shift/archive" -name state.json | head -1)"
 [ -n "$state" ] && [ -f "$state" ]                             || fail "no archived state.json (cursor empty-envelope)"
 [ "$(jq -r '.implement_backend_fallback' "$state")" = "claude" ] || fail "state.implement_backend_fallback is not 'claude' after the envelope-drift fallback"
 printf 'ok - cursor: rc==0 envelope with no session_id retries then falls back, run completes\n'
+
+# ── Scenario D: rc==0 + complete envelope + is_error:true -> same fallback ───
+# cursor-agent's in-band failure shape: a clean exit, a valid envelope, a real
+# session_id, and "is_error":true. Neither the rc!=0 branch nor the missing-
+# session_id guard can see it, and the stub writes its stage files and signal
+# first — so a run that treats the envelope as a success completes looking
+# perfectly healthy, on cursor, with zero retries and zero fallback. The retry
+# and fallback assertions below are therefore the whole test: they fail if the
+# is_error routing in invoke_primary is reverted.
+integration_setup
+write_stub happy
+write_cursor_stub cursor-is-error
+if ! NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor NIGHT_SHIFT_CURSOR_RETRY_BACKOFF=0 \
+  NIGHT_SHIFT_CURSOR_MAX_RETRIES=1 run_engine --spec "$SPEC"; then
+  tail -15 "$WORK/run.log" >&2 || true
+  fail "cursor is_error run exited non-zero"
+fi
+status="$(find "$PROJECT/.night-shift/archive" -name summary.json -exec jq -r .status {} \; 2>/dev/null | head -1)"
+[ "$status" = "complete" ]                                     || fail "cursor is_error status is '$status', not complete"
+events="$(find "$PROJECT/.night-shift/archive" -name events.jsonl | head -1)"
+[ -n "$events" ] && [ -f "$events" ]                           || fail "no archived journal (cursor is_error)"
+blocked="$(jq -c 'select(.type=="run_blocked")' "$events" | wc -l | tr -d ' ')"
+[ "$blocked" -eq 0 ]                                           || fail "an is_error envelope produced $blocked run_blocked event(s); it must retry/fall back, not block"
+retry_count="$(jq -c 'select(.type=="backend_retry")' "$events" | wc -l | tr -d ' ')"
+[ "$retry_count" -eq 1 ]                                       || fail "expected 1 backend_retry event for the is_error envelope (CURSOR_MAX_RETRIES=1), got $retry_count — an is_error:true envelope was accepted as a successful turn"
+jq -e 'select(.type=="backend_fallback") | .payload.from=="cursor" and .payload.to=="claude"' \
+  "$events" >/dev/null                                         || fail "journal missing backend_fallback{from:cursor,to:claude} for the is_error path"
+[ "$(jq -r 'select(.type=="backend_retry" or .type=="backend_fallback") | .type' "$events" | paste -sd, -)" \
+  = "backend_retry,backend_fallback" ]                         || fail "journal order is not backend_retry then backend_fallback (is_error path)"
+state="$(find "$PROJECT/.night-shift/archive" -name state.json | head -1)"
+[ -n "$state" ] && [ -f "$state" ]                             || fail "no archived state.json (cursor is_error)"
+[ "$(jq -r '.implement_backend_fallback' "$state")" = "claude" ] || fail "state.implement_backend_fallback is not 'claude' after the is_error fallback"
+# The candidate was finished by claude, so the run must not attribute it to
+# cursor: no cursor turn ever SUCCEEDED, so the positive attribution marker
+# must never have been stamped.
+[ "$(jq -r '.implement_backend_used // "null"' "$state")" = "null" ] || fail "state.implement_backend_used was stamped despite every cursor turn reporting is_error"
+printf 'ok - cursor: an is_error:true envelope at rc 0 retries then falls back, run completes on claude\n'

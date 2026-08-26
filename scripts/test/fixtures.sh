@@ -159,6 +159,11 @@ run_dry_fixtures() {
   fixture_assert "codex review: default OFF, advisory-only, journaled skip/error, indented section" fixture_codex_review "$root"
   fixture_assert "implementer backend: plan pinned to claude, post-plan scopes follow the knob, design/fallback overrides, sticky fallback_set" fixture_implementer_backend "$root"
   fixture_assert "invoke_primary dispatches on implement_scope_backend, cursor branch redirects stderr, structural guarantees intact, backend knob defaults claude, cursor+run-scope dies at startup" fixture_cursor_primary_dispatch "$root"
+  fixture_assert "implementer backend: implement_backend_fallback_set writes the sticky flag AND nulls the session in ONE state write" fixture_cursor_fallback_atomic "$root"
+  fixture_assert "implementer backend: a Design Contract latches claude run-scoped; a chained plain spec cannot flip the vendor back" fixture_cursor_design_latch "$root"
+  fixture_assert "implementer backend: start_next_task's per-task reset clears .implement_backend_used, keeps the run-sticky fallback" fixture_cursor_task_reset_attribution "$root"
+  fixture_assert "cursor startup probe: logged-out/unknown-slug DIE, inconclusive probes WARN and proceed, skip knob honored" fixture_cursor_startup_probe "$root"
+  fixture_assert "cursor version canary: journals the build, WARNs on drift, never blocks, silent on the claude backend" fixture_cursor_contract_canary "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
   fixture_assert "Smoke phase: field parsing/validation, exit + server modes, timeout/abort leave no zombie" fixture_smoke_phase "$root"
@@ -2552,7 +2557,7 @@ fixture_cursor_primary_dispatch() {
   # under pipefail. The `list_config | grep` below is a different shape —
   # captured into a var, not a boolean pipe, so command substitution reads
   # the whole stream to EOF — and is exempt from that rationale.
-  local body line out rc
+  local body line
   body="$(declare -f invoke_primary)"
   case "$body" in *implement_scope_backend*) ;; *) return 1 ;; esac
   # declare -f re-serializes the function (bash inserts a space after a
@@ -2575,38 +2580,336 @@ fixture_cursor_primary_dispatch() {
   # claude, which neither CLI's --resume contract supports. Drives the REAL
   # main_run with a die() shim (same idiom as fixture_acquire_release_lock)
   # so the die is captured without a real "required executable" or
-  # "--project is required" failure masking it.
-  out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=cursor; SESSION_SCOPE=run
-    CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30
-    die() { printf 'DIE:%s\n' "$1"; exit 9; }
-    main_run
-  ) 2>&1 )"
-  rc=$?
-  fx "cursor + SESSION_SCOPE=run dies at startup" test "$rc" -eq 9 || exit 1
-  fx "die message names the incompatible combo" \
-    grep -qF "DIE:NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor requires NIGHT_SHIFT_SESSION_SCOPE=stage" <<<"$out" || exit 1
-  # cursor + the DEFAULT stage scope must NOT trip the new guard — falls
-  # through to the next, unrelated validation ("--project is required").
-  out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=cursor; SESSION_SCOPE=stage
-    CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30; PROJECT=""
-    die() { printf 'DIE:%s\n' "$1"; exit 9; }
-    main_run
-  ) 2>&1 )"
-  rc=$?
-  fx "cursor + SESSION_SCOPE=stage passes the guard" test "$rc" -eq 9 || exit 1
-  fx "fallthrough die is the unrelated --project check, not the new guard" \
-    grep -qF "DIE:--project is required" <<<"$out" || exit 1
-  # claude + SESSION_SCOPE=run must also NOT trip the guard (it is
-  # backend-gated, not scope-gated alone).
-  out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=claude; SESSION_SCOPE=run
-    CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30; PROJECT=""
-    die() { printf 'DIE:%s\n' "$1"; exit 9; }
-    main_run
-  ) 2>&1 )"
-  rc=$?
-  fx "claude backend + SESSION_SCOPE=run is unaffected by the cursor guard" test "$rc" -eq 9 || exit 1
-  fx "claude+run falls straight through to --project" \
-    grep -qF "DIE:--project is required" <<<"$out" || exit 1
+  # "--project is required" failure masking it. Wrapped in a subshell like
+  # every other fx-bearing fixture: fx exits 1 on failure, and fixture_assert
+  # runs fixtures in the CURRENT shell — an unwrapped fx failure here would
+  # kill the whole suite instead of recording `not ok` for this fixture.
+  (
+    out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=cursor; SESSION_SCOPE=run
+      CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30
+      die() { printf 'DIE:%s\n' "$1"; exit 9; }
+      main_run
+    ) 2>&1 )"
+    rc=$?
+    fx "cursor + SESSION_SCOPE=run dies at startup" test "$rc" -eq 9
+    fx "die message names the incompatible combo" \
+      grep -qF "DIE:NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor requires NIGHT_SHIFT_SESSION_SCOPE=stage" <<<"$out"
+    # cursor + the DEFAULT stage scope must NOT trip the new guard — falls
+    # through to the next, unrelated validation ("--project is required").
+    out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=cursor; SESSION_SCOPE=stage
+      CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30; PROJECT=""
+      die() { printf 'DIE:%s\n' "$1"; exit 9; }
+      main_run
+    ) 2>&1 )"
+    rc=$?
+    fx "cursor + SESSION_SCOPE=stage passes the guard" test "$rc" -eq 9
+    fx "fallthrough die is the unrelated --project check, not the new guard" \
+      grep -qF "DIE:--project is required" <<<"$out"
+    # claude + SESSION_SCOPE=run must also NOT trip the guard (it is
+    # backend-gated, not scope-gated alone).
+    out="$( ( PRIMARY=claude; IMPLEMENT_BACKEND=claude; SESSION_SCOPE=run
+      CURSOR_MAX_RETRIES=3; CURSOR_RETRY_BACKOFF=30; PROJECT=""
+      die() { printf 'DIE:%s\n' "$1"; exit 9; }
+      main_run
+    ) 2>&1 )"
+    rc=$?
+    fx "claude backend + SESSION_SCOPE=run is unaffected by the cursor guard" test "$rc" -eq 9
+    fx "claude+run falls straight through to --project" \
+      grep -qF "DIE:--project is required" <<<"$out"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# The sticky fallback has to land as ONE state write: the claude flag AND the
+# nulled session together. Split across two writes, a crash in the window
+# leaves .implement_backend_fallback="claude" pinned to a CURSOR session id,
+# and every relaunch then runs `claude -p --resume <cursor-uuid>` into a
+# failure no retry can clear. Counting the writes needs a seam, so state_set is
+# shadowed by a recorder that still APPLIES the real filter — otherwise the
+# field assertions below would be vacuous (a recorder that swallowed the write
+# would leave both fields unset and the greps would be the only evidence).
+fixture_cursor_fallback_atomic() {
+  local root="$1" dir="$root/cursor-fallback-atomic"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/rs"
+  (
+    RUN_ROOT="$dir/rs"; RUN_ID="cfa"; STATE="$RUN_ROOT/state.json"
+    printf '%s\n' '{"stage":"implementation","session_id":"cursor-uuid-1"}' >"$STATE"
+    log() { :; }
+    state_set() {
+      local filter="$1"; shift
+      # One recorded line per call, newlines flattened so `wc -l` counts CALLS.
+      printf '%s\n' "$(printf '%s' "$filter" | tr '\n' ' ')" >>"$dir/ss-filters"
+      jq "$@" "$filter" "$STATE" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    }
+    implement_backend_fallback_set "cursor retries exhausted" 1
+    fx "fallback_set performs exactly ONE state write" \
+      test "$(wc -l <"$dir/ss-filters" | tr -d ' ')" -eq 1
+    fx "that write sets the sticky claude flag" \
+      test "$(jq -r '.implement_backend_fallback' "$STATE")" = "claude"
+    fx "the SAME write nulls the cursor session id" \
+      test "$(jq -r '.session_id' "$STATE")" = "null"
+    fx "the single filter carries the flag mutation" \
+      grep -qF '.implement_backend_fallback="claude"' "$dir/ss-filters"
+    fx "the single filter carries the session mutation" \
+      grep -qF '.session_id=null' "$dir/ss-filters"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# The Design-Contract force-claude rule is RUN-scoped, not per-$SPEC: the first
+# activation check that sees a `## Design Contract` latches the decision in run
+# state, so a chained NEXT_TASK task whose spec has no contract cannot flip the
+# primary back to cursor mid-run (the per-scope vendor sandwich
+# specs/cursor-implementer-backend.md rules out). Every "claude" assertion here
+# is paired with a control that genuinely reads "cursor", so a predicate that
+# simply stopped returning cursor at all could not pass this fixture.
+fixture_cursor_design_latch() {
+  local root="$1" dir="$root/cursor-design-latch"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/rs"
+  printf '# spec\n\n## Design Contract\nring built from two layered wave nodes\n' >"$dir/design.md"
+  printf '# spec\n\n## Test Plan\n- nothing visual here\n' >"$dir/plain.md"
+  (
+    IMPLEMENT_BACKEND=cursor
+    RUN_ROOT="$dir/rs"; RUN_ID="cdl"; STATE="$RUN_ROOT/state.json"
+    printf '{"stage":"implementation"}\n' >"$STATE"
+    log() { :; }
+    SPEC="$dir/plain.md"
+    fx "control: a contract-free spec with the knob on routes implement to cursor" \
+      test "$(implement_scope_backend implement)" = "cursor"
+    fx "control: no latch is written for a contract-free spec" \
+      test "$(jq -r '.implement_backend_design_latch // "absent"' "$STATE")" = "absent"
+    SPEC="$dir/design.md"
+    fx "a Design Contract spec forces claude" \
+      test "$(implement_scope_backend implement)" = "claude"
+    fx "and latches that decision in run state" \
+      test "$(jq -r '.implement_backend_design_latch' "$STATE")" = "true"
+    # The fix under test: NEXT_TASK swaps $SPEC to a contract-free spec.
+    SPEC="$dir/plain.md"
+    fx "a chained contract-free spec cannot flip the vendor back to cursor" \
+      test "$(implement_scope_backend implement)" = "claude"
+    fx_not "implement_backend_active reports active while the latch is set" \
+      implement_backend_active
+    fx "the observe scope is latched too, not just implement" \
+      test "$(implement_scope_backend observe)" = "claude"
+    # Run-scoped, not process-scoped: a fresh run's state with the very same
+    # contract-free spec is cursor again (proves the latch, not a stuck knob).
+    printf '{"stage":"implementation"}\n' >"$STATE"
+    fx "a FRESH run state with the same plain spec is cursor again" \
+      test "$(implement_scope_backend implement)" = "cursor"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# .implement_backend_used is TASK-scoped attribution, so start_next_task's
+# per-task reset must clear it: without that, one early cursor task stamps
+# every later chained task's observer verdict with primary:"cursor"
+# (candidate_primary_vendor prefers the marker over the live predicate). The
+# run-sticky .implement_backend_fallback must NOT be cleared by the same reset.
+# Runs the REAL reset — the jq program is lifted verbatim out of
+# start_next_task via declare -f (which preserves the multi-line single-quoted
+# literal) rather than restated here, so a change to the production filter is
+# what this fixture reads.
+fixture_cursor_task_reset_attribution() {
+  local root="$1" dir="$root/cursor-task-reset" filter
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir"
+  filter="$(declare -f start_next_task |
+    awk '/^ *\.task=\$task \| \.stage="planning"/,/^ *\.updated_at=\$now[ ]*$/')"
+  [ -n "$filter" ] || return 1
+  (
+    IMPLEMENT_BACKEND=cursor
+    STATE="$dir/state.json"
+    # The exact shape that mis-attributes a chained task: the finished task's
+    # candidate was built on cursor, and the run has since fallen back.
+    printf '%s\n' '{"implement_backend_used":"cursor","implement_backend_fallback":"claude","session_id":"cursor-uuid-1"}' >"$STATE"
+    fx "pre-reset: the finished task's candidate is attributed to cursor" \
+      test "$(candidate_primary_vendor)" = "cursor"
+    fx "the extracted per-task reset is valid jq and applies" \
+      bash -c 'jq --arg task "$2/next.md" --argjson epoch 0 --arg base bbbbbbb \
+        --arg branch feat/x --arg baseline_status "$2/bs.txt" --arg now n \
+        "$1" "$3" >"$2/after.json"' _ "$filter" "$dir" "$STATE"
+    mv "$dir/after.json" "$STATE"
+    fx "the per-task reset clears .implement_backend_used" \
+      test "$(jq -r '.implement_backend_used' "$STATE")" = "null"
+    fx "the per-task reset keeps the RUN-sticky .implement_backend_fallback" \
+      test "$(jq -r '.implement_backend_fallback' "$STATE")" = "claude"
+    fx "post-reset attribution follows the live predicate (claude: this run already fell back)" \
+      test "$(candidate_primary_vendor)" = "claude"
+    # Control: the reset does not hard-code claude either — with no run
+    # fallback recorded, the same post-reset state attributes cursor again.
+    jq 'del(.implement_backend_fallback)' "$STATE" >"$dir/nofb.json" && mv "$dir/nofb.json" "$STATE"
+    fx "control: with no run fallback, post-reset attribution is cursor again" \
+      test "$(candidate_primary_vendor)" = "cursor"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# cursor_startup_probe's three-outcome contract: a probe that positively
+# reports logged-out / slug-absent DIES with an actionable message; a probe
+# that is merely inconclusive (timeout, nonzero rc, unrecognized output) WARNs
+# and proceeds, because a transient blip must never block a run the in-run
+# retry/fallback machinery could have handled. Drives the real function with
+# the cursor_probe_exec seam stubbed — the probe commands are free, but a real
+# `cursor-agent status` would depend on this machine's login state.
+fixture_cursor_startup_probe() {
+  local root="$1" dir="$root/cursor-probe" out
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir"
+  # main_run must actually call the probe (the behavior below is worth nothing
+  # if the call site is gone); --sweep-only mirrors it at the top level of
+  # night-shift.sh, where there is no function to declare -f.
+  case "$(declare -f main_run)" in *cursor_startup_probe*) ;; *) return 1 ;; esac
+  case "$(awk '/^if \[ "\$SWEEP_ONLY" -eq 1 \]; then/,/^fi$/' \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh")" in
+    *cursor_startup_probe*) ;; *) return 1 ;;
+  esac
+  (
+    CURSOR_IMPLEMENT_MODEL="cursor-grok-4.6-high"
+    # $1 status rc, $2 status output, $3 --list-models rc, $4 --list-models output.
+    run_probe() {
+      ( P_SRC="$1"; P_SOUT="$2"; P_MRC="$3"; P_MOUT="$4"
+        die() { printf 'DIE:%s\n' "$1"; exit 9; }
+        log() { printf 'LOG:%s\n' "$*"; }
+        cursor_probe_exec() {
+          local dest="$2"; shift 2
+          printf '%s\n' "$1" >>"$dir/probe-calls"
+          case "$1" in
+            status) printf '%s\n' "$P_SOUT" >"$dest"; return "$P_SRC" ;;
+            --list-models) printf '%s\n' "$P_MOUT" >"$dest"; return "$P_MRC" ;;
+          esac
+          : >"$dest"; return 0
+        }
+        cursor_startup_probe
+        printf 'RC:%s\n' "$?"
+      ) 2>&1
+    }
+    models_ok="Available models:
+  cursor-grok-4.6-high - Grok 4.6 (high reasoning)
+  claude-sonnet-5 - Sonnet 5"
+
+    # (a) Definitive: the CLI positively reports a logged-out session.
+    out="$(run_probe 0 'Not logged in. Run cursor-agent login to continue.' 0 "$models_ok")"
+    fx "(a) a logged-out cursor-agent dies at startup" grep -qF 'DIE:' <<<"$out"
+    fx "(a) the die names the fix (login / CURSOR_API_KEY)" \
+      grep -qF 'run `cursor-agent login` or set CURSOR_API_KEY' <<<"$out"
+    fx_not "(a) execution continues past a definitive auth die" \
+      grep -qF 'RC:' <<<"$out"
+
+    # (b) Inconclusive auth (nonzero rc + output the probe cannot classify):
+    # WARN, then carry on into the model check and return 0.
+    out="$(run_probe 143 'watchdog killed the probe' 0 "$models_ok")"
+    fx "(b) an inconclusive auth probe does not block" grep -qF 'RC:0' <<<"$out"
+    fx "(b) it WARNs about the unconfirmed auth" \
+      grep -qF 'LOG:WARN: cursor probe: could not confirm cursor-agent auth' <<<"$out"
+    fx_not "(b) an inconclusive probe never dies" grep -qF 'DIE:' <<<"$out"
+
+    # (c) Inconclusive model list (rc 0 but unrecognized output): WARN, proceed.
+    out="$(run_probe 0 '✓ Logged in as dev@example.com' 0 'usage: cursor-agent [options]')"
+    fx "(c) an unrecognized --list-models shape does not block" grep -qF 'RC:0' <<<"$out"
+    fx "(c) it WARNs about the skipped slug validation" \
+      grep -qF 'LOG:WARN: cursor probe: could not list cursor-agent models' <<<"$out"
+    fx_not "(c) an unrecognized model list never dies" grep -qF 'DIE:' <<<"$out"
+
+    # (d) Definitive: the configured slug is absent from a well-formed list.
+    out="$( CURSOR_IMPLEMENT_MODEL="cursor-grok-4.6-hgih"
+      run_probe 0 '✓ Logged in as dev@example.com' 0 "$models_ok" )"
+    fx "(d) a slug the CLI does not offer dies at startup" grep -qF 'DIE:' <<<"$out"
+    fx "(d) the die names the knob and the typo'd value" \
+      grep -qF 'NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL=cursor-grok-4.6-hgih' <<<"$out"
+
+    # (e) The happy probe is silent: no die, no WARN.
+    out="$(run_probe 0 '✓ Logged in as dev@example.com' 0 "$models_ok")"
+    fx "(e) a healthy probe returns 0" grep -qF 'RC:0' <<<"$out"
+    fx_not "(e) a healthy probe warns" grep -qF 'LOG:WARN' <<<"$out"
+    fx_not "(e) a healthy probe dies" grep -qF 'DIE:' <<<"$out"
+
+    # (f) A parameterized model (--model 'name[k=v,…]') is legitimate but never
+    # listed verbatim, so slug validation is skipped rather than dying.
+    rm -f "$dir/probe-calls"
+    out="$( CURSOR_IMPLEMENT_MODEL="cursor-grok-4.6[reasoning=high]"
+      run_probe 0 '✓ Logged in as dev@example.com' 0 "$models_ok" )"
+    fx "(f) a parameterized model slug does not die" grep -qF 'RC:0' <<<"$out"
+    fx_not "(f) a parameterized model slug is never looked up in the list" \
+      grep -qFx -- '--list-models' "$dir/probe-calls"
+
+    # (g) The escape hatch: NIGHT_SHIFT_CURSOR_SKIP_PROBE=1 runs no probe at all
+    # (what the subprocess-driven integration harnesses rely on).
+    rm -f "$dir/probe-calls"
+    out="$( NIGHT_SHIFT_CURSOR_SKIP_PROBE=1
+      run_probe 0 'Not logged in.' 0 "$models_ok" )"
+    fx "(g) the skip knob returns 0 without dying" grep -qF 'RC:0' <<<"$out"
+    fx_not "(g) the skip knob invokes cursor-agent at all" [ -e "$dir/probe-calls" ]
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# cursor_contract_canary is the cursor twin of rate_limit_contract_canary: a
+# version tripwire that journals the installed build on EVERY startup and WARNs
+# — never blocks — when it differs from the build the headless contract was
+# verified against. Silent on the claude backend (a claude-only run must not
+# shell out to cursor-agent at all).
+fixture_cursor_contract_canary() {
+  local root="$1" dir="$root/cursor-canary" out
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/rs"
+  case "$(declare -f main_run)" in *cursor_contract_canary*) ;; *) return 1 ;; esac
+  (
+    RUN_ROOT="$dir/rs"; RUN_ID="ccc"; STATE="$RUN_ROOT/state.json"
+    printf '{"stage":"planning"}\n' >"$STATE"
+    run_canary() {
+      ( IMPLEMENT_BACKEND="$1"; C_RC="$2"; C_OUT="$3"
+        log() { printf 'LOG:%s\n' "$*"; }
+        cursor_probe_exec() {
+          printf '%s\n' "$3" >>"$dir/canary-calls"
+          printf '%s\n' "$C_OUT" >"$2"; return "$C_RC"
+        }
+        cursor_contract_canary
+        printf 'RC:%s\n' "$?"
+      ) 2>&1
+    }
+    # (a) Drift: journal + WARN, run continues.
+    : >"$RUN_ROOT/events.jsonl"
+    out="$(run_canary cursor 0 '1999.01.01-deadbee (cursor-agent)')"
+    fx "(a) drift never blocks" grep -qF 'RC:0' <<<"$out"
+    fx "(a) drift WARNs and names the installed build" \
+      grep -qF 'LOG:WARNING: cursor-agent 1999.01.01-deadbee differs from' <<<"$out"
+    fx "(a) drift names the verified build the contract was pinned to" \
+      grep -qF "$CURSOR_CONTRACT_CLI_VERSION" <<<"$out"
+    fx "(a) drift journals contract_canary{cursor-cli, expected, found}" \
+      jq -e --arg e "$CURSOR_CONTRACT_CLI_VERSION" \
+        'select(.type=="contract_canary") | .payload.contract=="cursor-cli" and
+         .payload.expected==$e and .payload.found=="1999.01.01-deadbee"' \
+        "$RUN_ROOT/events.jsonl" >/dev/null
+    # (b) Match: still journaled (forensics pin the build behind every run),
+    # but no warning.
+    : >"$RUN_ROOT/events.jsonl"
+    out="$(run_canary cursor 0 "$CURSOR_CONTRACT_CLI_VERSION")"
+    fx "(b) a matching build is journaled too" \
+      jq -e 'select(.type=="contract_canary") | .payload.found==.payload.expected' \
+        "$RUN_ROOT/events.jsonl" >/dev/null
+    fx_not "(b) a matching build warns" grep -qF 'LOG:WARNING' <<<"$out"
+    # (c) A failed/timed-out probe is a silent no-op, never a block.
+    : >"$RUN_ROOT/events.jsonl"
+    out="$(run_canary cursor 143 '')"
+    fx "(c) a failed version probe returns 0" grep -qF 'RC:0' <<<"$out"
+    fx_not "(c) a failed version probe journals anything" \
+      grep -q contract_canary "$RUN_ROOT/events.jsonl"
+    # (d) claude backend: no cursor-agent call, no event.
+    : >"$RUN_ROOT/events.jsonl"; rm -f "$dir/canary-calls"
+    out="$(run_canary claude 0 "$CURSOR_CONTRACT_CLI_VERSION")"
+    fx "(d) the claude backend returns 0" grep -qF 'RC:0' <<<"$out"
+    fx_not "(d) the claude backend probes cursor-agent" [ -e "$dir/canary-calls" ]
+    fx_not "(d) the claude backend journals a cursor canary" \
+      grep -q contract_canary "$RUN_ROOT/events.jsonl"
+    exit 0
+  ) || return 1
   return 0
 }
 
@@ -7154,40 +7457,50 @@ fixture_recovery_guard_ratelimit_dirty() {
 # whole dirty/rate-limit block entirely and reaches the `.primary` guard (and
 # the new `.implement_backend` guard right after it) directly.
 fixture_recovery_guard_backend_mismatch() {
-  local root="$1" proj="$root/rgbm-proj" out rc
+  local root="$1" proj="$root/rgbm-proj"
   _fixture_recovery_guard_project "$proj" || return 1
   printf '%s\n' '{"status":"running","primary":"claude","implement_backend":"cursor","primary_turns":1}' \
     >"$proj/.night-shift/state.json"
-  out="$( ( PROJECT="$proj"; PRIMARY="claude"; IMPLEMENT_BACKEND="claude"; RESUME=0
-    recover_run
-  ) 2>&1 )"
-  rc=$?
-  fx "recover_run dies (exit 1) on a backend mismatch" test "$rc" -eq 1
-  fx "die names the stored backend" grep -q "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor" <<<"$out"
-  fx "die tells the operator which knob to relaunch with" \
-    grep -q "relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor" <<<"$out"
+  # Subshell wrap: fx exits on failure and fixture_assert runs this in the
+  # CURRENT shell — unwrapped, one red sub-check would kill the whole suite.
+  (
+    out="$( ( PROJECT="$proj"; PRIMARY="claude"; IMPLEMENT_BACKEND="claude"; RESUME=0
+      recover_run
+    ) 2>&1 )"
+    rc=$?
+    fx "recover_run dies (exit 1) on a backend mismatch" test "$rc" -eq 1
+    fx "die names the stored backend" grep -q "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor" <<<"$out"
+    fx "die tells the operator which knob to relaunch with" \
+      grep -q "relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor" <<<"$out"
+    exit 0
+  ) || return 1
   return 0
 }
 
 fixture_recovery_guard_backend_match() {
-  local root="$1" proj="$root/rgbk-proj" out rc
+  local root="$1" proj="$root/rgbk-proj"
   _fixture_recovery_guard_project "$proj" || return 1
   printf '{}\n' >"$proj/.night-shift/baseline.json"
   printf '%s\n' '{"status":"running","primary":"claude","implement_backend":"cursor","primary_turns":1,"run_id":"rgbk","task":"spec.md","observer":"claude","base_commit":"deadbeef","base_branch":"main","baseline_status":"'"$proj"'/.night-shift/baseline.json","stage":"implementation","stage_started":{}}' \
     >"$proj/.night-shift/state.json"
-  out="$( (
-    PROJECT="$proj"; PRIMARY="claude"; IMPLEMENT_BACKEND="cursor"; RESUME=0
-    log() { :; }
-    set_spec_workdir() { SPEC="$1"; return 0; }
-    validate_spec_smoke() { return 0; }
-    cleanup_validation_worktree() { return 0; }
-    recover_run
-    printf 'rc=%s\n' "$?"
-  ) 2>&1 )"
-  rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
-  fx "recover_run completes (rc 0) when the stored backend matches" test "$rc" = "0"
-  fx "no backend-mismatch die leaked into the output" \
-    bash -c '! printf "%s" "$1" | grep -q "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND"' _ "$out"
+  # Subshell wrap: fx exits on failure and fixture_assert runs this in the
+  # CURRENT shell — unwrapped, one red sub-check would kill the whole suite.
+  (
+    out="$( (
+      PROJECT="$proj"; PRIMARY="claude"; IMPLEMENT_BACKEND="cursor"; RESUME=0
+      log() { :; }
+      set_spec_workdir() { SPEC="$1"; return 0; }
+      validate_spec_smoke() { return 0; }
+      cleanup_validation_worktree() { return 0; }
+      recover_run
+      printf 'rc=%s\n' "$?"
+    ) 2>&1 )"
+    rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
+    fx "recover_run completes (rc 0) when the stored backend matches" test "$rc" = "0"
+    fx "no backend-mismatch die leaked into the output" \
+      bash -c '! printf "%s" "$1" | grep -q "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND"' _ "$out"
+    exit 0
+  ) || return 1
   return 0
 }
 
@@ -7840,8 +8153,40 @@ fixture_sweep_backend_dispatch() {
 # SESSION_SCOPE=stage: that guard exists only because a primary session
 # switches vendors at stage-scope boundaries, and this surface has no primary
 # sessions at all.
+# Echo $PATH with `cursor-agent` — and ONLY cursor-agent — made unreachable,
+# for the fixtures that must drive a REAL night-shift.sh subprocess through the
+# "cursor-agent is not on PATH" guard (an in-process fixture would just override
+# the cursor_available seam, the way fixture_codex_review overrides
+# codex_available). Every PATH directory that owns an executable cursor-agent is
+# replaced, IN PLACE in the PATH order, by a symlink farm under $1 mirroring all
+# of that directory's entries except that one binary. The first version of this
+# simply dropped the owning directory from PATH, which made the fixture
+# machine-dependent: green where cursor-agent sits alone in ~/.local/bin, red on
+# a machine where it shares /opt/homebrew/bin with git/jq/node and the strip
+# took those with it. Returns 1 if the farm cannot be built.
+_fixture_path_without_cursor_agent() {
+  local mirror_root="$1" out="" p mirror n=0
+  rm -rf "$mirror_root" 2>/dev/null
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ -x "$p/cursor-agent" ]; then
+      n=$((n + 1)); mirror="$mirror_root/$n"
+      mkdir -p "$mirror" || return 1
+      # One bulk `ln -s` (not a per-file loop): the owning directory can hold
+      # hundreds of entries and a fork each would be the slowest thing in the
+      # suite. The glob always matches — the directory holds cursor-agent.
+      ln -s "$p"/* "$mirror/" 2>/dev/null || true
+      rm -f "$mirror/cursor-agent"
+      [ ! -x "$mirror/cursor-agent" ] || return 1
+      p="$mirror"
+    fi
+    if [ -z "$out" ]; then out="$p"; else out="$out:$p"; fi
+  done <<<"$(printf '%s' "$PATH" | tr ':' '\n')"
+  printf '%s' "$out"
+}
+
 fixture_sweep_only_backend_guards() {
-  local root="$1" dir="$root/sweep-only-backend-guards" proj bin out rc no_cursor_path strip_dir cursor_bin
+  local root="$1" dir="$root/sweep-only-backend-guards" proj bin out rc no_cursor_path
   proj="$dir/proj"; bin="$dir/bin"
   mkdir -p "$bin"
   _fixture_sweep_branch_project "$proj" || return 1
@@ -7851,16 +8196,10 @@ cat >/dev/null
 printf '{"result":"fine\\nSWEEP_PASS"}\n'
 STUB
   chmod +x "$bin/claude"
-  # Build a PATH with the real cursor-agent's directory (if any — this
-  # machine may have one installed) surgically removed, everything else kept
-  # (bash, git, jq, …), so the "cursor unavailable" edge is proven for real
-  # rather than accidentally finding a genuine cursor-agent further down PATH.
-  no_cursor_path="$bin:$PATH"
-  cursor_bin="$(command -v cursor-agent 2>/dev/null || true)"
-  if [ -n "$cursor_bin" ]; then
-    strip_dir="$(dirname "$cursor_bin")"
-    no_cursor_path="$bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vFx "$strip_dir" | paste -sd: -)"
-  fi
+  # A real subprocess reads the guard, so the "cursor unavailable" edge has to
+  # be built out of PATH — but it must shadow ONE binary, not a whole
+  # directory (see _fixture_path_without_cursor_agent).
+  no_cursor_path="$bin:$(_fixture_path_without_cursor_agent "$dir/nocursor")" || return 1
   (
     rc=0
     out="$(PATH="$bin:$PATH" NIGHT_SHIFT_IMPLEMENT_BACKEND=bogus \
