@@ -2513,6 +2513,12 @@ fixture_implementer_backend() {
         .payload.from=="cursor" and .payload.to=="claude" and
         .payload.reason=="cursor retries exhausted" and .payload.rc==1' \
         "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # An rc-less call must journal rc:0, not any other default — pins the
+    # "${2:-0}" guard (mutation survivor def01#1: :-0 -> :-1 was undetected).
+    implement_backend_fallback_set "no-rc misuse"
+    fx "(f) fallback_set defaults a missing rc to 0" \
+      jq -e 'select(.payload.reason=="no-rc misuse") | .payload.rc==0' \
+        "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
     # (g) candidate_primary_vendor (Task 4 review carry-forward, F2): prefers the
     # recorded .implement_backend_used marker over the live predicate — a
     # candidate partly built by cursor before a LATER turn's sticky fallback to
