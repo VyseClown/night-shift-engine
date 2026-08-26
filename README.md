@@ -140,6 +140,10 @@ The engine spends the strong model only where judgment matters. All knobs accept
 | `NIGHT_SHIFT_PERSONA_MODEL` | `sonnet` | Review persona sub-agents |
 | `NIGHT_SHIFT_OBSERVER_MODEL` | `opus` | Independent final gate (the backstop that makes a cheaper primary safe) |
 | `NIGHT_SHIFT_SESSION_SCOPE` | `stage` | Fresh session per stage scope; `run` for one pinned session |
+| `NIGHT_SHIFT_IMPLEMENT_BACKEND` | `claude` | Opt-in `cursor` runs post-plan primary work (implement/observe/completion) on the Cursor CLI instead; plan/observer/design stay Claude |
+| `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` | `cursor-grok-4.6-high` | Model slug for the cursor backend, fresh sessions only |
+| `NIGHT_SHIFT_CURSOR_MAX_RETRIES` | `3` | Cursor turn retries before a sticky per-run fallback to Claude |
+| `NIGHT_SHIFT_CURSOR_RETRY_BACKOFF` | `30` | Seconds; backoff is this value times the attempt number |
 
 The model changes only at stage-scope boundaries (which already start a fresh
 session), so it is constant within a scope and resumes never re-pass it.

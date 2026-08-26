@@ -295,6 +295,14 @@ design-fidelity work (Flow B) and bumps to `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL`
 start a fresh session), so it is constant within a scope and resumes never re-pass
 it. Set any model knob to `inherit` to use the CLI's startup model.
 
+Opt-in second implementer vendor: `NIGHT_SHIFT_IMPLEMENT_BACKEND` (default
+`claude`) set to `cursor` runs the primary's post-plan scopes on the Cursor
+CLI instead — `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` (default
+`cursor-grok-4.6-high`) is the model slug, `NIGHT_SHIFT_CURSOR_MAX_RETRIES`
+(default `3`) and `NIGHT_SHIFT_CURSOR_RETRY_BACKOFF` (default `30`) bound the
+retry-then-sticky-Claude-fallback path. Plan, personas, the observer, and any
+`## Design Contract` spec always stay Claude. See `docs/cursor-cli-setup.md`.
+
 **Optional reviewers** (cross-track, off by default): Product Reviewer, Design
 Fidelity Reviewer, Security Reviewer, API Contract Reviewer. A spec opts in via an
 `- Optional reviewers:` line or by including the matching `## … Contract` section

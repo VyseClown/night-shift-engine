@@ -41,6 +41,7 @@ that silently breaks).
 | `NIGHT_SHIFT_OBSERVER_MODEL` | Strongest available. Never weaker than the implement model. |
 | `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` | Strongest available for design-contract work; `sonnet` for cosmetic-only specs. |
 | `NIGHT_SHIFT_SWEEP_MODEL` | Strongest available — whole-branch judgment; defaults to the observer model. |
+| `NIGHT_SHIFT_IMPLEMENT_BACKEND` | `claude` (default). Opt-in `cursor` runs post-plan implement work on `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` (default `cursor-grok-4.6-high`); plan/observer/design stay strongest-available Claude regardless. Never for money-math or engine-safety specs without an explicit call. |
 
 Spec-type adjustments: scratch/demo targets (`nightshift-demo`, throwaway
 specs) run everything on `sonnet` — never spend judgment-tier budget there.

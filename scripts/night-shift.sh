@@ -293,7 +293,9 @@ Runs use
 explicit session IDs, local candidate commits, per-profile persona approvals, and
 observer approval. Live fixture tests make paid Claude calls;
 full six-persona live coverage requires --full-persona-live-test and
-NIGHT_SHIFT_ACCEPT_COSTS=YES. (--primary is accepted only as claude.)
+NIGHT_SHIFT_ACCEPT_COSTS=YES. (--primary is accepted only as claude;
+NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor optionally runs post-plan implement
+turns on cursor-agent/grok.)
 EOF
 }
 
@@ -3142,7 +3144,8 @@ observer_prompt() {
   local context="$1" candidate="$2" retry_note="${3:-}" expected_primary="${4:-claude}"
   retry_note="$(rejection_preamble "$retry_note")"
   cat <<EOF
-You are an independent Claude observer reviewing another Claude session's work.
+You are an independent Claude observer reviewing another agent session's work;
+the implementer vendor is named below.
 You share no context with the implementer; judge only the supplied evidence.
 $retry_note
 The sections marked "authoritative" (the engine-computed base..candidate diff and
