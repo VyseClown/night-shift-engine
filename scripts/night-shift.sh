@@ -736,18 +736,21 @@ bump_finding_history() {
   jq -r '[to_entries[].value.count] | max // 0' "$history"
 }
 
-# Append a finished turn's cost to the run's incremental ledger. The raw claude
-# JSON is the only source of total_cost_usd/usage, so record it the instant the
-# turn completes rather than re-reading raw files at archive time — a costly turn
-# (notably the opus observer) is then never lost to a raw file that has since been
-# rewritten, retried, or cleaned. A raw without total_cost_usd (rate-limit partial,
-# non-JSON) contributes nothing and is not fatal.
+# Append a finished turn's cost to the run's incremental ledger. The raw
+# implementer-backend JSON is the only source of total_cost_usd/usage, so record
+# it the instant the turn completes rather than re-reading raw files at archive
+# time — a costly turn (notably the opus observer) is then never lost to a raw
+# file that has since been rewritten, retried, or cleaned. A raw with neither
+# total_cost_usd nor usage (rate-limit partial, non-JSON) contributes nothing
+# and is not fatal. The cursor-agent envelope carries usage token fields but no
+# total_cost_usd, so a row is still recorded (with total_cost_usd:null) rather
+# than the turn vanishing from the ledger entirely.
 record_cost() {
   local raw="$1" source="$2"
   [ -f "$raw" ] || return 0
   jq -c --arg source "$source" \
-    'select(type == "object" and has("total_cost_usd")) |
-     {source: $source, total_cost_usd, num_turns: (.num_turns // null), usage: (.usage // null)}' \
+    'select(type == "object" and (has("total_cost_usd") or has("usage"))) |
+     {source: $source, total_cost_usd: (.total_cost_usd // null), num_turns: (.num_turns // null), usage: (.usage // null)}' \
     "$raw" >>"$RUN_ROOT/cost-ledger.jsonl" 2>/dev/null || true
 }
 
@@ -798,7 +801,7 @@ compact_success() {
     # the same file in one pipeline (jq ... "$ledger" >>"$ledger") has undefined
     # ordering and could silently drop the row. The append is best-effort.
     local total_tmp="$ledger.total.$$"
-    if jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd) | add), records: length}' \
+    if jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd // 0) | add), records: length}' \
       "$ledger" >"$total_tmp" 2>/dev/null; then
       cat "$total_tmp" >>"$ledger"
     fi

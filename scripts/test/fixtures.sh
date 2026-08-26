@@ -1133,18 +1133,53 @@ fixture_cost_ledger() {
   # A non-JSON raw (e.g. a rate-limit retry's partial output) contributes nothing.
   printf 'not json' >"$dir/raw/primary-2.json"
   record_cost "$dir/raw/primary-2.json" "primary-2.json"
+  # A cursor-agent envelope: usage token fields but NO total_cost_usd. Without
+  # the `has("usage")` branch in record_cost this turn silently vanishes from
+  # the ledger — the exact gap Task 5 closes.
+  printf '{"session_id":"c1","num_turns":3,"usage":{"inputTokens":50,"outputTokens":20,"cacheReadTokens":0,"cacheWriteTokens":0}}\n' \
+    >"$dir/raw/cursor-1.json"
+  record_cost "$dir/raw/cursor-1.json" "cursor-1.json"
   printf '{}\n' >"$dir/state.json"
   compact_success "$dir" testrun
   ledger="$dir/archive/testrun/costs.jsonl"
   [ -f "$ledger" ] || return 1
-  [ "$(grep -c . "$ledger")" -eq 3 ] || return 1
+  # 3 turn rows (primary-1, observer-abc, cursor-1) + the TOTAL row.
+  [ "$(grep -c . "$ledger")" -eq 4 ] || return 1
   # The observer turn's cost is captured — the gap this guards against.
   jq -se 'any(.[]; .source == "observer-abc.jsonl" and .total_cost_usd == 0.5)' \
     "$ledger" >/dev/null || return 1
-  jq -se '[.[] | select(.source == "TOTAL")][0] | .total_cost_usd == 1.75 and .records == 2' \
+  # The cursor turn is recorded with a null cost and its usage preserved,
+  # instead of being dropped entirely for lacking total_cost_usd.
+  jq -se 'any(.[]; .source == "cursor-1.json" and .total_cost_usd == null and .usage.outputTokens == 20)' \
+    "$ledger" >/dev/null || return 1
+  # jq's `add` already folds a null element as its identity, so the TOTAL row's
+  # sum was correct even with the null-cost cursor row present — the `// 0`
+  # guard is not about crash/vanish avoidance. It is about TYPE STABILITY: it
+  # guarantees the TOTAL row's total_cost_usd is always a number, so a ledger
+  # made of only cost-less (usage-only) rows totals 0 rather than null, which
+  # is the contract downstream consumers (viewer, reports) can rely on.
+  jq -se '[.[] | select(.source == "TOTAL")][0] | .total_cost_usd == 1.75 and .records == 3' \
     "$ledger" >/dev/null || return 1
   # The raw files themselves are still compacted away.
   [ ! -d "$dir/raw" ] || return 1
+
+  # Pin the `// 0` guard directly: a ledger of ONLY usage rows (no
+  # total_cost_usd anywhere) must still total a number, not null. This fails
+  # if `// 0` reverts to a bare `map(.total_cost_usd) | add`.
+  local zdir="$root/cost-ledger-zero"
+  mkdir -p "$zdir/raw"
+  ( RUN_ROOT="$zdir"
+    printf '{"session_id":"z1","num_turns":1,"usage":{"inputTokens":5,"outputTokens":3,"cacheReadTokens":0,"cacheWriteTokens":0}}\n' \
+      >"$zdir/raw/cursor-z1.json"
+    record_cost "$zdir/raw/cursor-z1.json" "cursor-z1.json"
+    printf '{}\n' >"$zdir/state.json"
+    compact_success "$zdir" zerorun
+  )
+  local zledger="$zdir/archive/zerorun/costs.jsonl"
+  [ -f "$zledger" ] || return 1
+  jq -se '[.[] | select(.source == "TOTAL")][0] |
+    .total_cost_usd == 0 and (.total_cost_usd | type) == "number"' \
+    "$zledger" >/dev/null || return 1
   return 0
 }
 
