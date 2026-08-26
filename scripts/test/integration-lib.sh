@@ -148,15 +148,21 @@ emit(){ jq -cn --arg s "$1" --arg r "$2" '{type:"result",subtype:"success",is_er
 # write_run_feedback and sweep_fix_cycle pipe their prompt on STDIN and pass no
 # positional prompt argv arg; invoke_primary's own cursor calls pass the prompt
 # as the LAST positional argv arg and leave this process's stdin closed/empty
-# (the engine's own </dev/null). Read stdin FIRST, unconditionally — on a
-# primary call `cat` on the closed pipe returns immediately with no content —
-# so the two invocation shapes are told apart without inspecting flags.
+# (run_engine's own </dev/null redirect below, not anything the engine itself
+# does). Read stdin FIRST, unconditionally — on a primary call `cat` on the
+# closed pipe returns immediately with no content — so the two invocation
+# shapes are told apart without inspecting flags.
 nonprimary_prompt="$(cat)"
 if [ -n "$nonprimary_prompt" ]; then
   printf '%s\n' "${MODE:-happy}" >> "$WORK/.cursor-nonprimary-calls"
   case "$nonprimary_prompt" in
     *'Write 5-15 bullet lines of feedback'*)
-      emit stubcursorfeedback '- one\n- two\n- three\n- four\n- five\n- six' ;;
+      # $'...' ANSI-C quoting so bash expands \n into REAL newlines before jq
+      # ever sees the string — a plain '...' single-quoted literal would hand
+      # jq's --arg the two characters backslash-n, producing one giant line
+      # that still happens to start with "- " and would slip past
+      # write_run_feedback's `grep -E '^- '` filter as a false pass.
+      emit stubcursorfeedback $'- one\n- two\n- three\n- four\n- five\n- six' ;;
     *) emit stubcursorfix 'done' ;;
   esac
   exit 0

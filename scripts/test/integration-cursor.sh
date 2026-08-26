@@ -61,6 +61,16 @@ grep -qx 'implementation' "$WORK/.cursor-calls"                || fail ".cursor-
 obs_verdict="$(find "$PROJECT/.night-shift/archive" -path '*/validated/*' -name 'observer-*.json' | head -1)"
 [ -n "$obs_verdict" ] && [ -f "$obs_verdict" ]                 || fail "no archived observer verdict (cursor happy path)"
 [ "$(jq -r '.primary' "$obs_verdict")" = "cursor" ]            || fail "archived observer verdict .primary is not 'cursor'"
+# The positive attribution marker (night-shift.sh ~1702, a mutation survivor
+# without this check): a successful cursor turn stamps state.implement_backend_used
+# so the candidate is attributed to cursor even past a later fallback.
+state="$(find "$PROJECT/.night-shift/archive" -name state.json | head -1)"
+[ -n "$state" ] && [ -f "$state" ]                             || fail "no archived state.json (cursor happy path)"
+[ "$(jq -r '.implement_backend_used' "$state")" = "cursor" ]   || fail "state.implement_backend_used is not 'cursor' after the happy path"
+# The advisory run-feedback session (write_run_feedback, unconditional at
+# completion) must also have dispatched to the cursor stub, not silently
+# stayed on claude — proof the backend knob reaches non-primary sessions too.
+[ -s "$WORK/.cursor-nonprimary-calls" ]                        || fail "cursor-agent stub's non-primary path (write_run_feedback) was never invoked"
 printf 'ok - cursor: happy path runs post-plan turns on cursor-agent, plan stays claude, run completes\n'
 
 # ── Scenario B: bounded retries exhaust -> sticky fallback to claude ─────────

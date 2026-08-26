@@ -138,7 +138,12 @@ CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
 # CURSOR_IMPLEMENT_MODEL. Plan, personas, the observer, and any ## Design
 # Contract spec stay Claude. Cursor failures retry CURSOR_MAX_RETRIES times
 # (backoff CURSOR_RETRY_BACKOFF * attempt seconds), then the run falls back to
-# the Claude implement model for the rest of the run (journaled, sticky).
+# the Claude implement model for the rest of the run (journaled, sticky) —
+# that retry/fallback machinery belongs ONLY to the primary turn loop
+# (invoke_primary): the sweep fix cycle and run-feedback sessions dispatch on
+# the same backend but degrade through their own paths instead (a dirty-tree/
+# failed-revalidation `git reset --hard` for the fix cycle, a plain WARN for
+# feedback) — see sweep.sh's write_run_feedback/sweep_fix_cycle comments.
 IMPLEMENT_BACKEND="${NIGHT_SHIFT_IMPLEMENT_BACKEND:-claude}"
 CURSOR_IMPLEMENT_MODEL="${NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL:-cursor-grok-4.6-high}"
 CURSOR_MAX_RETRIES="${NIGHT_SHIFT_CURSOR_MAX_RETRIES:-3}"

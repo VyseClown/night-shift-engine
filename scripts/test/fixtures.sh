@@ -7797,13 +7797,29 @@ fixture_sweep_fix_cycle_no_run_root_skips_revalidation() {
 # respective cursor branches carry --trust (the headless workspace-trust
 # flag every cursor-agent invocation in this codebase requires).
 fixture_sweep_backend_dispatch() {
-  local body
+  local body line
   body="$(declare -f write_run_feedback)"
   case "$body" in *implement_backend_active*) ;; *) return 1 ;; esac
-  case "$body" in *'cursor-agent'*'--trust'*) ;; *) return 1 ;; esac
+  # Bind the assertion to the ACTUAL cursor-agent invocation line(s), not a
+  # loose whole-body glob (which would pass even if -f/--add-dir leaked onto
+  # this advisory session from a copy-paste of sweep_fix_cycle's branch below).
+  line="$(printf '%s\n' "$body" | grep -F 'cursor-agent')"
+  [ -n "$line" ] || return 1
+  case "$line" in *'--trust'*) ;; *) return 1 ;; esac
+  # write_run_feedback is advisory/read-only (no file edits needed): its
+  # cursor-agent line must NEVER carry -f or --add-dir — an advisory session
+  # must never get write/exec.
+  case "$line" in *' -f '*|*' -f'|*'--add-dir'*) return 1 ;; esac
+
   body="$(declare -f sweep_fix_cycle)"
   case "$body" in *implement_backend_active*) ;; *) return 1 ;; esac
-  case "$body" in *'cursor-agent'*'--trust'*) ;; *) return 1 ;; esac
+  line="$(printf '%s\n' "$body" | grep -F 'cursor-agent')"
+  [ -n "$line" ] || return 1
+  case "$line" in *'--trust'*) ;; *) return 1 ;; esac
+  # sweep_fix_cycle edits code on the branch: its cursor-agent line MUST carry
+  # both -f and --add-dir (the asymmetry with write_run_feedback above).
+  case "$line" in *' -f '*|*' -f') ;; *) return 1 ;; esac
+  case "$line" in *'--add-dir'*) ;; *) return 1 ;; esac
   return 0
 }
 

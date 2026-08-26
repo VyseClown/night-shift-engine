@@ -59,15 +59,16 @@ sweep_parse_verdict() {
 # ambiguities, loops, validation friction). Runs unconditionally at completion
 # regardless of BRANCH_SWEEP (see complete_run's call site, which sits before
 # the sweep block). By completion the stage-scoped sessions are already gone,
-# so this is a short FRESH `claude -p` session, same idiom as sweep_run, fed
-# the spec path + the tail of events.jsonl + the review-round count rather
-# than asked to explore the repo itself.
+# so this is a short FRESH implementer-backend session (dispatched on the
+# active backend below, same as invoke_primary), fed the spec path + the tail
+# of events.jsonl + the review-round count rather than asked to explore the
+# repo itself.
 # Every failure mode (no run context, session error, empty/unparsable reply,
 # no bullet lines, an unwritable feedback.md) warns and returns 0 — feedback
 # must never block or delay completion. Guards every run-scoped global with
 # ${VAR:-} (set -u is in effect for the whole orchestrator).
 write_run_feedback() {
-  local project="$1" out feedback model raw rc=0 tail_events round result bullets lines prompt_text
+  local project="$1" out feedback raw rc=0 tail_events round result bullets lines prompt_text
   [ -n "${RUN_ROOT:-}" ] && [ -n "${SPEC:-}" ] && [ -f "${STATE:-}" ] || {
     log "WARN: run feedback skipped (no run context — RUN_ROOT/SPEC/STATE unset)"
     return 0
@@ -82,7 +83,6 @@ write_run_feedback() {
   tail_events="$(tail -n 200 "$RUN_ROOT/events.jsonl" 2>/dev/null)"
   round="$(jq -r '.review_round // 0' "$STATE" 2>/dev/null)" || round=""
   [ -n "$round" ] || round=0
-  model="$(resolve_effective_model "${IMPLEMENT_MODEL:-sonnet}")"
   raw="$out/session.json"
   # Prompt built once into a variable so both backend branches below pipe the
   # identical text on stdin (`printf '%s'` — command substitution already
@@ -105,11 +105,14 @@ write_run_feedback() {
     (cd "$project" && printf '%s' "$prompt_text" |
       cursor-agent -p --output-format json --model "$CURSOR_IMPLEMENT_MODEL" --trust) >"$raw" 2>"$raw.err" || rc=$?
   else
+    # model computed only on this branch — the cursor branch above passes its
+    # own $CURSOR_IMPLEMENT_MODEL and never reads it, so resolving it up front
+    # for both branches was dead work on the cursor path.
     # model_flag intentionally word-splits into `--model X` (or nothing); same
     # idiom as sweep_run/invoke_observer_once.
     # shellcheck disable=SC2046
     (cd "$project" && printf '%s' "$prompt_text" |
-      claude -p $(model_flag "$model") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+      claude -p $(model_flag "$(resolve_effective_model "${IMPLEMENT_MODEL:-sonnet}")") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
     log "WARN: run feedback session failed (rc=$rc; see $raw.err)"
@@ -117,7 +120,7 @@ write_run_feedback() {
   fi
   result="$(jq -r '.result // empty' "$raw" 2>/dev/null)"
   [ -n "$result" ] || {
-    log "WARN: run feedback skipped (empty/unparsable claude reply, see $raw)"
+    log "WARN: run feedback skipped (empty/unparsable model reply, see $raw)"
     return 0
   }
   bullets="$(printf '%s\n' "$result" | grep -E '^- ')"
