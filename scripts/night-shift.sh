@@ -2061,7 +2061,7 @@ persona_prompt() {
   retry_note="$(rejection_preamble "$retry_note")"
   cat <<EOF
 You are the "$persona" review persona for night-shift run $RUN_ID, independently
-reviewing another Claude session's $stage work. You share no context with the
+reviewing another agent session's $stage work. You share no context with the
 implementer and cannot see the repository — judge ONLY the review bundle below,
 strictly through your persona's lens. This is unattended; never ask questions.
 $retry_note

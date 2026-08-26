@@ -48,7 +48,7 @@ is not a git repo.
     docs/
       review-personas.md     ← rn-track + the 4 optional cross-track personas
       review-personas-web.md ← web-track review personas and their checklists
-      dev-environment.md / codex-cli-setup.md / terminal-setup.md ← env setup
+      dev-environment.md / codex-cli-setup.md / cursor-cli-setup.md / terminal-setup.md ← env setup
   rn-sandbox/ web-app/ water-tracker-app/ nightshift-demo/ ← project repos, siblings (own repos)
   night-shift-viewer/ ← read dashboard + gated launcher + gated spec editor (own repo;
                         spawns the engine's scripts/night-shift.sh — see its WORKFLOW.md)

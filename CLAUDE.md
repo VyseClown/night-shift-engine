@@ -146,8 +146,10 @@ directory; run engine/workflow git inside the engine directory.
   `events.jsonl`): `sweep` (branch-sweep verdict), `sweep_fix` /
   `sweep_fix_reverted` (fix-cycle round + deterministic revert, the latter
   carrying a `reason` of `dirty_tree` or a failed re-validation), `run_feedback`
-  (feedback entry appended), and `smoke` (smoke-phase result). All are advisory;
-  none gates a run.
+  (feedback entry appended), `smoke` (smoke-phase result), and — from the
+  cursor implementer backend — `backend_retry` (a failed cursor turn retrying)
+  and `backend_fallback` (sticky per-run fallback to Claude after retries are
+  exhausted). All are advisory; none gates a run.
 - **Codex second opinion (opt-in, default OFF):** `NIGHT_SHIFT_CODEX_REVIEW=1`
   adds one bounded `codex exec -s read-only` advisory review per candidate
   (gpt-5.5 via the Codex CLI), handed to the observer as supplementary,

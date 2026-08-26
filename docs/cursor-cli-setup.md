@@ -49,9 +49,12 @@ Check the current auth state:
 cursor-agent status
 ```
 
-`require_command cursor-agent` runs at startup whenever the backend knob is
-`cursor` — a missing binary dies loudly before any work starts, it does not
-silently fall back.
+Whenever the backend knob is `cursor`, the engine's own `cursor_available`
+check (which shells out to `command -v cursor-agent`) runs at startup — a
+missing binary dies loudly before any work starts, it does not silently fall
+back. This guard runs on both entry points: the normal run path and the
+standalone `--sweep-only` surface each carry their own copy of the same
+check with the same die message.
 
 ## Model discovery
 
@@ -89,7 +92,12 @@ cursor backend viable at all: each stage scope hands off through files on
 disk and starts a fresh session, so `cursor-agent --resume <session_id>`
 only ever needs to carry one stage's context forward, matching the same
 session invariants the Claude branch relies on (non-empty, stable
-`session_id` across a scope).
+`session_id` across a scope). This is not just a recommendation — it is
+enforced at startup: `NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor` with
+`NIGHT_SHIFT_SESSION_SCOPE` set to anything other than `stage` (e.g. the
+legacy `run` scope) dies immediately with `"NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor
+requires NIGHT_SHIFT_SESSION_SCOPE=stage (the backend switches vendors at
+stage-scope session boundaries)"` before any work starts.
 
 ## `--trust` / `-f` semantics
 
@@ -110,6 +118,13 @@ Per-project/user config (allow/deny lists) lives in
 also auto-applies the target repo's own `AGENTS.md`/`CLAUDE.md` as rules, so
 target-repo instructions still reach the grok implementer the same way they
 reach Claude.
+
+Not every cursor invocation passes both flags: the run-feedback session
+(`write_run_feedback`) deliberately runs `--trust` **without** `-f` — it only
+reads the journal and writes 5-15 bullets of advisory feedback, never edits
+the target repo, so it needs no edit-permission flag. The sweep fix cycle
+and the primary implement turns pass both, since those sessions do edit
+files.
 
 ## Envelope differences from Claude
 
@@ -142,7 +157,9 @@ Two differences the rest of the engine has to account for:
 On a cursor turn failure (non-zero exit or `is_error:true`), the engine
 journals `backend_retry {attempt, rc}` and sleeps
 `NIGHT_SHIFT_CURSOR_RETRY_BACKOFF * attempt` seconds, up to
-`NIGHT_SHIFT_CURSOR_MAX_RETRIES` attempts. On exhaustion it sets a sticky
+`NIGHT_SHIFT_CURSOR_MAX_RETRIES` retries after the initial turn (the
+default of `3` means at most 4 invocations total before falling back). On
+exhaustion it sets a sticky
 per-run state flag (`.implement_backend_fallback="claude"`, survives
 `--resume`), nulls the session, journals `backend_fallback
 {from:"cursor", to:"claude", reason, rc}`, and continues the same stage
@@ -162,12 +179,25 @@ The Claude branch's own failure handling (session-limit 429 waits, per-model
 usage-cap fallback, the rate-limit contract canary) is untouched and stays
 Claude-only regardless of the backend knob.
 
+### Resuming a run under a different backend
+
+`--resume` refuses to switch backends mid-run: the engine compares the
+`NIGHT_SHIFT_IMPLEMENT_BACKEND` recorded in the run's state at start time
+against the value passed to the resume invocation, and dies if they differ
+(`existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND=<recorded>;
+relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=<recorded> to resume it`). This
+also covers the sticky per-run fallback above — once a run has fallen back
+to Claude, its recorded backend is still `cursor` (the fallback is a runtime
+flag, not a rewrite of the original knob), so a resume must still pass
+`NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor` even though the run is currently
+executing on Claude.
+
 ## Design Contract specs force Claude
 
 Any spec with a `## Design Contract` section ignores the cursor backend for
-the **whole run**, even if the knob is set to `cursor` — `implement_backend_
-active()` checks `spec_has_design_contract` before anything else. Design-
-fidelity implement work is judgment-heavy (bumped to
+the **whole run**, even if the knob is set to `cursor` — `implement_backend_active()`
+checks the backend knob first, then `spec_has_design_contract`. Design-fidelity
+implement work is judgment-heavy (bumped to
 `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL`, strongest-available Claude, on the
 Claude branch) and this avoids a per-scope vendor sandwich mid-run.
 
@@ -196,5 +226,5 @@ pool first; beyond that pool, per-token pricing is:
 (The `-fast` model variants cost more than their base counterparts.) There
 is no USD figure in the cursor turn envelope itself (see above) — the
 engine's cost ledger records token usage for cursor rows, not a computed
-USD total, so reconciling against this pricing table against actual Cursor
-billing is a manual step in v1.
+USD total, so reconciling this pricing table against actual Cursor billing
+is a manual step in v1.
