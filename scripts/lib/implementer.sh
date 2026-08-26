@@ -38,9 +38,20 @@ implement_scope_backend() {
 # The vendor that produced (or will produce) the candidate the observer is
 # about to review — feeds the observer-review wire contract's `primary` field
 # (schemas/observer-review.json) so its expected value tracks the ACTIVE
-# backend rather than being hard-coded to claude. Mirrors implement_backend_active's
-# own logic rather than implement_scope_backend's (no session-scope concept here).
+# backend rather than being hard-coded to claude. Prefers the recorded
+# .implement_backend_used marker (set once by invoke_primary after any turn
+# that actually succeeded on cursor) over the live implement_backend_active
+# predicate: a candidate that was partly built by cursor before a later turn
+# fell back to claude must still attribute cursor, which the live predicate
+# alone cannot see (it would read the CURRENT — post-fallback — state and
+# report claude). Falls back to the live predicate when the marker is absent,
+# e.g. a resumed run's first turn, or --sweep-only where STATE is unset.
 candidate_primary_vendor() {
+  local used
+  if [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ]; then
+    used="$(jq -r '.implement_backend_used // empty' "$STATE" 2>/dev/null)"
+    [ -z "$used" ] || { printf '%s' "$used"; return 0; }
+  fi
   if implement_backend_active; then printf 'cursor'; else printf 'claude'; fi
 }
 

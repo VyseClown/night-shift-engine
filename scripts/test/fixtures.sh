@@ -2076,6 +2076,12 @@ fixture_retry_feedback_note() {
   printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' || return 1
   p="$(observer_prompt "$dir/ctx.txt" deadbeef)"
   printf '%s' "$p" | grep -q 'PREVIOUS ATTEMPT REJECTED' && return 1
+  # observer_prompt's 4th arg (expected_primary) must interpolate into the
+  # embedded example verdict's `"primary"` field, not stay hard-coded to
+  # claude — this is what lets the observer wire contract track the ACTIVE
+  # implementer backend (Task 4 review carry-forward, F1).
+  p="$(observer_prompt "$dir/ctx.txt" deadbeef "" cursor)"
+  printf '%s' "$p" | grep -q '"primary":"cursor"' || return 1
   # (3) spawn_personas feeds a note to attempt 2 only.
   ( log() { :; }
     RUN_ROOT="$dir"; PERSONA_MODEL="inherit"
@@ -2472,6 +2478,20 @@ fixture_implementer_backend() {
         .payload.from=="cursor" and .payload.to=="claude" and
         .payload.reason=="cursor retries exhausted" and .payload.rc==1' \
         "$RUN_ROOT/events.jsonl" >/dev/null || exit 1
+    # (g) candidate_primary_vendor (Task 4 review carry-forward, F2): prefers the
+    # recorded .implement_backend_used marker over the live predicate — a
+    # candidate partly built by cursor before a LATER turn's sticky fallback to
+    # claude must still attribute cursor, which the live implement_backend_active
+    # predicate alone cannot see (it only reflects CURRENT state, post-fallback).
+    printf '{"implement_backend_used":"cursor","implement_backend_fallback":"claude"}\n' >"$STATE"
+    fx "(g) candidate_primary_vendor attributes cursor after a simulated fallback (marker wins)" \
+      test "$(candidate_primary_vendor)" = "cursor" || exit 1
+    printf '{}\n' >"$STATE"
+    fx "(g) candidate_primary_vendor falls back to the live predicate with no marker (cursor active)" \
+      test "$(candidate_primary_vendor)" = "cursor" || exit 1
+    unset STATE
+    fx "(g) candidate_primary_vendor is --sweep-only safe (unset STATE -> live predicate)" \
+      test "$(candidate_primary_vendor)" = "cursor" || exit 1
     exit 0
   ) || return 1
   return 0
@@ -3063,6 +3083,12 @@ fixture_schema_inline_sync() {
   [ "$engine_actions" = "$schema_actions" ] || return 1
   schema_personas="$(jq -r '.properties.persona.enum | sort | join("|")' "$WORKSPACE_ROOT/schemas/persona-review.json")"
   [ "$schema_personas" = "$(printf '%s' "$PERSONAS" | tr '|' '\n' | sort | paste -sd'|' -)" ] || return 1
+  # The observer-review wire contract's `primary` enum must stay pinned to
+  # exactly the two implementer vendors the engine can ever report
+  # (candidate_primary_vendor, lib/implementer.sh) — a schema drift here would
+  # let an observer verdict silently pass validation with a vendor the engine
+  # never emits, or reject one it does.
+  [ "$(jq -r '.properties.primary.enum | sort | join("|")' "$WORKSPACE_ROOT/schemas/observer-review.json")" = "claude|cursor" ] || return 1
   return 0
 }
 

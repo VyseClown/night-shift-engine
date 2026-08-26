@@ -1687,12 +1687,20 @@ invoke_primary() {
   # .night-shift/. Verify the wrapper-owned state BEFORE the engine's own writes
   # below would launder an out-of-band edit into the private copy.
   integrity_guard "$STATE" "state-turn-$turn" "state.json (during the primary turn)"
+  # .implement_backend_used is a positive attribution marker (distinct from
+  # .implement_backend_fallback above, which only records a NEGATIVE event —
+  # falling BACK to claude): once a cursor turn actually succeeds, stamp it so
+  # candidate_primary_vendor can attribute the candidate to cursor even after
+  # a LATER turn in the same candidate falls back to claude (a candidate
+  # partly built by cursor before a fallback still used cursor). jq-idempotent
+  # — safe to set on every successful cursor turn, not just the first.
   state_set '
     .session_id=$session |
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
     .rate_limit_consecutive=0 |
-    .updated_at=$now
-  ' --arg session "$emitted" --arg now "$(now_iso)"
+    .updated_at=$now |
+    (if $backend == "cursor" then .implement_backend_used="cursor" else . end)
+  ' --arg session "$emitted" --arg now "$(now_iso)" --arg backend "$backend"
   record_cost "$raw" "$(basename "$raw")"
   enforce_elapsed_limits
 }
