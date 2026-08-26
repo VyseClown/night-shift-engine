@@ -325,6 +325,8 @@ run_dry_fixtures() {
   fixture_assert "branch sweep: --sweep-only bare never runs the fix cycle (advisory by default)" fixture_sweep_only_bare_skips_fix "$root"
   fixture_assert "branch sweep: --sweep-only NIGHT_SHIFT_BRANCH_SWEEP=1 runs the fix cycle (explicit opt-in)" fixture_sweep_only_branch_sweep_1_runs_fix "$root"
   fixture_assert "branch sweep: fix cycle skips revalidation cleanly when SPEC is set but RUN_ROOT is not" fixture_sweep_fix_cycle_no_run_root_skips_revalidation "$root"
+  fixture_assert "branch sweep: write_run_feedback + sweep_fix_cycle dispatch on implement_backend_active, cursor branches carry --trust" fixture_sweep_backend_dispatch
+  fixture_assert "branch sweep: --sweep-only enforces the IMPLEMENT_BACKEND enum + cursor_available guards at startup" fixture_sweep_only_backend_guards "$root"
   fixture_assert "run feedback: writes one section + event, second run appends" fixture_run_feedback_writes_and_appends "$root"
   fixture_assert "run feedback: session failure warns and never blocks (advisory)" fixture_run_feedback_session_failure_is_advisory "$root"
   fixture_assert "run feedback: NIGHT_SHIFT_RUN_FEEDBACK=0 skips the session and never writes feedback.md; default runs it" fixture_run_feedback_knob "$root"
@@ -7723,6 +7725,79 @@ fixture_sweep_fix_cycle_no_run_root_skips_revalidation() {
       bash -c 'test "$(git -C "$1" rev-parse HEAD)" != "$2"' _ "$proj" "$tip_before"
     fx "no RUN_ROOT: cycle completed via the re-sweep (SWEEP_PASS)" \
       test "$(cat "$out/verdict.txt")" = "SWEEP_PASS"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+# Task 4 (cursor-implementer-backend, sweep fix cycle + run feedback follow
+# the backend): structural pin that both sweep.sh sessions actually dispatch
+# on implement_backend_active (not hard-coded to claude), and that their
+# respective cursor branches carry --trust (the headless workspace-trust
+# flag every cursor-agent invocation in this codebase requires).
+fixture_sweep_backend_dispatch() {
+  local body
+  body="$(declare -f write_run_feedback)"
+  case "$body" in *implement_backend_active*) ;; *) return 1 ;; esac
+  case "$body" in *'cursor-agent'*'--trust'*) ;; *) return 1 ;; esac
+  body="$(declare -f sweep_fix_cycle)"
+  case "$body" in *implement_backend_active*) ;; *) return 1 ;; esac
+  case "$body" in *'cursor-agent'*'--trust'*) ;; *) return 1 ;; esac
+  return 0
+}
+
+# --sweep-only has no run/queue and never calls main_run, so main_run's own
+# startup guards (the IMPLEMENT_BACKEND enum die + the cursor_available die)
+# never execute for this surface — but sweep_fix_cycle now dispatches on
+# implement_backend_active exactly like the in-run path, so an
+# unset-enum/unavailable-cursor misconfiguration must be caught here too, same
+# checks, same messages, BEFORE any sweep work starts (real subprocess
+# invocation: the guard lives at the top level of night-shift.sh, outside any
+# function this suite can call directly). Deliberately does NOT check
+# SESSION_SCOPE=stage: that guard exists only because a primary session
+# switches vendors at stage-scope boundaries, and this surface has no primary
+# sessions at all.
+fixture_sweep_only_backend_guards() {
+  local root="$1" dir="$root/sweep-only-backend-guards" proj bin out rc no_cursor_path strip_dir cursor_bin
+  proj="$dir/proj"; bin="$dir/bin"
+  mkdir -p "$bin"
+  _fixture_sweep_branch_project "$proj" || return 1
+  cat >"$bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '{"result":"fine\\nSWEEP_PASS"}\n'
+STUB
+  chmod +x "$bin/claude"
+  # Build a PATH with the real cursor-agent's directory (if any — this
+  # machine may have one installed) surgically removed, everything else kept
+  # (bash, git, jq, …), so the "cursor unavailable" edge is proven for real
+  # rather than accidentally finding a genuine cursor-agent further down PATH.
+  no_cursor_path="$bin:$PATH"
+  cursor_bin="$(command -v cursor-agent 2>/dev/null || true)"
+  if [ -n "$cursor_bin" ]; then
+    strip_dir="$(dirname "$cursor_bin")"
+    no_cursor_path="$bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vFx "$strip_dir" | paste -sd: -)"
+  fi
+  (
+    rc=0
+    out="$(PATH="$bin:$PATH" NIGHT_SHIFT_IMPLEMENT_BACKEND=bogus \
+      "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" 2>&1)" || rc=$?
+    fx "sweep-only: invalid IMPLEMENT_BACKEND dies before any sweep work" test "$rc" -ne 0
+    fx "sweep-only: die message names the bad enum value" \
+      grep -qF "NIGHT_SHIFT_IMPLEMENT_BACKEND must be claude or cursor" <<<"$out"
+
+    rc=0
+    out="$(PATH="$no_cursor_path" NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor \
+      "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" 2>&1)" || rc=$?
+    fx "sweep-only: cursor backend with no cursor-agent on PATH dies" test "$rc" -ne 0
+    fx "sweep-only: die message names the missing cursor-agent" \
+      grep -qF "cursor-agent is not on PATH" <<<"$out"
+
+    # Sanity: the default claude backend is unaffected by the new guards and
+    # still completes a bare sweep normally.
+    rc=0
+    PATH="$bin:$PATH" "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only: claude backend (default) still exits 0 on SWEEP_PASS" test "$rc" -eq 0
     exit 0
   ) >/dev/null || return 1
   return 0

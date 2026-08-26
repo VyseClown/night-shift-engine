@@ -3763,6 +3763,22 @@ if [ "$SWEEP_ONLY" -eq 1 ]; then
   [ -n "$PROJECT" ] || die "--sweep-only requires --project"
   git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
     die "project is not a Git repository: $PROJECT"
+  # --sweep-only exits before main_run, so main_run's own IMPLEMENT_BACKEND
+  # guards (the enum die + the cursor_available die) never run for this
+  # surface — but sweep_fix_cycle (called below when BRANCH_SWEEP=1) now
+  # dispatches on implement_backend_active same as the in-run path, so an
+  # unvalidated/unavailable cursor backend must be caught here too, same
+  # checks, same messages. NOT included: the SESSION_SCOPE=stage requirement
+  # main_run also enforces — that guard exists only because a primary session
+  # switches vendors at stage-scope boundaries, and this surface has no
+  # primary sessions at all (sweep_run/sweep_fix_cycle never call invoke_primary).
+  case "$IMPLEMENT_BACKEND" in
+    claude|cursor) ;;
+    *) die "NIGHT_SHIFT_IMPLEMENT_BACKEND must be claude or cursor (got: $IMPLEMENT_BACKEND)" ;;
+  esac
+  if [ "$IMPLEMENT_BACKEND" = "cursor" ] && ! cursor_available; then
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
+  fi
   # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
   # queued specs, so it never touches --spec/NEXT_TASK task selection. Even
   # with --spec given, sweep_fix_cycle's re-validation branch is a no-op

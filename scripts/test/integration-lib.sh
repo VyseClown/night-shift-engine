@@ -119,13 +119,17 @@ SPEC
 }
 
 # Scripted `cursor-agent` on PATH (specs/cursor-implementer-backend.md Task 2):
-# the cursor implementer backend. Unlike write_stub's `claude` binary, this is
-# the primary ONLY — no role multiplexing needed, since plan/persona/observer
-# turns stay on the claude stub regardless of the backend knob. --trust is
-# asserted defensively as the expected discriminator (the primary's cursor
-# invocation always passes it; a call missing it is a wiring bug). Appends one
-# line per invocation to $WORK/.cursor-calls (proves cursor actually ran the
-# turns it was supposed to). MODE=cursor-fail exits 1 with the verified
+# the cursor implementer backend. Two callers reach this stub: invoke_primary
+# (the primary turns) AND, per Task 4 (sweep fix cycle + run feedback follow
+# the backend), write_run_feedback / sweep_fix_cycle — plan/persona/observer
+# turns still stay on the claude stub regardless of the backend knob, but
+# these two advisory/fix sessions do not. --trust is asserted defensively as
+# the expected discriminator (every cursor invocation, primary or not, passes
+# it; a call missing it is a wiring bug). Appends one line per PRIMARY-TURN
+# invocation to $WORK/.cursor-calls (proves cursor actually ran the turns it
+# was supposed to — deliberately excludes the feedback/fix-cycle calls below,
+# which are not primary turns and would otherwise inflate that count past the
+# journaled signal_accepted total). MODE=cursor-fail exits 1 with the verified
 # stderr-only RetriableError shape and nothing on stdout, to drive the
 # bounded-retry -> sticky-fallback path. MODE=cursor-empty exits 0 with a
 # valid JSON envelope but no session_id (drift, not a CLI failure) — the SAME
@@ -141,6 +145,22 @@ write_cursor_stub() {
 has_trust=0; for a in "$@"; do [ "$a" = "--trust" ] && has_trust=1; done
 [ "$has_trust" = "1" ] || { printf 'Error: expected --trust in argv (not the cursor primary?)\n' >&2; exit 1; }
 emit(){ jq -cn --arg s "$1" --arg r "$2" '{type:"result",subtype:"success",is_error:false,result:$r,session_id:$s,usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'; }
+# write_run_feedback and sweep_fix_cycle pipe their prompt on STDIN and pass no
+# positional prompt argv arg; invoke_primary's own cursor calls pass the prompt
+# as the LAST positional argv arg and leave this process's stdin closed/empty
+# (the engine's own </dev/null). Read stdin FIRST, unconditionally — on a
+# primary call `cat` on the closed pipe returns immediately with no content —
+# so the two invocation shapes are told apart without inspecting flags.
+nonprimary_prompt="$(cat)"
+if [ -n "$nonprimary_prompt" ]; then
+  printf '%s\n' "${MODE:-happy}" >> "$WORK/.cursor-nonprimary-calls"
+  case "$nonprimary_prompt" in
+    *'Write 5-15 bullet lines of feedback'*)
+      emit stubcursorfeedback '- one\n- two\n- three\n- four\n- five\n- six' ;;
+    *) emit stubcursorfix 'done' ;;
+  esac
+  exit 0
+fi
 # Stage-dispatch mirrors write_stub's primary branch below (LOCKSTEP: any stage
 # case added there must be mirrored here too, and vice versa — see the
 # reciprocal comment on write_stub's own case statement). Planning branches
