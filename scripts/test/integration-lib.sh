@@ -21,6 +21,12 @@
 #                        (envelope drift, not a CLI failure), to drive the
 #                        SAME bounded-retry -> sticky-claude-fallback path via
 #                        invoke_primary's rc==0-but-no-session_id guard.
+#   no-session         — write_stub only: the claude primary exits 0 with a
+#                        valid JSON envelope but no session_id key at all, to
+#                        pin the CLAUDE path's OWN "primary emitted no
+#                        resumable session ID" block_run (the guard the
+#                        cursor rc==0-but-no-session_id check sits next to,
+#                        for the backend that had it first).
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 ENGINE="$ENGINE_DIR/scripts/night-shift.sh"
@@ -121,7 +127,10 @@ SPEC
 # line per invocation to $WORK/.cursor-calls (proves cursor actually ran the
 # turns it was supposed to). MODE=cursor-fail exits 1 with the verified
 # stderr-only RetriableError shape and nothing on stdout, to drive the
-# bounded-retry -> sticky-fallback path.
+# bounded-retry -> sticky-fallback path. MODE=cursor-empty exits 0 with a
+# valid JSON envelope but no session_id (drift, not a CLI failure) — the SAME
+# bounded-retry -> sticky-fallback path, but via invoke_primary's rc==0-but-
+# no-session_id guard rather than a nonzero exit.
 write_cursor_stub() {
   local mode="${1:-happy}"
   {
@@ -199,6 +208,15 @@ for a in "$@"; do [ "$a" = "--version" ] && { printf '9.9.9 (Claude Code)\n'; ex
 is_primary=0; for a in "$@"; do [ "$a" = "bypassPermissions" ] && is_primary=1; done
 emit(){ jq -cn --arg s "$1" --arg r "$2" '{session_id:$s,result:$r,total_cost_usd:0,num_turns:1,is_error:false}'; }
 if [ "$is_primary" = "1" ]; then
+  if [ "$MODE" = "no-session" ]; then
+    # Envelope drift on the CLAUDE path: rc 0, valid JSON, no session_id key
+    # at all. No signal is written — invoke_primary must block right after
+    # this single turn via its post-loop "primary emitted no resumable
+    # session ID" check, the same one the cursor rc==0-but-no-session_id
+    # guard defers to on the cursor path.
+    jq -cn --arg r "done" '{result:$r,total_cost_usd:0,num_turns:1,is_error:false}'
+    exit 0
+  fi
   st=.night-shift/state.json; c=.night-shift/control; mkdir -p "$c"; sig="$c/next-action.json"
   stage="$(jq -r '.stage' "$st")"; spec="$(jq -r '.task' "$st")"
   if [ "$MODE" = "malformed" ]; then
@@ -237,15 +255,22 @@ fi
 p="$(cat)"
 if printf '%s' "$p" | grep -q 'independent Claude observer'; then
   cand="$(printf '%s' "$p" | sed -nE 's/.*Candidate commit: ([0-9a-f]{7,64}).*/\1/p' | head -1)"
+  # Echo back the vendor the prompt itself asked for (observer_prompt interpolates
+  # $expected_primary into the example JSON's "primary" field) rather than
+  # hard-coding "claude" — this is what proves the cursor happy-path scenario's
+  # archived observer verdict genuinely carries primary:"cursor" end to end,
+  # not just a stub that always says claude.
+  pv="$(printf '%s' "$p" | sed -nE 's/.*"primary":"([a-z]+)".*/\1/p' | head -1)"
+  : "${pv:=claude}"
   if [ "$MODE" = "block-then-approve" ]; then
     n="$(cat "$WORK/.obs-count" 2>/dev/null || echo 0)"; n=$((n+1)); printf '%s' "$n" > "$WORK/.obs-count"
     if [ "$n" -eq 1 ]; then
-      emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" '{observer:"claude",primary:"claude",task:"t",candidate_commit:$c,status:"BLOCK",
+      emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" --arg pv "$pv" '{observer:"claude",primary:$pv,task:"t",candidate_commit:$c,status:"BLOCK",
         findings:[{id:"OBS-001",evidence:"add() propagates NaN for non-numeric input",required_change:"guard or document non-numeric input handling in add.js"}],
         documentation_changes:[]}')"; exit 0
     fi
   fi
-  emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" '{observer:"claude",primary:"claude",task:"t",candidate_commit:$c,status:"APPROVE",findings:[],documentation_changes:[]}')"; exit 0
+  emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" --arg pv "$pv" '{observer:"claude",primary:$pv,task:"t",candidate_commit:$c,status:"APPROVE",findings:[],documentation_changes:[]}')"; exit 0
 fi
 emit stubpersona "$(jq -cn '{persona:"x",stage:"implementation",commit:null,status:"APPROVE",findings:[],documentation_changes:[]}')"; exit 0
 STUB

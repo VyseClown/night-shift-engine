@@ -89,6 +89,13 @@ run_dry_fixtures() {
   fixture_assert "observer blocker schema" json_schema_basic observer-review "$good"
   jq '.observer = "codex"' "$good" >"$bad"
   fixture_reject "observer must be claude" json_schema_basic observer-review "$bad"
+  # cursor-implementer-backend wire contract: `primary` tracks the vendor that
+  # produced the candidate, so cursor validates alongside claude, but the
+  # enum is still closed (no third vendor).
+  jq '.primary = "cursor"' "$good" >"$root/observer-cursor.json"
+  fixture_assert "primary may be cursor" json_schema_basic observer-review "$root/observer-cursor.json"
+  jq '.primary = "codex"' "$good" >"$root/observer-bad-primary.json"
+  fixture_reject "primary must be claude or cursor" json_schema_basic observer-review "$root/observer-bad-primary.json"
 
   good="$root/evidence.json"
   printf '%s\n' '{"task":"specs/a.md","baseline":[{"command":"check","exit_status":0,"output":"ok"}],"test_first":{"command":"test","failing_exit_status":1,"failing_output":"failed","passing_exit_status":0,"passing_output":"passed"},"final_validation":[{"command":"check","exit_status":0,"output":"ok"}]}' >"$good"

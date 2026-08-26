@@ -48,6 +48,15 @@ retry_count="$(jq -c 'select(.type=="backend_retry")' "$events" | wc -l | tr -d 
 fallback_count="$(jq -c 'select(.type=="backend_fallback")' "$events" | wc -l | tr -d ' ')"
 [ "$fallback_count" -eq 0 ]                                    || fail "happy path journaled $fallback_count backend_fallback event(s); cursor should never fall back on the happy path"
 grep -qx 'implementation' "$WORK/.cursor-calls"                || fail ".cursor-calls is missing an 'implementation' stage line"
+# The observer-review wire contract (specs/cursor-implementer-backend.md's
+# "Wire contract" section): candidate_primary_vendor computes "cursor" here
+# (implement_backend_active, no fallback), observer_prompt tells the observer
+# to emit primary:"cursor", and the claude stub echoes back whatever vendor
+# it found in the prompt — so the archived verdict is real end-to-end proof,
+# not just a hard-coded stub value.
+obs_verdict="$(find "$PROJECT/.night-shift/archive" -name 'observer-*.json' | head -1)"
+[ -n "$obs_verdict" ] && [ -f "$obs_verdict" ]                 || fail "no archived observer verdict (cursor happy path)"
+[ "$(jq -r '.primary' "$obs_verdict")" = "cursor" ]            || fail "archived observer verdict .primary is not 'cursor'"
 printf 'ok - cursor: happy path runs post-plan turns on cursor-agent, plan stays claude, run completes\n'
 
 # ── Scenario B: bounded retries exhaust -> sticky fallback to claude ─────────

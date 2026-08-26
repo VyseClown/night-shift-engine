@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # integration-adverse.sh — the paths the engine exists to survive: a run that
-# BLOCKS (malformed-signal cap) and a run that recovers from an observer BLOCK.
+# BLOCKS (malformed-signal cap), a run that recovers from an observer BLOCK,
+# --resume clearing a logic block, and a primary envelope with no session_id.
 # Same scripted-stub approach as integration-run.sh; nothing inside the engine
-# is mocked. Exit 0 + two "ok - adverse: ..." lines on success.
+# is mocked. Exit 0 + four "ok - adverse: ..." lines on success.
 set -uo pipefail
 FAIL_PREFIX=adverse
 # shellcheck source=scripts/test/integration-lib.sh
@@ -62,3 +63,18 @@ jq -e 'select(.type=="run_recovered") | .payload.resumed_block==true' "$ev" >/de
                                                                || fail "journal missing run_recovered{resumed_block:true}"
 jq -e 'select(.type=="run_complete")' "$ev" >/dev/null         || fail "resumed run did not complete"
 printf 'ok - adverse: --resume clears a logic block and the run completes\n'
+
+# ── Scenario D: claude primary with no session_id → block_run (no retry) ─────
+# write_stub's no-session mode: rc 0, a valid JSON envelope, but no
+# session_id key at all. This pins invoke_primary's CLAUDE-path guard (the
+# post-loop "primary emitted no resumable session ID" block_run) — the guard
+# the cursor backend's own rc==0-but-no-session_id check
+# (specs/cursor-implementer-backend.md) sits next to, for the vendor that had
+# it first.
+integration_setup
+write_stub no-session
+run_engine --spec "$SPEC" && fail "engine exited 0 despite the primary never emitting a session_id"
+[ "$(jq -r .status "$PROJECT/.night-shift/state.json")" = "blocked" ]      || fail "status is not blocked (no-session)"
+jq -r .block_reason "$PROJECT/.night-shift/state.json" | grep -q 'no resumable session ID' \
+                                                               || fail "block_reason does not name the missing session_id"
+printf 'ok - adverse: a claude primary envelope with no session_id blocks with an actionable reason\n'

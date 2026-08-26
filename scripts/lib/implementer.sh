@@ -35,6 +35,15 @@ implement_scope_backend() {
   esac
 }
 
+# The vendor that produced (or will produce) the candidate the observer is
+# about to review — feeds the observer-review wire contract's `primary` field
+# (schemas/observer-review.json) so its expected value tracks the ACTIVE
+# backend rather than being hard-coded to claude. Mirrors implement_backend_active's
+# own logic rather than implement_scope_backend's (no session-scope concept here).
+candidate_primary_vendor() {
+  if implement_backend_active; then printf 'cursor'; else printf 'claude'; fi
+}
+
 # Record the sticky per-run fallback to Claude after cursor retries are
 # exhausted: state flag (survives resume; state_set is integrity-guarded by
 # the caller's flow), journal, log. Never fails the run itself.

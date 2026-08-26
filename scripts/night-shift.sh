@@ -450,7 +450,7 @@ json_schema_basic() {
       jq -e --argjson okeys "$OBSERVER_REVIEW_KEYS" '
         type == "object" and
         ((keys | sort) == $okeys) and
-        (.observer == "claude") and (.primary == "claude") and
+        (.observer == "claude") and (.primary | IN("claude","cursor")) and
         (.task | type == "string" and length > 0) and
         (.candidate_commit | type == "string" and test("^[0-9a-f]{7,64}$")) and
         (.status | IN("APPROVE","BLOCK")) and
@@ -1625,6 +1625,13 @@ invoke_primary() {
       # bounded retries with linear backoff, then a sticky per-run fallback to
       # the Claude implement model. The fresh Claude session reorients from the
       # files on disk via the same handoff note a stage boundary uses.
+      # Archive any stale signal FIRST: a cursor call that actually did its
+      # work (wrote next-action.json) before failing/drifting must not leave
+      # that signal sitting at control/next-action.json for the fallback
+      # turn's engine read to consume — archive_old_signal is idempotent
+      # (no-ops when the signal is already absent), so calling it again here
+      # on a retry that never wrote one is harmless.
+      archive_old_signal
       if [ "$cursor_attempts" -lt "$CURSOR_MAX_RETRIES" ]; then
         cursor_attempts=$((cursor_attempts + 1))
         emit_event backend_retry "$(jq -cn --argjson a "$cursor_attempts" --argjson rc "$rc" '{backend:"cursor", attempt:$a, rc:$rc}')"
@@ -1636,6 +1643,10 @@ invoke_primary() {
       backend="claude"
       session=""
       state_set '.session_id=null'
+      # Preserve the pre-fallback prompt for forensics BEFORE primary_prompt
+      # overwrites $prompt in place below — best-effort (never blocks the
+      # fallback on a cp failure).
+      cp "$prompt" "$prompt.pre-fallback" 2>/dev/null || true
       # Null'd .session_id above, so primary_prompt (which reads .session_id
       # fresh from state) now rebuilds $prompt with the "FRESH stage session"
       # file-handoff reorientation block — the prompt built at the top of THIS
@@ -3112,7 +3123,7 @@ codex_review_section() {
 }
 
 observer_prompt() {
-  local context="$1" candidate="$2" retry_note="${3:-}"
+  local context="$1" candidate="$2" retry_note="${3:-}" expected_primary="${4:-claude}"
   retry_note="$(rejection_preamble "$retry_note")"
   cat <<EOF
 You are an independent Claude observer reviewing another Claude session's work.
@@ -3130,12 +3141,13 @@ Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:
 
 \`\`\`json
-{"observer":"claude","primary":"claude","task":"$SPEC","candidate_commit":"$candidate","status":"APPROVE","findings":[],"documentation_changes":[]}
+{"observer":"claude","primary":"$expected_primary","task":"$SPEC","candidate_commit":"$candidate","status":"APPROVE","findings":[],"documentation_changes":[]}
 \`\`\`
 
 Rules for that JSON object:
-- "observer" and "primary" are both "claude"; "task" and "candidate_commit" are
-  exactly the values above.
+- "observer" is "claude"; "primary" is exactly "$expected_primary" (the vendor
+  that implemented the candidate); "task" and "candidate_commit" are exactly
+  the values above.
 - "status" is EXACTLY "APPROVE" or "BLOCK" — there is no other value. To request
   changes, use "BLOCK" (not "REQUEST_CHANGES"). Use ONLY the seven keys shown
   above; do not add keys like "severity", "location", "summary", or "base_commit".
@@ -3154,7 +3166,7 @@ EOF
 }
 
 invoke_observer_once() {
-  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral rc=0
+  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" expected_primary="${6:-claude}" neutral rc=0
   # Context-isolated observer: a fresh Claude session (no --resume) launched from
   # a neutral empty directory. It runs in the default (non-bypass) permission
   # mode, so tool use is not auto-approved and, combined with the neutral cwd, it
@@ -3173,7 +3185,7 @@ invoke_observer_once() {
   # still be sizeable, and a positional arg risks the ARG_MAX/E2BIG exec limit.
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
-  (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" |
+  (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" "$expected_primary" |
     claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # Same 429 distinction as invoke_persona_once: a live-recoverable transient,
@@ -3383,9 +3395,14 @@ run_observer() {
 
 validated_observer_retry() {
   local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note="" iv
+  # Computed ONCE per observer round (not per attempt): the backend that
+  # produced the candidate does not change mid-round, and re-deriving it per
+  # attempt would let a fallback that fires mid-round (unlikely but possible
+  # via state) desync the prompt's stated vendor from the comparison below.
+  local expected_primary; expected_primary="$(candidate_primary_vendor)"
   while [ "$attempt" -lt 2 ]; do
     enforce_limits
-    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note"; iv=$?
+    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note" "$expected_primary"; iv=$?
     if [ "$iv" -eq 42 ]; then
       # 429 (session OR per-model): the same live-recoverable transient the
       # primary already survives — not a contract failure. Wait/fall back and
@@ -3406,11 +3423,11 @@ validated_observer_retry() {
     # the success path we return 0 below WITHOUT a second record_cost call,
     # so there is no double-counting.
     record_cost "$raw.$attempt" "$(basename "$raw")"
-    normalize_observer_output "$out" "$SPEC" "$candidate"
+    normalize_observer_output "$out" "$SPEC" "$candidate" "$expected_primary"
     enforce_elapsed_limits
     if json_schema_basic observer-review "$out" &&
       [ "$(jq -r '.observer' "$out")" = "$OBSERVER" ] &&
-      [ "$(jq -r '.primary' "$out")" = "$PRIMARY" ] &&
+      [ "$(jq -r '.primary' "$out")" = "$expected_primary" ] &&
       { [ "$(jq -r '.task' "$out")" = "$SPEC" ] ||
         [ "$(basename "$(jq -r '.task' "$out")")" = "$(basename "$SPEC")" ]; } &&
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
