@@ -3,7 +3,8 @@
 > Summary: How to install/authenticate the Cursor CLI (`cursor-agent`) and
 > what `NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor` does — the knobs, the startup
 > probes and version canary, the `--trust`/`-f`/`--add-dir` semantics, where
-> the four invocations live, envelope/pricing differences from Claude, and
+> the four invocations live, the bounded retry → sticky Claude fallback and how
+> a fallen-back run resumes, envelope/pricing differences from Claude, and
 > the boundary (cursor never plans/reviews/observes/designs).
 
 This document covers the engine's **opt-in second implementer vendor**: with
@@ -53,9 +54,23 @@ cursor-agent status
 Whenever the backend knob is `cursor`, the engine's own `cursor_available`
 check (which shells out to `command -v cursor-agent`) runs at startup — a
 missing binary dies loudly before any work starts, it does not silently fall
-back. This guard runs on both entry points: the normal run path and the
-standalone `--sweep-only` surface each carry their own copy of the same
-check with the same die message.
+back. This guard runs on both entry points: the normal run path (inside
+`cursor_startup_guards`) and the standalone `--sweep-only` surface each carry
+their own copy of the same check with the same die message.
+
+On the run path the guard is deliberately **deferred** past spec selection and
+state recovery, because two situations make `cursor-agent` irrelevant for the
+whole run and dying on it would refuse a run that needs the binary for nothing:
+
+- the run's state already records the sticky fallback
+  (`.implement_backend_fallback == "claude"`) or the design latch
+  (`.implement_backend_design_latch == true`) — every remaining turn is Claude;
+- the selected spec declares a `## Design Contract` — the backend is inert all
+  run (see *Design Contract specs force Claude* below).
+
+Either case logs the skip and proceeds. A fresh cursor run with neither still
+dies at startup, before `initialize_run`'s minutes-long baseline, so a genuinely
+misconfigured backend fails as fast as it ever did.
 
 ### Startup probes (auth + model slug)
 
@@ -64,29 +79,51 @@ a **logged-out** CLI, and a **typo'd model slug**. Either one passes the
 availability check, then burns the whole retry budget plus backoff on the
 first post-plan turn and silently strands the run on the Claude fallback —
 the operator's vendor choice discarded, with only a journal entry to show
-for it. So when (and only when) the backend knob is `cursor`, startup also
-runs two free, bounded probes — `cursor-agent status` and
-`cursor-agent --list-models`, never a paid model call — on both the run path
-and the `--sweep-only` surface. Each probe has three outcomes:
+for it. So when (and only when) the backend knob is `cursor` — and, on the run
+path, only when the deferred guards above did not skip — startup also runs two
+free, bounded probes: `cursor-agent status` and `cursor-agent --list-models`,
+never a paid model call. `--sweep-only` runs the same probe from its own copy
+(no canary there: journaling needs a `RUN_ROOT` that surface never has). Each
+probe has three outcomes:
 
 | Outcome | What it means | What the engine does |
 |---|---|---|
 | ok | `status` reports logged in; the configured slug appears in the model list | proceed silently |
-| definitive failure | the probe completed and positively reported "not logged in", or a well-formed model list that does not contain the slug | **die** with an actionable message — naming `cursor-agent login` / `CURSOR_API_KEY` for auth, or the offending `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL=<slug>` for the model |
-| inconclusive | timeout, non-zero rc, or output the engine does not recognize | **WARN and proceed** — a transient blip must never block a run the in-run retry/fallback could have handled |
+| definitive failure | the probe completed and positively reported "not logged in" — **only the auth check can reach this outcome** | **die** with an actionable message naming `cursor-agent login` / `CURSOR_API_KEY` |
+| inconclusive | timeout, non-zero rc, output the engine does not recognize — **and a slug absent from an otherwise well-formed model list** | **WARN and proceed** — a transient blip or a formatting change must never block a run the in-run retry/fallback could have handled |
+
+The slug check is a WARN, not a die, and the asymmetry is deliberate: "not
+logged in" is a *positive report from the CLI*, while a slug miss is *inferred
+from the list's row format* (`<slug> - <display name>`, exact first-field
+match). A build that indents, prefixes, or colorizes its rows keeps the
+`available models` header while failing that match — killing a run whose slug is
+perfectly valid, and doing it before the version canary that would have flagged
+the drift. A genuinely typo'd slug is not silently tolerated either: it is
+warned at startup with the correct slug spelled out, and then fails fast through
+the in-run retry/fallback, landing the run on Claude within ~180s at the default
+knobs (30s + 60s + 90s of backoff).
 
 Two deliberate exemptions: a **parameterized** model
 (`--model 'name[key=value,…]'`) is legitimate but never listed verbatim, so
 slug validation is skipped rather than failed; and
-`NIGHT_SHIFT_CURSOR_SKIP_PROBE=1` disables the probes entirely (what the
-subprocess-driven test harnesses use). Probe commands are wrapped in a
-portable watchdog — macOS has no coreutils `timeout` — bounded by
+`NIGHT_SHIFT_CURSOR_SKIP_PROBE=1` disables both probes entirely. That knob is
+an operator escape hatch for a machine where the probes themselves misbehave —
+it gives up all auth and slug validation for the run, so the skip itself is
+logged rather than silent. It is **not** how the test suites run: the
+subprocess-driven integration harness leaves it unset — its scripted
+`cursor-agent` answers only real turns, so both probes come back *inconclusive*
+and take the WARN-and-proceed arm. The knob's only user in-tree is one sub-check
+inside `fixture_cursor_startup_probe`. Probe commands are wrapped in a portable
+watchdog — macOS has no coreutils `timeout` — bounded by
 `NIGHT_SHIFT_CURSOR_PROBE_TIMEOUT` (default `30` seconds).
 
-**Maintenance:** `fixture_cursor_startup_probe` holds all three outcomes,
-both exemptions, and the presence of the call on both surfaces;
-`fixture_sweep_only_backend_guards` drives the `--sweep-only` availability
-guard through a real subprocess.
+**Maintenance:** `fixture_cursor_startup_probe` holds all three outcomes
+(including that the slug miss WARNs and the auth failure still dies), both
+exemptions, and the presence of the call on both surfaces;
+`fixture_cursor_startup_guards` holds the two run-path skips (each with a
+control that genuinely dies) and that `main_run` reaches the guards from both
+arms of its recover/init fork; `fixture_sweep_only_backend_guards` drives the
+`--sweep-only` availability guard through a real subprocess.
 
 ## Model discovery
 
@@ -106,7 +143,7 @@ cursor-grok-4.6-high
 
 ## The knobs
 
-The four that shape a run:
+The five that shape a run:
 
 | Knob | Default | Meaning |
 |---|---|---|
@@ -114,13 +151,14 @@ The four that shape a run:
 | `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` | `cursor-grok-4.6-high` | Passed verbatim to `cursor-agent --model` on fresh sessions only — a `--resume` turn must not re-pass `--model`, same rule the Claude side follows. |
 | `NIGHT_SHIFT_CURSOR_MAX_RETRIES` | `3` | Cursor invocation retries (incremental backoff) before the run sticks a per-run fallback to the Claude implement model. |
 | `NIGHT_SHIFT_CURSOR_RETRY_BACKOFF` | `30` | Seconds; actual sleep is this value times the attempt number. |
+| `NIGHT_SHIFT_CURSOR_MAX_WAIT` | `600` | Ceiling (seconds) on the TOTAL backoff one primary turn may spend retrying cursor. Retries × backoff is otherwise an unbounded product; once the next sleep would cross this, the turn takes the sticky Claude fallback immediately instead of sleeping out the remaining budget. The cursor twin of `NIGHT_SHIFT_SWEEP_MAX_WAIT`. |
 
 Plus two that only tune the startup probes (see below):
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `NIGHT_SHIFT_CURSOR_PROBE_TIMEOUT` | `30` | Seconds each free probe command (`status`, `--list-models`, `--version`) may take before its watchdog kills it. |
-| `NIGHT_SHIFT_CURSOR_SKIP_PROBE` | `0` | `1` skips the auth/model startup probes entirely (used by the subprocess-driven test harnesses). |
+| `NIGHT_SHIFT_CURSOR_SKIP_PROBE` | `0` | `1` skips the auth/model startup probes entirely — an operator escape hatch that trades away auth + slug validation for the run (the skip is logged). Not used by the integration harness. |
 
 There is no `inherit` sentinel for the cursor model — `inherit` means "use the
 Claude CLI's startup model," a concept specific to the Claude branch. The
@@ -230,22 +268,52 @@ Shared invariants across all four:
   cycle reaches its own out-of-project output dir. The advisory run-feedback
   session gets neither `-f` nor `--add-dir`.
 
-**Maintenance:** those invariants are held in lockstep by named fixtures, so
-changing a call site without changing its fixture turns the suite red —
-`fixture_cursor_primary_dispatch` (primary dispatch + the stderr redirect +
-the knob's `claude` default) and `fixture_sweep_backend_dispatch` (both
-sweep.sh call sites, including the deliberate `-f`/`--add-dir` asymmetry
-between them) in `scripts/test/fixtures.sh`. End-to-end behavior lives in
+**Maintenance:** most — not all — of those invariants have a named pin, so
+check which one covers the flag you are about to touch:
+
+| Invariant | Pinned by |
+|---|---|
+| primary dispatches on the backend; stderr → `.err` | `fixture_cursor_primary_dispatch` (`scripts/test/fixtures.sh`) |
+| `--add-dir "$WORKSPACE_ROOT"` on **both** primary branches (fresh + `--resume`) | `fixture_cursor_primary_dispatch` (counts two occurrences) and `integration-cursor.sh` Scenario A (every recorded primary argv) |
+| `--model` on a fresh start, never on a `--resume` | `fixture_cursor_retry_resumes_and_rechecks_limits` |
+| `--trust` on every invocation | the integration harness's `cursor-agent` stub rejects any argv without it |
+| `--trust`/`-f`/`--add-dir` on the two `sweep.sh` sites, including the deliberate asymmetry between them | `fixture_sweep_backend_dispatch` |
+
+The one gap worth knowing: **the primary's `-f` has no pin** — dropping it would
+not turn the suite red (the stub only checks `--trust`, and a real cursor
+session without `-f` would fail at edit time, not at argv time). Add the flag
+back by hand if you refactor those two lines. End-to-end behavior lives in
 `scripts/test/integration-cursor.sh`.
 
 ## Retry → sticky Claude fallback
 
-On a cursor turn failure (non-zero exit or `is_error:true`), the engine
-journals `backend_retry {attempt, rc}` and sleeps
+A cursor turn counts as failed on a non-zero exit, on `is_error:true` in an
+otherwise clean envelope, on a missing `session_id`, or when a `--resume` echoes
+back a *different* session id (that last one is logged as CLI-contract drift and
+routed here rather than hard-blocking — the Claude path keeps its hard block,
+because its `--resume` contract is verified). On any of them the engine journals
+`backend_retry {attempt, rc}` and sleeps
 `NIGHT_SHIFT_CURSOR_RETRY_BACKOFF * attempt` seconds, up to
 `NIGHT_SHIFT_CURSOR_MAX_RETRIES` retries after the initial turn (the
-default of `3` means at most 4 invocations total before falling back). On
-exhaustion it sets a sticky
+default of `3` means at most 4 invocations total before falling back).
+
+Three things happen around each retry:
+
+- **The retry resumes the failed attempt's own session** when that attempt
+  emitted one. A failed cursor turn is not side-effect-free — the CLI can have
+  edited files or even committed before reporting the error — so a retry in a
+  brand-new session would re-run the identical prompt blind to that work.
+- **The turn budget is re-checked** (`enforce_limits`) after every backoff
+  sleep. Turn counters deliberately do not advance on a retry, so without this a
+  retry storm could outrun the stage/task *time* caps entirely. A budget hit at
+  the re-check blocks the run there — before any fallback.
+- **The cumulative backoff is capped** by `NIGHT_SHIFT_CURSOR_MAX_WAIT`
+  (default `600`s). Once the *next* sleep would push this turn's total backoff
+  past the ceiling, the engine stops retrying and takes the fallback
+  immediately, logging (and journaling, in the `backend_fallback` reason) that
+  the ceiling — not the retry count — is what fired.
+
+On either stop condition it sets a sticky
 per-run state flag (`.implement_backend_fallback="claude"`, survives
 `--resume`) and nulls the session **in one atomic state write** — split
 across two writes, a crash in between would leave the run pinned to Claude
@@ -296,16 +364,50 @@ silent no-op, the claude backend never probes).
 
 ### Resuming a run under a different backend
 
-`--resume` refuses to switch backends mid-run: the engine compares the
+A relaunch normally refuses to switch backends mid-run: the engine compares the
 `NIGHT_SHIFT_IMPLEMENT_BACKEND` recorded in the run's state at start time
-against the value passed to the resume invocation, and dies if they differ
+against the value passed to the relaunch, and dies if they differ
 (`existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND=<recorded>;
-relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=<recorded> to resume it`). This
-also covers the sticky per-run fallback above — once a run has fallen back
-to Claude, its recorded backend is still `cursor` (the fallback is a runtime
-flag, not a rewrite of the original knob), so a resume must still pass
-`NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor` even though the run is currently
-executing on Claude.
+relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=<recorded> to resume it`).
+
+**A run that already took the sticky fallback is the exception**, and it needs
+to be: expired or unreachable cursor auth is the usual *cause* of the fallback,
+so demanding the original knob back would be circular — the operator could
+resume with neither backend, behind a tree too dirty for a bare relaunch, with
+the night's committed work stranded. So once state records
+`.implement_backend_fallback == "claude"`:
+
+- the backend comparison is relaxed (the flag can only be set on a run whose
+  stored backend was cursor, so the relaxation is exactly cursor → claude) and
+  the acceptance is logged. Resume with `NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor`,
+  with `=claude`, or with the knob unset — all three work;
+- `cursor_startup_guards` returns early, so `cursor-agent` may be **absent from
+  `PATH` or logged out** and the run still resumes. Nothing left in the run uses
+  it. (The version canary is likewise a silent no-op when the probe cannot run.)
+
+There is no hand-edit alternative and never was: `state.json` is
+integrity-anchored and guarded on every primary turn, so editing it out of band
+quarantines the file, journals `integrity_violation`, restores the engine's copy
+and blocks the run. Use the resume above instead.
+
+**Null-session resumes.** The fallback nulls `.session_id` in the same write as
+the flag, so a block during the fallback turn leaves `status: blocked` with no
+pinned session. `--resume` re-enters that state under
+`NIGHT_SHIFT_SESSION_SCOPE=stage` (the default, and the only scope this backend
+allows): a stage session is restartable *from files* by construction, so the
+next primary turn simply starts fresh and reorients from the working tree and
+`control/plan.md`. Under the legacy `=run` scope a null session genuinely means
+lost context, and the old refusal stands — the refusal message names which
+precondition failed rather than guessing.
+
+**Maintenance:** `integration-cursor.sh` Scenario E reproduces the whole
+incident end to end — plan on Claude, cursor burns its budget, sticky fallback,
+the fallback turn writes work and fails, the run blocks with `session_id: null`
+over a dirty tree, a bare relaunch is refused, and `--resume` under
+`NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor` with `cursor-agent` deleted from `PATH`
+completes the run. `fixture_resume_blocked` and `fixture_resume_refusal_reason`
+hold the scope rule and the refusal messages;
+`fixture_recovery_guard_backend_mismatch_after_fallback` holds the relaxed die.
 
 ## Design Contract specs force Claude
 

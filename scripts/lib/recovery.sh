@@ -5,7 +5,8 @@
 # scripts/lib/recovery.sh
 # Rate-limit detection + reset-time math, and run-recovery state predicates.
 # Sourced by night-shift.sh; uses now_iso/now_epoch/log/block_run and the STATE
-# global (+ RATE_LIMIT_MAX_WAIT_SECONDS) at runtime from the orchestrator.
+# global (+ RATE_LIMIT_MAX_WAIT_SECONDS, SESSION_SCOPE) at runtime from the
+# orchestrator.
 
 # Recognizes Claude's structured session-limit response: HTTP 429 plus a result
 # string carrying a 12-hour clock reset time and an IANA (slash) timezone, e.g.
@@ -150,14 +151,64 @@ recoverable_rate_limit_state() {
 }
 
 # True when an explicit `--resume` may re-enter a logic-blocked run: status is
-# "blocked", it is NOT a rate-limit block (no rate_limit_reset_at), and a session_id
-# is present. The primary match is enforced by the caller. Operator-gated — never
-# consulted unless --resume was passed, so a recurring block cannot auto-loop.
+# "blocked", it is NOT a rate-limit block (no rate_limit_reset_at), and either a
+# session_id is present OR the run is stage-scoped. The primary/backend match is
+# enforced by the caller. Operator-gated — never consulted unless --resume was
+# passed, so a recurring block cannot auto-loop.
+#
+# The null-session allowance: under SESSION_SCOPE=stage a primary session is
+# restartable FROM FILES by construction (set_stage nulls .session_id at every
+# scope boundary, and the next turn's prompt carries the file-handoff
+# reorientation), so "no pinned session" is a normal mid-run state there, not a
+# lost context. Under SESSION_SCOPE=run — one session pinned for the whole run,
+# never nulled at a boundary — a null session genuinely means there is no
+# resumable context, so the original refusal stands.
+#
+# The failure this closes: the cursor backend's sticky fallback
+# (implement_backend_fallback_set) deliberately nulls .session_id in the same
+# atomic write as the flag, so ANY block during the fallback turn produced
+# status=blocked + session_id=null. --resume then refused ("no resumable blocked
+# run") while a bare relaunch refused on the dirty tree — which is the tree's
+# state for the whole implementation scope by design — stranding the night's
+# work. The cursor backend REQUIRES stage scope (main_run's own guard), so this
+# is exactly the case the stale "no session ⇒ not resumable" premise misjudged.
 resumable_blocked_state() {
   local state="$1"
   [ "$(jq -r '.status' "$state")" = "blocked" ] || return 1
   [ "$(jq -r '.rate_limit_reset_at // empty' "$state")" = "" ] || return 1
-  [ -n "$(jq -r '.session_id // empty' "$state")" ] || return 1
+  [ -z "$(jq -r '.session_id // empty' "$state")" ] || return 0
+  [ "${SESSION_SCOPE:-stage}" = "stage" ]
+}
+
+# The human-facing WHY behind a refused `--resume`, checked in the same order as
+# resumable_blocked_state's preconditions so the message names the precondition
+# that actually failed. The old blanket message listed reasons that were often
+# false ("not blocked" for a run that WAS blocked, "primary mismatch" for a
+# mismatch that dies inside recover_run with its own message), which sent
+# operators hunting the wrong problem at 3am. Never fails: an unreadable or
+# absent state yields a message, not an error.
+resume_refusal_reason() {
+  local state="$1" status
+  [ -f "$state" ] ||
+    { printf 'no run state at %s — there is no run to resume' "$state"; return 0; }
+  status="$(jq -r '.status // "unreadable"' "$state" 2>/dev/null)"
+  [ -n "$status" ] || status="unreadable"
+  if [ "$status" != "blocked" ]; then
+    printf 'the run at %s has status "%s", not "blocked" — --resume only re-enters a blocked run' \
+      "$state" "$status"
+    return 0
+  fi
+  if [ "$(jq -r '.rate_limit_reset_at // empty' "$state" 2>/dev/null)" != "" ]; then
+    printf 'the run at %s is blocked on a rate limit (rate_limit_reset_at is set) — that path recovers on its own; relaunch (with or without --resume) once the reported reset has passed' \
+      "$state"
+    return 0
+  fi
+  if [ -z "$(jq -r '.session_id // empty' "$state" 2>/dev/null)" ]; then
+    printf 'the run at %s is blocked with no pinned session and NIGHT_SHIFT_SESSION_SCOPE=%s — a run-scoped session cannot be restarted from files; re-run with NIGHT_SHIFT_SESSION_SCOPE=stage to resume it from the working tree' \
+      "$state" "${SESSION_SCOPE:-stage}"
+    return 0
+  fi
+  printf 'the run at %s does not satisfy the --resume preconditions' "$state"
 }
 
 wait_for_rate_limit_reset() {

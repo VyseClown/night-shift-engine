@@ -30,6 +30,18 @@
 #                        invoke_primary must still route it into the same
 #                        bounded-retry -> sticky-claude-fallback path instead
 #                        of accepting the turn as a success.
+#   plan-then-impl-fail— write_stub only: planning succeeds normally, then the
+#                        implementation turn WRITES its work and exits 1 with
+#                        no envelope. Paired with a failing cursor stub it
+#                        produces the stranded shape C1/C2 exist for: the
+#                        sticky fallback nulls .session_id, the claude
+#                        fallback turn then fails, and the run blocks with
+#                        status=blocked + session_id=null over a DIRTY tree.
+#   spec-tamper        — write_stub only: the primary rewrites the SPEC's
+#                        final-validation commands while building the
+#                        candidate — the "update the spec to match what I
+#                        built" move that would weaken the gate judging it.
+#                        Uncommitted, so no diff would ever show it.
 #   no-session         — write_stub only: the claude primary exits 0 with a
 #                        valid JSON envelope but no session_id key at all, to
 #                        pin the CLAUDE path's OWN "primary emitted no
@@ -135,6 +147,9 @@ SPEC
 # these two advisory/fix sessions do not. --trust is asserted defensively as
 # the expected discriminator (every cursor invocation, primary or not, passes
 # it; a call missing it is a wiring bug). Appends one line per PRIMARY-TURN
+# invocation to $WORK/.cursor-argv holding that call's flags (the prompt arg
+# dropped — see there), so a scenario can assert the argv the engine really
+# built, e.g. --add-dir "$WORKSPACE_ROOT". Appends one line per PRIMARY-TURN
 # invocation to $WORK/.cursor-calls (proves cursor actually ran the turns it
 # was supposed to — deliberately excludes the feedback/fix-cycle calls below,
 # which are not primary turns and would otherwise inflate that count past the
@@ -186,6 +201,15 @@ stage="$(jq -r '.stage' "$st")"; spec="$(jq -r '.task' "$st")"
 # One line per invocation, keyed on stage (NOT the raw multi-line prompt in
 # "$*" — that would inflate the line count with the prompt's own newlines).
 printf '%s\n' "$stage" >> "$WORK/.cursor-calls"
+# One line per PRIMARY invocation carrying that call's FLAGS, so a scenario can
+# assert what the engine actually passed cursor-agent. The final positional arg
+# (the prompt) is dropped: it is multi-line, so including it would break the
+# one-line-per-call shape every count here depends on. Non-primary callers
+# (write_run_feedback / sweep_fix_cycle) already returned above, so the last arg
+# is always the prompt at this point.
+ns_argv=""; ns_n=$#; ns_i=1
+for a in "$@"; do [ "$ns_i" -lt "$ns_n" ] && ns_argv="$ns_argv $a"; ns_i=$((ns_i + 1)); done
+printf '%s\n' "${ns_argv# }" >> "$WORK/.cursor-argv"
 if [ "$MODE" = "cursor-fail" ]; then
   printf 'Error: RetriableError: [resource_exhausted]\n' >&2
   exit 1
@@ -277,6 +301,12 @@ if [ "$is_primary" = "1" ]; then
       jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"planning",reason:"plan",artifacts:[]}' > "$sig" ;;
     implementation|implementation_review)
       printf 'module.exports.add = (a, b) => a + b;\n' > add.js
+      # Work first, THEN crash: rc 1, no envelope, no signal — the shape that
+      # leaves real uncommitted work behind a failed turn.
+      if [ "$MODE" = "plan-then-impl-fail" ]; then
+        printf 'Error: simulated claude CLI failure\n' >&2
+        exit 1
+      fi
       # Re-entered after an observer BLOCK: append the requested guard line so
       # the second candidate genuinely differs from the blocked one.
       if [ "$MODE" = "block-then-approve" ] && [ -f "$WORK/.obs-count" ]; then
@@ -284,6 +314,11 @@ if [ "$is_primary" = "1" ]; then
       fi
       jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"implementation",reason:"impl",artifacts:[]}' > "$sig" ;;
     implementation_ready)
+      # Rewrite the gate that is about to judge this candidate. $spec is the
+      # run's own spec path, straight out of state.json.
+      if [ "$MODE" = "spec-tamper" ]; then
+        printf -- '\n- Final validation commands (run in this order):\n  1. `true`\n' >> "$spec"
+      fi
       git add add.js >/dev/null 2>&1; git commit -qm "feat: add() helper" >/dev/null 2>&1
       jq -cn --arg t "$spec" '{task:$t,
         baseline:[{command:"node --version",exit_status:0,output:"v"}],

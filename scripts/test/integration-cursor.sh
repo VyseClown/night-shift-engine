@@ -6,8 +6,10 @@
 # the envelope carries no session_id (drift, not a CLI failure). Same
 # scripted-stub approach as integration-run.sh / integration-adverse.sh;
 # nothing inside the engine is mocked. A fourth scenario covers cursor's
-# in-band failure shape: rc 0, a complete envelope, "is_error":true.
-# specs/cursor-implementer-backend.md — Task 2 fix wave. Exit 0 + four
+# in-band failure shape: rc 0, a complete envelope, "is_error":true, and a
+# fifth covering the stranding a fallen-back run used to suffer (blocked with
+# no session, over a dirty tree, resumable by neither relaunch path).
+# specs/cursor-implementer-backend.md — Task 2 fix wave. Exit 0 + five
 # "ok - cursor: ..." lines on success.
 set -uo pipefail
 FAIL_PREFIX=cursor
@@ -49,6 +51,16 @@ retry_count="$(jq -c 'select(.type=="backend_retry")' "$events" | wc -l | tr -d 
 fallback_count="$(jq -c 'select(.type=="backend_fallback")' "$events" | wc -l | tr -d ' ')"
 [ "$fallback_count" -eq 0 ]                                    || fail "happy path journaled $fallback_count backend_fallback event(s); cursor should never fall back on the happy path"
 grep -qx 'implementation' "$WORK/.cursor-calls"                || fail ".cursor-calls is missing an 'implementation' stage line"
+# --add-dir "$WORKSPACE_ROOT" on EVERY primary cursor invocation: primary_prompt
+# orders reads of AGENTS.md / AGENT_LOOP.md / the spec / schemas/ and the TODO.md
+# edit, all outside the --trust'd $PROJECT. A stub cannot fail on a missing flag
+# (it just reads fewer files), so the flag has to be asserted from the recorded
+# argv. Both the fresh-start and the --resume branch must carry it, which is why
+# this counts EVERY recorded call rather than grepping for one hit.
+argv_calls="$(wc -l < "$WORK/.cursor-argv" | tr -d ' ')"
+[ "$argv_calls" -eq "$cursor_calls" ]                          || fail ".cursor-argv recorded $argv_calls calls but .cursor-calls recorded $cursor_calls"
+argv_with_dir="$(grep -cF -- "--add-dir $ENGINE_DIR" "$WORK/.cursor-argv")"
+[ "$argv_with_dir" -eq "$cursor_calls" ]                       || fail "only $argv_with_dir of $cursor_calls primary cursor invocations passed --add-dir $ENGINE_DIR (the workspace root the prompt orders reads from)"
 # The observer-review wire contract (specs/cursor-implementer-backend.md's
 # "Wire contract" section): candidate_primary_vendor computes "cursor" here
 # (implement_backend_active, no fallback), observer_prompt tells the observer
@@ -168,3 +180,48 @@ state="$(find "$PROJECT/.night-shift/archive" -name state.json | head -1)"
 # must never have been stamped.
 [ "$(jq -r '.implement_backend_used // "null"' "$state")" = "null" ] || fail "state.implement_backend_used was stamped despite every cursor turn reporting is_error"
 printf 'ok - cursor: an is_error:true envelope at rc 0 retries then falls back, run completes on claude\n'
+
+# ── Scenario E: a fallen-back run that then BLOCKS is still resumable ────────
+# The stranding this closes, end to end. The sticky fallback nulls .session_id
+# in the same atomic write as the flag, so a block during the fallback turn
+# leaves status=blocked + session_id=null over a tree that is dirty for the
+# whole implementation scope by design. Before the fix BOTH relaunch paths
+# refused: --resume because resumable_blocked_state demanded a non-empty
+# session, and a bare relaunch because of the dirty tree — the night's work was
+# orphaned. And resuming under the stored backend ran straight into the cursor
+# availability/auth dies, which is what caused the fallback in the first place.
+#
+# Setup: plan succeeds on claude, the implementation turn goes to cursor, cursor
+# fails its whole retry budget, the fallback turn runs claude — which writes its
+# work and then fails, blocking the run.
+integration_setup
+write_stub plan-then-impl-fail
+write_cursor_stub cursor-fail
+NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor NIGHT_SHIFT_CURSOR_RETRY_BACKOFF=0 \
+  NIGHT_SHIFT_CURSOR_MAX_RETRIES=1 run_engine --spec "$SPEC" \
+  && fail "setup: the fallback-then-fail run unexpectedly succeeded"
+ns="$PROJECT/.night-shift"
+[ "$(jq -r .status "$ns/state.json")" = "blocked" ]            || fail "setup: run is not blocked"
+[ "$(jq -r '.implement_backend_fallback' "$ns/state.json")" = "claude" ] \
+                                                               || fail "setup: the run never took the sticky fallback"
+[ "$(jq -r '.session_id' "$ns/state.json")" = "null" ]         || fail "setup: the blocked run still has a pinned session (the stranding shape needs none)"
+[ -n "$(git -C "$PROJECT" status --porcelain)" ]               || fail "setup: the tree is clean; the stranding shape needs uncommitted work"
+# A bare relaunch is (correctly) refused — the work in the tree is real.
+run_engine --spec "$SPEC" && fail "a bare relaunch over a dirty blocked tree must not start a fresh run"
+grep -q 're-run with --resume' "$WORK/run.log"                 || fail "the bare-relaunch refusal does not point at --resume"
+# Now the escape that used to be closed: --resume, still on the cursor backend,
+# with cursor-agent GONE from PATH (the logged-out/unavailable state that
+# caused the fallback). The run needs cursor for nothing and must finish.
+rm -f "$BIN/cursor-agent"
+write_stub happy
+if ! NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor run_engine --resume; then
+  tail -20 "$WORK/run.log" >&2 || true
+  fail "--resume of a fallen-back run failed (cursor-agent absent)"
+fi
+ev="$(find "$PROJECT/.night-shift/archive" -name events.jsonl | head -1)"
+[ -n "$ev" ] && [ -f "$ev" ]                                   || fail "no archived journal after the fallback resume"
+jq -e 'select(.type=="run_recovered") | .payload.resumed_block==true' "$ev" >/dev/null \
+                                                               || fail "journal missing run_recovered{resumed_block:true} for the null-session resume"
+jq -e 'select(.type=="run_complete")' "$ev" >/dev/null          || fail "the resumed fallen-back run did not complete"
+grep -q 'already pinned to claude' "$WORK/run.log"              || fail "the cursor startup guards were not skipped for the fallen-back run"
+printf 'ok - cursor: a fallen-back run that blocked resumes with cursor-agent gone (null session + guards skipped)\n'

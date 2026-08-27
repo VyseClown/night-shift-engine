@@ -156,6 +156,17 @@ IMPLEMENT_BACKEND="${NIGHT_SHIFT_IMPLEMENT_BACKEND:-claude}"
 CURSOR_IMPLEMENT_MODEL="${NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL:-cursor-grok-4.6-high}"
 CURSOR_MAX_RETRIES="${NIGHT_SHIFT_CURSOR_MAX_RETRIES:-3}"
 CURSOR_RETRY_BACKOFF="${NIGHT_SHIFT_CURSOR_RETRY_BACKOFF:-30}"
+# Sanity ceiling on the TOTAL backoff one primary turn may spend retrying
+# cursor-agent, the cursor twin of SWEEP_MAX_WAIT above: MAX_RETRIES and
+# RETRY_BACKOFF are each validated as non-negative integers with no ceiling, so
+# their product is unbounded (5 retries x 3600s backoff = over 13 hours of
+# sleep inside ONE turn, with no elapsed check between the sleeps — every other
+# wait in the engine is capped). Once the NEXT sleep would push this turn's
+# cumulative backoff past this many seconds, invoke_primary stops retrying and
+# takes the sticky claude fallback immediately, logging which limit stopped it.
+# The fallback is the whole point: an unreachable cursor must cost the night a
+# bounded delay, not the night.
+CURSOR_MAX_WAIT="${NIGHT_SHIFT_CURSOR_MAX_WAIT:-600}"
 # Timeout (seconds) for the spec-declared smoke-run validation phase
 # (run_smoke_phase, scripts/lib/preflight.sh) — how long a server-mode smoke
 # command gets to answer HTTP 200, or an exit-mode smoke command gets to exit.
@@ -931,6 +942,16 @@ initialize_run() {
     --arg baseline_status "$BASE_STATUS" --arg backend "$IMPLEMENT_BACKEND" ||
     die "could not initialize run state"
   integrity_put "$STATE"
+  # Anchor the SPEC itself (vendor-neutral). The spec is not wrapper-owned the
+  # way state.json is — a human authored it — but the engine re-reads it at
+  # CANDIDATE time for the "Final validation commands" that judge the work
+  # (verify_candidate), and the primary has unattended write access to the
+  # whole workspace in between. An implementer that "updates the spec to match
+  # what it built" would then weaken the very gate judging it, silently, with
+  # no diff to show for it if the edit is uncommitted. Anchored here, guarded
+  # there. integrity_key uses the basename for out-of-RUN_ROOT files, so each
+  # chained task's spec gets its own key.
+  integrity_put "$SPEC"
   # Journal the moment the run exists: run_started only fires after the
   # minutes-long baseline gate below, so a run blocked during baseline would
   # otherwise leave a journal that starts mid-story. Also the one event that
@@ -1014,14 +1035,34 @@ recover_run() {
     die "existing run belongs to primary $(jq -r '.primary' "$STATE")"
   # // "claude" default: state written before this field existed (old runs)
   # stays recoverable as claude, matching the backend that actually ran it.
-  local stored_backend
+  local stored_backend fell_back
   stored_backend="$(jq -r '.implement_backend // "claude"' "$STATE")"
-  [ "$stored_backend" = "$IMPLEMENT_BACKEND" ] ||
-    die "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend; relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend to resume it (got $IMPLEMENT_BACKEND)"
+  fell_back="$(jq -r '.implement_backend_fallback // empty' "$STATE")"
+  if [ "$stored_backend" != "$IMPLEMENT_BACKEND" ] && [ "$fell_back" = "claude" ]; then
+    # The run already took the sticky fallback: every remaining turn is claude,
+    # and it needs cursor-agent for NOTHING. Demanding the original
+    # NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor here would send the operator back
+    # through the cursor availability/auth guards — and expired cursor auth is
+    # the very thing that usually CAUSED the fallback, so the demand is
+    # circular and strands the night's committed work behind a tree too dirty
+    # for a bare relaunch. (The flag can only be set on a run whose stored
+    # backend was cursor, so this relaxation is exactly cursor -> claude.)
+    log "recovery: this run already fell back to claude (.implement_backend_fallback); accepting NIGHT_SHIFT_IMPLEMENT_BACKEND=$IMPLEMENT_BACKEND instead of the stored $stored_backend — nothing left in the run uses cursor-agent"
+  else
+    [ "$stored_backend" = "$IMPLEMENT_BACKEND" ] ||
+      die "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend; relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend to resume it (got $IMPLEMENT_BACKEND)"
+  fi
   RUN_ID="$(jq -r '.run_id' "$STATE")"
   SPEC="$(jq -r '.task' "$STATE")"
   set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
   validate_spec_smoke "$SPEC" || die "resumed spec Smoke field is invalid"
+  # RE-anchor the spec (never guard it here): between a block and an operator's
+  # --resume the human is expected to have edited the spec — that is often the
+  # whole point of resuming — and the anchor exists to catch the IMPLEMENTER
+  # rewriting the gate mid-turn, not to freeze the operator out. Same posture
+  # as the conventions snapshot, whose anchor dir is per-RUN_ID, so a different
+  # run can never be wedged by an edit made for this one.
+  integrity_put "$SPEC"
   OBSERVER="$(jq -r '.observer' "$STATE")"
   BASE_COMMIT="$(jq -r '.base_commit' "$STATE")"
   BASE_BRANCH="$(jq -r '.base_branch' "$STATE")"
@@ -1029,7 +1070,16 @@ recover_run() {
   [ -f "$BASE_STATUS" ] || die "recorded baseline status is missing: $BASE_STATUS"
   cleanup_validation_worktree ||
     die "could not clean the interrupted candidate validation worktree"
-  log "recovering run $RUN_ID at stage $(jq -r '.stage' "$STATE") with explicit session $(jq -r '.session_id' "$STATE")"
+  # A null session here is normal under SESSION_SCOPE=stage (a scope boundary,
+  # a session refresh, or the cursor backend's sticky fallback all null it):
+  # invoke_primary reads .session_id fresh and takes its no-session branch, so
+  # the next turn starts a FRESH session with the file-handoff prompt — it
+  # never passes an empty --resume. Say which of the two it will be.
+  if [ -n "$(jq -r '.session_id // empty' "$STATE")" ]; then
+    log "recovering run $RUN_ID at stage $(jq -r '.stage' "$STATE") with explicit session $(jq -r '.session_id' "$STATE")"
+  else
+    log "recovering run $RUN_ID at stage $(jq -r '.stage' "$STATE") with no pinned session; the next primary turn starts fresh and reorients from the files on disk"
+  fi
   if [ "$resume_block" -eq 1 ]; then
     # Operator-initiated --resume of a logic-blocked run: clear the block and rebase
     # the clocks. plan/implementation approvals and the recorded stage are kept, so
@@ -1585,6 +1635,10 @@ invoke_primary() {
   prompt="$RUN_ROOT/prompts/primary-$turn.txt"
   raw="$RUN_ROOT/raw/primary-$turn.json"
   local session emitted rc model backend scope cursor_attempts=0
+  # Cursor retry accounting, per TURN (both reset by the next invoke_primary
+  # call): attempts against CURSOR_MAX_RETRIES, and seconds already slept
+  # against the CURSOR_MAX_WAIT ceiling.
+  local cursor_backoff=0 cursor_backoff_total=0 cursor_fb_reason=""
   # The consecutive 429-without-success counter now lives entirely in
   # handle_rate_limit_wait (lib/recovery.sh): persisted in state so recovery
   # after a crash picks up the count; reset to 0 on the first clean turn below.
@@ -1654,9 +1708,28 @@ invoke_primary() {
     # JSON, so the empty-$emitted arm already covers that). Short-circuits on
     # backend != cursor, so the Claude branch's rc (and therefore its
     # break/continue behavior) is untouched.
-    if [ "$backend" = "cursor" ] && [ "$rc" -eq 0 ] &&
-      { [ -z "$emitted" ] || jq -e '.is_error == true' "$raw" >/dev/null 2>&1; }; then
-      rc=1
+    #
+    # `.is_error == true` matches ONLY a JSON boolean true — the shape the live
+    # envelope carries (specs/cursor-implementer-backend.md); a string "true"
+    # would read as a success. Deliberate: a loose match would also swallow
+    # unrelated drift, and the missing-session_id arm plus the post-turn
+    # signal/verdict gates already fail closed on a mangled envelope.
+    if [ "$backend" = "cursor" ] && [ "$rc" -eq 0 ]; then
+      if [ -z "$emitted" ] || jq -e '.is_error == true' "$raw" >/dev/null 2>&1; then
+        rc=1
+      elif [ -n "$session" ] && [ "$emitted" != "$session" ]; then
+        # A cursor --resume that echoes a DIFFERENT session id breaks the same
+        # invariant the post-loop check below hard-blocks on. Route it into the
+        # retry/fallback branch instead: the post-loop block sits outside that
+        # branch, so a future cursor build that stopped echoing the same id
+        # would hard-block every post-first turn at 3am on a run that could
+        # have finished on claude. The CLAUDE path keeps the hard block — its
+        # --resume contract is verified and a changed id there means something
+        # the engine does not model. Never reached with an empty $session (a
+        # fresh start legitimately mints a new id).
+        log "cursor backend: session ID changed from $session to $emitted on a --resume (the CLI's resume contract drifted); treating the turn as failed so it retries and, if that persists, falls back to claude"
+        rc=1
+      fi
     fi
     [ "$rc" -ne 0 ] || break
     if [ "$backend" = "cursor" ]; then
@@ -1671,18 +1744,48 @@ invoke_primary() {
       # (no-ops when the signal is already absent), so calling it again here
       # on a retry that never wrote one is harmless.
       archive_old_signal
-      if [ "$cursor_attempts" -lt "$CURSOR_MAX_RETRIES" ]; then
+      # Two independent stop conditions, both ending in the SAME sticky
+      # fallback; $cursor_fb_reason records which one fired so the journal and
+      # the morning's run.log say why the night switched vendors.
+      cursor_backoff=$((CURSOR_RETRY_BACKOFF * (cursor_attempts + 1)))
+      if [ "$cursor_attempts" -ge "$CURSOR_MAX_RETRIES" ]; then
+        cursor_fb_reason="cursor invocation failed after $cursor_attempts retries"
+      elif [ $((cursor_backoff_total + cursor_backoff)) -gt "$CURSOR_MAX_WAIT" ]; then
+        # I5 ceiling: the next sleep would push this turn's cumulative backoff
+        # past NIGHT_SHIFT_CURSOR_MAX_WAIT. Fall back NOW rather than sleep out
+        # a retry budget that (MAX_RETRIES x RETRY_BACKOFF being unbounded)
+        # could hold one turn open for hours.
+        cursor_fb_reason="cursor retry backoff would reach $((cursor_backoff_total + cursor_backoff))s, past the ${CURSOR_MAX_WAIT}s NIGHT_SHIFT_CURSOR_MAX_WAIT ceiling, after $cursor_attempts retries"
+        log "cursor backend: $cursor_fb_reason; falling back to claude now instead of waiting out the remaining retries"
+      else
         cursor_attempts=$((cursor_attempts + 1))
+        cursor_backoff_total=$((cursor_backoff_total + cursor_backoff))
         emit_event backend_retry "$(jq -cn --argjson a "$cursor_attempts" --argjson rc "$rc" '{backend:"cursor", attempt:$a, rc:$rc}')"
-        log "cursor backend: attempt $cursor_attempts/$CURSOR_MAX_RETRIES failed (rc=$rc; see $raw.err); retrying in $((CURSOR_RETRY_BACKOFF * cursor_attempts))s"
-        sleep $((CURSOR_RETRY_BACKOFF * cursor_attempts))
+        log "cursor backend: attempt $cursor_attempts/$CURSOR_MAX_RETRIES failed (rc=$rc; see $raw.err); retrying in ${cursor_backoff}s (cumulative ${cursor_backoff_total}s of the ${CURSOR_MAX_WAIT}s ceiling)"
+        sleep "$cursor_backoff"
+        # Resume the FAILED attempt's own session when it emitted one (rc!=0
+        # with a partial envelope, is_error, or a drifted resume id). A failed
+        # cursor turn is not side-effect-free: the CLI can have edited files
+        # and even committed before reporting the error, and a retry in a
+        # brand-new session would re-run the identical prompt blind to that
+        # work — duplicated edits and duplicate commits, billed every time,
+        # against a single charged turn. Resuming makes the retry see what its
+        # own prior attempt did. No emitted id (the CLI died before answering)
+        # leaves $session as it was, which is the pre-existing behavior.
+        [ -z "$emitted" ] || session="$emitted"
+        # Re-enter the budget gate on every retry: the turn counters are
+        # deliberately NOT incremented for a retry, so without this a retry
+        # storm (sleeps + long cursor calls) could outrun the stage/task TIME
+        # caps entirely — enforce_limits is the only thing that reads them, and
+        # it is otherwise called once per turn, before the first attempt.
+        enforce_limits
         continue
       fi
       # implement_backend_fallback_set nulls .session_id in the SAME state
       # write as the sticky flag (atomic — a crash between two writes would
       # strand backend=claude with a pinned cursor session id); only the
       # local mirror needs clearing here.
-      implement_backend_fallback_set "cursor invocation failed after $cursor_attempts retries" "$rc"
+      implement_backend_fallback_set "$cursor_fb_reason" "$rc"
       backend="claude"
       session=""
       # Preserve the pre-fallback prompt for forensics BEFORE primary_prompt
@@ -1722,6 +1825,10 @@ invoke_primary() {
     block_run "primary command failed with status $rc"
   done
   [ -n "$emitted" ] || block_run "primary emitted no resumable session ID"
+  # Reachable only on the CLAUDE path now: a cursor turn with a changed (or
+  # missing) session id is converted to rc=1 inside the loop above and routed
+  # through the retry/fallback branch, so it can never break out of the loop
+  # into these two hard blocks. Claude's behavior here is unchanged.
   if [ -n "$session" ] && [ "$emitted" != "$session" ]; then
     block_run "primary session ID changed from $session to $emitted"
   fi
@@ -2659,6 +2766,12 @@ EOF
     block_run "primary test-first evidence does not match wrapper-owned executions (exit statuses)"
   evidence_exit_status_matches "$evidence" baseline "$RUN_ROOT/validated/baseline.json" ||
     block_run "primary baseline evidence does not match wrapper-owned baseline (exit statuses)"
+  # The final-validation gate is defined by the spec, re-read HERE — after the
+  # implementer has had unattended write access to the workspace for the whole
+  # implementation scope. Verify it is byte-identical to the spec the run was
+  # started (or resumed) with, before its commands decide whether the candidate
+  # passes. Anchored in initialize_run / recover_run / start_next_task.
+  integrity_guard "$SPEC" spec "the spec whose Final validation commands gate this candidate"
   final_commands="$(extract_validation_commands "$SPEC" "Final validation commands")"
   run_validation_commands final "$RUN_ROOT/validated/final.json" "$final_commands" "$validation_worktree" ||
     block_run "final validation commands are missing or could not run"
@@ -3645,6 +3758,10 @@ EOF
   # re-surfaces the real problem instead of re-driving the completed task.
   set_spec_workdir "$SPEC" || block_run "next TODO spec has an invalid Workdir"
   validate_spec_smoke "$SPEC" || block_run "next TODO spec has an invalid Smoke field"
+  # Anchor the NEW task's spec: $SPEC just changed, and verify_candidate guards
+  # it at this task's candidate time (see the guard there). Per-spec key, so
+  # the finished task's anchor is untouched.
+  integrity_put "$SPEC"
   check_branch_and_worktree "$SPEC" ||
     block_run "next task branch or worktree routing is unsafe"
   baseline_commands="$(extract_validation_commands "$SPEC" "Baseline validation commands")"
@@ -3701,16 +3818,24 @@ cursor_probe_exec() {
 # stick the whole night on Claude, discarding the operator's vendor choice.
 # Three outcomes per check:
 #   ok            -> proceed silently.
-#   definitive    -> die with an actionable message (the probe completed and
-#                    positively reported logged-out / slug-absent).
+#   definitive    -> die with an actionable message. ONLY the auth check can
+#                    reach this: "not logged in" is a positive report from the
+#                    CLI itself, not something inferred from output shape.
 #   inconclusive  -> WARN and proceed (timeout, nonzero rc, unrecognized
-#                    output shape): a transient blip must never block a run
-#                    the in-run retry/fallback machinery could have handled.
+#                    output shape, AND a slug the model list does not show —
+#                    see the slug branch): a transient blip or a formatting
+#                    change must never block a run the in-run retry/fallback
+#                    machinery could have handled.
 # Seam for fixtures (same rationale as cursor_available): tests may redefine
 # this function, and subprocess-driven integration runs can skip it with
 # NIGHT_SHIFT_CURSOR_SKIP_PROBE=1.
 cursor_startup_probe() {
-  [ "${NIGHT_SHIFT_CURSOR_SKIP_PROBE:-0}" != "1" ] || return 0
+  # Log the skip like every other skip in the engine — a silent return leaves
+  # no trace that the run's cursor auth was never checked.
+  if [ "${NIGHT_SHIFT_CURSOR_SKIP_PROBE:-0}" = "1" ]; then
+    log "cursor probe: skipped (NIGHT_SHIFT_CURSOR_SKIP_PROBE=1); cursor auth and model slug are unverified for this run"
+    return 0
+  fi
   local tmo="${NIGHT_SHIFT_CURSOR_PROBE_TIMEOUT:-30}" out rc
   out="$(mktemp "${TMPDIR:-/tmp}/night-shift-cursor-probe.XXXXXX")" ||
     { log "WARN: cursor probe: mktemp failed; skipping (inconclusive, never blocks)"; return 0; }
@@ -3738,14 +3863,60 @@ cursor_startup_probe() {
   cursor_probe_exec "$tmo" "$out" --list-models || rc=$?
   if [ "$rc" -eq 0 ] && grep -qi 'available models' "$out"; then
     if ! awk -v m="$CURSOR_IMPLEMENT_MODEL" '$1 == m && $2 == "-" { f = 1 } END { exit !f }' "$out"; then
-      rm -f "$out"
-      die "NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL=$CURSOR_IMPLEMENT_MODEL is not offered by this cursor-agent (\`cursor-agent --list-models\`); fix the slug (grok 4.6 at high reasoning is exactly cursor-grok-4.6-high)"
+      # WARN, never die. Unlike the auth check above — a POSITIVE report from
+      # the CLI ("not logged in") — a slug miss is inferred from the ROW
+      # FORMAT: the header grep only proves this is a model list, and a build
+      # that prefixes, indents differently, or colorizes its rows keeps the
+      # header while failing `$1 == m && $2 == "-"`, killing a run whose slug
+      # is perfectly valid. This was the one probe branch that failed closed on
+      # a format inference, and the version canary that would have flagged the
+      # drift runs AFTER it. A genuinely bad slug still fails fast: the first
+      # cursor turn errors and the bounded retry/fallback lands the run on
+      # claude within ~180s at the default knobs.
+      log "WARN: cursor probe: NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL=$CURSOR_IMPLEMENT_MODEL is not offered by this cursor-agent (\`cursor-agent --list-models\`); fix the slug (grok 4.6 at high reasoning is exactly cursor-grok-4.6-high) — proceeding, since this check reads the list's row format: a bad slug still fails fast through the in-run retry/fallback"
     fi
   else
     log "WARN: cursor probe: could not list cursor-agent models (rc=$rc); skipping slug validation — a bad model still fails fast on the first cursor turn"
   fi
   rm -f "$out"
   return 0
+}
+
+# The cursor backend's two STARTUP dies (cursor-agent on PATH, then the auth/
+# slug probe), deferred until BOTH the spec and any prior run state are known.
+# main_run calls this from each arm of its recover/init fork — never from the
+# early knob block, where neither is resolved yet. Two skips, each closing a
+# way the dies would refuse a run that needs cursor-agent for nothing:
+#
+#   - the run already fell back to claude (.implement_backend_fallback, or the
+#     design latch): every remaining turn is claude. Expired cursor auth is the
+#     usual CAUSE of that fallback, so dying on it here made the documented
+#     recovery ("relaunch with the stored backend") impossible — the run could
+#     be resumed by neither backend, and the hand-edit escape is blocked by the
+#     integrity anchor.
+#   - the spec declares a ## Design Contract: implement_backend_active pins the
+#     whole run to claude for it, so the backend is inert all run and a
+#     logged-out cursor-agent is irrelevant. Checking this needs $SPEC, which
+#     is exactly why the dies moved after spec selection.
+#
+# A fresh cursor run with no fallback and no contract still dies at startup,
+# before any paid work — the check these guards were added for is unchanged.
+cursor_startup_guards() {
+  [ "$IMPLEMENT_BACKEND" = "cursor" ] || return 0
+  if [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ] &&
+    [ "$(jq -r 'select(.implement_backend_fallback == "claude" or
+                       .implement_backend_design_latch == true) | "y"' \
+        "$STATE" 2>/dev/null)" = "y" ]; then
+    log "cursor backend: this run is already pinned to claude (fallback or design latch recorded in state); skipping the cursor-agent availability/auth guards — nothing left in the run uses cursor-agent"
+    return 0
+  fi
+  if spec_has_design_contract "${SPEC:-}"; then
+    log "cursor backend: the spec declares a ## Design Contract, which pins the whole run to claude; skipping the cursor-agent availability/auth guards"
+    return 0
+  fi
+  cursor_available ||
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
+  cursor_startup_probe
 }
 
 # Version tripwire for the cursor CLI contract, the cursor twin of
@@ -3788,6 +3959,7 @@ main_run() {
   esac
   case "$CURSOR_MAX_RETRIES" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_RETRIES must be a non-negative integer" ;; esac
   case "$CURSOR_RETRY_BACKOFF" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_RETRY_BACKOFF must be a non-negative integer" ;; esac
+  case "$CURSOR_MAX_WAIT" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_WAIT must be a non-negative integer" ;; esac
   if [ "$IMPLEMENT_BACKEND" = "cursor" ] && [ "$SESSION_SCOPE" != "stage" ]; then
     die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor requires NIGHT_SHIFT_SESSION_SCOPE=stage (the backend switches vendors at stage-scope session boundaries)"
   fi
@@ -3801,14 +3973,11 @@ main_run() {
   # the pinned primary session), not a second model.
   OBSERVER="claude"
   require_command claude
-  if [ "$IMPLEMENT_BACKEND" = "cursor" ] && ! cursor_available; then
-    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
-  fi
-  # Auth + model-slug probe (cursor_startup_probe): command -v alone let a
-  # logged-out CLI or a typo'd cursor model pass startup and silently strand
-  # the night on the Claude fallback. Free, bounded, gated on the backend —
-  # a claude-only startup pays nothing.
-  [ "$IMPLEMENT_BACKEND" != "cursor" ] || cursor_startup_probe
+  # The cursor availability + auth/slug dies do NOT run here: they need the
+  # spec (a ## Design Contract makes the backend inert) and the prior run's
+  # state (a run that already fell back needs cursor for nothing), neither of
+  # which is resolved yet. cursor_startup_guards runs them from both arms of
+  # the recover/init fork below, still before any paid work.
   case "$RATE_LIMIT_BUFFER_SECONDS" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS must be a non-negative integer" ;;
   esac
@@ -3832,12 +4001,15 @@ main_run() {
   trap 'cleanup_smoke_pgid 2>/dev/null || true; release_lock' EXIT
 
   if recover_run; then
-    :
+    # State is loaded: the guards can now see a run that already fell back.
+    cursor_startup_guards
   else
     # --resume must never silently fall through to a fresh run: if recovery found
     # nothing resumable, that is an operator error, not a cue to start over.
+    # resume_refusal_reason names the precondition that actually failed — the
+    # old blanket list guessed, and often guessed wrong.
     [ "$RESUME" -eq 0 ] ||
-      die "--resume: no resumable blocked run for this project (state missing, not blocked, rate-limited, or session/primary mismatch)"
+      die "--resume: $(resume_refusal_reason "$PROJECT/.night-shift/state.json")"
     if [ -z "$SPEC" ]; then
       SPEC="$(select_task_from_todo "$WORKSPACE_ROOT/TODO.md")" ||
         die "no unfinished bug or feature entry in TODO.md and no --spec supplied"
@@ -3851,6 +4023,10 @@ main_run() {
     validate_spec_smoke "$SPEC" || die "spec Smoke field is invalid"
     check_branch_and_worktree "$SPEC" ||
       die "current branch or worktree does not safely match the spec"
+    # $SPEC is resolved: the guards can now see a Design-Contract spec (backend
+    # inert all run). Still before initialize_run's minutes-long baseline, so a
+    # genuinely misconfigured cursor backend fails as fast as it used to.
+    cursor_startup_guards
     initialize_run
   fi
   trap 'block_run "run interrupted by signal"' HUP INT TERM

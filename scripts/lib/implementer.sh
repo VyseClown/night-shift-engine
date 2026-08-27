@@ -1,9 +1,12 @@
 # shellcheck shell=bash
 # scripts/lib/implementer.sh
 # Implementer-backend seam: opt-in cursor-agent (Grok) for the primary's
-# post-plan work. Pure predicates + cursor helpers only — invoke_primary keeps
-# the loop. Sourced by night-shift.sh AFTER the knob block. Claude stays the
-# only planner/observer/persona vendor; see specs/cursor-implementer-backend.md.
+# post-plan work. Predicates + cursor helpers only — invoke_primary keeps the
+# loop. The predicates are read-only EXCEPT for implement_backend_active's
+# design-contract latch, which is a best-effort cache write (see there); the
+# only state-mutating verb here is implement_backend_fallback_set. Sourced by
+# night-shift.sh AFTER the knob block. Claude stays the only planner/observer/
+# persona vendor; see specs/cursor-implementer-backend.md.
 # Only ever sourced by night-shift.sh, so state_set/emit_event/log/
 # spec_has_design_contract (defined there) are safe to call here at runtime.
 
@@ -32,8 +35,20 @@ implement_backend_active() {
   if spec_has_design_contract "${SPEC:-}"; then
     # First sighting this run: latch it (run-scoped, survives resume). No
     # journal event — the latch is a derived fact, not a run occurrence.
+    #
+    # The write is BEST-EFFORT, in its own subshell, and never fatal. This
+    # predicate is normally called inside a command substitution
+    # ($(implement_scope_backend …)), where state_set's `die` would exit only
+    # that subshell and hand the parent an EMPTY vendor string — a backend
+    # matching neither branch, an "You are the fixed  primary" prompt, and an
+    # expected_primary the observer's enum rejects. (night-shift.sh's state_int
+    # comment documents the same hazard for the same reason.) The latch is only
+    # a cache: the live spec_has_design_contract check above is the source of
+    # truth for THIS process, and a failed write costs at most the latch's
+    # cross-task/cross-resume memory, which is worth strictly less than the run.
     if [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ]; then
-      state_set '.implement_backend_design_latch=true'
+      ( state_set '.implement_backend_design_latch=true' ) ||
+        log "WARN: could not latch the design-contract backend decision in run state; this run still uses claude (the live spec check decides), but a chained task or a resume may re-derive it"
     fi
     return 1
   fi

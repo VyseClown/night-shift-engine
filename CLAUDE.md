@@ -147,9 +147,14 @@ directory; run engine/workflow git inside the engine directory.
   `sweep_fix_reverted` (fix-cycle round + deterministic revert, the latter
   carrying a `reason` of `dirty_tree` or a failed re-validation), `run_feedback`
   (feedback entry appended), `smoke` (smoke-phase result), and — from the
-  cursor implementer backend — `backend_retry` (a failed cursor turn retrying)
-  and `backend_fallback` (sticky per-run fallback to Claude after retries are
-  exhausted). All are advisory; none gates a run.
+  cursor implementer backend — `backend_retry` (a failed cursor turn retrying),
+  `backend_fallback` (sticky per-run fallback to Claude, its `reason` naming
+  whether the retry count or the `NIGHT_SHIFT_CURSOR_MAX_WAIT` backoff ceiling
+  fired) and `contract_canary {contract:"cursor-cli"}` (the installed
+  `cursor-agent` build, journaled on every cursor-backend startup — on a match
+  too, so each run's journal pins the build behind it). All are advisory; none
+  gates a run. Not advisory: `integrity_violation` now also fires with
+  `label:"spec"` when the spec changes mid-run, and that one blocks.
 - **Codex second opinion (opt-in, default OFF):** `NIGHT_SHIFT_CODEX_REVIEW=1`
   adds one bounded `codex exec -s read-only` advisory review per candidate
   (gpt-5.5 via the Codex CLI), handed to the observer as supplementary,

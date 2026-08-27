@@ -370,6 +370,13 @@ sweep_fix_cycle() {
     # cleanly. Revalidation is in-run-only; --sweep-only never revalidates.
     vcmds=""
     if [ -n "${SPEC:-}" ] && [ -n "${RUN_ROOT:-}" ]; then
+      # Same trust point as verify_candidate's final-validation re-read, for the
+      # same reason: the fix session above just had unattended write access to
+      # the workspace, and these commands decide whether its commits survive.
+      # Re-reading the spec here without the guard left the identical weakening
+      # vector open on this path. Anchored in initialize_run / recover_run /
+      # start_next_task; unreachable from --sweep-only (no RUN_ROOT).
+      integrity_guard "$SPEC" spec "the spec whose Final validation commands gate the sweep fix cycle"
       vcmds="$(extract_validation_commands "$SPEC" "Final validation commands")"
     fi
     # Isolated (worktree) re-validation + smoke re-run at the fixed tip — parity

@@ -162,7 +162,14 @@ run_dry_fixtures() {
   fixture_assert "implementer backend: implement_backend_fallback_set writes the sticky flag AND nulls the session in ONE state write" fixture_cursor_fallback_atomic "$root"
   fixture_assert "implementer backend: a Design Contract latches claude run-scoped; a chained plain spec cannot flip the vendor back" fixture_cursor_design_latch "$root"
   fixture_assert "implementer backend: start_next_task's per-task reset clears .implement_backend_used, keeps the run-sticky fallback" fixture_cursor_task_reset_attribution "$root"
-  fixture_assert "cursor startup probe: logged-out/unknown-slug DIE, inconclusive probes WARN and proceed, skip knob honored" fixture_cursor_startup_probe "$root"
+  fixture_assert "implementer backend: a failed design-latch write is non-fatal (never an empty vendor inside a command substitution)" fixture_implementer_latch_write_is_nonfatal "$root"
+  fixture_assert "cursor retry: resumes the failed attempt's own session and re-checks the budget on every retry" fixture_cursor_retry_resumes_and_rechecks_limits "$root"
+  fixture_assert "cursor retry: total backoff is capped by NIGHT_SHIFT_CURSOR_MAX_WAIT, then falls back immediately" fixture_cursor_backoff_ceiling "$root"
+  fixture_assert "cursor retry: a drifting --resume session id retries then falls back, never hard-blocks" fixture_cursor_session_drift_falls_back "$root"
+  fixture_assert "primary_prompt opener names the vendor that runs the turn, not \$PRIMARY" fixture_primary_prompt_vendor_opener "$root"
+  fixture_assert "cursor_probe_exec: portable watchdog kills an overrunning probe and returns fast; success is unaffected" fixture_cursor_probe_exec "$root"
+  fixture_assert "cursor startup probe: logged-out DIE, unknown slug WARNs, inconclusive probes WARN and proceed, skip knob logged" fixture_cursor_startup_probe "$root"
+  fixture_assert "cursor startup guards: deferred past spec selection; skipped for a fallen-back run and a Design Contract spec" fixture_cursor_startup_guards "$root"
   fixture_assert "cursor version canary: journals the build, WARNs on drift, never blocks, silent on the claude backend" fixture_cursor_contract_canary "$root"
   fixture_assert "validation worktree links pnpm workspace node_modules + .nx cache" fixture_worktree_pnpm_links "$root"
   fixture_assert "Workdir field scopes every validation phase to the project subdir" fixture_workdir_field "$root"
@@ -195,6 +202,7 @@ run_dry_fixtures() {
   fixture_assert "wrapper-owned state/evidence tampering is detected (engine-private anchor)" fixture_wrapper_owned_integrity "$root"
   fixture_assert "record_findings re-seeds the anchor (live false-positive regression)" fixture_record_findings_integrity "$root"
   fixture_assert "integrity mismatch quarantines forensics + restores engine truth" fixture_integrity_quarantine "$root"
+  fixture_assert "spec integrity: anchored at init/recovery/next-task, guarded before the final-validation re-read" fixture_spec_integrity_anchor "$root"
   fixture_assert "malformed-signal correction turn carries the rejection reason + exact signal shape" fixture_signal_rejection_feedback "$root"
   fixture_assert "CREATE_CANDIDATE with invalid evidence is a correctable rejection, not a terminal block" fixture_candidate_evidence_feedback "$root"
   fixture_assert "session scope boundaries clear only across scopes" fixture_session_scope "$root"
@@ -223,13 +231,15 @@ run_dry_fixtures() {
   fixture_assert "preflight reports ready only on a valid spec + feature branch" fixture_preflight_report "$root"
   fixture_assert "spec project guard accepts a worktree of the declared project" fixture_spec_project_worktree "$root"
   fixture_assert "evidence verify matches on exit status, ignores command-string transcription" fixture_evidence_exit_status_match "$root"
-  fixture_assert "resumable_blocked_state gates --resume to logic-blocked, session-bearing state" fixture_resume_blocked "$root"
+  fixture_assert "resumable_blocked_state gates --resume to logic-blocked state; a null session resumes under stage scope only" fixture_resume_blocked "$root"
+  fixture_assert "--resume refusal names the precondition that actually failed" fixture_resume_refusal_reason "$root"
   fixture_assert "supervisor auto-resumes transient blocks, escalates a repeated stuck one" fixture_supervisor_decision "$root"
   fixture_assert "explicit Personas list overrides the profile (floor kept)" fixture_explicit_personas_override "$root"
   fixture_assert "explicit Personas list may name an optional reviewer" fixture_explicit_personas_with_optional "$root"
   fixture_assert "explicit Personas list rejects an off-track name" fixture_explicit_personas_unknown "$root"
   fixture_assert "structured session limit is recognized" fixture_rate_limit_recognition "$root"
-  fixture_assert "rate-limit reset epoch uses reported timezone" fixture_rate_limit_epoch "$root"
+  fixture_assert "rate-limit reset epoch uses reported timezone and converts am/pm (incl. 12am/12pm)" fixture_rate_limit_epoch "$root"
+  fixture_assert "rate-limit wait actually sleeps out the remaining window, then resumes" fixture_rate_limit_waits_for_reset "$root"
   fixture_assert "rate-limit resume rebases elapsed budgets" fixture_rate_limit_rebase "$root"
   fixture_assert "preserved rate-limit block is recoverable" fixture_rate_limit_recovery "$root"
   fixture_assert "runaway rate-limit wait hits the cap" fixture_rate_limit_cap "$root"
@@ -341,6 +351,7 @@ run_dry_fixtures() {
   fixture_assert "recovery-guard: rate-limit-blocked+dirty still auto-recovers (guard does not fire)" fixture_recovery_guard_ratelimit_dirty "$root"
   fixture_assert "recovery-guard: resuming under a different NIGHT_SHIFT_IMPLEMENT_BACKEND dies, names the stored backend" fixture_recovery_guard_backend_mismatch "$root"
   fixture_assert "recovery-guard: resuming under the SAME NIGHT_SHIFT_IMPLEMENT_BACKEND proceeds (guard does not fire)" fixture_recovery_guard_backend_match "$root"
+  fixture_assert "recovery-guard: a run that already fell back to claude resumes under the claude backend" fixture_recovery_guard_backend_mismatch_after_fallback "$root"
   fixture_assert "doc-freshness: dir hit + mention hit found, unrelated root doc absent, valid JSON" fixture_doc_freshness_basic "$root"
   fixture_assert "doc-freshness: candidate list capped at 10 with truncated:true" fixture_doc_freshness_cap "$root"
   fixture_assert "doc-freshness: empty diff (base==HEAD) yields docs:[] truncated:false" fixture_doc_freshness_empty_diff "$root"
@@ -1430,6 +1441,62 @@ fixture_integrity_quarantine() {
     integrity_check "$STATE" || exit 1
     integrity_cleanup
     exit 0 ) || return 1
+  return 0
+}
+
+# I4 (vendor-neutral): the SPEC defines the final-validation gate and is
+# re-read at CANDIDATE time — after the implementer has had unattended write
+# access to the whole workspace for the entire implementation scope. An
+# implementer that "updates the spec to match what it built" would weaken the
+# very gate judging it, with nothing in the base..candidate diff to show for it
+# if the edit is uncommitted. So the spec is anchored at run start (and on
+# recovery, and on every NEXT_TASK swap) and guarded before that re-read.
+fixture_spec_integrity_anchor() {
+  local root="$1" dir="$root/spec-anchor" spec body
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/run"
+  spec="$dir/spec.md"
+  (
+    log() { :; }
+    RUN_ROOT="$dir/run"; STATE="$RUN_ROOT/state.json"; RUN_ID="specanchor-$$"
+    mkdir -p "$RUN_ROOT/raw"
+    printf '{"stage":"implementation_ready"}\n' >"$STATE"
+    printf -- '- Final validation commands (run in this order):\n  1. `node --test`\n' >"$spec"
+    integrity_put "$spec"
+    fx "an untouched spec passes the guard" integrity_check "$spec"
+    # The attack this closes: relax the gate the candidate is about to be
+    # judged by. Uncommitted, so no diff would ever show it.
+    printf -- '- Final validation commands (run in this order):\n  1. `true`\n' >"$spec"
+    fx_not "a spec edited mid-run is detected" integrity_check "$spec"
+    # And the guard's quarantine restores the engine's copy, so the gate that
+    # actually runs is the one the run started with.
+    integrity_quarantine "$spec" spec
+    fx "the guarded re-read sees the ORIGINAL commands" grep -qF 'node --test' "$spec"
+    fx_not "the weakened command is gone from the live spec" grep -qF '1. `true`' "$spec"
+    integrity_cleanup
+    exit 0
+  ) || return 1
+  # Anchored on every path that can change $SPEC, and guarded exactly where the
+  # spec is re-read to build the final-validation gate.
+  body="$(declare -f initialize_run)"
+  case "$body" in *'integrity_put "$SPEC"'*) ;; *) return 1 ;; esac
+  body="$(declare -f recover_run)"
+  case "$body" in *'integrity_put "$SPEC"'*) ;; *) return 1 ;; esac
+  body="$(declare -f start_next_task)"
+  case "$body" in *'integrity_put "$SPEC"'*) ;; *) return 1 ;; esac
+  # The guard must PRECEDE the re-read inside verify_candidate, not merely
+  # exist somewhere in it.
+  declare -f verify_candidate |
+    awk '/integrity_guard "\$SPEC"/{seen=1}
+         /extract_validation_commands "\$SPEC" "Final validation commands"/{if(!seen) exit 1}
+         END{exit !seen}' || return 1
+  # sweep_fix_cycle re-reads the SAME gate for its post-fix re-validation, after
+  # its own unattended editing session — the identical weakening vector, one
+  # function away. It must carry the identical guard, in the identical order.
+  ( fx "sweep_fix_cycle guards \$SPEC before IT re-reads the final-validation commands (same trust point as verify_candidate, after its own editing session)" \
+      awk '/integrity_guard "\$SPEC"/{seen=1}
+           /extract_validation_commands "\$SPEC" "Final validation commands"/{if(!seen) exit 1}
+           END{exit !seen}' <<<"$(declare -f sweep_fix_cycle)" ) || return 1
   return 0
 }
 
@@ -2543,6 +2610,57 @@ fixture_implementer_backend() {
   return 0
 }
 
+# N1: implement_backend_active's design-contract latch is a CACHE write, and it
+# happens inside a predicate that is normally evaluated in a command
+# substitution ($(implement_scope_backend …)). A `die` there (state_set's
+# failure path) exits only the subshell, so the parent would carry on with an
+# EMPTY vendor string: "You are the fixed  primary" in the prompt, a backend
+# matching neither branch, and an expected_primary the observer's enum rejects.
+# The write must therefore be best-effort — WARN and continue with the correct
+# claude decision, which the live spec check (not the latch) already produced.
+fixture_implementer_latch_write_is_nonfatal() {
+  local root="$1" dir="$root/latch-nonfatal" out
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir"
+  printf '# spec\n\n## Design Contract\nring built from two layered wave nodes\n' >"$dir/design.md"
+  printf '{"stage":"implementation"}\n' >"$dir/state.json"
+  (
+    IMPLEMENT_BACKEND=cursor
+    SPEC="$dir/design.md"; STATE="$dir/state.json"
+    log() { printf 'LOG:%s\n' "$*" >&2; }
+    # The failure case runs in its OWN subshell so the dying state_set stub is
+    # scoped to it (an `unset -f` here would delete the function outright, not
+    # restore the real one, and would silently fake the control below).
+    (
+      # The exact failure mode: state_set dies — its real behavior when the
+      # state write fails — inside a command substitution.
+      state_set() { die "failed to update run state; preserved at $dir"; }
+      out="$(implement_scope_backend implement 2>"$dir/err")"
+      fx "a failed latch write still yields a NON-EMPTY vendor" test -n "$out"
+      fx "…and the vendor is the correct claude decision" test "$out" = "claude"
+      fx "the failure is WARNed, not swallowed" \
+        grep -qF 'LOG:WARN: could not latch the design-contract backend decision' "$dir/err"
+      # The predicate is also called DIRECTLY (sweep dispatch, candidate
+      # attribution), not only through a command substitution — there an
+      # uncaught die would take the whole engine down. Deliberately unwrapped:
+      # before the fix this line exits this subshell, failing the fixture.
+      implement_backend_active; rc=$?
+      fx "called directly, it returns the claude decision (1) instead of exiting" test "$rc" -eq 1
+      exit 0
+    ) || exit 1
+    fx_not "the failed write left no latch behind" \
+      test "$(jq -r '.implement_backend_design_latch // "absent"' "$STATE")" = "true"
+    # Control: with the REAL state_set the latch is genuinely written, so the
+    # assertions above are not passing because the latch stopped working.
+    fx "control: the healthy path still resolves claude" \
+      test "$(implement_scope_backend implement)" = "claude"
+    fx "control: …and the latch is actually persisted" \
+      test "$(jq -r '.implement_backend_design_latch' "$STATE")" = "true"
+    exit 0
+  ) || return 1
+  return 0
+}
+
 fixture_cursor_primary_dispatch() {
   # Structural: invoke_primary must dispatch through implement_scope_backend
   # (specs/cursor-implementer-backend.md Task 2), the cursor exec branch must
@@ -2565,6 +2683,19 @@ fixture_cursor_primary_dispatch() {
   # so the pin targets the operand only — still unambiguous for "did the
   # cursor branch redirect stderr to a file".
   case "$body" in *'"$raw.err"'*) ;; *) return 1 ;; esac
+  # --add-dir "$WORKSPACE_ROOT" on BOTH cursor invocations (fresh start and
+  # --resume). primary_prompt orders reads of workspace files (AGENTS.md,
+  # AGENT_LOOP.md, the spec, schemas/) and the TODO.md edit — all outside the
+  # --trust'd $PROJECT, so dropping the flag makes every one of those accesses
+  # depend on cursor's undocumented out-of-root behavior. Nothing else in the
+  # suite reads the flag on the PRIMARY path (sweep_fix_cycle passes its own
+  # --add-dir "$out", which is a different call site), and the integration
+  # harness's cursor stub cannot see a missing flag as a failure — it just
+  # reads fewer files. Count, not presence: a pin that only proved "somewhere"
+  # would stay green after the flag was dropped from one of the two branches,
+  # which is exactly the shape of the resume-path bug this guards.
+  ( fx "the cursor branch grants --add-dir \"\$WORKSPACE_ROOT\" on BOTH invocations (fresh + --resume)" \
+      test "$(printf '%s\n' "$body" | grep -cF -- '--add-dir "$WORKSPACE_ROOT"')" -eq 2 ) || return 1
   case "$body" in *maybe_refresh_session*) ;; *) return 1 ;; esac
   case "$body" in *resolve_effective_model*) ;; *) return 1 ;; esac
   # "Inert when unset" pin: the engine's own --list-config surface (grep-
@@ -2720,7 +2851,11 @@ fixture_cursor_task_reset_attribution() {
   mkdir -p "$dir"
   filter="$(declare -f start_next_task |
     awk '/^ *\.task=\$task \| \.stage="planning"/,/^ *\.updated_at=\$now[ ]*$/')"
-  [ -n "$filter" ] || return 1
+  # Diagnostic, not a bare `return 1`: this scrapes production TEXT, so a
+  # reformat of start_next_task's jq program (rewrapping the first or last line
+  # of the filter) turns this red with nothing to go on.
+  ( fx "the per-task reset jq filter was extracted from start_next_task (awk range '.task=\$task | .stage=\"planning\"' .. '.updated_at=\$now' matched nothing)" \
+      test -n "$filter" ) || return 1
   (
     IMPLEMENT_BACKEND=cursor
     STATE="$dir/state.json"
@@ -2750,6 +2885,323 @@ fixture_cursor_task_reset_attribution() {
   return 0
 }
 
+# The prompt's opening line names the vendor that is about to READ it. It must
+# come from the live scope backend, never from $PRIMARY (hard-pinned "claude"):
+# with $PRIMARY there, a grok turn opens "You are the fixed claude primary" —
+# an agent told, in its first sentence, that it is a different vendor than it
+# is. Nothing downstream can catch that (the prompt is prose; no schema, no
+# gate, no journal reads this line), so it needs its own behavioral pin.
+# Drives the REAL primary_prompt with synthetic state under both backends, the
+# same collar fixture_handoff_prompt uses.
+fixture_primary_prompt_vendor_opener() {
+  local root="$1" dir="$root/vendor-opener" prompt
+  mkdir -p "$dir"
+  prompt="$dir/prompt.txt"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  local PRIMARY=claude IMPLEMENT_BACKEND=claude
+  fixture_write_min_spec "$SPEC"
+  (
+    # (a) Default backend: the opener says claude — byte-identical to the
+    # pre-backend engine, and the control that makes (b) meaningful.
+    printf '%s\n' '{"stage":"implementation","stage_turns":0,"primary_turns":2,"session_id":"s1"}' >"$STATE"
+    primary_prompt "$prompt"
+    fx "(a) the claude backend opens 'You are the fixed claude primary'" \
+      grep -qF 'You are the fixed claude primary' "$prompt"
+    # (b) The bug: knob on, implement scope -> the turn runs on cursor-agent, so
+    # the opener must say cursor. $PRIMARY is still "claude" here (it is pinned
+    # for the whole engine), so an opener sourced from $PRIMARY passes (a) and
+    # fails ONLY this.
+    IMPLEMENT_BACKEND=cursor
+    primary_prompt "$prompt"
+    fx "(b) the cursor backend opens 'You are the fixed cursor primary'" \
+      grep -qF 'You are the fixed cursor primary' "$prompt"
+    fx_not "(b) a cursor turn is never told it is claude" \
+      grep -qF 'You are the fixed claude primary' "$prompt"
+    # (c) Scope-aware, not knob-aware: planning is always claude, so the plan
+    # turn's opener says claude even with the knob on.
+    printf '%s\n' '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}' >"$STATE"
+    primary_prompt "$prompt"
+    fx "(c) the plan stage opens as claude even on the cursor backend" \
+      grep -qF 'You are the fixed claude primary' "$prompt"
+    # (d) After the sticky fallback the remaining turns really are claude, and
+    # the rebuilt prompt must say so — the case candidate_primary_vendor gets
+    # deliberately wrong (its marker still attributes the CANDIDATE to cursor).
+    printf '%s\n' '{"stage":"implementation","stage_turns":1,"primary_turns":3,"session_id":null,"implement_backend_used":"cursor","implement_backend_fallback":"claude"}' >"$STATE"
+    fx "(d) precondition: the candidate is still ATTRIBUTED to cursor" \
+      test "$(candidate_primary_vendor)" = "cursor"
+    primary_prompt "$prompt"
+    fx "(d) …but the fallen-back turn's opener names claude, the vendor reading it" \
+      grep -qF 'You are the fixed claude primary' "$prompt"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# invoke_primary's cursor retry/fallback branch, driven for real.
+#
+# The branch is unreachable from a pure predicate test and expensive to reach
+# from the integration harness (a whole scripted run per shape), so these
+# fixtures drive the REAL invoke_primary with the smallest possible collar:
+# scripted `cursor-agent` and `claude` binaries on PATH, real state_set /
+# emit_event / implement_scope_backend / implement_backend_fallback_set, and
+# shims only for the run-scaffolding calls that would otherwise need a whole
+# run (primary_prompt, record_cost, archive_old_signal) plus the two verbs a
+# test must observe rather than perform (block_run, enforce_limits).
+#
+# $1 dir, $2 cursor stub body file, then KEY=VALUE knob overrides. Runs
+# invoke_primary in a subshell; writes $dir/cursor-argv (one line per cursor
+# call), $dir/claude-argv, $dir/limits (one line per enforce_limits call),
+# $dir/blocks (block_run reasons), $dir/log, and a real $dir/rs/events.jsonl.
+# Echoes the subshell's exit status on the last line as "rc=<n>".
+_fixture_cursor_turn_run() {
+  local dir="$1" stub="$2"; shift 2
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/rs/raw" "$dir/rs/prompts" "$dir/rs/control" "$dir/bin" "$dir/proj"
+  cp "$stub" "$dir/bin/cursor-agent"; chmod +x "$dir/bin/cursor-agent"
+  cat >"$dir/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$WORK_DIR/claude-argv"
+jq -cn '{session_id:"claude-sess",result:"ok",total_cost_usd:0,num_turns:1,is_error:false}'
+STUB
+  chmod +x "$dir/bin/claude"
+  (
+    # Knob overrides arrive as KEY=VALUE words; eval'ing them here keeps each
+    # case's setup to one readable call line.
+    for kv in "$@"; do eval "$kv"; done
+    WORK_DIR="$dir"; export WORK_DIR
+    PATH="$dir/bin:$PATH"
+    PROJECT="$dir/proj"; RUN_ROOT="$dir/rs"; STATE="$RUN_ROOT/state.json"
+    # Fresh RUN_ID per case: the integrity anchor lives under a per-RUN_ID tmp
+    # dir, and a reused id would compare this case's state against the last
+    # case's anchor.
+    RUN_ID="cturn-$$-${RANDOM}"
+    IMPLEMENT_BACKEND=cursor
+    : >"$RUN_ROOT/events.jsonl"
+    # A mid-implementation turn with a session already pinned, so every case
+    # exercises the --resume shape (the one the retry has to get right).
+    printf '%s\n' '{"stage":"implementation","session_id":"sess-A","primary_turns":0,"stage_turns":0,"task_turns":0}' >"$STATE"
+    integrity_put "$STATE"
+    unset SPEC 2>/dev/null
+    log() { printf '%s\n' "$*" >>"$dir/log"; }
+    # Scaffolding a single turn does not need (and cannot cheaply provide).
+    primary_prompt() { printf 'PROMPT\n' >"$1"; }
+    record_cost() { :; }
+    archive_old_signal() { :; }
+    enforce_elapsed_limits() { :; }
+    # Observed, not performed: the count proves the per-retry budget re-check,
+    # and LIMIT_BLOCK_AT lets a case make the Nth check block like the real one.
+    enforce_limits() {
+      printf 'x\n' >>"$dir/limits"
+      [ -n "${LIMIT_BLOCK_AT:-}" ] || return 0
+      [ "$(wc -l <"$dir/limits" | tr -d ' ')" -ne "$LIMIT_BLOCK_AT" ] || \
+        block_run "turn/time limit reached"
+    }
+    block_run() { printf '%s\n' "$1" >>"$dir/blocks"; exit 7; }
+    invoke_primary
+  ) >>"$dir/out" 2>&1
+  # invoke_primary is the subshell's last command, so its status IS the
+  # subshell's — except on a block, where the block_run shim exits 7 directly.
+  printf 'rc=%s\n' "$?"
+}
+
+# I3(a): a failed cursor attempt is NOT side-effect-free — the CLI can have
+# edited files and even committed before reporting the error — so a retry that
+# opened a BRAND-NEW session would re-run the identical prompt blind to that
+# work (duplicated edits and commits, billed every time, against one charged
+# turn). When the failed attempt emitted a session id, the retry must resume
+# THAT session. I3(b): the retry must also re-enter enforce_limits, or a retry
+# storm outruns the stage/task time caps entirely (turn counters deliberately
+# do not advance on a retry, so nothing else reads them).
+fixture_cursor_retry_resumes_and_rechecks_limits() {
+  local root="$1" dir="$root/cursor-retry-resume" out
+  cat >"$root/cursor-stub-fail-once.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$WORK_DIR/cursor-argv"
+n=$(( $(cat "$WORK_DIR/ncalls" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" >"$WORK_DIR/ncalls"
+if [ "$n" -eq 1 ]; then
+  # In-band failure that DOES report a session: rc 0, complete envelope,
+  # is_error true — the shape a cursor turn takes after it has already worked.
+  jq -cn '{type:"result",is_error:true,result:"boom",session_id:"sess-B"}'; exit 0
+fi
+jq -cn '{type:"result",is_error:false,result:"ok",session_id:"sess-B"}'; exit 0
+STUB
+  out="$(_fixture_cursor_turn_run "$dir" "$root/cursor-stub-fail-once.sh" \
+    'CURSOR_MAX_RETRIES=2' 'CURSOR_RETRY_BACKOFF=0' 'CURSOR_MAX_WAIT=600')"
+  (
+    # argv first: it is the specific thing under test, so a regression names
+    # itself instead of surfacing as a downstream rc.
+    fx "the FIRST call resumed the session state pinned (sess-A)" \
+      grep -qF -- '--resume sess-A' <<<"$(head -1 "$dir/cursor-argv")"
+    fx "the RETRY resumes the FAILED attempt's own session (sess-B), not a fresh one" \
+      grep -qF -- '--resume sess-B' <<<"$(tail -1 "$dir/cursor-argv")"
+    fx_not "the retry does not start a fresh session (no --model on a resume)" \
+      grep -qF -- '--model' <<<"$(tail -1 "$dir/cursor-argv")"
+    fx "cursor was called twice (one failure, one retry)" \
+      test "$(wc -l <"$dir/cursor-argv" | tr -d ' ')" -eq 2
+    fx "the turn ultimately succeeds (rc 0)" grep -qx 'rc=0' <<<"$out"
+    fx "exactly one backend_retry is journaled" \
+      test "$(jq -c 'select(.type=="backend_retry")' "$dir/rs/events.jsonl" | wc -l | tr -d ' ')" -eq 1
+    fx_not "a recovered retry never falls back" \
+      jq -e 'select(.type=="backend_fallback")' "$dir/rs/events.jsonl" >/dev/null
+    fx "enforce_limits ran once per attempt (turn entry + the retry)" \
+      test "$(wc -l <"$dir/limits" | tr -d ' ')" -eq 2
+    exit 0
+  ) || return 1
+  # I3(b) bite: with the budget exhausted at the retry's re-check, the run must
+  # block THERE — before the retry budget is spent and before any fallback.
+  out="$(_fixture_cursor_turn_run "$dir" "$root/cursor-stub-fail-once.sh" \
+    'CURSOR_MAX_RETRIES=2' 'CURSOR_RETRY_BACKOFF=0' 'CURSOR_MAX_WAIT=600' 'LIMIT_BLOCK_AT=2')"
+  (
+    fx "a budget hit at the retry's re-check blocks the run (rc 7)" grep -qx 'rc=7' <<<"$out"
+    fx "…naming the limit" grep -qF 'turn/time limit reached' "$dir/blocks"
+    fx "…before any fallback to claude" \
+      test "$(jq -c 'select(.type=="backend_fallback")' "$dir/rs/events.jsonl" | wc -l | tr -d ' ')" -eq 0
+    fx_not "…and claude was never invoked" [ -e "$dir/claude-argv" ]
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# I5: NIGHT_SHIFT_CURSOR_MAX_RETRIES x NIGHT_SHIFT_CURSOR_RETRY_BACKOFF is an
+# unbounded product (5 x 3600 = over 13 hours of sleep inside ONE turn) and no
+# elapsed check runs between the sleeps — every other wait in the engine is
+# capped. Once the next sleep would push this turn's cumulative backoff past
+# NIGHT_SHIFT_CURSOR_MAX_WAIT, the run must fall back immediately and say why.
+fixture_cursor_backoff_ceiling() {
+  local root="$1" dir="$root/cursor-ceiling" out reason
+  cat >"$root/cursor-stub-always-fail.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$WORK_DIR/cursor-argv"
+printf 'Error: RetriableError: [resource_exhausted]\n' >&2
+exit 1
+STUB
+  # Ceiling 0 with a 1s backoff: the FIRST sleep already exceeds it.
+  out="$(_fixture_cursor_turn_run "$dir" "$root/cursor-stub-always-fail.sh" \
+    'CURSOR_MAX_RETRIES=3' 'CURSOR_RETRY_BACKOFF=1' 'CURSOR_MAX_WAIT=0')"
+  (
+    fx "the turn still completes on the claude fallback (rc 0)" grep -qx 'rc=0' <<<"$out"
+    fx "the ceiling stops the retries before any of them run" \
+      test "$(jq -c 'select(.type=="backend_retry")' "$dir/rs/events.jsonl" | wc -l | tr -d ' ')" -eq 0
+    fx "cursor was called exactly once" \
+      test "$(wc -l <"$dir/cursor-argv" | tr -d ' ')" -eq 1
+    reason="$(jq -r 'select(.type=="backend_fallback") | .payload.reason' "$dir/rs/events.jsonl")"
+    fx "the fallback reason names the ceiling knob" \
+      grep -qF 'NIGHT_SHIFT_CURSOR_MAX_WAIT' <<<"$reason"
+    fx "the run continued on claude" [ -s "$dir/claude-argv" ]
+    exit 0
+  ) || return 1
+  # Control: the SAME failing stub with headroom exhausts the retry budget
+  # instead, so the assertions above pin the ceiling and not a broken retry
+  # loop. Backoff 0 keeps the control instant and can never reach a ceiling.
+  out="$(_fixture_cursor_turn_run "$dir" "$root/cursor-stub-always-fail.sh" \
+    'CURSOR_MAX_RETRIES=3' 'CURSOR_RETRY_BACKOFF=0' 'CURSOR_MAX_WAIT=600')"
+  (
+    fx "control: with headroom the full retry budget is spent" \
+      test "$(jq -c 'select(.type=="backend_retry")' "$dir/rs/events.jsonl" | wc -l | tr -d ' ')" -eq 3
+    reason="$(jq -r 'select(.type=="backend_fallback") | .payload.reason' "$dir/rs/events.jsonl")"
+    fx "control: the fallback reason names the retry exhaustion, not the ceiling" \
+      grep -qF 'failed after 3 retries' <<<"$reason"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# I6: the post-loop "primary session ID changed" invariant sits OUTSIDE the
+# cursor retry/fallback branch, so a future cursor build that stopped echoing
+# the same id on --resume would hard-block every post-first turn at 3am on a
+# run that could have finished on claude. A cursor-path id change must route
+# into the same retry-then-fallback branch; the claude path keeps the hard
+# block (pinned separately by integration-adverse's own session invariants).
+fixture_cursor_session_drift_falls_back() {
+  local root="$1" dir="$root/cursor-drift" out
+  cat >"$root/cursor-stub-drift.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$WORK_DIR/cursor-argv"
+n=$(( $(cat "$WORK_DIR/ncalls" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" >"$WORK_DIR/ncalls"
+# A clean, successful envelope that simply does not echo the resumed id back.
+jq -cn --arg s "drift-$n" '{type:"result",is_error:false,result:"ok",session_id:$s}'
+exit 0
+STUB
+  out="$(_fixture_cursor_turn_run "$dir" "$root/cursor-stub-drift.sh" \
+    'CURSOR_MAX_RETRIES=2' 'CURSOR_RETRY_BACKOFF=0' 'CURSOR_MAX_WAIT=600')"
+  (
+    fx "a drifting session id never hard-blocks the run" grep -qx 'rc=0' <<<"$out"
+    fx_not "…and no block reason is recorded at all" [ -e "$dir/blocks" ]
+    fx "the drift is logged so the morning can see why the vendor changed" \
+      grep -qF 'session ID changed from' "$dir/log"
+    fx "it is routed through the ordinary retry budget" \
+      test "$(jq -c 'select(.type=="backend_retry")' "$dir/rs/events.jsonl" | wc -l | tr -d ' ')" -eq 2
+    fx "and ends in the sticky claude fallback" \
+      jq -e 'select(.type=="backend_fallback") | .payload.from=="cursor" and .payload.to=="claude"' \
+        "$dir/rs/events.jsonl" >/dev/null
+    fx "the run finished the turn on claude" [ -s "$dir/claude-argv" ]
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# cursor_probe_exec is the portable watchdog every FREE cursor-agent probe runs
+# under (status, --list-models, --version). macOS ships no coreutils `timeout`,
+# so it is hand-rolled out of background + sleep + kill — real portability risk,
+# and every OTHER cursor fixture stubs it out, so nothing exercised the body at
+# all: replacing it wholesale with `: >"$out"; return 0` left the suite green.
+# What it must do: bound a hung probe (a logged-out CLI that sits on a prompt
+# would otherwise hang the whole startup), report the kill instead of swallowing
+# it, capture stderr as well as stdout (the parsers grep ONE file), pass a real
+# rc through, and never make a fast probe wait out its own timeout.
+fixture_cursor_probe_exec() {
+  local root="$1" dir="$root/probe-exec"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/bin"
+  cat >"$dir/bin/cursor-agent" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  # exec so the SIGTERM reaches the sleep itself: a real cursor-agent is a
+  # binary, and a wrapper script would defer the signal until its foreground
+  # child finished — an artifact of the stub, not of the watchdog.
+  slow) exec sleep 5 ;;
+  boom) printf 'stderr-only failure report\n' >&2; exit 3 ;;
+  *) printf 'probe output for %s\n' "${1:-none}"; exit 0 ;;
+esac
+STUB
+  chmod +x "$dir/bin/cursor-agent"
+  (
+    PATH="$dir/bin:$PATH"
+    local rc start elapsed
+    # (a) The watchdog: a probe that outlives its timeout is killed, and the
+    # kill is REPORTED (128+SIGTERM=143), not laundered into a success — the
+    # callers' "inconclusive" branches key off a nonzero rc.
+    rc=0; start=$SECONDS
+    cursor_probe_exec 1 "$dir/slow.out" slow || rc=$?
+    elapsed=$((SECONDS - start))
+    fx "(a) an overrunning probe returns the SIGTERM status (143), not 0" test "$rc" -eq 143
+    # Upper bound is deliberately loose (timeout 1s, probe 5s): this must not
+    # flake on a loaded machine, it only has to prove the 5s probe was cut short.
+    fx "(a) …and returns in about the timeout, not the probe's full runtime" test "$elapsed" -lt 4
+    # (b) A fast probe must not wait out its own (long) timeout — i.e. the
+    # function waits on the PROBE and then disposes of the watchdog, never the
+    # other way round.
+    rc=0; start=$SECONDS
+    cursor_probe_exec 30 "$dir/fast.out" status || rc=$?
+    elapsed=$((SECONDS - start))
+    fx "(b) a successful probe returns 0" test "$rc" -eq 0
+    fx "(b) …immediately, not after the 30s timeout" test "$elapsed" -lt 4
+    fx "(b) …with the probe's stdout captured in the destination file" \
+      grep -qF 'probe output for status' "$dir/fast.out"
+    # (c) The parsers grep ONE file, so stderr has to land in it too — a CLI
+    # that reports "not logged in" on stderr must still reach the auth check.
+    rc=0
+    cursor_probe_exec 30 "$dir/err.out" boom || rc=$?
+    fx "(c) a real nonzero exit is passed through verbatim" test "$rc" -eq 3
+    fx "(c) stderr is captured into the destination file alongside stdout" \
+      grep -qF 'stderr-only failure report' "$dir/err.out"
+    exit 0
+  ) || return 1
+  return 0
+}
+
 # cursor_startup_probe's three-outcome contract: a probe that positively
 # reports logged-out / slug-absent DIES with an actionable message; a probe
 # that is merely inconclusive (timeout, nonzero rc, unrecognized output) WARNs
@@ -2761,14 +3213,29 @@ fixture_cursor_startup_probe() {
   local root="$1" dir="$root/cursor-probe" out
   rm -rf "$dir" 2>/dev/null
   mkdir -p "$dir"
-  # main_run must actually call the probe (the behavior below is worth nothing
-  # if the call site is gone); --sweep-only mirrors it at the top level of
-  # night-shift.sh, where there is no function to declare -f.
-  case "$(declare -f main_run)" in *cursor_startup_probe*) ;; *) return 1 ;; esac
-  case "$(awk '/^if \[ "\$SWEEP_ONLY" -eq 1 \]; then/,/^fi$/' \
-    "$WORKSPACE_ROOT/scripts/night-shift.sh")" in
-    *cursor_startup_probe*) ;; *) return 1 ;;
-  esac
+  # The probe must still be reached from a real run (the behavior below is
+  # worth nothing if the call site is gone). main_run now reaches it through
+  # cursor_startup_guards — which is what defers it past spec selection — and
+  # --sweep-only mirrors the call at the top level of night-shift.sh, where
+  # there is no function to declare -f.
+  # Diagnostic, not bare `return 1`: these read production TEXT, so a cosmetic
+  # reformat (renaming the guard, re-wrapping the --sweep-only block's opening
+  # line) turns them red, and a message naming what could not be found is the
+  # difference between a one-line fix and a bisect.
+  local sweep_block
+  sweep_block="$(awk '/^if \[ "\$SWEEP_ONLY" -eq 1 \]; then/,/^fi$/' \
+    "$WORKSPACE_ROOT/scripts/night-shift.sh")"
+  (
+    fx "main_run still reaches the cursor startup guards (declare -f main_run mentions cursor_startup_guards)" \
+      grep -qF 'cursor_startup_guards' <<<"$(declare -f main_run)"
+    fx "cursor_startup_guards still runs the auth/slug probe (declare -f mentions cursor_startup_probe)" \
+      grep -qF 'cursor_startup_probe' <<<"$(declare -f cursor_startup_guards)"
+    fx "the --sweep-only block was located in night-shift.sh (awk range 'if [ \"\$SWEEP_ONLY\" -eq 1 ]; then' .. 'fi' matched text)" \
+      test -n "$sweep_block"
+    fx "the --sweep-only block still mirrors the probe (cursor_startup_probe appears inside it)" \
+      grep -qF 'cursor_startup_probe' <<<"$sweep_block"
+    exit 0
+  ) || return 1
   (
     CURSOR_IMPLEMENT_MODEL="cursor-grok-4.6-high"
     # $1 status rc, $2 status output, $3 --list-models rc, $4 --list-models output.
@@ -2816,12 +3283,28 @@ fixture_cursor_startup_probe() {
       grep -qF 'LOG:WARN: cursor probe: could not list cursor-agent models' <<<"$out"
     fx_not "(c) an unrecognized model list never dies" grep -qF 'DIE:' <<<"$out"
 
-    # (d) Definitive: the configured slug is absent from a well-formed list.
+    # (d) A slug the list does not show: a loud WARN, never a die. The check
+    # infers the miss from the list's ROW FORMAT (`$1 == slug && $2 == "-"`),
+    # gated only by a header grep — so a build that indents, prefixes or
+    # colorizes its rows keeps the header and fails the row match, killing a
+    # run whose slug is perfectly valid. This was the one probe branch that
+    # failed closed on a format inference, and the version canary that would
+    # have flagged the drift runs after it.
     out="$( CURSOR_IMPLEMENT_MODEL="cursor-grok-4.6-hgih"
       run_probe 0 '✓ Logged in as dev@example.com' 0 "$models_ok" )"
-    fx "(d) a slug the CLI does not offer dies at startup" grep -qF 'DIE:' <<<"$out"
-    fx "(d) the die names the knob and the typo'd value" \
+    fx_not "(d) an unlisted slug never dies at startup" grep -qF 'DIE:' <<<"$out"
+    fx "(d) the run proceeds (a bad slug fails fast via the in-run fallback)" \
+      grep -qF 'RC:0' <<<"$out"
+    fx "(d) it WARNs loudly instead" grep -qF 'LOG:WARN: cursor probe:' <<<"$out"
+    fx "(d) the WARN keeps the actionable text: the knob and the typo'd value" \
       grep -qF 'NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL=cursor-grok-4.6-hgih' <<<"$out"
+    fx "(d) …and the correct slug to use" \
+      grep -qF 'cursor-grok-4.6-high' <<<"$out"
+    # (d2) The auth die is NOT downgraded: "not logged in" is a positive report
+    # from the CLI, not an inference from output shape, so it still dies even
+    # when the model list is perfectly well-formed.
+    out="$(run_probe 0 'Not logged in.' 0 "$models_ok")"
+    fx "(d2) the auth die survives the slug downgrade" grep -qF 'DIE:' <<<"$out"
 
     # (e) The happy probe is silent: no die, no WARN.
     out="$(run_probe 0 '✓ Logged in as dev@example.com' 0 "$models_ok")"
@@ -2845,6 +3328,110 @@ fixture_cursor_startup_probe() {
       run_probe 0 'Not logged in.' 0 "$models_ok" )"
     fx "(g) the skip knob returns 0 without dying" grep -qF 'RC:0' <<<"$out"
     fx_not "(g) the skip knob invokes cursor-agent at all" [ -e "$dir/probe-calls" ]
+    # A silent skip leaves no trace that this run's cursor auth was never
+    # checked — every other skip in the engine says so.
+    fx "(g) the skip is logged, not silent" \
+      grep -qF 'LOG:cursor probe: skipped (NIGHT_SHIFT_CURSOR_SKIP_PROBE=1)' <<<"$out"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# cursor_startup_guards: the cursor availability + auth/slug dies, deferred
+# until the spec AND any prior run state are known. Both skips exist because a
+# run that needs cursor-agent for NOTHING was being refused by them:
+#   - a run that already took the sticky fallback is claude for every remaining
+#     turn, and expired cursor auth is the usual CAUSE of that fallback — so
+#     dying on it made the documented recovery circular (neither backend could
+#     relaunch it, and the hand-edit escape is blocked by the integrity anchor);
+#   - a ## Design Contract spec pins the whole run to claude, so the backend is
+#     inert all run.
+# Every skip assertion is paired with a control that genuinely dies, so a guard
+# function that simply stopped checking could not pass this fixture.
+fixture_cursor_startup_guards() {
+  local root="$1" dir="$root/cursor-guards" out
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir"
+  printf '# spec\n\n## Design Contract\ntwo layered wave nodes\n' >"$dir/design.md"
+  printf '# spec\n\n## Test Plan\n- nothing visual\n' >"$dir/plain.md"
+  (
+    # $1 spec path (may be empty), $2 state path (may be empty), $3 backend.
+    run_guards() {
+      ( SPEC="$1"; STATE="$2"; IMPLEMENT_BACKEND="$3"
+        die() { printf 'DIE:%s\n' "$1"; exit 9; }
+        log() { printf 'LOG:%s\n' "$*"; }
+        # cursor-agent is ABSENT in every case below — the availability die is
+        # the cheapest observable proof of whether the guards ran at all.
+        cursor_available() { return 1; }
+        cursor_startup_probe() { printf 'PROBE\n'; return 0; }
+        cursor_startup_guards
+        printf 'RC:%s\n' "$?"
+      ) 2>&1
+    }
+    # (a) Control: a plain spec, no state — the guards still die, exactly as
+    # they did before they moved. This is the check the guards exist for.
+    out="$(run_guards "$dir/plain.md" "" cursor)"
+    fx "(a) control: a plain cursor run with no cursor-agent still dies at startup" \
+      grep -qF 'DIE:' <<<"$out"
+    fx "(a) the die names the missing binary" grep -qF 'cursor-agent is not on PATH' <<<"$out"
+
+    # (b) The C2 skip: state records the sticky fallback -> no die, no probe.
+    printf '%s\n' '{"implement_backend":"cursor","implement_backend_fallback":"claude"}' >"$dir/fellback.json"
+    out="$(run_guards "$dir/plain.md" "$dir/fellback.json" cursor)"
+    fx_not "(b) a fallen-back run is not refused by the cursor guards" grep -qF 'DIE:' <<<"$out"
+    fx "(b) it proceeds" grep -qF 'RC:0' <<<"$out"
+    fx_not "(b) and the auth probe is not even run (expired auth caused the fallback)" \
+      grep -qF 'PROBE' <<<"$out"
+    fx "(b) the skip is logged" grep -qF 'LOG:cursor backend: this run is already pinned to claude' <<<"$out"
+
+    # (b2) The design latch is the same situation recorded a different way.
+    printf '%s\n' '{"implement_backend":"cursor","implement_backend_design_latch":true}' >"$dir/latched.json"
+    out="$(run_guards "$dir/plain.md" "$dir/latched.json" cursor)"
+    fx_not "(b2) a design-latched run is not refused either" grep -qF 'DIE:' <<<"$out"
+
+    # (b3) Control: a run whose state records NEITHER still dies, so (b)/(b2)
+    # are about the recorded pin, not about state.json merely existing.
+    printf '%s\n' '{"implement_backend":"cursor"}' >"$dir/plainstate.json"
+    out="$(run_guards "$dir/plain.md" "$dir/plainstate.json" cursor)"
+    fx "(b3) control: state with no fallback and no latch still dies" grep -qF 'DIE:' <<<"$out"
+
+    # (c) Deferring past spec selection is the point: a Design-Contract spec
+    # makes the backend inert all run, so cursor-agent may be absent/logged out.
+    out="$(run_guards "$dir/design.md" "" cursor)"
+    fx_not "(c) a Design Contract spec is not refused by the cursor guards" grep -qF 'DIE:' <<<"$out"
+    fx "(c) the skip names the reason" grep -qF 'LOG:cursor backend: the spec declares a ## Design Contract' <<<"$out"
+
+    # (d) The claude backend never touches any of this.
+    out="$(run_guards "$dir/plain.md" "" claude)"
+    fx_not "(d) the claude backend never reaches the cursor guards" grep -qF 'DIE:' <<<"$out"
+    fx_not "(d) …and never probes" grep -qF 'PROBE' <<<"$out"
+
+    # (e) The healthy cursor path still probes (the guards are not now a no-op).
+    out="$( ( SPEC="$dir/plain.md"; STATE=""; IMPLEMENT_BACKEND=cursor
+      die() { printf 'DIE:%s\n' "$1"; exit 9; }
+      log() { :; }
+      cursor_available() { return 0; }
+      cursor_startup_probe() { printf 'PROBE\n'; return 0; }
+      cursor_startup_guards
+      printf 'RC:%s\n' "$?" ) 2>&1 )"
+    fx "(e) an available cursor-agent still runs the auth/slug probe" grep -qF 'PROBE' <<<"$out"
+    fx "(e) …and proceeds" grep -qF 'RC:0' <<<"$out"
+    exit 0
+  ) || return 1
+  # The call sites: main_run must reach the guards from BOTH arms of its
+  # recover/init fork (recovered run = state known; fresh run = spec known),
+  # and never from the early knob block, where neither is resolved.
+  local body
+  body="$(declare -f main_run)"
+  (
+    fx "main_run calls cursor_startup_guards at all" \
+      grep -qF 'cursor_startup_guards' <<<"$body"
+    fx "main_run reaches the guards from BOTH arms of the recover/init fork (expected exactly 2 call sites)" \
+      test "$(printf '%s\n' "$body" | grep -cF 'cursor_startup_guards')" -eq 2
+    # …and the guards must sit AFTER spec selection: check_branch_and_worktree is
+    # the last spec-resolution step on the fresh-run arm.
+    fx "at least one cursor_startup_guards call follows check_branch_and_worktree (the guards must not move back before spec selection)" \
+      awk '/check_branch_and_worktree/{seen=1} /cursor_startup_guards/{if(seen) hit=1} END{exit !hit}' <<<"$body"
     exit 0
   ) || return 1
   return 0
@@ -2901,6 +3488,21 @@ fixture_cursor_contract_canary() {
     fx "(c) a failed version probe returns 0" grep -qF 'RC:0' <<<"$out"
     fx_not "(c) a failed version probe journals anything" \
       grep -q contract_canary "$RUN_ROOT/events.jsonl"
+    # (c2) The rc guard, not the empty-output guard, is what makes (c) hold.
+    # A watchdog kill lands mid-line, so a killed probe routinely leaves
+    # PARTIAL output behind: `2026.08.25-3e8ee` parses as a perfectly plausible
+    # $found, and without the rc early-return the canary would journal that
+    # truncation as the installed build and WARN about drift that never
+    # happened — poisoning the one forensic record of which CLI ran the night.
+    # (c) alone cannot see this: its empty output satisfies the `[ -n "$found" ]`
+    # guard on its own.
+    : >"$RUN_ROOT/events.jsonl"
+    out="$(run_canary cursor 143 "${CURSOR_CONTRACT_CLI_VERSION%?????}")"
+    fx "(c2) a probe killed mid-line still returns 0" grep -qF 'RC:0' <<<"$out"
+    fx_not "(c2) truncated output is never journaled as the installed build" \
+      grep -q contract_canary "$RUN_ROOT/events.jsonl"
+    fx_not "(c2) …and never WARNs about drift that is really a watchdog kill" \
+      grep -qF 'LOG:WARNING' <<<"$out"
     # (d) claude backend: no cursor-agent call, no event.
     : >"$RUN_ROOT/events.jsonl"; rm -f "$dir/canary-calls"
     out="$(run_canary claude 0 "$CURSOR_CONTRACT_CLI_VERSION")"
@@ -3977,18 +4579,83 @@ fixture_spec_project_worktree() {
 
 fixture_resume_blocked() {
   local root="$1" state="$root/rb-state.json"
-  # blocked, not rate-limit, session present → resumable via --resume.
-  printf '%s\n' '{"status":"blocked","session_id":"sid-1","block_reason":"primary baseline evidence does not match wrapper-owned baseline (exit statuses)"}' >"$state"
-  resumable_blocked_state "$state" || return 1
-  # blocked but no session_id → not resumable (can't safely re-enter).
-  printf '%s\n' '{"status":"blocked","block_reason":"x"}' >"$state"
-  resumable_blocked_state "$state" && return 1
-  # rate-limit block (rate_limit_reset_at set) → handled by the rate-limit path, not this one.
-  printf '%s\n' '{"status":"blocked","session_id":"sid-1","rate_limit_reset_at":"2026-01-01T00:00:00Z"}' >"$state"
-  resumable_blocked_state "$state" && return 1
-  # running → not a blocked-resume case at all.
-  printf '%s\n' '{"status":"running","session_id":"sid-1"}' >"$state"
-  resumable_blocked_state "$state" && return 1
+  (
+    SESSION_SCOPE=stage
+    # blocked, not rate-limit, session present → resumable via --resume.
+    printf '%s\n' '{"status":"blocked","session_id":"sid-1","block_reason":"primary baseline evidence does not match wrapper-owned baseline (exit statuses)"}' >"$state"
+    fx "blocked + session + stage scope is resumable" resumable_blocked_state "$state"
+    # rate-limit block (rate_limit_reset_at set) → handled by the rate-limit path, not this one.
+    printf '%s\n' '{"status":"blocked","session_id":"sid-1","rate_limit_reset_at":"2026-01-01T00:00:00Z"}' >"$state"
+    fx_not "a rate-limit block is not a --resume case" resumable_blocked_state "$state"
+    # running → not a blocked-resume case at all.
+    printf '%s\n' '{"status":"running","session_id":"sid-1"}' >"$state"
+    fx_not "a running run is not a --resume case" resumable_blocked_state "$state"
+
+    # The C1 fix: a NULL session is resumable under SESSION_SCOPE=stage and
+    # only there. The cursor backend's sticky fallback nulls .session_id in the
+    # same atomic write as the flag, so a block during that turn produced
+    # blocked+null — which --resume refused while a bare relaunch refused on
+    # the dirty tree, stranding the night's work.
+    printf '%s\n' '{"status":"blocked","block_reason":"primary command failed with status 1"}' >"$state"
+    fx "blocked + NULL session is resumable under SESSION_SCOPE=stage (restartable from files)" \
+      resumable_blocked_state "$state"
+    # An explicit null (what implement_backend_fallback_set writes) is the same
+    # case as an absent key — `// empty` collapses both.
+    printf '%s\n' '{"status":"blocked","session_id":null,"implement_backend_fallback":"claude"}' >"$state"
+    fx "the sticky-fallback shape (session_id:null) is resumable under stage scope" \
+      resumable_blocked_state "$state"
+    # SESSION_SCOPE=run pins ONE session for the whole run and never nulls it
+    # at a boundary, so there a null session genuinely means no resumable
+    # context — the original refusal must stand.
+    printf '%s\n' '{"status":"blocked","block_reason":"primary command failed with status 1"}' >"$state"
+    ( SESSION_SCOPE=run
+      fx_not "blocked + NULL session is NOT resumable under SESSION_SCOPE=run" \
+        resumable_blocked_state "$state" ) || exit 1
+    # Control: run scope still resumes a SESSION-BEARING block, so the guard
+    # above is about the missing session, not about the scope alone.
+    printf '%s\n' '{"status":"blocked","session_id":"sid-1"}' >"$state"
+    ( SESSION_SCOPE=run
+      fx "control: run scope still resumes a session-bearing block" \
+        resumable_blocked_state "$state" ) || exit 1
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# The --resume refusal message must name the precondition that ACTUALLY failed.
+# The old blanket text ("state missing, not blocked, rate-limited, or
+# session/primary mismatch") listed reasons that were frequently false — it said
+# "not blocked" about a run that WAS blocked — which sent the operator hunting
+# the wrong problem. Each case below asserts the true cause is named AND that a
+# wrong one is not.
+fixture_resume_refusal_reason() {
+  local root="$1" state="$root/rrr-state.json" out
+  # The message is only worth anything if the refusal actually uses it.
+  case "$(declare -f main_run)" in *resume_refusal_reason*) ;; *) return 1 ;; esac
+  rm -f "$state"
+  (
+    SESSION_SCOPE=stage
+    out="$(resume_refusal_reason "$state")"
+    fx "missing state is named as such" grep -qF 'no run state at' <<<"$out"
+    fx_not "missing state does not claim 'not blocked'" grep -qF 'not "blocked"' <<<"$out"
+
+    printf '%s\n' '{"status":"complete","session_id":"sid-1"}' >"$state"
+    out="$(resume_refusal_reason "$state")"
+    fx "a non-blocked run names its actual status" grep -qF 'has status "complete", not "blocked"' <<<"$out"
+
+    printf '%s\n' '{"status":"blocked","session_id":"sid-1","rate_limit_reset_at":"2026-01-01T00:00:00Z"}' >"$state"
+    out="$(resume_refusal_reason "$state")"
+    fx "a rate-limit block says so" grep -qF 'blocked on a rate limit' <<<"$out"
+    fx_not "…and does not claim the run is not blocked" grep -qF 'not "blocked"' <<<"$out"
+
+    printf '%s\n' '{"status":"blocked"}' >"$state"
+    out="$( SESSION_SCOPE=run; resume_refusal_reason "$state" )"
+    fx "a run-scoped null session names the session AND the scope knob" \
+      grep -qF 'no pinned session and NIGHT_SHIFT_SESSION_SCOPE=run' <<<"$out"
+    fx "…and tells the operator the knob that would let it resume" \
+      grep -qF 'NIGHT_SHIFT_SESSION_SCOPE=stage' <<<"$out"
+    exit 0
+  ) || return 1
   return 0
 }
 
@@ -4062,8 +4729,70 @@ fixture_rate_limit_recognition() {
 
 fixture_rate_limit_epoch() {
   local root="$1" raw="$root/rate-epoch.json"
-  printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 12:01am (Etc/UTC)","session_id":"fixed-id"}' >"$raw"
-  [ "$(rate_limit_reset_epoch "$raw" 0)" = "60" ]
+  # Every case is anchored at reference epoch 0 = 00:00 UTC, so the expected
+  # value is just "seconds past midnight" and the 12-hour -> 24-hour conversion
+  # is what is really under test. Only the am-noon case existed before, which
+  # left the ENTIRE pm branch (`meridiem = pm && hour != 12 -> hour + 12`)
+  # unexercised: inverting its comparison — turning every afternoon reset into
+  # a morning one, so the engine retries hours early and re-blocks — kept the
+  # whole suite green.
+  (
+    emit() {
+      printf '%s\n' "{\"api_error_status\":429,\"result\":\"session limit - resets $1 (Etc/UTC)\",\"session_id\":\"fixed-id\"}" >"$raw"
+    }
+    emit 12:01am
+    fx "12:01am is 00:01, one minute past the reference midnight" \
+      test "$(rate_limit_reset_epoch "$raw" 0)" = "60"
+    emit 3:00pm
+    fx "3:00pm converts to 15:00, not 03:00 (the pm +12 branch)" \
+      test "$(rate_limit_reset_epoch "$raw" 0)" = "54000"
+    emit 12:30pm
+    fx "12:30pm stays 12:30 — noon is the pm hour that must NOT be shifted" \
+      test "$(rate_limit_reset_epoch "$raw" 0)" = "45000"
+    emit 11:59am
+    fx "11:59am stays in the morning" \
+      test "$(rate_limit_reset_epoch "$raw" 0)" = "43140"
+    exit 0
+  ) || return 1
+  return 0
+}
+
+# The engine's session-limit wait is the one recovery path that costs real
+# hours, and nothing asserted it ever actually SLEEPS: every existing rate-limit
+# fixture forces the deadline into the past (a negative buffer) or the cap
+# negative, so both `[ "$wait_seconds" -gt 0 ]` guards could be inverted — the
+# clamp turning every positive wait into 0, the branch skipping the sleep — and
+# the suite stayed green while the engine hammered a still-limited API instead
+# of waiting for the reset. The sleep is OBSERVED, never performed: a `sleep`
+# function shadows the external command, so the fixture stays instant.
+fixture_rate_limit_waits_for_reset() {
+  local root="$1" dir="$root/rl-wait"
+  rm -rf "$dir" 2>/dev/null
+  mkdir -p "$dir/raw"
+  (
+    RUN_ROOT="$dir"; RUN_ID="rlwait-$$"; STATE="$dir/state.json"
+    RATE_LIMIT_BUFFER_SECONDS=0
+    RATE_LIMIT_MAX_WAIT_SECONDS=3600
+    printf '%s\n' '{"status":"running","stage":"planning","stage_started_at":0,"task_started_at":0,"stage_started":{"planning":0},"session_id":"fixed-id"}' >"$STATE"
+    printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 12:01am (Etc/UTC)","session_id":"fixed-id"}' >"$dir/raw.json"
+    log() { :; }
+    block_run() { printf 'BLOCK:%s\n' "$1" >>"$dir/blocks"; exit 9; }
+    # A deterministic 30s window, the same seam fixture_sweep_rate_limit_wait
+    # uses — the real parse is covered by fixture_rate_limit_epoch above, and
+    # wall-clock-derived reset text would make the assertions racy.
+    rate_limit_reset_epoch() { printf '%s\n' "$(( $(now_epoch) + 30 ))"; }
+    sleep() { printf '%s\n' "$1" >>"$dir/slept"; }
+    wait_for_rate_limit_reset "$dir/raw.json"
+    fx "the engine actually sleeps rather than retrying immediately" [ -s "$dir/slept" ]
+    slept="$(head -1 "$dir/slept")"
+    fx "…for the whole remaining window, not a clamped 0" test "$slept" -ge 25
+    fx "…and never past it" test "$slept" -le 31
+    fx_not "…and an ordinary in-cap wait never blocks the run" [ -e "$dir/blocks" ]
+    fx "the run is marked running again after the wait" \
+      test "$(jq -r '.status' "$STATE")" = "running"
+    exit 0
+  ) || return 1
+  return 0
 }
 
 fixture_rate_limit_rebase() {
@@ -4090,7 +4819,29 @@ fixture_rate_limit_recovery() {
   local root="$1" state="$root/rate-recovery-state.json" raw="$root/rate-recovery-raw.json"
   printf '%s\n' '{"status":"blocked","session_id":"fixed-id","block_reason":"primary command failed with status 1"}' >"$state"
   printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 5:40am (America/Sao_Paulo)","session_id":"fixed-id"}' >"$raw"
-  recoverable_rate_limit_state "$state" "$raw"
+  (
+    fx "a 429 block on the run's own session auto-recovers" \
+      recoverable_rate_limit_state "$state" "$raw"
+    # The two guards this predicate exists for, each with only the positive
+    # above to contrast against. AUTO-recovery is unattended — it re-enters a
+    # blocked run with no operator in the loop — so both false-positive shapes
+    # below would silently restart a run that must stay blocked:
+    #   - a non-429 failure (a genuine logic block) resumed as if it were a
+    #     rate limit, on a loop, forever;
+    #   - a 429 whose envelope belongs to a DIFFERENT session, which would
+    #     resume this run inside someone else's session id.
+    printf '%s\n' '{"api_error_status":500,"result":"Internal server error","session_id":"fixed-id"}' >"$raw.500"
+    fx_not "a non-429 failure on the same session is NOT auto-recoverable" \
+      recoverable_rate_limit_state "$state" "$raw.500"
+    printf '%s\n' '{"api_error_status":429,"result":"session limit - resets 5:40am (America/Sao_Paulo)","session_id":"someone-elses-id"}' >"$raw.other"
+    fx_not "a 429 whose envelope names a DIFFERENT session is NOT auto-recoverable" \
+      recoverable_rate_limit_state "$state" "$raw.other"
+    printf '%s\n' '{"status":"blocked","block_reason":"primary command failed with status 1"}' >"$state.nosess"
+    fx_not "a blocked run with no pinned session is NOT auto-recoverable" \
+      recoverable_rate_limit_state "$state.nosess" "$raw"
+    exit 0
+  ) || return 1
+  return 0
 }
 
 fixture_rate_limit_cap() {
@@ -7477,6 +8228,43 @@ fixture_recovery_guard_backend_mismatch() {
   return 0
 }
 
+# C2: a run that already took the sticky fallback to claude needs cursor-agent
+# for NOTHING, so the stored-backend mismatch die must not force the operator
+# back through the cursor guards to resume it — expired cursor auth is usually
+# what CAUSED the fallback, which made that demand circular (and the documented
+# hand-edit escape is blocked by the integrity anchor). Paired with the
+# unchanged mismatch fixture above, which still dies without the flag.
+fixture_recovery_guard_backend_mismatch_after_fallback() {
+  local root="$1" proj="$root/rgbf-proj"
+  _fixture_recovery_guard_project "$proj" || return 1
+  printf '{}\n' >"$proj/.night-shift/baseline.json"
+  printf '%s\n' '{"status":"running","primary":"claude","implement_backend":"cursor","implement_backend_fallback":"claude","primary_turns":1,"run_id":"rgbf","task":"spec.md","observer":"claude","base_commit":"deadbeef","base_branch":"main","baseline_status":"'"$proj"'/.night-shift/baseline.json","stage":"implementation","session_id":null,"stage_started":{}}' \
+    >"$proj/.night-shift/state.json"
+  (
+    out="$( (
+      PROJECT="$proj"; PRIMARY="claude"; IMPLEMENT_BACKEND="claude"; RESUME=0
+      log() { printf 'LOG:%s\n' "$*"; }
+      set_spec_workdir() { SPEC="$1"; return 0; }
+      validate_spec_smoke() { return 0; }
+      cleanup_validation_worktree() { return 0; }
+      recover_run
+      printf 'rc=%s\n' "$?"
+    ) 2>&1 )"
+    rc="$(printf '%s\n' "$out" | sed -n 's/^rc=//p')"
+    fx "a fallen-back cursor run resumes under NIGHT_SHIFT_IMPLEMENT_BACKEND=claude" test "$rc" = "0"
+    fx_not "no backend-mismatch die fires" \
+      grep -q "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND" <<<"$out"
+    fx "the relaxation is logged, not silent" \
+      grep -qF 'LOG:recovery: this run already fell back to claude' <<<"$out"
+    # …and the recovered run really has no session to resume, which is the
+    # shape C1's resumable_blocked_state had to learn to accept.
+    fx "the recovery says the next turn starts fresh (no pinned session)" \
+      grep -qF 'with no pinned session' <<<"$out"
+    exit 0
+  ) || return 1
+  return 0
+}
+
 fixture_recovery_guard_backend_match() {
   local root="$1" proj="$root/rgbk-proj"
   _fixture_recovery_guard_project "$proj" || return 1
@@ -8196,11 +8984,38 @@ cat >/dev/null
 printf '{"result":"fine\\nSWEEP_PASS"}\n'
 STUB
   chmod +x "$bin/claude"
+  # A recording cursor-agent, so the surface's BACKEND GATE is observable: the
+  # auth/slug probe is the only thing on this surface that shells out to
+  # cursor-agent, and a claude-backend --sweep-only run must never touch it (the
+  # probe can die on a logged-out CLI — a claude-only sweep must not be
+  # refused because of a vendor it is not using). Answers both probe commands
+  # so the cursor-backend control below gets a clean, silent probe.
+  cat >"$bin/cursor-agent" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-none}" >> "$NS_FIXTURE_CURSOR_LOG"
+case "${1:-}" in
+  status) printf '\342\234\223 Logged in as dev@example.com\n' ;;
+  --list-models) printf 'Available models:\n  cursor-grok-4.6-high - Grok 4.6 (high reasoning)\n' ;;
+esac
+exit 0
+STUB
+  chmod +x "$bin/cursor-agent"
   # A real subprocess reads the guard, so the "cursor unavailable" edge has to
   # be built out of PATH — but it must shadow ONE binary, not a whole
-  # directory (see _fixture_path_without_cursor_agent).
-  no_cursor_path="$bin:$(_fixture_path_without_cursor_agent "$dir/nocursor")" || return 1
+  # directory (see _fixture_path_without_cursor_agent). $bin is prepended
+  # AFTER the mirror is built, and $bin now holds a cursor-agent of its own —
+  # so build the mirror from the ambient PATH first, then prepend a $bin copy
+  # with cursor-agent removed.
+  mkdir -p "$dir/bin-nocursor"
+  ln -s "$bin"/* "$dir/bin-nocursor/" 2>/dev/null || true
+  rm -f "$dir/bin-nocursor/cursor-agent"
+  no_cursor_path="$dir/bin-nocursor:$(_fixture_path_without_cursor_agent "$dir/nocursor")" || return 1
   (
+    # Exported before the FIRST subprocess: the recorder stub appends to this
+    # path unconditionally, so leaving it unset would turn an unexpected early
+    # cursor-agent call into a stub error rather than a recorded fact.
+    export NS_FIXTURE_CURSOR_LOG="$dir/cursor-calls"
+    rm -f "$NS_FIXTURE_CURSOR_LOG"
     rc=0
     out="$(PATH="$bin:$PATH" NIGHT_SHIFT_IMPLEMENT_BACKEND=bogus \
       "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" 2>&1)" || rc=$?
@@ -8217,9 +9032,24 @@ STUB
 
     # Sanity: the default claude backend is unaffected by the new guards and
     # still completes a bare sweep normally.
+    rm -f "$NS_FIXTURE_CURSOR_LOG"
     rc=0
     PATH="$bin:$PATH" "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
     fx "sweep-only: claude backend (default) still exits 0 on SWEEP_PASS" test "$rc" -eq 0
+    # The backend gate on this surface's probe call. cursor-agent IS on PATH
+    # here, so nothing but the gate stops the probe from running — and a probe
+    # that ran could DIE (a logged-out CLI) on a run that uses no cursor at all.
+    fx_not "sweep-only: the claude backend never shells out to cursor-agent" \
+      [ -e "$NS_FIXTURE_CURSOR_LOG" ]
+    # Paired control: with the knob ON, the same surface DOES probe — so the
+    # assertion above pins the gate, not a probe call that was simply deleted.
+    rm -f "$NS_FIXTURE_CURSOR_LOG"
+    rc=0
+    PATH="$bin:$PATH" NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor \
+      "$WORKSPACE_ROOT/scripts/night-shift.sh" --sweep-only --project "$proj" >/dev/null 2>&1 || rc=$?
+    fx "sweep-only: control — a healthy cursor backend still exits 0 on SWEEP_PASS" test "$rc" -eq 0
+    fx "sweep-only: control — the cursor backend DOES run the auth probe here" \
+      grep -qx 'status' "$NS_FIXTURE_CURSOR_LOG"
     exit 0
   ) >/dev/null || return 1
   return 0
