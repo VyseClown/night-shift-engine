@@ -145,7 +145,7 @@ them separately, but know what they mean when they fire:
 ### Static checks (same CI job)
 
 ```sh
-shellcheck scripts/**/*.sh                  # pinned 0.11.0 in CI; honors .shellcheckrc
+shellcheck scripts/**/*.sh .cursor/*.sh     # pinned via .cursor/install.sh; honors .shellcheckrc
 node --check <changed>.js                   # JS syntax for the static-scan libs
 bash scripts/doc-summaries.sh --check        # every top-level docs/*.md opens with `> Summary:` in its first 7 lines
 ```
