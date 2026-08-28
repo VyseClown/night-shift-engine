@@ -20,28 +20,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pin shellcheck so "green locally" == "green in CI". Ubuntu's apt build
-      # lags (0.9.0) and reports findings newer versions don't, so an unpinned
-      # install drifts. Bump SC_VERSION deliberately, in sync with what the
-      # repo-root .shellcheckrc + inline pragmas were validated against.
+      # Pin shellcheck so "green locally" == "green in CI". The version lives
+      # in .cursor/install.sh (this job calls it — do not re-pin here). Ubuntu's
+      # apt build lags (0.9.0) and reports findings newer versions don't, so an
+      # unpinned install drifts. Bump SC_VERSION in .cursor/install.sh
+      # deliberately, in sync with what the repo-root .shellcheckrc + inline
+      # pragmas were validated against.
       - name: Install shellcheck (pinned)
-        env:
-          SC_VERSION: "0.11.0"
-        run: |
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${SC_VERSION}/shellcheck-v${SC_VERSION}.linux.x86_64.tar.xz" \
-            | tar -xJ
-          sudo install "shellcheck-v${SC_VERSION}/shellcheck" /usr/local/bin/shellcheck
+        run: bash ./.cursor/install.sh
 
-      # Full-coverage lint of every scripts/**/*.sh (orchestrator, libs, extracted
-      # fixtures, worktree wrapper) at default severity. The style/false-positive
-      # noise that previously forced --severity=error is now handled precisely by
-      # the repo-root .shellcheckrc (categorical false positives only) plus visible
+      # Full-coverage lint of every scripts/**/*.sh (orchestrator, libs,
+      # extracted fixtures, worktree wrapper) and .cursor/*.sh (Cloud Agent
+      # install) at default severity. The style/false-positive noise that
+      # previously forced --severity=error is now handled precisely by the
+      # repo-root .shellcheckrc (categorical false positives only) plus visible
       # inline pragmas — so this is the "tighten once cleaned up" follow-through.
       # `find -exec {} +` passes all files robustly (no word-split / IFS quirks).
       - name: Shellcheck
         run: |
           shellcheck --version
-          find scripts -name '*.sh' -type f -exec shellcheck -s bash {} +
+          find scripts .cursor -name '*.sh' -type f -exec shellcheck -s bash {} +
 
       # Enforces the docs/*.md `> Summary:` convention (agentic-gaps §B) —
       # cheap, so it rides along in the same job as the other static checks.
