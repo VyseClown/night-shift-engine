@@ -1,0 +1,4 @@
+{
+  "name": "night-shift-engine",
+  "install": "bash ./.cursor/install.sh"
+}
