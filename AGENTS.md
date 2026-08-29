@@ -132,7 +132,19 @@ Three free, deterministic layers — run all of them before any engine commit:
 3. **Adverse-path integration** — `bash scripts/test/integration-adverse.sh`:
    the malformed-signal block and the observer-BLOCK→fresh-session recovery.
 
-All three gate CI (`.github/workflows/ci.yml`), alongside pinned shellcheck.
+All three gate CI (`.github/workflows/ci.yml`), alongside pinned shellcheck
+(installed by `.cursor/install.sh`, which also lints `.cursor/*.sh`).
+
+### Cursor Cloud
+
+Cloud Agents bootstrap with `bash ./.cursor/install.sh` (pinned `shellcheck`
+plus a node/jq/git/curl check). There is no `start` or `terminals` — the
+engine is a CLI + deterministic test harness, not a long-running service.
+After install, the same gates as CI apply: `shellcheck` over `scripts/` and
+`.cursor/`, `scripts/doc-summaries.sh --check`, `node --check` on
+`scripts/lib/*.js`, then the fixture / integration / scenario layers above.
+The `claude`/`codex` CLIs are not part of the environment (live paid runs
+only).
 
 ---
 

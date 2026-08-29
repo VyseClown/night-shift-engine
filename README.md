@@ -216,7 +216,8 @@ no network, run all of them before any engine commit:
 
 CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) runs on every push
 to `main` and every PR across four jobs: **Shellcheck** (pinned shellcheck
-`0.11.0` over every `scripts/**/*.sh`, honoring [`.shellcheckrc`](./.shellcheckrc))
+via [`.cursor/install.sh`](./.cursor/install.sh) over every `scripts/**/*.sh`
+and `.cursor/*.sh`, honoring [`.shellcheckrc`](./.shellcheckrc))
 plus doc-summary and JS-syntax (`node --check`) checks in the same job;
 **Fixture tests** (the deterministic suite); **Integration smoke** (both
 integration scripts + the gherkin scenarios); and a **Mutation sample** (a
