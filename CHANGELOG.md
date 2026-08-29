@@ -6,6 +6,61 @@ observer approval.
 
 ## Unreleased
 
+### Codex + Claude engine split (opt-in)
+
+- A spec can now declare `- Engines: implement=codex review=codex` to run its
+  implement-stage grind on the Codex CLI instead of Claude, and/or opt the
+  existing advisory per-candidate codex review in/out per spec (overriding
+  `NIGHT_SHIFT_CODEX_REVIEW` in both directions — the spec always wins). Default
+  (no field) is byte-for-byte today's behavior: Claude-only, codex dormant. This
+  is a narrower, deliberate return of a second vendor than the Codex primary path
+  removed below ("Claude-only flow & observer") — only the implement stage scope
+  can ever be codex; `plan`/`observer` are rejected outright as Claude-only (the
+  judgment gates that make a second vendor safe), so the independent Claude
+  observer still gates every codex-implemented candidate.
+- `invoke_primary` branches to a codex adapter on the implement scope only:
+  fresh turns run `codex exec -s <sandbox> ... --json`, resumes run
+  `codex exec resume <thread> -c sandbox_mode=... --json` (resume rejects `-s`
+  — verified live against codex-cli 0.144.3, also re-verified against 0.146.0),
+  and the session id is the `thread.started` thread_id from the captured JSONL
+  stream. No Claude-shaped 429 handling for codex in v1: a nonzero exit is
+  retried up to `NIGHT_SHIFT_CODEX_MAX_RETRY` (default 2, 60s apart) before
+  blocking the run. A codex turn's usage is journaled on its own
+  `codex_primary` event rather than the Claude-JSON-shaped cost ledger.
+- The observer prompt, the observer-review wire contract, and
+  `NIGHT_SHIFT_REVIEW.md` now show the TRUE implement vendor in the `primary`
+  field (`"codex"` when a task's spec opted in) instead of always `"claude"`;
+  `observer` stays `"claude"` always. The `--primary` CLI flag is unchanged
+  (still an explicit claude-only flag) — the spec field, not the flag, is the
+  codex opt-in.
+- New knobs: `NIGHT_SHIFT_CODEX_SANDBOX` (default `danger-full-access`; the
+  other accepted value is `workspace-write`, kept for a future codex version —
+  see the review-wave fix below), `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` (default
+  empty — codex's own configured default), `NIGHT_SHIFT_CODEX_MAX_RETRY`
+  (default `2`).
+- **Review-wave hardening** (post-merge, against the real CLI + spec-dialect
+  edge matrix): `NIGHT_SHIFT_CODEX_SANDBOX` defaults to `danger-full-access`
+  (proven live: `workspace-write` keeps `.git` read-only under codex's own
+  sandbox policy, so an implement run could never commit a candidate);
+  `validate_spec_engines` now rejects `implement=codex` outright under
+  `workspace-write` and under `NIGHT_SHIFT_SESSION_SCOPE=run` (vendor-specific
+  session ids never cross vendors); the resume invocation now also passes
+  `codex_model_flag` (codex re-resolves its model per call, unlike
+  `claude --resume`, so a set `NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL` used to
+  silently revert after turn 1); `invoke_primary_codex` no longer calls
+  `block_run` on retry exhaustion (calling it from inside its own command
+  substitution only unwound the subshell, so the run fell through to a
+  second, generic `block_run` in the parent) — it now writes the informative
+  reason to disk and returns 1 for the parent to `block_run` exactly once;
+  `spec_field_scope` (Track/Personas/Review Profile/Engines) now strips `\r`
+  before scoping and skips fenced code blocks, so a CRLF spec's fields are no
+  longer silently absent and a quoted example inside a ` ``` ` block can no
+  longer switch the vendor; `validate_spec_engines` rejects a duplicate
+  `- Engines:` field and near-miss spellings (`- Engines :`, `- engines:`,
+  colon-less) instead of silently treating either as absent; `run_started`
+  now journals `engines:{implement,review}` alongside `models` so a codex
+  run's timeline is honest about which vendor implemented it.
+
 ### Cost & model tiering
 
 - **Per-role model tiering.** The primary plans on `NIGHT_SHIFT_PLAN_MODEL`
@@ -151,3 +206,12 @@ observer approval.
   the viewer renders it as a checklist.
 - `scripts/parallel-worktrees.sh` wrapper for fan-out runs across worktrees;
   design + plan docs are kept local-only (gitignored, same policy as specs).
+- **Approved plan survives success compaction.** Both task-completion paths
+  (COMPLETE and NEXT_TASK) copy `control/plan.md` into
+  `validated/plan-<spec>.md` before `control/` is deleted, so archived runs
+  keep the plan a human reviews the diff against (the viewer's Plan panel
+  renders it). The spec name is sanitized to the viewer's filename regex and
+  never clobbers a differing same-name plan (suffixed instead), and a copy also
+  lands at `validated/plan.md` (last-writer-wins) — the viewer's preferred
+  fixed logical-plan name. Best-effort: fixture/dry runs without a plan are a
+  clean no-op, and a failed mkdir/cp WARNs rather than failing the task.

@@ -86,7 +86,9 @@ candidate_primary_vendor() {
     used="$(jq -r '.implement_backend_used // empty' "$STATE" 2>/dev/null)"
     [ -z "$used" ] || { printf '%s' "$used"; return 0; }
   fi
-  if implement_backend_active; then printf 'cursor'; else printf 'claude'; fi
+  if implement_backend_active; then printf 'cursor'; return 0; fi
+  if [ "${ENGINE_IMPLEMENT:-claude}" = "codex" ]; then printf 'codex'; return 0; fi
+  printf 'claude'
 }
 
 # Record the sticky per-run fallback to Claude after cursor retries are
