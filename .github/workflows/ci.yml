@@ -96,6 +96,9 @@ jobs:
       - name: Adverse paths (blocked run + observer-BLOCK recovery)
         run: bash scripts/test/integration-adverse.sh
 
+      - name: Cursor implementer backend (happy path + retry/fallback)
+        run: bash scripts/test/integration-cursor.sh
+
       - name: Gherkin scenarios (executable QA procedures)
         run: bash scripts/test/scenario-run.sh --all
 

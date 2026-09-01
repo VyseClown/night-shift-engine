@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # integration-lib.sh — shared scaffold for the full-orchestration tests
-# (integration-run.sh = happy path, integration-adverse.sh = blocked/recovery).
-# Everything here is a verbatim extraction from integration-run.sh; the stub
-# gained MODES so adverse scenarios can misbehave deterministically:
+# (integration-run.sh = happy path, integration-adverse.sh = blocked/recovery,
+# integration-cursor.sh = cursor implementer backend). Everything here is a
+# verbatim extraction from integration-run.sh; the stub gained MODES so
+# adverse scenarios can misbehave deterministically:
 #   happy              — the original scripted pipeline (plan -> impl -> candidate
 #                        -> observer APPROVE -> complete)
 #   malformed          — the primary emits an invalid signal every turn (drives
@@ -10,6 +11,43 @@
 #   block-then-approve — the observer BLOCKs the first candidate with OBS-001;
 #                        the re-entered implement turn appends a guard line so
 #                        the SECOND candidate differs; second verdict APPROVEs.
+#   cursor-fail        — write_cursor_stub only: the cursor-agent primary
+#                        exits 1 with the verified stderr-only RetriableError
+#                        shape and nothing on stdout, to drive
+#                        invoke_primary's bounded-retry -> sticky-claude-
+#                        fallback path.
+#   cursor-empty       — write_cursor_stub only: the cursor-agent primary
+#                        exits 0 with a valid JSON envelope but no session_id
+#                        (envelope drift, not a CLI failure), to drive the
+#                        SAME bounded-retry -> sticky-claude-fallback path via
+#                        invoke_primary's rc==0-but-no-session_id guard.
+#   cursor-is-error    — write_cursor_stub only: the cursor-agent primary
+#                        exits 0 with a COMPLETE, valid envelope — session_id
+#                        included — that carries "is_error":true. cursor-agent
+#                        reports in-band failures this way (rc 0, error in the
+#                        envelope), so this is the one failure shape neither
+#                        the rc!=0 nor the missing-session_id guard can see;
+#                        invoke_primary must still route it into the same
+#                        bounded-retry -> sticky-claude-fallback path instead
+#                        of accepting the turn as a success.
+#   plan-then-impl-fail— write_stub only: planning succeeds normally, then the
+#                        implementation turn WRITES its work and exits 1 with
+#                        no envelope. Paired with a failing cursor stub it
+#                        produces the stranded shape C1/C2 exist for: the
+#                        sticky fallback nulls .session_id, the claude
+#                        fallback turn then fails, and the run blocks with
+#                        status=blocked + session_id=null over a DIRTY tree.
+#   spec-tamper        — write_stub only: the primary rewrites the SPEC's
+#                        final-validation commands while building the
+#                        candidate — the "update the spec to match what I
+#                        built" move that would weaken the gate judging it.
+#                        Uncommitted, so no diff would ever show it.
+#   no-session         — write_stub only: the claude primary exits 0 with a
+#                        valid JSON envelope but no session_id key at all, to
+#                        pin the CLAUDE path's OWN "primary emitted no
+#                        resumable session ID" block_run (the guard the
+#                        cursor rc==0-but-no-session_id check sits next to,
+#                        for the backend that had it first).
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 ENGINE="$ENGINE_DIR/scripts/night-shift.sh"
@@ -101,6 +139,127 @@ JS
 SPEC
 }
 
+# Scripted `cursor-agent` on PATH (specs/cursor-implementer-backend.md Task 2):
+# the cursor implementer backend. Two callers reach this stub: invoke_primary
+# (the primary turns) AND, per Task 4 (sweep fix cycle + run feedback follow
+# the backend), write_run_feedback / sweep_fix_cycle — plan/persona/observer
+# turns still stay on the claude stub regardless of the backend knob, but
+# these two advisory/fix sessions do not. --trust is asserted defensively as
+# the expected discriminator (every cursor invocation, primary or not, passes
+# it; a call missing it is a wiring bug). Appends one line per PRIMARY-TURN
+# invocation to $WORK/.cursor-argv holding that call's flags (the prompt arg
+# dropped — see there), so a scenario can assert the argv the engine really
+# built, e.g. --add-dir "$WORKSPACE_ROOT". Appends one line per PRIMARY-TURN
+# invocation to $WORK/.cursor-calls (proves cursor actually ran the turns it
+# was supposed to — deliberately excludes the feedback/fix-cycle calls below,
+# which are not primary turns and would otherwise inflate that count past the
+# journaled signal_accepted total). MODE=cursor-fail exits 1 with the verified
+# stderr-only RetriableError shape and nothing on stdout, to drive the
+# bounded-retry -> sticky-fallback path. MODE=cursor-empty exits 0 with a
+# valid JSON envelope but no session_id (drift, not a CLI failure) — the SAME
+# bounded-retry -> sticky-fallback path, but via invoke_primary's rc==0-but-
+# no-session_id guard rather than a nonzero exit.
+write_cursor_stub() {
+  local mode="${1:-happy}"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'MODE=%q\n' "$mode"
+    printf 'WORK=%q\n' "$WORK"
+    cat <<'STUB'
+has_trust=0; for a in "$@"; do [ "$a" = "--trust" ] && has_trust=1; done
+[ "$has_trust" = "1" ] || { printf 'Error: expected --trust in argv (not the cursor primary?)\n' >&2; exit 1; }
+emit(){ jq -cn --arg s "$1" --arg r "$2" '{type:"result",subtype:"success",is_error:false,result:$r,session_id:$s,usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'; }
+# write_run_feedback and sweep_fix_cycle pipe their prompt on STDIN and pass no
+# positional prompt argv arg; invoke_primary's own cursor calls pass the prompt
+# as the LAST positional argv arg and leave this process's stdin closed/empty
+# (run_engine's own </dev/null redirect below, not anything the engine itself
+# does). Read stdin FIRST, unconditionally — on a primary call `cat` on the
+# closed pipe returns immediately with no content — so the two invocation
+# shapes are told apart without inspecting flags.
+nonprimary_prompt="$(cat)"
+if [ -n "$nonprimary_prompt" ]; then
+  printf '%s\n' "${MODE:-happy}" >> "$WORK/.cursor-nonprimary-calls"
+  case "$nonprimary_prompt" in
+    *'Write 5-15 bullet lines of feedback'*)
+      # $'...' ANSI-C quoting so bash expands \n into REAL newlines before jq
+      # ever sees the string — a plain '...' single-quoted literal would hand
+      # jq's --arg the two characters backslash-n, producing one giant line
+      # that still happens to start with "- " and would slip past
+      # write_run_feedback's `grep -E '^- '` filter as a false pass.
+      emit stubcursorfeedback $'- one\n- two\n- three\n- four\n- five\n- six' ;;
+    *) emit stubcursorfix 'done' ;;
+  esac
+  exit 0
+fi
+# Stage-dispatch mirrors write_stub's primary branch below (LOCKSTEP: any stage
+# case added there must be mirrored here too, and vice versa — see the
+# reciprocal comment on write_stub's own case statement). Planning branches
+# are unreachable in cursor mode (the plan scope always stays on the claude
+# stub) but kept for lockstep/documentation.
+st=.night-shift/state.json; c=.night-shift/control; mkdir -p "$c"; sig="$c/next-action.json"
+stage="$(jq -r '.stage' "$st")"; spec="$(jq -r '.task' "$st")"
+# One line per invocation, keyed on stage (NOT the raw multi-line prompt in
+# "$*" — that would inflate the line count with the prompt's own newlines).
+printf '%s\n' "$stage" >> "$WORK/.cursor-calls"
+# One line per PRIMARY invocation carrying that call's FLAGS, so a scenario can
+# assert what the engine actually passed cursor-agent. The final positional arg
+# (the prompt) is dropped: it is multi-line, so including it would break the
+# one-line-per-call shape every count here depends on. Non-primary callers
+# (write_run_feedback / sweep_fix_cycle) already returned above, so the last arg
+# is always the prompt at this point.
+ns_argv=""; ns_n=$#; ns_i=1
+for a in "$@"; do [ "$ns_i" -lt "$ns_n" ] && ns_argv="$ns_argv $a"; ns_i=$((ns_i + 1)); done
+printf '%s\n' "${ns_argv# }" >> "$WORK/.cursor-argv"
+if [ "$MODE" = "cursor-fail" ]; then
+  printf 'Error: RetriableError: [resource_exhausted]\n' >&2
+  exit 1
+fi
+if [ "$MODE" = "cursor-empty" ]; then
+  # Envelope drift: rc 0 (a clean exit — no stderr, no nonzero status) but the
+  # JSON envelope carries no session_id. invoke_primary must treat this the
+  # same as a cursor invocation failure (routes into the SAME bounded-retry ->
+  # sticky-fallback branch), not the post-loop "primary emitted no resumable
+  # session ID" block_run.
+  jq -cn --arg r "done" '{type:"result",subtype:"success",is_error:false,result:$r,usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'
+  exit 0
+fi
+case "$stage" in
+  planning|plan_review)
+    printf '# Plan\n- create add.js exporting add(a,b)=>a+b.\n' > "$c/plan.md"
+    jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"planning",reason:"plan",artifacts:[]}' > "$sig" ;;
+  implementation|implementation_review)
+    printf 'module.exports.add = (a, b) => a + b;\n' > add.js
+    jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"implementation",reason:"impl",artifacts:[]}' > "$sig" ;;
+  implementation_ready)
+    git add add.js >/dev/null 2>&1; git commit -qm "feat: add() helper" >/dev/null 2>&1
+    jq -cn --arg t "$spec" '{task:$t,
+      baseline:[{command:"node --version",exit_status:0,output:"v"}],
+      test_first:{command:"node --test add.test.js",failing_exit_status:1,failing_output:"red",passing_exit_status:0,passing_output:"green"},
+      final_validation:[{command:"node --version",exit_status:0,output:"v"},{command:"node --test add.test.js",exit_status:0,output:"green"}]}' > "$c/evidence.json"
+    jq -cn --arg t "$spec" '{action:"CREATE_CANDIDATE",task:$t,stage:"implementation_ready",reason:"cand",artifacts:[".night-shift/control/evidence.json"]}' > "$sig" ;;
+  observer_review)
+    jq -cn --arg t "$spec" '{action:"REQUEST_OBSERVER",task:$t,stage:"observer_review",reason:"obs",artifacts:[]}' > "$sig" ;;
+  completion)
+    jq -cn --arg t "$spec" '{action:"COMPLETE",task:$t,stage:"completion",reason:"done",artifacts:[]}' > "$sig" ;;
+  *) jq -cn --arg t "$spec" --arg s "$stage" '{action:"BLOCKED",task:$t,stage:$s,reason:("stub stage "+$s),artifacts:[]}' > "$sig" ;;
+esac
+if [ "$MODE" = "cursor-is-error" ]; then
+  # In-band failure: rc 0 and a COMPLETE envelope (session_id present), but
+  # is_error:true. The stage work and the signal above were done deliberately,
+  # exactly as on the happy path — the is_error flag is then the ONLY thing
+  # separating this turn from a successful one, so a run that ignores it looks
+  # entirely healthy (completes, zero retries, zero fallback) and the scenario
+  # asserting a retry + fallback is what catches the regression.
+  jq -cn --arg r "cursor hit an internal error" \
+    '{type:"result",subtype:"error",is_error:true,result:$r,session_id:"stubcursor",usage:{inputTokens:1,outputTokens:1,cacheReadTokens:0,cacheWriteTokens:0}}'
+  exit 0
+fi
+emit stubcursor "done"; exit 0
+STUB
+  } > "$BIN/cursor-agent"
+  chmod +x "$BIN/cursor-agent"
+}
+
 # Scripted `claude` on PATH: primary (writes stage files + signal), personas,
 # observer — behavior selected by mode (see header).
 write_stub() {
@@ -119,18 +278,35 @@ for a in "$@"; do [ "$a" = "--version" ] && { printf '9.9.9 (Claude Code)\n'; ex
 is_primary=0; for a in "$@"; do [ "$a" = "bypassPermissions" ] && is_primary=1; done
 emit(){ jq -cn --arg s "$1" --arg r "$2" '{session_id:$s,result:$r,total_cost_usd:0,num_turns:1,is_error:false}'; }
 if [ "$is_primary" = "1" ]; then
+  if [ "$MODE" = "no-session" ]; then
+    # Envelope drift on the CLAUDE path: rc 0, valid JSON, no session_id key
+    # at all. No signal is written — invoke_primary must block right after
+    # this single turn via its post-loop "primary emitted no resumable
+    # session ID" check, the same one the cursor rc==0-but-no-session_id
+    # guard defers to on the cursor path.
+    jq -cn --arg r "done" '{result:$r,total_cost_usd:0,num_turns:1,is_error:false}'
+    exit 0
+  fi
   st=.night-shift/state.json; c=.night-shift/control; mkdir -p "$c"; sig="$c/next-action.json"
   stage="$(jq -r '.stage' "$st")"; spec="$(jq -r '.task' "$st")"
   if [ "$MODE" = "malformed" ]; then
     jq -cn --arg t "$spec" '{action:"FLABBERGAST",task:$t,stage:"planning",reason:"nope",artifacts:[]}' > "$sig"
     emit stubprimary "done"; exit 0
   fi
+  # Stage-dispatch is mirrored in write_cursor_stub's own case above (LOCKSTEP:
+  # any stage case added here must be mirrored there too, and vice versa).
   case "$stage" in
     planning|plan_review)
       printf '# Plan\n- create add.js exporting add(a,b)=>a+b.\n' > "$c/plan.md"
       jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"planning",reason:"plan",artifacts:[]}' > "$sig" ;;
     implementation|implementation_review)
       printf 'module.exports.add = (a, b) => a + b;\n' > add.js
+      # Work first, THEN crash: rc 1, no envelope, no signal — the shape that
+      # leaves real uncommitted work behind a failed turn.
+      if [ "$MODE" = "plan-then-impl-fail" ]; then
+        printf 'Error: simulated claude CLI failure\n' >&2
+        exit 1
+      fi
       # Re-entered after an observer BLOCK: append the requested guard line so
       # the second candidate genuinely differs from the blocked one.
       if [ "$MODE" = "block-then-approve" ] && [ -f "$WORK/.obs-count" ]; then
@@ -138,6 +314,11 @@ if [ "$is_primary" = "1" ]; then
       fi
       jq -cn --arg t "$spec" '{action:"RUN_PERSONAS",task:$t,stage:"implementation",reason:"impl",artifacts:[]}' > "$sig" ;;
     implementation_ready)
+      # Rewrite the gate that is about to judge this candidate. $spec is the
+      # run's own spec path, straight out of state.json.
+      if [ "$MODE" = "spec-tamper" ]; then
+        printf -- '\n- Final validation commands (run in this order):\n  1. `true`\n' >> "$spec"
+      fi
       git add add.js >/dev/null 2>&1; git commit -qm "feat: add() helper" >/dev/null 2>&1
       jq -cn --arg t "$spec" '{task:$t,
         baseline:[{command:"node --version",exit_status:0,output:"v"}],
@@ -155,15 +336,22 @@ fi
 p="$(cat)"
 if printf '%s' "$p" | grep -q 'independent Claude observer'; then
   cand="$(printf '%s' "$p" | sed -nE 's/.*Candidate commit: ([0-9a-f]{7,64}).*/\1/p' | head -1)"
+  # Echo back the vendor the prompt itself asked for (observer_prompt interpolates
+  # $expected_primary into the example JSON's "primary" field) rather than
+  # hard-coding "claude" — this is what proves the cursor happy-path scenario's
+  # archived observer verdict genuinely carries primary:"cursor" end to end,
+  # not just a stub that always says claude.
+  pv="$(printf '%s' "$p" | sed -nE 's/.*"primary":"([a-z]+)".*/\1/p' | head -1)"
+  : "${pv:=claude}"
   if [ "$MODE" = "block-then-approve" ]; then
     n="$(cat "$WORK/.obs-count" 2>/dev/null || echo 0)"; n=$((n+1)); printf '%s' "$n" > "$WORK/.obs-count"
     if [ "$n" -eq 1 ]; then
-      emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" '{observer:"claude",primary:"claude",task:"t",candidate_commit:$c,status:"BLOCK",
+      emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" --arg pv "$pv" '{observer:"claude",primary:$pv,task:"t",candidate_commit:$c,status:"BLOCK",
         findings:[{id:"OBS-001",evidence:"add() propagates NaN for non-numeric input",required_change:"guard or document non-numeric input handling in add.js"}],
         documentation_changes:[]}')"; exit 0
     fi
   fi
-  emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" '{observer:"claude",primary:"claude",task:"t",candidate_commit:$c,status:"APPROVE",findings:[],documentation_changes:[]}')"; exit 0
+  emit stubobs "$(jq -cn --arg c "${cand:-abcdef1}" --arg pv "$pv" '{observer:"claude",primary:$pv,task:"t",candidate_commit:$c,status:"APPROVE",findings:[],documentation_changes:[]}')"; exit 0
 fi
 emit stubpersona "$(jq -cn '{persona:"x",stage:"implementation",commit:null,status:"APPROVE",findings:[],documentation_changes:[]}')"; exit 0
 STUB

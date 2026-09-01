@@ -59,15 +59,16 @@ sweep_parse_verdict() {
 # ambiguities, loops, validation friction). Runs unconditionally at completion
 # regardless of BRANCH_SWEEP (see complete_run's call site, which sits before
 # the sweep block). By completion the stage-scoped sessions are already gone,
-# so this is a short FRESH `claude -p` session, same idiom as sweep_run, fed
-# the spec path + the tail of events.jsonl + the review-round count rather
-# than asked to explore the repo itself.
+# so this is a short FRESH implementer-backend session (dispatched on the
+# active backend below, same as invoke_primary), fed the spec path + the tail
+# of events.jsonl + the review-round count rather than asked to explore the
+# repo itself.
 # Every failure mode (no run context, session error, empty/unparsable reply,
 # no bullet lines, an unwritable feedback.md) warns and returns 0 — feedback
 # must never block or delay completion. Guards every run-scoped global with
 # ${VAR:-} (set -u is in effect for the whole orchestrator).
 write_run_feedback() {
-  local project="$1" out feedback model raw rc=0 tail_events round result bullets lines
+  local project="$1" out feedback raw rc=0 tail_events round result bullets lines prompt_text
   [ -n "${RUN_ROOT:-}" ] && [ -n "${SPEC:-}" ] && [ -f "${STATE:-}" ] || {
     log "WARN: run feedback skipped (no run context — RUN_ROOT/SPEC/STATE unset)"
     return 0
@@ -82,12 +83,11 @@ write_run_feedback() {
   tail_events="$(tail -n 200 "$RUN_ROOT/events.jsonl" 2>/dev/null)"
   round="$(jq -r '.review_round // 0' "$STATE" 2>/dev/null)" || round=""
   [ -n "$round" ] || round=0
-  model="$(resolve_effective_model "${IMPLEMENT_MODEL:-sonnet}")"
   raw="$out/session.json"
-  # model_flag intentionally word-splits into `--model X` (or nothing); same
-  # idiom as sweep_run/invoke_observer_once.
-  # shellcheck disable=SC2046
-  (cd "$project" && {
+  # Prompt built once into a variable so both backend branches below pipe the
+  # identical text on stdin (`printf '%s'` — command substitution already
+  # stripped the trailing newline, which the model does not care about).
+  prompt_text="$(
     printf 'Spec: %s\n' "$SPEC"
     printf 'Review rounds completed: %s\n\n' "$round"
     printf 'Write 5-15 bullet lines of feedback for the human who authors specs and\n'
@@ -95,14 +95,32 @@ write_run_feedback() {
     printf 'stages that looped, validation friction, anything a better spec would\n'
     printf 'have prevented. Plain `- ` bullets only, no headings.\n\n'
     printf '## events.jsonl (last 200 lines)\n%s\n' "$tail_events"
-  } | claude -p $(model_flag "$model") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+  )"
+  # Dispatch on the active implementer backend (scripts/lib/implementer.sh):
+  # this session is advisory and read-only-ish (no -f — feedback needs no file
+  # edits), so a cursor failure here takes NO retry/fallback machinery of its
+  # own; it just falls through to the existing "rc != 0" WARN-and-return path
+  # below, same as any other feedback-session failure.
+  if implement_backend_active; then
+    (cd "$project" && printf '%s' "$prompt_text" |
+      cursor-agent -p --output-format json --model "$CURSOR_IMPLEMENT_MODEL" --trust) >"$raw" 2>"$raw.err" || rc=$?
+  else
+    # model computed only on this branch — the cursor branch above passes its
+    # own $CURSOR_IMPLEMENT_MODEL and never reads it, so resolving it up front
+    # for both branches was dead work on the cursor path.
+    # model_flag intentionally word-splits into `--model X` (or nothing); same
+    # idiom as sweep_run/invoke_observer_once.
+    # shellcheck disable=SC2046
+    (cd "$project" && printf '%s' "$prompt_text" |
+      claude -p $(model_flag "$(resolve_effective_model "${IMPLEMENT_MODEL:-sonnet}")") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+  fi
   if [ "$rc" -ne 0 ]; then
     log "WARN: run feedback session failed (rc=$rc; see $raw.err)"
     return 0
   fi
   result="$(jq -r '.result // empty' "$raw" 2>/dev/null)"
   [ -n "$result" ] || {
-    log "WARN: run feedback skipped (empty/unparsable claude reply, see $raw)"
+    log "WARN: run feedback skipped (empty/unparsable model reply, see $raw)"
     return 0
   }
   bullets="$(printf '%s\n' "$result" | grep -E '^- ')"
@@ -290,26 +308,47 @@ sweep_revalidate_isolated() {
 # "SWEEP_FINDINGS" — SWEEP_PASS (nothing to fix) and SWEEP_ERROR (nothing
 # coherent to fix; the session itself failed) both fall through untouched.
 sweep_fix_cycle() {
-  local project="$1" out="$2" tip_before vcmds cycles=0
+  local project="$1" out="$2" tip_before vcmds cycles=0 fix_prompt
   [ "$(cat "$out/verdict.txt" 2>/dev/null)" = "SWEEP_FINDINGS" ] || return 0
   while [ "$cycles" -lt "$SWEEP_MAX_FIX" ]; do
     cycles=$((cycles + 1))
     tip_before="$(git -C "$project" rev-parse HEAD)"
     # The fix session's own exit status is not the gate — re-validation below
     # is (a session that "succeeds" but leaves the build red is caught the
-    # same as one that crashes outright; both revert). model_flag intentionally
-    # word-splits, same idiom as sweep_run/invoke_observer_once. --add-dir "$out"
-    # for the same reason as sweep_run: $out sits outside $project, and this
-    # session may need to consult other sweep artifacts alongside the findings
-    # already piped into its prompt (e.g. package.diff for fuller context).
-    # shellcheck disable=SC2046
-    (cd "$project" && {
+    # same as one that crashes outright; both revert). --add-dir "$out" for
+    # both backends for the same reason as sweep_run: $out sits outside
+    # $project, and this session may need to consult other sweep artifacts
+    # alongside the findings already piped into its prompt (e.g. package.diff
+    # for fuller context) — cursor-agent takes the same --add-dir flag
+    # (verified in `cursor-agent --help`, build 2026.08.25-3e8eec8: "--add-dir
+    # <path>  Add an additional workspace root directory (can be specified
+    # multiple times)").
+    fix_prompt="$(
       printf 'Fix ONLY the findings below on the current branch. Commit in\n'
       printf 'logical chunks. Run the covering tests for what you change.\n\n'
       cat "$out/findings.md"
-    } | claude -p $(model_flag "$(resolve_effective_model "$IMPLEMENT_MODEL")") \
-      --add-dir "$out" --permission-mode acceptEdits --output-format json) \
-      >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
+    )"
+    # Dispatch on the active implementer backend (scripts/lib/implementer.sh).
+    # This session edits (-f for cursor; acceptEdits for claude), so unlike
+    # write_run_feedback above a cursor failure here is not merely advisory —
+    # but it still gets NO retry/fallback machinery of its own: the existing
+    # gate below (dirty-tree check, then isolated re-validation) already
+    # `git reset --hard`s back to the pre-fix tip on any failure, cursor
+    # crashes and stalls included, so degrading through that gate is
+    # sufficient without duplicating invoke_primary's cursor retry/fallback.
+    if implement_backend_active; then
+      (cd "$project" && printf '%s' "$fix_prompt" |
+        cursor-agent -p --output-format json --model "$CURSOR_IMPLEMENT_MODEL" --trust -f --add-dir "$out") \
+        >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
+    else
+      # model_flag intentionally word-splits, same idiom as
+      # sweep_run/invoke_observer_once.
+      # shellcheck disable=SC2046
+      (cd "$project" && printf '%s' "$fix_prompt" |
+        claude -p $(model_flag "$(resolve_effective_model "$IMPLEMENT_MODEL")") \
+        --add-dir "$out" --permission-mode acceptEdits --output-format json) \
+        >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
+    fi
     emit_event sweep_fix "$(jq -cn --argjson c "$cycles" '{cycle:$c}')"
     # The fix session must commit everything it changed. A dirty tree here
     # (uncommitted edits or untracked files) means re-validation below — which
@@ -331,6 +370,13 @@ sweep_fix_cycle() {
     # cleanly. Revalidation is in-run-only; --sweep-only never revalidates.
     vcmds=""
     if [ -n "${SPEC:-}" ] && [ -n "${RUN_ROOT:-}" ]; then
+      # Same trust point as verify_candidate's final-validation re-read, for the
+      # same reason: the fix session above just had unattended write access to
+      # the workspace, and these commands decide whether its commits survive.
+      # Re-reading the spec here without the guard left the identical weakening
+      # vector open on this path. Anchored in initialize_run / recover_run /
+      # start_next_task; unreachable from --sweep-only (no RUN_ROOT).
+      integrity_guard "$SPEC" spec "the spec whose Final validation commands gate the sweep fix cycle"
       vcmds="$(extract_validation_commands "$SPEC" "Final validation commands")"
     fi
     # Isolated (worktree) re-validation + smoke re-run at the fixed tip — parity

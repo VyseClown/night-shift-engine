@@ -48,7 +48,7 @@ is not a git repo.
     docs/
       review-personas.md     ← rn-track + the 4 optional cross-track personas
       review-personas-web.md ← web-track review personas and their checklists
-      dev-environment.md / codex-cli-setup.md / terminal-setup.md ← env setup
+      dev-environment.md / codex-cli-setup.md / cursor-cli-setup.md / terminal-setup.md ← env setup
   rn-sandbox/ web-app/ water-tracker-app/ nightshift-demo/ ← project repos, siblings (own repos)
   night-shift-viewer/ ← read dashboard + gated launcher + gated spec editor (own repo;
                         spawns the engine's scripts/night-shift.sh — see its WORKFLOW.md)
@@ -95,7 +95,14 @@ is not a git repo.
 
 - **Specs** define scope, permissions, acceptance criteria, validation, tests,
   repository routing, and documentation ownership. Selected incomplete specs
-  are blockers, not prompts to guess.
+  are blockers, not prompts to guess. A spec is **integrity-anchored for the
+  duration of its run** (anchored at run init, at `--resume`, and when
+  `NEXT_TASK` swaps in the next spec; guarded before every re-read of its
+  `Final validation commands` — at candidate time and in the sweep fix cycle's
+  re-validation). Editing a spec **while its run is
+  live** therefore blocks that run — the edit is quarantined under `raw/`, the
+  engine's copy is restored, and `integrity_violation` is journaled. Editing
+  between a block and a `--resume` is fine and expected: recovery re-anchors.
 - **`TODO.md`** is the task queue. Unfinished bug entries precede features.
   Every entry points to a spec.
 - **`CHANGELOG.md`** records completed changes after validation and review.
@@ -188,6 +195,14 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project PATH --spec specs/
   the wrapper waits until the reported reset time plus a safety buffer, pauses
   its elapsed-time budgets, and resumes the same explicit stage session.
   Other API failures still stop via `block_run`. Nothing is pushed or merged.
+- **Resuming a logic-blocked run.** `--resume` re-enters it, including when it
+  blocked with **no pinned session** — normal under the default
+  `NIGHT_SHIFT_SESSION_SCOPE=stage`, where the stage restarts from the files on
+  disk (`=run` still refuses; the refusal names the failed precondition). A run
+  that took the cursor backend's sticky fallback resumes under either
+  `NIGHT_SHIFT_IMPLEMENT_BACKEND` value and with `cursor-agent` gone. Never
+  hand-edit `.night-shift/state.json` — it is integrity-anchored, so the edit
+  blocks the run instead of unsticking it.
 - **Reviewing a whole branch before merge?** See `docs/COMMAND-PLAYBOOK.md`
   §10 (`scripts/night-shift.sh --sweep-only --project <path>`).
 
@@ -319,6 +334,16 @@ design-fidelity work (Flow B) and bumps to `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL`
 (default `opus`). The model changes only at stage-scope boundaries (which already
 start a fresh session), so it is constant within a scope and resumes never re-pass
 it. Set any model knob to `inherit` to use the CLI's startup model.
+
+Opt-in second implementer vendor: `NIGHT_SHIFT_IMPLEMENT_BACKEND` (default
+`claude`) set to `cursor` runs the primary's post-plan scopes on the Cursor
+CLI instead — `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` (default
+`cursor-grok-4.6-high`) is the model slug, and `NIGHT_SHIFT_CURSOR_MAX_RETRIES`
+(default `3`), `NIGHT_SHIFT_CURSOR_RETRY_BACKOFF` (default `30`) and
+`NIGHT_SHIFT_CURSOR_MAX_WAIT` (default `600`, the ceiling on one turn's total
+retry backoff) bound the retry-then-sticky-Claude-fallback path. Plan, personas,
+the observer, and any `## Design Contract` spec always stay Claude. See
+`docs/cursor-cli-setup.md`.
 
 **Optional reviewers** (cross-track, off by default): Product Reviewer, Design
 Fidelity Reviewer, Security Reviewer, API Contract Reviewer. A spec opts in via an

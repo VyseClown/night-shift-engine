@@ -41,6 +41,7 @@ that silently breaks).
 | `NIGHT_SHIFT_OBSERVER_MODEL` | Strongest available. Never weaker than the implement model. |
 | `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` | Strongest available for design-contract work; `sonnet` for cosmetic-only specs. |
 | `NIGHT_SHIFT_SWEEP_MODEL` | Strongest available — whole-branch judgment; defaults to the observer model. |
+| `NIGHT_SHIFT_IMPLEMENT_BACKEND` | `claude` (default). Opt-in `cursor` runs post-plan implement work on `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` (default `cursor-grok-4.6-high`); plan/observer/design stay strongest-available Claude regardless. Never for money-math or engine-safety specs without an explicit call. |
 
 Spec-type adjustments: scratch/demo targets (`nightshift-demo`, throwaway
 specs) run everything on `sonnet` — never spend judgment-tier budget there.
@@ -158,8 +159,15 @@ directory; run engine/workflow git inside the engine directory.
   `events.jsonl`): `sweep` (branch-sweep verdict), `sweep_fix` /
   `sweep_fix_reverted` (fix-cycle round + deterministic revert, the latter
   carrying a `reason` of `dirty_tree` or a failed re-validation), `run_feedback`
-  (feedback entry appended), and `smoke` (smoke-phase result). All are advisory;
-  none gates a run.
+  (feedback entry appended), `smoke` (smoke-phase result), and — from the
+  cursor implementer backend — `backend_retry` (a failed cursor turn retrying),
+  `backend_fallback` (sticky per-run fallback to Claude, its `reason` naming
+  whether the retry count or the `NIGHT_SHIFT_CURSOR_MAX_WAIT` backoff ceiling
+  fired) and `contract_canary {contract:"cursor-cli"}` (the installed
+  `cursor-agent` build, journaled on every cursor-backend startup — on a match
+  too, so each run's journal pins the build behind it). All are advisory; none
+  gates a run. Not advisory: `integrity_violation` now also fires with
+  `label:"spec"` when the spec changes mid-run, and that one blocks.
 - **Codex second opinion (opt-in, default OFF):** `NIGHT_SHIFT_CODEX_REVIEW=1`
   adds one bounded `codex exec -s read-only` advisory review per candidate
   (gpt-5.5 via the Codex CLI), handed to the observer as supplementary,
@@ -235,6 +243,15 @@ directory; run engine/workflow git inside the engine directory.
   repair agent honors the spec's `## Design Contract` + `## Design source` sections — so
   design details a flat image misses (e.g. a ring built from two layered wave nodes) are
   stated in the spec you edit and backed by the complete node tree.
+- **Ad-hoc visual comparison (no capture):** `scripts/visual-compare.sh --manifest
+  <pairs.json> --run-dir <runDir> [--name <report>]` pixel-diffs EXISTING image pairs
+  (e.g. responsive-web screenshots vs native sim captures for a design review) and
+  writes a standard `visual-diff-<name>.json` + assets into the run's `validated/`,
+  so the viewer's Visual-validation panel renders reference|candidate|diff + diff%
+  with zero viewer changes. Reuses `__visual_pixel_diff` (odiff parsing + resize
+  edge cases); `diff_pct` is the contract's 0–1 fraction; per-pair
+  `tolerance`/`device`/`analysis` overrides in the manifest (see the script header
+  for the manifest shape). Requires `odiff` + `jq`; no simulator, no Figma.
 
 > For **parallel** visual_review across worktrees, set `NIGHT_SHIFT_DEVICE_REGISTRY=1`
 > (the `scripts/parallel-worktrees.sh` wrapper sets it automatically for `--jobs>1`). Each

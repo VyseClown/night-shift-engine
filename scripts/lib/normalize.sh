@@ -120,6 +120,12 @@ normalize_persona_result() {
 # verdict, which fails-open toward "no findings"). We cannot instead use the CLI's
 # --json-schema to force a clean shape: in this CLI it waits on stdin and hangs
 # (see run_observer). Bias: fail-closed on BLOCK, never fabricate an APPROVE.
+#
+# primary_vendor (4th arg, default "claude") is the wire contract's expected
+# `primary` value — the vendor that actually produced the candidate
+# (candidate_primary_vendor, lib/implementer.sh) — NOT a hard-coded "claude".
+# The default keeps every claude-only call site (and every existing fixture
+# call passing 3 args) unchanged.
 normalize_observer_output() {
   local file="$1" task="$2" candidate="$3" primary="${4:-claude}" tmp="$1.norm.$$"
   jq --arg task "$task" --arg candidate "$candidate" --arg primary "$primary" "${JQ_VERDICT_PRELUDE}"'

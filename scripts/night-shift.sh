@@ -45,6 +45,14 @@ RATE_LIMIT_BUFFER_SECONDS="${NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS:-60}"
 # logs a warning (never blocks) reminding to re-verify the capture. Bump this
 # after re-verifying against a real 429 on a newer CLI.
 RATE_LIMIT_CONTRACT_CLI_VERSION="2.1.202"
+# The cursor-agent build the cursor backend's CLI contract was last verified
+# against (headless JSON envelope + --resume live-probed on 2026.08.11-e8db854,
+# specs/cursor-implementer-backend.md; status/--list-models/--help flag
+# surfaces incl. --add-dir re-verified on this build). Envelope drift cannot be
+# re-proven without a paid call, so cursor_contract_canary is a version
+# tripwire: a differing installed CLI logs a warning (never blocks) reminding
+# to re-verify the contract. Bump this after re-verifying on a newer CLI.
+CURSOR_CONTRACT_CLI_VERSION="2026.08.25-3e8eec8"
 # Sanity ceiling on a rate-limit wait. A genuine session limit resets within a
 # few hours; a wait longer than this almost certainly means the reset time was
 # misparsed, so we block for manual resume instead of sleeping for ~a day.
@@ -140,6 +148,33 @@ SWEEP_MAX_WAIT="${NIGHT_SHIFT_SWEEP_MAX_WAIT:-900}"
 # pipeline and wire contracts are untouched either way.
 CODEX_REVIEW="${NIGHT_SHIFT_CODEX_REVIEW:-0}"
 CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
+# Opt-in second implementer vendor (scripts/lib/implementer.sh): "cursor" runs
+# the primary's POST-PLAN scopes (implement, observe-request, completion — and
+# the sweep fix + run-feedback sessions) on the Cursor CLI (cursor-agent) with
+# CURSOR_IMPLEMENT_MODEL. Plan, personas, the observer, and any ## Design
+# Contract spec stay Claude. Cursor failures retry CURSOR_MAX_RETRIES times
+# (backoff CURSOR_RETRY_BACKOFF * attempt seconds), then the run falls back to
+# the Claude implement model for the rest of the run (journaled, sticky) —
+# that retry/fallback machinery belongs ONLY to the primary turn loop
+# (invoke_primary): the sweep fix cycle and run-feedback sessions dispatch on
+# the same backend but degrade through their own paths instead (a dirty-tree/
+# failed-revalidation `git reset --hard` for the fix cycle, a plain WARN for
+# feedback) — see sweep.sh's write_run_feedback/sweep_fix_cycle comments.
+IMPLEMENT_BACKEND="${NIGHT_SHIFT_IMPLEMENT_BACKEND:-claude}"
+CURSOR_IMPLEMENT_MODEL="${NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL:-cursor-grok-4.6-high}"
+CURSOR_MAX_RETRIES="${NIGHT_SHIFT_CURSOR_MAX_RETRIES:-3}"
+CURSOR_RETRY_BACKOFF="${NIGHT_SHIFT_CURSOR_RETRY_BACKOFF:-30}"
+# Sanity ceiling on the TOTAL backoff one primary turn may spend retrying
+# cursor-agent, the cursor twin of SWEEP_MAX_WAIT above: MAX_RETRIES and
+# RETRY_BACKOFF are each validated as non-negative integers with no ceiling, so
+# their product is unbounded (5 retries x 3600s backoff = over 13 hours of
+# sleep inside ONE turn, with no elapsed check between the sleeps — every other
+# wait in the engine is capped). Once the NEXT sleep would push this turn's
+# cumulative backoff past this many seconds, invoke_primary stops retrying and
+# takes the sticky claude fallback immediately, logging which limit stopped it.
+# The fallback is the whole point: an unreachable cursor must cost the night a
+# bounded delay, not the night.
+CURSOR_MAX_WAIT="${NIGHT_SHIFT_CURSOR_MAX_WAIT:-600}"
 # Codex as an IMPLEMENT-stage primary vendor (engine + Codex split design,
 # 2026-07-29): opt-in per spec via `- Engines: implement=codex`, validated at
 # spec selection (validate_spec_engines). These three knobs configure that
@@ -164,6 +199,8 @@ CODEX_TIMEOUT="${NIGHT_SHIFT_CODEX_TIMEOUT:-300}"
 #   CODEX_MAX_RETRY: bounded retries (60s apart, codex_retry_backoff) on a
 #     nonzero exit before block_run. No Claude-shaped 429 parsing in v1 (see
 #     the design doc) — a codex failure is just a failure, retried blindly.
+# A spec's `- Engines: implement=codex` wins over NIGHT_SHIFT_IMPLEMENT_BACKEND
+# for the implement scope (the spec is the executable contract).
 CODEX_SANDBOX="${NIGHT_SHIFT_CODEX_SANDBOX:-danger-full-access}"
 CODEX_IMPLEMENT_MODEL="${NIGHT_SHIFT_CODEX_IMPLEMENT_MODEL:-}"
 CODEX_MAX_RETRY="${NIGHT_SHIFT_CODEX_MAX_RETRY:-2}"
@@ -247,6 +284,11 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # Engine-private integrity anchor for wrapper-owned files. See scripts/lib/integrity.sh.
 # shellcheck source=scripts/lib/integrity.sh
 . "$NIGHT_SHIFT_LIB/integrity.sh"
+# Opt-in second implementer vendor (NIGHT_SHIFT_IMPLEMENT_BACKEND). See
+# scripts/lib/implementer.sh. Sourced BEFORE sweep.sh: sweep_fix_cycle and
+# write_run_feedback dispatch on implement_backend_active.
+# shellcheck source=scripts/lib/implementer.sh
+. "$NIGHT_SHIFT_LIB/implementer.sh"
 # End-of-run whole-branch sweep (NIGHT_SHIFT_BRANCH_SWEEP). See scripts/lib/sweep.sh.
 # shellcheck source=scripts/lib/sweep.sh
 . "$NIGHT_SHIFT_LIB/sweep.sh"
@@ -307,7 +349,9 @@ Runs use
 explicit session IDs, local candidate commits, per-profile persona approvals, and
 observer approval. Live fixture tests make paid Claude calls;
 full six-persona live coverage requires --full-persona-live-test and
-NIGHT_SHIFT_ACCEPT_COSTS=YES. (--primary is accepted only as claude.)
+NIGHT_SHIFT_ACCEPT_COSTS=YES. (--primary is accepted only as claude;
+NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor optionally runs post-plan implement
+turns on cursor-agent/grok.)
 EOF
 }
 
@@ -476,7 +520,7 @@ json_schema_basic() {
       jq -e --argjson okeys "$OBSERVER_REVIEW_KEYS" --arg primary_vendor "$(stage_engine implement)" '
         type == "object" and
         ((keys | sort) == $okeys) and
-        (.observer == "claude") and (.primary == $primary_vendor) and
+        (.observer == "claude") and (.primary | IN("claude","cursor","codex")) and
         (.task | type == "string" and length > 0) and
         (.candidate_commit | type == "string" and test("^[0-9a-f]{7,64}$")) and
         (.status | IN("APPROVE","BLOCK")) and
@@ -762,18 +806,21 @@ bump_finding_history() {
   jq -r '[to_entries[].value.count] | max // 0' "$history"
 }
 
-# Append a finished turn's cost to the run's incremental ledger. The raw claude
-# JSON is the only source of total_cost_usd/usage, so record it the instant the
-# turn completes rather than re-reading raw files at archive time — a costly turn
-# (notably the opus observer) is then never lost to a raw file that has since been
-# rewritten, retried, or cleaned. A raw without total_cost_usd (rate-limit partial,
-# non-JSON) contributes nothing and is not fatal.
+# Append a finished turn's cost to the run's incremental ledger. The raw
+# implementer-backend JSON is the only source of total_cost_usd/usage, so record
+# it the instant the turn completes rather than re-reading raw files at archive
+# time — a costly turn (notably the opus observer) is then never lost to a raw
+# file that has since been rewritten, retried, or cleaned. A raw with neither
+# total_cost_usd nor usage (rate-limit partial, non-JSON) contributes nothing
+# and is not fatal. The cursor-agent envelope carries usage token fields but no
+# total_cost_usd, so a row is still recorded (with total_cost_usd:null) rather
+# than the turn vanishing from the ledger entirely.
 record_cost() {
   local raw="$1" source="$2"
   [ -f "$raw" ] || return 0
   jq -c --arg source "$source" \
-    'select(type == "object" and has("total_cost_usd")) |
-     {source: $source, total_cost_usd, num_turns: (.num_turns // null), usage: (.usage // null)}' \
+    'select(type == "object" and (has("total_cost_usd") or has("usage"))) |
+     {source: $source, total_cost_usd: (.total_cost_usd // null), num_turns: (.num_turns // null), usage: (.usage // null)}' \
     "$raw" >>"$RUN_ROOT/cost-ledger.jsonl" 2>/dev/null || true
 }
 
@@ -824,7 +871,7 @@ compact_success() {
     # the same file in one pipeline (jq ... "$ledger" >>"$ledger") has undefined
     # ordering and could silently drop the row. The append is best-effort.
     local total_tmp="$ledger.total.$$"
-    if jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd) | add), records: length}' \
+    if jq -sc '{source: "TOTAL", total_cost_usd: (map(.total_cost_usd // 0) | add), records: length}' \
       "$ledger" >"$total_tmp" 2>/dev/null; then
       cat "$total_tmp" >>"$ledger"
     fi
@@ -980,15 +1027,25 @@ initialize_run() {
       plan_approved:false,implementation_approved:false,
       candidate_verified:false,baseline_complete:false,
       stage_counters:{planning:0},stage_started:{planning:$epoch},
-      malformed_signal_consecutive:0
+      malformed_signal_consecutive:0,implement_backend:$backend
     }' \
     --arg run_id "$RUN_ID" --arg primary "$PRIMARY" --arg observer "$OBSERVER" \
     --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" \
     --arg task "$SPEC" --argjson epoch "$(now_epoch)" --arg iso "$(now_iso)" \
     --arg base "$BASE_COMMIT" --arg branch "$BASE_BRANCH" \
-    --arg baseline_status "$BASE_STATUS" ||
+    --arg baseline_status "$BASE_STATUS" --arg backend "$IMPLEMENT_BACKEND" ||
     die "could not initialize run state"
   integrity_put "$STATE"
+  # Anchor the SPEC itself (vendor-neutral). The spec is not wrapper-owned the
+  # way state.json is — a human authored it — but the engine re-reads it at
+  # CANDIDATE time for the "Final validation commands" that judge the work
+  # (verify_candidate), and the primary has unattended write access to the
+  # whole workspace in between. An implementer that "updates the spec to match
+  # what it built" would then weaken the very gate judging it, silently, with
+  # no diff to show for it if the edit is uncommitted. Anchored here, guarded
+  # there. integrity_key uses the basename for out-of-RUN_ROOT files, so each
+  # chained task's spec gets its own key.
+  integrity_put "$SPEC"
   # Journal the moment the run exists: run_started only fires after the
   # minutes-long baseline gate below, so a run blocked during baseline would
   # otherwise leave a journal that starts mid-story. Also the one event that
@@ -1030,8 +1087,11 @@ initialize_run() {
   state_set '.baseline_complete=true'
   emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
     --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
+    --arg backend "$IMPLEMENT_BACKEND" --arg cursor "$CURSOR_IMPLEMENT_MODEL" \
     --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" \
-    '{spec:$spec, base:$base, models:{plan:$plan, implement:$impl, personas:$pers, observer:$obs},
+    '{spec:$spec, base:$base,
+      models: ({plan:$plan, implement:$impl, personas:$pers, observer:$obs,
+        implement_backend:$backend} + (if $backend == "cursor" then {cursor_model:$cursor} else {} end)),
       engines:{implement:$engine_implement, review:($engine_review|if .=="" then null else . end)}}')"
 }
 
@@ -1070,11 +1130,37 @@ recover_run() {
   fi
   [ "$(jq -r '.primary' "$STATE")" = "$PRIMARY" ] ||
     die "existing run belongs to primary $(jq -r '.primary' "$STATE")"
+  # // "claude" default: state written before this field existed (old runs)
+  # stays recoverable as claude, matching the backend that actually ran it.
+  local stored_backend fell_back
+  stored_backend="$(jq -r '.implement_backend // "claude"' "$STATE")"
+  fell_back="$(jq -r '.implement_backend_fallback // empty' "$STATE")"
+  if [ "$stored_backend" != "$IMPLEMENT_BACKEND" ] && [ "$fell_back" = "claude" ]; then
+    # The run already took the sticky fallback: every remaining turn is claude,
+    # and it needs cursor-agent for NOTHING. Demanding the original
+    # NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor here would send the operator back
+    # through the cursor availability/auth guards — and expired cursor auth is
+    # the very thing that usually CAUSED the fallback, so the demand is
+    # circular and strands the night's committed work behind a tree too dirty
+    # for a bare relaunch. (The flag can only be set on a run whose stored
+    # backend was cursor, so this relaxation is exactly cursor -> claude.)
+    log "recovery: this run already fell back to claude (.implement_backend_fallback); accepting NIGHT_SHIFT_IMPLEMENT_BACKEND=$IMPLEMENT_BACKEND instead of the stored $stored_backend — nothing left in the run uses cursor-agent"
+  else
+    [ "$stored_backend" = "$IMPLEMENT_BACKEND" ] ||
+      die "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend; relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend to resume it (got $IMPLEMENT_BACKEND)"
+  fi
   RUN_ID="$(jq -r '.run_id' "$STATE")"
   SPEC="$(jq -r '.task' "$STATE")"
   set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
   validate_spec_smoke "$SPEC" || die "resumed spec Smoke field is invalid"
   validate_spec_engines "$SPEC" || die "resumed spec Engines field is invalid"
+  # RE-anchor the spec (never guard it here): between a block and an operator's
+  # --resume the human is expected to have edited the spec — that is often the
+  # whole point of resuming — and the anchor exists to catch the IMPLEMENTER
+  # rewriting the gate mid-turn, not to freeze the operator out. Same posture
+  # as the conventions snapshot, whose anchor dir is per-RUN_ID, so a different
+  # run can never be wedged by an edit made for this one.
+  integrity_put "$SPEC"
   OBSERVER="$(jq -r '.observer' "$STATE")"
   BASE_COMMIT="$(jq -r '.base_commit' "$STATE")"
   BASE_BRANCH="$(jq -r '.base_branch' "$STATE")"
@@ -1082,7 +1168,16 @@ recover_run() {
   [ -f "$BASE_STATUS" ] || die "recorded baseline status is missing: $BASE_STATUS"
   cleanup_validation_worktree ||
     die "could not clean the interrupted candidate validation worktree"
-  log "recovering run $RUN_ID at stage $(jq -r '.stage' "$STATE") with explicit session $(jq -r '.session_id' "$STATE")"
+  # A null session here is normal under SESSION_SCOPE=stage (a scope boundary,
+  # a session refresh, or the cursor backend's sticky fallback all null it):
+  # invoke_primary reads .session_id fresh and takes its no-session branch, so
+  # the next turn starts a FRESH session with the file-handoff prompt — it
+  # never passes an empty --resume. Say which of the two it will be.
+  if [ -n "$(jq -r '.session_id // empty' "$STATE")" ]; then
+    log "recovering run $RUN_ID at stage $(jq -r '.stage' "$STATE") with explicit session $(jq -r '.session_id' "$STATE")"
+  else
+    log "recovering run $RUN_ID at stage $(jq -r '.stage' "$STATE") with no pinned session; the next primary turn starts fresh and reorients from the files on disk"
+  fi
   if [ "$resume_block" -eq 1 ]; then
     # Operator-initiated --resume of a logic-blocked run: clear the block and rebase
     # the clocks. plan/implementation approvals and the recorded stage are kept, so
@@ -1440,14 +1535,27 @@ primary_prompt() {
   local prompt="$1" stage turns remaining persona_list persona_count active
   local review_stage_name pending pending_stage review_set reround_note
   local session primary_turns handoff_note design_build_note spec_base expected
-  local rejection_note malformed_prev doc_freshness_note turn_vendor
+  local rejection_note malformed_prev doc_freshness_note vendor turn_vendor opener_vendor
   stage="$(jq -r '.stage' "$STATE")"
+  # The vendor that executes THIS turn, for the opener below: the live scope
+  # backend, not $PRIMARY (hard-pinned "claude") and not
+  # candidate_primary_vendor (which attributes the CANDIDATE — its sticky
+  # .implement_backend_used marker keeps saying "cursor" after a mid-candidate
+  # fallback, exactly when this prompt is being rebuilt FOR a claude session).
+  # After a fallback the state flag is already set, so the rebuilt prompt
+  # correctly resolves to claude. On the claude backend this equals $PRIMARY,
+  # keeping the prompt byte-identical to the pre-backend engine.
+  vendor="$(implement_scope_backend "$(stage_session_scope "$stage")")"
   expected="$(expected_action "$stage")"
   # The vendor actually running THIS turn — claude for every scope except an
   # implement scope a spec opted into codex (stage_engine). Told to the model
   # honestly rather than always saying "claude", which would be wrong (and
   # confusing) for a codex implement session.
   turn_vendor="$(stage_engine "$(stage_session_scope "$stage")")"
+  # Spec `- Engines: implement=codex` wins over the env cursor knob for this
+  # turn's opener so the model is told the vendor that will actually run.
+  opener_vendor="$vendor"
+  [ "$turn_vendor" = "codex" ] && opener_vendor="codex"
   turns="$(jq -r '.stage_turns' "$STATE")"
   remaining=$((MAX_STAGE_TURNS - turns))
   active="$(resolve_active_personas "$SPEC")" || block_run "cannot resolve review profile for $SPEC"
@@ -1555,7 +1663,7 @@ screen to match its Figma design. Before/while implementing:
   [ -z "${WORKDIR:-}" ] ||
     workdir_note="Workdir: run ALL spec validation/test commands from $PROJECT/$WORKDIR (the engine runs its own copies there too)."
   cat >"$prompt" <<EOF
-You are the fixed $turn_vendor primary for night-shift run $RUN_ID.
+You are the fixed $opener_vendor primary for night-shift run $RUN_ID.
 Project: $PROJECT
 Task spec: $SPEC
 Current stage: $stage
@@ -1787,7 +1895,11 @@ invoke_primary() {
     block_run "could not read .primary_turns from state; state may be corrupt"
   prompt="$RUN_ROOT/prompts/primary-$turn.txt"
   raw="$RUN_ROOT/raw/primary-$turn.json"
-  local session emitted rc model
+  local session emitted rc model backend scope engine cursor_attempts=0
+  # Cursor retry accounting, per TURN (both reset by the next invoke_primary
+  # call): attempts against CURSOR_MAX_RETRIES, and seconds already slept
+  # against the CURSOR_MAX_WAIT ceiling.
+  local cursor_backoff=0 cursor_backoff_total=0 cursor_fb_reason=""
   # The consecutive 429-without-success counter now lives entirely in
   # handle_rate_limit_wait (lib/recovery.sh): persisted in state so recovery
   # after a crash picks up the count; reset to 0 on the first clean turn below.
@@ -1796,8 +1908,20 @@ invoke_primary() {
   session="$(jq -r '.session_id // empty' "$STATE")"
   session="$(maybe_refresh_session "$session")"
   primary_prompt "$prompt"
-  engine="$(stage_engine "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")"
+  # Model for this stage's scope, pinned only on a FRESH start. A session is born
+  # inside one scope and the model is constant within a scope (a scope boundary
+  # already nulls .session_id and starts a fresh session), so a --resume — whether
+  # a turn-to-turn continue, a rate-limit retry, or recovery of a blocked run —
+  # already carries its creation model and must NOT re-pass --model. This keeps
+  # resume robust regardless of whether the CLI accepts --model alongside --resume.
+  # resolve_effective_model maps the knob through state's .model_fallbacks (a
+  # per-model 429 fallback recorded earlier in the run under
+  # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
+  scope="$(stage_session_scope "$(jq -r '.stage' "$STATE")")"
+  model="$(resolve_effective_model "$(stage_model "$scope")")"
+  backend="$(implement_scope_backend "$scope")"
   log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
+  engine="$(stage_engine "$scope")"
   if [ "$engine" = "codex" ]; then
     # Bounded retry lives inside invoke_primary_codex; a successful call
     # prints a non-empty thread id, so the only thing left to check below is
@@ -1809,61 +1933,180 @@ invoke_primary() {
     # at "$raw.block-reason". This is the ONLY block_run call on the codex
     # exhaustion path; a missing reason file (should not happen, but fails
     # safe) falls back to a generic message naming $raw for forensics.
+    # A spec's `- Engines: implement=codex` wins over NIGHT_SHIFT_IMPLEMENT_BACKEND.
     emitted="$(invoke_primary_codex "$prompt" "$raw" "$session")" ||
       block_run "$(cat "$raw.block-reason" 2>/dev/null || printf 'codex primary failed; see %s.err' "$raw")"
   else
-    # Model for this stage's scope, pinned only on a FRESH start. A session is born
-    # inside one scope and the model is constant within a scope (a scope boundary
-    # already nulls .session_id and starts a fresh session), so a --resume — whether
-    # a turn-to-turn continue, a rate-limit retry, or recovery of a blocked run —
-    # already carries its creation model and must NOT re-pass --model. This keeps
-    # resume robust regardless of whether the CLI accepts --model alongside --resume.
-    # resolve_effective_model maps the knob through state's .model_fallbacks (a
-    # per-model 429 fallback recorded earlier in the run under
-    # NIGHT_SHIFT_MODEL_FALLBACK=1); identity when no fallback is recorded.
-    model="$(resolve_effective_model "$(stage_model "$(stage_session_scope "$(jq -r '.stage' "$STATE")")")")"
-    while :; do
-      rc=0
-      # The primary must edit files and run commands unattended, so it runs in a
-      # non-interactive permission mode. Safe because the run is confined to a
-      # feature branch and the wrapper forbids push/merge/destructive Git ops and
-      # excludes pre-existing dirt from candidate commits.
+  while :; do
+    rc=0
+    # The primary must edit files and run commands unattended, so it runs in a
+    # non-interactive permission mode. Safe because the run is confined to a
+    # feature branch and the wrapper forbids push/merge/destructive Git ops and
+    # excludes pre-existing dirt from candidate commits.
+    if [ "$backend" = "cursor" ]; then
+      # Cursor implementer (specs/cursor-implementer-backend.md): same prompt,
+      # same session invariants, cursor envelope. stderr MUST go to a file —
+      # cursor errors are stderr-only prose with no JSON on stdout. -f allows
+      # commands (the bypassPermissions analogue); --trust skips the headless
+      # workspace-trust hard-fail. --model only on a fresh start (a --resume
+      # carries its creation model, same rule as the Claude branch).
+      # --add-dir "$WORKSPACE_ROOT": primary_prompt orders reads of workspace
+      # files (AGENTS.md, AGENT_LOOP.md, the spec, schemas/) and the TODO.md
+      # edit — all OUTSIDE the --trust'd $PROJECT. sweep_fix_cycle's cursor
+      # branch already passes --add-dir for exactly that out-of-workspace
+      # reason; granting it here too makes those accesses deterministic
+      # instead of depending on cursor's out-of-root behavior.
       if [ -z "$session" ]; then
-        # model_flag must word-split into `--model X` (or vanish when empty).
-        # shellcheck disable=SC2046
-        (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
-          --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+        (cd "$PROJECT" && cursor-agent -p --model "$CURSOR_IMPLEMENT_MODEL" --output-format json \
+          --trust -f --add-dir "$WORKSPACE_ROOT" "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
       else
-        (cd "$PROJECT" && claude -p --resume "$session" --permission-mode bypassPermissions \
-          --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+        (cd "$PROJECT" && cursor-agent -p --resume "$session" --output-format json \
+          --trust -f --add-dir "$WORKSPACE_ROOT" "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
       fi
-      emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
-      [ "$rc" -ne 0 ] || break
-      if is_rate_limit_response "$raw" &&
-        [ -n "$emitted" ] &&
-        { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then
-        # Session limit with a parseable reset: count, cap, journal, and sleep it
-        # out (handle_rate_limit_wait, lib/recovery.sh — the extracted, unchanged
-        # production wait path), then retry pinned to the emitted session.
-        handle_rate_limit_wait "$raw"
-        session="$emitted"
+    elif [ -z "$session" ]; then
+      # model_flag must word-split into `--model X` (or vanish when empty).
+      # shellcheck disable=SC2046
+      (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
+        --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+    else
+      (cd "$PROJECT" && claude -p --resume "$session" --permission-mode bypassPermissions \
+        --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+    fi
+    emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
+    # rc==0 is not proof of success for cursor: the envelope's session_id can
+    # still be missing (a real headless-CLI drift, not just a nonzero exit),
+    # or the envelope can carry is_error:true alongside a clean exit — the
+    # contract (spec + docs) is rc!=0 OR is_error==true, both retry-then-
+    # fallback. Treat either as a synthetic failure so it falls through into
+    # the SAME cursor retry/fallback branch below instead of surviving the
+    # loop and hitting the post-loop "primary emitted no resumable session
+    # ID" block_run. jq -e fails on unparseable raw (no match — rc stays 0
+    # only if session_id somehow parsed, which it can't from unparseable
+    # JSON, so the empty-$emitted arm already covers that). Short-circuits on
+    # backend != cursor, so the Claude branch's rc (and therefore its
+    # break/continue behavior) is untouched.
+    #
+    # `.is_error == true` matches ONLY a JSON boolean true — the shape the live
+    # envelope carries (specs/cursor-implementer-backend.md); a string "true"
+    # would read as a success. Deliberate: a loose match would also swallow
+    # unrelated drift, and the missing-session_id arm plus the post-turn
+    # signal/verdict gates already fail closed on a mangled envelope.
+    if [ "$backend" = "cursor" ] && [ "$rc" -eq 0 ]; then
+      if [ -z "$emitted" ] || jq -e '.is_error == true' "$raw" >/dev/null 2>&1; then
+        rc=1
+      elif [ -n "$session" ] && [ "$emitted" != "$session" ]; then
+        # A cursor --resume that echoes a DIFFERENT session id breaks the same
+        # invariant the post-loop check below hard-blocks on. Route it into the
+        # retry/fallback branch instead: the post-loop block sits outside that
+        # branch, so a future cursor build that stopped echoing the same id
+        # would hard-block every post-first turn at 3am on a run that could
+        # have finished on claude. The CLAUDE path keeps the hard block — its
+        # --resume contract is verified and a changed id there means something
+        # the engine does not model. Never reached with an empty $session (a
+        # fresh start legitimately mints a new id).
+        log "cursor backend: session ID changed from $session to $emitted on a --resume (the CLI's resume contract drifted); treating the turn as failed so it retries and, if that persists, falls back to claude"
+        rc=1
+      fi
+    fi
+    [ "$rc" -ne 0 ] || break
+    if [ "$backend" = "cursor" ]; then
+      # Cursor has no parseable 429 contract (stderr prose, no reset time):
+      # bounded retries with linear backoff, then a sticky per-run fallback to
+      # the Claude implement model. The fresh Claude session reorients from the
+      # files on disk via the same handoff note a stage boundary uses.
+      # Archive any stale signal FIRST: a cursor call that actually did its
+      # work (wrote next-action.json) before failing/drifting must not leave
+      # that signal sitting at control/next-action.json for the fallback
+      # turn's engine read to consume — archive_old_signal is idempotent
+      # (no-ops when the signal is already absent), so calling it again here
+      # on a retry that never wrote one is harmless.
+      archive_old_signal
+      # Two independent stop conditions, both ending in the SAME sticky
+      # fallback; $cursor_fb_reason records which one fired so the journal and
+      # the morning's run.log say why the night switched vendors.
+      cursor_backoff=$((CURSOR_RETRY_BACKOFF * (cursor_attempts + 1)))
+      if [ "$cursor_attempts" -ge "$CURSOR_MAX_RETRIES" ]; then
+        cursor_fb_reason="cursor invocation failed after $cursor_attempts retries"
+      elif [ $((cursor_backoff_total + cursor_backoff)) -gt "$CURSOR_MAX_WAIT" ]; then
+        # I5 ceiling: the next sleep would push this turn's cumulative backoff
+        # past NIGHT_SHIFT_CURSOR_MAX_WAIT. Fall back NOW rather than sleep out
+        # a retry budget that (MAX_RETRIES x RETRY_BACKOFF being unbounded)
+        # could hold one turn open for hours.
+        cursor_fb_reason="cursor retry backoff would reach $((cursor_backoff_total + cursor_backoff))s, past the ${CURSOR_MAX_WAIT}s NIGHT_SHIFT_CURSOR_MAX_WAIT ceiling, after $cursor_attempts retries"
+        log "cursor backend: $cursor_fb_reason; falling back to claude now instead of waiting out the remaining retries"
+      else
+        cursor_attempts=$((cursor_attempts + 1))
+        cursor_backoff_total=$((cursor_backoff_total + cursor_backoff))
+        emit_event backend_retry "$(jq -cn --argjson a "$cursor_attempts" --argjson rc "$rc" '{backend:"cursor", attempt:$a, rc:$rc}')"
+        log "cursor backend: attempt $cursor_attempts/$CURSOR_MAX_RETRIES failed (rc=$rc; see $raw.err); retrying in ${cursor_backoff}s (cumulative ${cursor_backoff_total}s of the ${CURSOR_MAX_WAIT}s ceiling)"
+        sleep "$cursor_backoff"
+        # Resume the FAILED attempt's own session when it emitted one (rc!=0
+        # with a partial envelope, is_error, or a drifted resume id). A failed
+        # cursor turn is not side-effect-free: the CLI can have edited files
+        # and even committed before reporting the error, and a retry in a
+        # brand-new session would re-run the identical prompt blind to that
+        # work — duplicated edits and duplicate commits, billed every time,
+        # against a single charged turn. Resuming makes the retry see what its
+        # own prior attempt did. No emitted id (the CLI died before answering)
+        # leaves $session as it was, which is the pre-existing behavior.
+        [ -z "$emitted" ] || session="$emitted"
+        # Re-enter the budget gate on every retry: the turn counters are
+        # deliberately NOT incremented for a retry, so without this a retry
+        # storm (sleeps + long cursor calls) could outrun the stage/task TIME
+        # caps entirely — enforce_limits is the only thing that reads them, and
+        # it is otherwise called once per turn, before the first attempt.
+        enforce_limits
         continue
       fi
-      if is_per_model_limit_response "$raw"; then
-        # Per-model usage cap: no reset time exists, so waiting cannot clear it.
-        # Default → block_run (inside the handler) with an actionable reason.
-        # NIGHT_SHIFT_MODEL_FALLBACK=1 → the handler records the fallback in
-        # state's .model_fallbacks, nulls the session, journals model_fallback,
-        # and returns: retry FRESH on the successor model.
-        handle_per_model_limit "$raw" "$model"
-        session=""
-        model="$(resolve_effective_model "$model")"
-        continue
-      fi
-      block_run "primary command failed with status $rc"
-    done
+      # implement_backend_fallback_set nulls .session_id in the SAME state
+      # write as the sticky flag (atomic — a crash between two writes would
+      # strand backend=claude with a pinned cursor session id); only the
+      # local mirror needs clearing here.
+      implement_backend_fallback_set "$cursor_fb_reason" "$rc"
+      backend="claude"
+      session=""
+      # Preserve the pre-fallback prompt for forensics BEFORE primary_prompt
+      # overwrites $prompt in place below — best-effort (never blocks the
+      # fallback on a cp failure).
+      cp "$prompt" "$prompt.pre-fallback" 2>/dev/null || true
+      # Null'd .session_id above, so primary_prompt (which reads .session_id
+      # fresh from state) now rebuilds $prompt with the "FRESH stage session"
+      # file-handoff reorientation block — the prompt built at the top of THIS
+      # turn still framed a --resume (or an earlier cursor session), and
+      # reusing it unchanged for the fresh Claude session below would silently
+      # drop that reorientation.
+      primary_prompt "$prompt"
+      continue
+    fi
+    if is_rate_limit_response "$raw" &&
+      [ -n "$emitted" ] &&
+      { [ -z "$session" ] || [ "$emitted" = "$session" ]; }; then
+      # Session limit with a parseable reset: count, cap, journal, and sleep it
+      # out (handle_rate_limit_wait, lib/recovery.sh — the extracted, unchanged
+      # production wait path), then retry pinned to the emitted session.
+      handle_rate_limit_wait "$raw"
+      session="$emitted"
+      continue
+    fi
+    if is_per_model_limit_response "$raw"; then
+      # Per-model usage cap: no reset time exists, so waiting cannot clear it.
+      # Default → block_run (inside the handler) with an actionable reason.
+      # NIGHT_SHIFT_MODEL_FALLBACK=1 → the handler records the fallback in
+      # state's .model_fallbacks, nulls the session, journals model_fallback,
+      # and returns: retry FRESH on the successor model.
+      handle_per_model_limit "$raw" "$model"
+      session=""
+      model="$(resolve_effective_model "$model")"
+      continue
+    fi
+    block_run "primary command failed with status $rc"
+  done
   fi
   [ -n "$emitted" ] || block_run "primary emitted no resumable session ID"
+  # Reachable only on the CLAUDE path now: a cursor turn with a changed (or
+  # missing) session id is converted to rc=1 inside the loop above and routed
+  # through the retry/fallback branch, so it can never break out of the loop
+  # into these two hard blocks. Claude's behavior here is unchanged.
   if [ -n "$session" ] && [ "$emitted" != "$session" ]; then
     block_run "primary session ID changed from $session to $emitted"
   fi
@@ -1871,16 +2114,22 @@ invoke_primary() {
   # .night-shift/. Verify the wrapper-owned state BEFORE the engine's own writes
   # below would launder an out-of-band edit into the private copy.
   integrity_guard "$STATE" "state-turn-$turn" "state.json (during the primary turn)"
+  # .implement_backend_used is a positive attribution marker (distinct from
+  # .implement_backend_fallback above, which only records a NEGATIVE event —
+  # falling BACK to claude): once a cursor turn actually succeeds, stamp it so
+  # candidate_primary_vendor can attribute the candidate to cursor even after
+  # a LATER turn in the same candidate falls back to claude (a candidate
+  # partly built by cursor before a fallback still used cursor). jq-idempotent
+  # — safe to set on every successful cursor turn, not just the first.
   state_set '
     .session_id=$session |
     .primary_turns += 1 | .task_turns += 1 | .stage_turns += 1 |
     .rate_limit_consecutive=0 |
-    .updated_at=$now
-  ' --arg session "$emitted" --arg now "$(now_iso)"
-  # record_cost is Claude-JSON-shaped (.total_cost_usd/.usage from `claude
-  # --output-format json`); a codex turn's cost was already journaled as
-  # usage on the codex_primary event inside invoke_primary_codex, so skip it
-  # here rather than feed record_cost a JSONL stream it cannot parse.
+    .updated_at=$now |
+    (if $backend == "cursor" then .implement_backend_used="cursor" else . end)
+  ' --arg session "$emitted" --arg now "$(now_iso)" --arg backend "$backend"
+  # record_cost is Claude/cursor-JSON-shaped; a codex turn's cost was already
+  # journaled as usage on the codex_primary event inside invoke_primary_codex.
   [ "$engine" = "codex" ] || record_cost "$raw" "$(basename "$raw")"
   enforce_elapsed_limits
 }
@@ -2231,7 +2480,7 @@ persona_prompt() {
   retry_note="$(rejection_preamble "$retry_note")"
   cat <<EOF
 You are the "$persona" review persona for night-shift run $RUN_ID, independently
-reviewing another Claude session's $stage work. You share no context with the
+reviewing another agent session's $stage work. You share no context with the
 implementer and cannot see the repository — judge ONLY the review bundle below,
 strictly through your persona's lens. This is unattended; never ask questions.
 $retry_note
@@ -2797,6 +3046,12 @@ EOF
     block_run "primary test-first evidence does not match wrapper-owned executions (exit statuses)"
   evidence_exit_status_matches "$evidence" baseline "$RUN_ROOT/validated/baseline.json" ||
     block_run "primary baseline evidence does not match wrapper-owned baseline (exit statuses)"
+  # The final-validation gate is defined by the spec, re-read HERE — after the
+  # implementer has had unattended write access to the workspace for the whole
+  # implementation scope. Verify it is byte-identical to the spec the run was
+  # started (or resumed) with, before its commands decide whether the candidate
+  # passes. Anchored in initialize_run / recover_run / start_next_task.
+  integrity_guard "$SPEC" spec "the spec whose Final validation commands gate this candidate"
   final_commands="$(extract_validation_commands "$SPEC" "Final validation commands")"
   run_validation_commands final "$RUN_ROOT/validated/final.json" "$final_commands" "$validation_worktree" ||
     block_run "final validation commands are missing or could not run"
@@ -3313,18 +3568,16 @@ codex_review_section() {
 }
 
 observer_prompt() {
-  local context="$1" candidate="$2" retry_note="${3:-}" primary_vendor
+  local context="$1" candidate="$2" retry_note="${3:-}" expected_primary="${4:-claude}"
   retry_note="$(rejection_preamble "$retry_note")"
   # The observer is ALWAYS claude (the judgment gate that makes any primary
-  # vendor safe); the implementer is whichever vendor actually ran this task's
-  # implement stage (stage_engine) — claude by default, codex only when the
-  # spec's `- Engines:` field opted in. Templated here instead of hardcoded so
-  # the observer is told the truth rather than always "claude".
-  primary_vendor="$(stage_engine implement)"
+  # vendor safe); expected_primary is the vendor that actually produced the
+  # candidate (candidate_primary_vendor: cursor marker, else ENGINE_IMPLEMENT
+  # when the spec opted implement=codex, else claude).
   cat <<EOF
-You are an independent Claude observer reviewing another session's work
-(implementer vendor: $primary_vendor). You share no context with the
-implementer; judge only the supplied evidence.
+You are an independent Claude observer reviewing another agent session's work;
+the implementer vendor is named below.
+You share no context with the implementer; judge only the supplied evidence.
 $retry_note
 The sections marked "authoritative" (the engine-computed base..candidate diff and
 the engine-run validation) are ground truth produced by the wrapper, not the
@@ -3338,13 +3591,13 @@ Reason briefly if you must, then END YOUR REPLY with exactly one fenced code
 block tagged json containing your verdict and nothing after it:
 
 \`\`\`json
-{"observer":"claude","primary":"$primary_vendor","task":"$SPEC","candidate_commit":"$candidate","status":"APPROVE","findings":[],"documentation_changes":[]}
+{"observer":"claude","primary":"$expected_primary","task":"$SPEC","candidate_commit":"$candidate","status":"APPROVE","findings":[],"documentation_changes":[]}
 \`\`\`
 
 Rules for that JSON object:
-- "observer" is "claude"; "primary" is exactly "$primary_vendor" (the vendor
-  that ran this task's implement stage); "task" and "candidate_commit" are
-  exactly the values above.
+- "observer" is "claude"; "primary" is exactly "$expected_primary" (the vendor
+  that implemented the candidate); "task" and "candidate_commit" are exactly
+  the values above.
 - "status" is EXACTLY "APPROVE" or "BLOCK" — there is no other value. To request
   changes, use "BLOCK" (not "REQUEST_CHANGES"). Use ONLY the seven keys shown
   above; do not add keys like "severity", "location", "summary", or "base_commit".
@@ -3363,7 +3616,7 @@ EOF
 }
 
 invoke_observer_once() {
-  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" neutral rc=0
+  local context="$1" candidate="$2" out="$3" raw="$4" retry_note="${5:-}" expected_primary="${6:-claude}" neutral rc=0
   # Context-isolated observer: a fresh Claude session (no --resume) launched from
   # a neutral empty directory. It runs in the default (non-bypass) permission
   # mode, so tool use is not auto-approved and, combined with the neutral cwd, it
@@ -3382,7 +3635,7 @@ invoke_observer_once() {
   # still be sizeable, and a positional arg risks the ARG_MAX/E2BIG exec limit.
   # model_flag intentionally word-splits into `--model X` (or nothing).
   # shellcheck disable=SC2046
-  (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" |
+  (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" "$expected_primary" |
     claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # Same 429 distinction as invoke_persona_once: a live-recoverable transient,
@@ -3592,9 +3845,14 @@ run_observer() {
 
 validated_observer_retry() {
   local context="$1" candidate="$2" out="$3" raw="$4" attempt=0 retry_note="" iv
+  # Computed ONCE per observer round (not per attempt): the backend that
+  # produced the candidate does not change mid-round, and re-deriving it per
+  # attempt would let a fallback that fires mid-round (unlikely but possible
+  # via state) desync the prompt's stated vendor from the comparison below.
+  local expected_primary; expected_primary="$(candidate_primary_vendor)"
   while [ "$attempt" -lt 2 ]; do
     enforce_limits
-    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note"; iv=$?
+    invoke_observer_once "$context" "$candidate" "$out" "$raw.$attempt" "$retry_note" "$expected_primary"; iv=$?
     if [ "$iv" -eq 42 ]; then
       # 429 (session OR per-model): the same live-recoverable transient the
       # primary already survives — not a contract failure. Wait/fall back and
@@ -3615,7 +3873,7 @@ validated_observer_retry() {
     # the success path we return 0 below WITHOUT a second record_cost call,
     # so there is no double-counting.
     record_cost "$raw.$attempt" "$(basename "$raw")"
-    normalize_observer_output "$out" "$SPEC" "$candidate" "$(stage_engine implement)"
+    normalize_observer_output "$out" "$SPEC" "$candidate" "$expected_primary"
     enforce_elapsed_limits
     # .primary is checked against the task's ACTUAL implement vendor
     # (stage_engine implement), not the CLI's $PRIMARY flag — $PRIMARY stays
@@ -3623,7 +3881,7 @@ validated_observer_retry() {
     # vendor is "codex" when this task's spec opted in via `- Engines:`.
     if json_schema_basic observer-review "$out" &&
       [ "$(jq -r '.observer' "$out")" = "$OBSERVER" ] &&
-      [ "$(jq -r '.primary' "$out")" = "$(stage_engine implement)" ] &&
+      [ "$(jq -r '.primary' "$out")" = "$expected_primary" ] &&
       { [ "$(jq -r '.task' "$out")" = "$SPEC" ] ||
         [ "$(basename "$(jq -r '.task' "$out")")" = "$(basename "$SPEC")" ]; } &&
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
@@ -3767,9 +4025,15 @@ EOF
   # -z: NUL-delimited literal paths; matches the format used in verify_candidate.
   git -C "$PROJECT" status --porcelain=v1 -z >"$BASE_STATUS"
   epoch="$(now_epoch)"
+  # .implement_backend_used is TASK-scoped attribution (which vendor built THIS
+  # candidate) — clear it with the rest of the per-task state or a single early
+  # cursor task would stamp every later chained task's observer verdict with
+  # primary:"cursor" (candidate_primary_vendor prefers the marker over the live
+  # predicate). .implement_backend_fallback stays: the fallback is RUN-sticky.
   state_set '
     .task=$task | .stage="planning" | .stage_turns=0 | .task_turns=0 |
     .session_id=null |
+    .implement_backend_used=null |
     .stage_started_at=$epoch | .task_started_at=$epoch |
     .base_commit=$base | .base_branch=$branch | .review_round=0 |
     .baseline_status=$baseline_status | .finding_ids=[] | .candidate_commits=[] |
@@ -3795,6 +4059,10 @@ EOF
   # instead, once ENGINE_IMPLEMENT/ENGINE_REVIEW reflect the new spec.
   state_set '.engines={implement:$engine_implement,review:($engine_review|if .=="" then null else . end)} | .updated_at=$now' \
     --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" --arg now "$(now_iso)"
+  # Anchor the NEW task's spec: $SPEC just changed, and verify_candidate guards
+  # it at this task's candidate time (see the guard there). Per-spec key, so
+  # the finished task's anchor is untouched.
+  integrity_put "$SPEC"
   check_branch_and_worktree "$SPEC" ||
     block_run "next task branch or worktree routing is unsafe"
   baseline_commands="$(extract_validation_commands "$SPEC" "Baseline validation commands")"
@@ -3825,6 +4093,160 @@ EOF
 
 # handle_signal lives in lib/signals.sh.
 
+# Portable watchdog runner for the FREE cursor-agent probe commands (status,
+# --list-models, --version — never a paid model call). macOS has no coreutils
+# `timeout`, so this copies codex_review_candidate's background+sleep+kill
+# idiom. stdout+stderr -> $2; returns the probe command's rc (143 on a
+# watchdog kill).
+cursor_probe_exec() {
+  local tmo="$1" out="$2" rc=0 pid wd
+  shift 2
+  cursor-agent "$@" >"$out" 2>&1 &
+  pid=$!
+  ( sleep "$tmo"; kill "$pid" 2>/dev/null ) &
+  wd=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  return "$rc"
+}
+
+# Startup probe for the cursor backend, run only when IMPLEMENT_BACKEND=cursor
+# (a claude-only startup never executes any of this). Guards the two failure
+# modes command -v cannot see: a logged-out CLI and a typo'd
+# NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL — either would otherwise pass startup,
+# burn the retry budget + backoff on the first post-plan turn, and silently
+# stick the whole night on Claude, discarding the operator's vendor choice.
+# Three outcomes per check:
+#   ok            -> proceed silently.
+#   definitive    -> die with an actionable message. ONLY the auth check can
+#                    reach this: "not logged in" is a positive report from the
+#                    CLI itself, not something inferred from output shape.
+#   inconclusive  -> WARN and proceed (timeout, nonzero rc, unrecognized
+#                    output shape, AND a slug the model list does not show —
+#                    see the slug branch): a transient blip or a formatting
+#                    change must never block a run the in-run retry/fallback
+#                    machinery could have handled.
+# Seam for fixtures (same rationale as cursor_available): tests may redefine
+# this function, and subprocess-driven integration runs can skip it with
+# NIGHT_SHIFT_CURSOR_SKIP_PROBE=1.
+cursor_startup_probe() {
+  # Log the skip like every other skip in the engine — a silent return leaves
+  # no trace that the run's cursor auth was never checked.
+  if [ "${NIGHT_SHIFT_CURSOR_SKIP_PROBE:-0}" = "1" ]; then
+    log "cursor probe: skipped (NIGHT_SHIFT_CURSOR_SKIP_PROBE=1); cursor auth and model slug are unverified for this run"
+    return 0
+  fi
+  local tmo="${NIGHT_SHIFT_CURSOR_PROBE_TIMEOUT:-30}" out rc
+  out="$(mktemp "${TMPDIR:-/tmp}/night-shift-cursor-probe.XXXXXX")" ||
+    { log "WARN: cursor probe: mktemp failed; skipping (inconclusive, never blocks)"; return 0; }
+  # (a) Auth: `cursor-agent status` prints "✓ Logged in as <email>" (rc 0)
+  # when authenticated (verified on build 2026.08.25-3e8eec8). The negative
+  # match runs FIRST — "not logged in" contains "logged in".
+  rc=0
+  cursor_probe_exec "$tmo" "$out" status || rc=$?
+  if grep -Eqi 'not logged in|logged out|not authenticated|unauthenticated' "$out"; then
+    rm -f "$out"
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not logged in (\`cursor-agent status\`); run \`cursor-agent login\` or set CURSOR_API_KEY"
+  fi
+  if [ "$rc" -ne 0 ] || ! grep -qi 'logged in' "$out"; then
+    log "WARN: cursor probe: could not confirm cursor-agent auth (rc=$rc, unrecognized \`cursor-agent status\` output); proceeding — a real auth failure is caught by the in-run retry/fallback"
+  fi
+  # (b) Model slug: the configured model must appear in `cursor-agent
+  # --list-models` (lines are "<slug> - <display name>"; exact first-field
+  # match, e.g. cursor-grok-4.6-high). A parameterized override
+  # (--model 'name[k=v,…]') is legitimate but never listed verbatim, so it is
+  # skipped, and a definitive miss requires rc 0 AND recognizable list output.
+  case "$CURSOR_IMPLEMENT_MODEL" in
+    *\[*\]*) rm -f "$out"; return 0 ;;
+  esac
+  rc=0
+  cursor_probe_exec "$tmo" "$out" --list-models || rc=$?
+  if [ "$rc" -eq 0 ] && grep -qi 'available models' "$out"; then
+    if ! awk -v m="$CURSOR_IMPLEMENT_MODEL" '$1 == m && $2 == "-" { f = 1 } END { exit !f }' "$out"; then
+      # WARN, never die. Unlike the auth check above — a POSITIVE report from
+      # the CLI ("not logged in") — a slug miss is inferred from the ROW
+      # FORMAT: the header grep only proves this is a model list, and a build
+      # that prefixes, indents differently, or colorizes its rows keeps the
+      # header while failing `$1 == m && $2 == "-"`, killing a run whose slug
+      # is perfectly valid. This was the one probe branch that failed closed on
+      # a format inference, and the version canary that would have flagged the
+      # drift runs AFTER it. A genuinely bad slug still fails fast: the first
+      # cursor turn errors and the bounded retry/fallback lands the run on
+      # claude within ~180s at the default knobs.
+      log "WARN: cursor probe: NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL=$CURSOR_IMPLEMENT_MODEL is not offered by this cursor-agent (\`cursor-agent --list-models\`); fix the slug (grok 4.6 at high reasoning is exactly cursor-grok-4.6-high) — proceeding, since this check reads the list's row format: a bad slug still fails fast through the in-run retry/fallback"
+    fi
+  else
+    log "WARN: cursor probe: could not list cursor-agent models (rc=$rc); skipping slug validation — a bad model still fails fast on the first cursor turn"
+  fi
+  rm -f "$out"
+  return 0
+}
+
+# The cursor backend's two STARTUP dies (cursor-agent on PATH, then the auth/
+# slug probe), deferred until BOTH the spec and any prior run state are known.
+# main_run calls this from each arm of its recover/init fork — never from the
+# early knob block, where neither is resolved yet. Two skips, each closing a
+# way the dies would refuse a run that needs cursor-agent for nothing:
+#
+#   - the run already fell back to claude (.implement_backend_fallback, or the
+#     design latch): every remaining turn is claude. Expired cursor auth is the
+#     usual CAUSE of that fallback, so dying on it here made the documented
+#     recovery ("relaunch with the stored backend") impossible — the run could
+#     be resumed by neither backend, and the hand-edit escape is blocked by the
+#     integrity anchor.
+#   - the spec declares a ## Design Contract: implement_backend_active pins the
+#     whole run to claude for it, so the backend is inert all run and a
+#     logged-out cursor-agent is irrelevant. Checking this needs $SPEC, which
+#     is exactly why the dies moved after spec selection.
+#
+# A fresh cursor run with no fallback and no contract still dies at startup,
+# before any paid work — the check these guards were added for is unchanged.
+cursor_startup_guards() {
+  [ "$IMPLEMENT_BACKEND" = "cursor" ] || return 0
+  if [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ] &&
+    [ "$(jq -r 'select(.implement_backend_fallback == "claude" or
+                       .implement_backend_design_latch == true) | "y"' \
+        "$STATE" 2>/dev/null)" = "y" ]; then
+    log "cursor backend: this run is already pinned to claude (fallback or design latch recorded in state); skipping the cursor-agent availability/auth guards — nothing left in the run uses cursor-agent"
+    return 0
+  fi
+  if spec_has_design_contract "${SPEC:-}"; then
+    log "cursor backend: the spec declares a ## Design Contract, which pins the whole run to claude; skipping the cursor-agent availability/auth guards"
+    return 0
+  fi
+  cursor_available ||
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
+  cursor_startup_probe
+}
+
+# Version tripwire for the cursor CLI contract, the cursor twin of
+# rate_limit_contract_canary: the headless envelope was live-verified against
+# exactly one build (CURSOR_CONTRACT_CLI_VERSION), and silent CLI drift has
+# bitten this engine before. Journals a dedicated contract_canary event (same
+# event name as the claude canary so one grep finds all vendor drift) rather
+# than extending run_started: run_started is emitted only inside
+# initialize_run, so a resumed run — whose CLI may have updated mid-night —
+# would never re-record it, while this runs on EVERY startup; emitting on
+# match too pins the exact build behind each run for later forensics.
+# WARN-only, never blocks; requires RUN_ROOT (emit_event), so called next to
+# rate_limit_contract_canary after init/recovery.
+cursor_contract_canary() {
+  [ "$IMPLEMENT_BACKEND" = "cursor" ] || return 0
+  local out found
+  out="$(mktemp "${TMPDIR:-/tmp}/night-shift-cursor-probe.XXXXXX")" || return 0
+  cursor_probe_exec "${NIGHT_SHIFT_CURSOR_PROBE_TIMEOUT:-30}" "$out" --version ||
+    { rm -f "$out"; return 0; }
+  found="$(awk 'NR == 1 { print $1 }' "$out")"
+  rm -f "$out"
+  [ -n "$found" ] || return 0
+  emit_event contract_canary "$(jq -cn --arg expected "$CURSOR_CONTRACT_CLI_VERSION" --arg found "$found" \
+    '{contract:"cursor-cli", expected:$expected, found:$found}')"
+  [ "$found" != "$CURSOR_CONTRACT_CLI_VERSION" ] || return 0
+  log "WARNING: cursor-agent $found differs from $CURSOR_CONTRACT_CLI_VERSION, the build the cursor headless contract (JSON envelope, --resume, stderr-only errors, --trust/-f/--add-dir) was last verified against; re-verify per specs/cursor-implementer-backend.md and bump CURSOR_CONTRACT_CLI_VERSION"
+  return 0
+}
+
 main_run() {
   require_command jq
   require_command git
@@ -3832,6 +4254,16 @@ main_run() {
     claude|"") PRIMARY="claude" ;;
     *) die "this workflow runs Claude only; --primary $PRIMARY is not supported" ;;
   esac
+  case "$IMPLEMENT_BACKEND" in
+    claude|cursor) ;;
+    *) die "NIGHT_SHIFT_IMPLEMENT_BACKEND must be claude or cursor (got: $IMPLEMENT_BACKEND)" ;;
+  esac
+  case "$CURSOR_MAX_RETRIES" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_RETRIES must be a non-negative integer" ;; esac
+  case "$CURSOR_RETRY_BACKOFF" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_RETRY_BACKOFF must be a non-negative integer" ;; esac
+  case "$CURSOR_MAX_WAIT" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_WAIT must be a non-negative integer" ;; esac
+  if [ "$IMPLEMENT_BACKEND" = "cursor" ] && [ "$SESSION_SCOPE" != "stage" ]; then
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor requires NIGHT_SHIFT_SESSION_SCOPE=stage (the backend switches vendors at stage-scope session boundaries)"
+  fi
   [ -n "$PROJECT" ] || die "--project is required"
   PROJECT="$(canonical_dir "$PROJECT")" || die "project directory does not exist"
   git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
@@ -3842,6 +4274,11 @@ main_run() {
   # the pinned primary session), not a second model.
   OBSERVER="claude"
   require_command claude
+  # The cursor availability + auth/slug dies do NOT run here: they need the
+  # spec (a ## Design Contract makes the backend inert) and the prior run's
+  # state (a run that already fell back needs cursor for nothing), neither of
+  # which is resolved yet. cursor_startup_guards runs them from both arms of
+  # the recover/init fork below, still before any paid work.
   case "$RATE_LIMIT_BUFFER_SECONDS" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_RATE_LIMIT_BUFFER_SECONDS must be a non-negative integer" ;;
   esac
@@ -3875,12 +4312,15 @@ main_run() {
   trap 'cleanup_smoke_pgid 2>/dev/null || true; release_lock' EXIT
 
   if recover_run; then
-    :
+    # State is loaded: the guards can now see a run that already fell back.
+    cursor_startup_guards
   else
     # --resume must never silently fall through to a fresh run: if recovery found
     # nothing resumable, that is an operator error, not a cue to start over.
+    # resume_refusal_reason names the precondition that actually failed — the
+    # old blanket list guessed, and often guessed wrong.
     [ "$RESUME" -eq 0 ] ||
-      die "--resume: no resumable blocked run for this project (state missing, not blocked, rate-limited, or session/primary mismatch)"
+      die "--resume: $(resume_refusal_reason "$PROJECT/.night-shift/state.json")"
     if [ -z "$SPEC" ]; then
       SPEC="$(select_task_from_todo "$WORKSPACE_ROOT/TODO.md")" ||
         die "no unfinished bug or feature entry in TODO.md and no --spec supplied"
@@ -3895,10 +4335,15 @@ main_run() {
     validate_spec_engines "$SPEC" || die "spec Engines field is invalid"
     check_branch_and_worktree "$SPEC" ||
       die "current branch or worktree does not safely match the spec"
+    # $SPEC is resolved: the guards can now see a Design-Contract spec (backend
+    # inert all run). Still before initialize_run's minutes-long baseline, so a
+    # genuinely misconfigured cursor backend fails as fast as it used to.
+    cursor_startup_guards
     initialize_run
   fi
   trap 'block_run "run interrupted by signal"' HUP INT TERM
   rate_limit_contract_canary
+  cursor_contract_canary
 
   local malformed_n rc
   while :; do
@@ -3969,6 +4414,27 @@ if [ "$SWEEP_ONLY" -eq 1 ]; then
   [ -n "$PROJECT" ] || die "--sweep-only requires --project"
   git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
     die "project is not a Git repository: $PROJECT"
+  # --sweep-only exits before main_run, so main_run's own IMPLEMENT_BACKEND
+  # guards (the enum die + the cursor_available die) never run for this
+  # surface — but sweep_fix_cycle (called below when BRANCH_SWEEP=1) now
+  # dispatches on implement_backend_active same as the in-run path, so an
+  # unvalidated/unavailable cursor backend must be caught here too, same
+  # checks, same messages. NOT included: the SESSION_SCOPE=stage requirement
+  # main_run also enforces — that guard exists only because a primary session
+  # switches vendors at stage-scope boundaries, and this surface has no
+  # primary sessions at all (sweep_run/sweep_fix_cycle never call invoke_primary).
+  case "$IMPLEMENT_BACKEND" in
+    claude|cursor) ;;
+    *) die "NIGHT_SHIFT_IMPLEMENT_BACKEND must be claude or cursor (got: $IMPLEMENT_BACKEND)" ;;
+  esac
+  if [ "$IMPLEMENT_BACKEND" = "cursor" ] && ! cursor_available; then
+    die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor but cursor-agent is not on PATH (install: curl https://cursor.com/install -fsS | bash)"
+  fi
+  # Same auth/model-slug probe as main_run's startup guard, mirrored here for
+  # the same reason as the two checks above (sweep_fix_cycle can invoke
+  # cursor-agent from this surface). No canary: emit_event needs a RUN_ROOT
+  # this surface never has.
+  [ "$IMPLEMENT_BACKEND" != "cursor" ] || cursor_startup_probe
   # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
   # queued specs, so it never touches --spec/NEXT_TASK task selection. Even
   # with --spec given, sweep_fix_cycle's re-validation branch is a no-op

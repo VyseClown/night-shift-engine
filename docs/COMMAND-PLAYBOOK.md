@@ -142,6 +142,15 @@ one change: the web bench with Backend & Data Expert promoted into the always-ru
 floor, profiles `full`/`logic` only, template `specs/_template-fullstack.md`). Model tiering: `NIGHT_SHIFT_PLAN_MODEL`
 (opus), `NIGHT_SHIFT_IMPLEMENT_MODEL` (sonnet), `NIGHT_SHIFT_OBSERVER_MODEL` (opus),
 `NIGHT_SHIFT_PERSONA_MODEL` (sonnet); set any to `inherit` for the CLI's startup model.
+Opt-in second implementer vendor: `NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor` (default
+`claude`) runs post-plan primary work on the Cursor CLI instead —
+`NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` (default `cursor-grok-4.6-high`),
+`NIGHT_SHIFT_CURSOR_MAX_RETRIES` (default `3`), `NIGHT_SHIFT_CURSOR_RETRY_BACKOFF`
+(default `30`), `NIGHT_SHIFT_CURSOR_MAX_WAIT` (default `600` — the ceiling on one
+turn's TOTAL retry backoff; crossing it falls back to Claude immediately);
+plan/observer/design stay Claude regardless. A run that fell back to Claude
+resumes under either backend value, with `cursor-agent` absent or logged out. See
+`docs/cursor-cli-setup.md`.
 The target repo must gitignore `.night-shift/` and be on the spec's feature branch.
 
 ## §7 — Convert a Figma design into a web component (web track)

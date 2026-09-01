@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # integration-adverse.sh — the paths the engine exists to survive: a run that
-# BLOCKS (malformed-signal cap) and a run that recovers from an observer BLOCK.
+# BLOCKS (malformed-signal cap), a run that recovers from an observer BLOCK,
+# --resume clearing a logic block, a primary envelope with no session_id, and a
+# primary that rewrites the spec gating its own candidate.
 # Same scripted-stub approach as integration-run.sh; nothing inside the engine
-# is mocked. Exit 0 + two "ok - adverse: ..." lines on success.
+# is mocked. Exit 0 + five "ok - adverse: ..." lines on success.
 set -uo pipefail
 FAIL_PREFIX=adverse
 # shellcheck source=scripts/test/integration-lib.sh
@@ -62,3 +64,43 @@ jq -e 'select(.type=="run_recovered") | .payload.resumed_block==true' "$ev" >/de
                                                                || fail "journal missing run_recovered{resumed_block:true}"
 jq -e 'select(.type=="run_complete")' "$ev" >/dev/null         || fail "resumed run did not complete"
 printf 'ok - adverse: --resume clears a logic block and the run completes\n'
+
+# ── Scenario D: claude primary with no session_id → block_run (no retry) ─────
+# write_stub's no-session mode: rc 0, a valid JSON envelope, but no
+# session_id key at all. This pins invoke_primary's CLAUDE-path guard (the
+# post-loop "primary emitted no resumable session ID" block_run) — the guard
+# the cursor backend's own rc==0-but-no-session_id check
+# (specs/cursor-implementer-backend.md) sits next to, for the vendor that had
+# it first.
+integration_setup
+write_stub no-session
+run_engine --spec "$SPEC" && fail "engine exited 0 despite the primary never emitting a session_id"
+[ "$(jq -r .status "$PROJECT/.night-shift/state.json")" = "blocked" ]      || fail "status is not blocked (no-session)"
+jq -r .block_reason "$PROJECT/.night-shift/state.json" | grep -q 'no resumable session ID' \
+                                                               || fail "block_reason does not name the missing session_id"
+printf 'ok - adverse: a claude primary envelope with no session_id blocks with an actionable reason\n'
+
+# ── Scenario E: the primary rewrites the spec that gates its own candidate ───
+# The spec is re-read at candidate time for the "Final validation commands"
+# that judge the work, and the primary has unattended write access to the whole
+# workspace in between — so an implementer that "updates the spec to match what
+# it built" weakened the gate judging it, uncommitted, with nothing in the
+# base..candidate diff to show for it. The spec is now integrity-anchored at
+# run start and guarded before that re-read. Vendor-neutral: this is the claude
+# primary doing it.
+integration_setup
+write_stub spec-tamper
+spec_before="$(cat "$SPEC")"
+run_engine --spec "$SPEC" && fail "engine exited 0 despite the primary rewriting the spec's final-validation gate"
+[ "$(jq -r .status "$PROJECT/.night-shift/state.json")" = "blocked" ] || fail "status is not blocked (spec tamper)"
+jq -r .block_reason "$PROJECT/.night-shift/state.json" | grep -q 'was modified outside the engine' \
+                                                               || fail "block_reason does not name the out-of-band modification"
+jq -r .block_reason "$PROJECT/.night-shift/state.json" | grep -q 'Final validation commands' \
+                                                               || fail "block_reason does not say WHICH wrapper-owned file (the gating spec)"
+ev="$PROJECT/.night-shift/events.jsonl"
+jq -e 'select(.type=="integrity_violation") | .payload.label=="spec"' "$ev" >/dev/null \
+                                                               || fail "journal missing integrity_violation{label:spec}"
+# The guard restores the engine's copy, so the gate that would run is still the
+# one the run started with — never the implementer's rewrite.
+[ "$(cat "$SPEC")" = "$spec_before" ]                          || fail "the tampered spec was not restored from the anchor"
+printf 'ok - adverse: a primary that rewrites its own final-validation gate is caught and the spec restored\n'

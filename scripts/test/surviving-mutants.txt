@@ -11,3 +11,6 @@
 # to kill these — see docs COMMAND-PLAYBOOK visual-review.
 scripts/lib/visual-repair.sh#eq_ne#1 # gap: REPAIR_SHARED allow-string toggle (line ~354) — repair-prompt build not offline-testable
 scripts/lib/visual-capture.sh#n_z#26 # gap: visual-capture guard — capture pipeline not offline-testable (no simulator)
+scripts/lib/recovery.sh#ret_true#1 # equivalent: rate_limit_reset_epoch's `[ -n "$fields" ]` is redundant — the 12-hour `case "$hour:$minute:$meridiem"` two lines below rejects the empty split identically
+scripts/lib/recovery.sh#ret_true#2 # unreachable: epoch_clock_fields only fails if BOTH `date -r` and `date -d` fail; a bogus timezone silently falls back to UTC (verified), so no input reaches this guard
+scripts/lib/recovery.sh#ret_true#3 # equivalent: recoverable_rate_limit_state's `[ -f state ] && [ -f raw ]` is redundant — a missing file makes the `jq -r .status` below empty, which the following `case` rejects identically
