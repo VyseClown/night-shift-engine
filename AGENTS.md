@@ -333,7 +333,16 @@ the implement grind of a spec with a `## Design Contract`, which is judgment-hea
 design-fidelity work (Flow B) and bumps to `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL`
 (default `opus`). The model changes only at stage-scope boundaries (which already
 start a fresh session), so it is constant within a scope and resumes never re-pass
-it. Set any model knob to `inherit` to use the CLI's startup model.
+it. Set any model knob to `inherit` to use the CLI's startup model. Every other
+step has an optional override that is empty by default and follows its tier
+(`NIGHT_SHIFT_VISUAL_MODEL` / `_OBSERVE_REQUEST_MODEL` / `_COMPLETE_MODEL` /
+`_FEEDBACK_MODEL` / `_SWEEP_FIX_MODEL` → implement; `_PERSONA_PLAN_MODEL` /
+`_PERSONA_IMPLEMENTATION_MODEL` / `_PORT_AUDIT_MODEL` → personas); values go
+verbatim to `claude --model`, and `NIGHT_SHIFT_MODEL_FALLBACK_CHAIN=a>b>c`
+names the per-model-cap fallback order for models the built-in ladder does not
+know. `NIGHT_SHIFT_MEMORY=ai-memory` (default off) adds cross-run agent memory
+for the primary and isolates the reviewers from user-level hooks/MCP so the
+observer stays independent — see `docs/ai-memory-integration.md`.
 
 Opt-in second implementer vendor: `NIGHT_SHIFT_IMPLEMENT_BACKEND` (default
 `claude`) set to `cursor` runs the primary's post-plan scopes on the Cursor

@@ -204,7 +204,9 @@ visual_stage_figma_data() {
   # claude process itself, not a wrapper subshell whose kill would orphan claude), then a
   # watchdog kills it after NIGHT_SHIFT_VISUAL_REF_TIMEOUT. The caller degrades cleanly
   # (the agent works from the images when the cache is absent).
-  claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
+  # claude_model_args word-splits into `--model X` or nothing (inherit).
+  # shellcheck disable=SC2046
+  claude -p $(claude_model_args "${VISUAL_REF_MODEL:-${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}}") \
     --permission-mode bypassPermissions \
     --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" \
     <<<"$prompt" >/dev/null 2>&1 &
@@ -368,8 +370,13 @@ When done, print ONLY a JSON object: {\"changed\":\"<one concise line describing
   # Tools are comma-separated — a single space-joined string is parsed as ONE
   # (invalid) tool name, leaving the agent with no tools. (Proven by the smoke.)
   local _err; _err="$(mktemp)"
+  # NIGHT_SHIFT_VISUAL_REPAIR_MODEL defaults to the `opus` alias (the docs'
+  # documented default; the previous hard-coded dated ID silently pinned the
+  # repair agent to one generation). claude_model_args word-splits into
+  # `--model X` or nothing (inherit).
+  # shellcheck disable=SC2046
   result="$(cd "$PROJECT" && printf '%s' "$prompt" | claude -p --output-format json \
-    --model "${NIGHT_SHIFT_VISUAL_REPAIR_MODEL:-claude-opus-4-8}" \
+    $(claude_model_args "${NIGHT_SHIFT_VISUAL_REPAIR_MODEL:-opus}") \
     --allowed-tools "Read,Edit,Write,Bash(npx tsc*),Bash(npx eslint*)" 2>"$_err")"
   local _rc=$?
   # Surface agent failures instead of silently degrading to {} (a no-op repair).

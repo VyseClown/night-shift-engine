@@ -51,6 +51,14 @@ fx_not() {
   return 0
 }
 
+# fn_body_has <function> <needle>: the function's `declare -f` body contains
+# the literal needle. The structural-wiring verb for fx — runs in THIS shell
+# (a `bash -c` child would not see the engine's functions at all).
+fn_body_has() {
+  case "$(declare -f "$1" 2>/dev/null)" in *"$2"*) return 0 ;; esac
+  return 1
+}
+
 fixture_reject() {
   local description="$1"
   shift
@@ -219,6 +227,11 @@ run_dry_fixtures() {
   fixture_assert "visual_review prompt signals engine-invoked RUN_VISUAL (no agent capture)" fixture_visual_review_prompt "$root"
   fixture_assert "model_flag builds the --model arg (empty for inherit)" fixture_model_flag "$root"
   fixture_assert "stage_model tiers plan vs the rest of the primary" fixture_stage_model "$root"
+  fixture_assert "claude_model_args = fallback map + inherit rule, shared with the visual libs" fixture_claude_model_args "$root"
+  fixture_assert "successor_model: family ladder + NIGHT_SHIFT_MODEL_FALLBACK_CHAIN" fixture_fallback_chain "$root"
+  fixture_assert "per-step model knobs follow their tier when empty, override when set" fixture_per_step_models "$root"
+  fixture_assert "memory: knob validation, reviewer-isolation argv, prompt blocks, startup probe" fixture_memory_integration "$root"
+  fixture_assert "primary_prompt carries memory recall (planning) / handoff (completion) iff NIGHT_SHIFT_MEMORY" fixture_memory_prompt_wiring "$root"
   fixture_assert "primary_prompt carries the build-from-Figma procedure iff a Design Contract" fixture_design_build_note "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
   fixture_assert "schema enums stay in sync with the engine's state machine + personas" fixture_schema_inline_sync "$root"
@@ -4835,6 +4848,10 @@ fixture_stage_model() {
   # The primary plans on PLAN_MODEL and does post-plan work on IMPLEMENT_MODEL;
   # a ## Design Contract bumps the IMPLEMENT scope to DESIGN_IMPLEMENT_MODEL.
   local PLAN_MODEL=opus IMPLEMENT_MODEL=sonnet DESIGN_IMPLEMENT_MODEL=opus SPEC=""
+  # The per-step overrides are pinned empty here so an exported
+  # NIGHT_SHIFT_*_MODEL in the developer's shell cannot skew the tier check
+  # (fixture_per_step_models covers the overrides themselves).
+  local VISUAL_MODEL="" OBSERVE_REQUEST_MODEL="" COMPLETE_MODEL=""
   printf 'Spec\n\n## Test Plan\n- x\n' >"$d/plain.md"
   printf 'Spec\n\n## Design Contract\n- Figma file: X, fileKey `ABC`\n' >"$d/design.md"
   # No Design Contract -> implement stays IMPLEMENT_MODEL.
@@ -4858,6 +4875,245 @@ fixture_stage_model() {
   PLAN_MODEL=inherit IMPLEMENT_MODEL=inherit DESIGN_IMPLEMENT_MODEL=inherit SPEC="$d/plain.md"
   [ "$(stage_model plan)" = "inherit" ] || return 1
   [ "$(stage_model implement)" = "inherit" ] || return 1
+  return 0
+}
+
+fixture_claude_model_args() {
+  # claude_model_args (scripts/lib/models.sh) = resolve_effective_model then
+  # model_flag: the ONE rule every `claude -p` in the engine builds its --model
+  # argv by, now including the visual libs that used to hard-code dated IDs.
+  local root="$1" d="$root/cma"
+  mkdir -p "$d"
+  (
+    STATE=""
+    fx "inherit -> no flag" test -z "$(claude_model_args inherit)"
+    fx "empty -> no flag" test -z "$(claude_model_args '')"
+    fx "alias -> --model alias" test "$(claude_model_args opus)" = "--model opus"
+    fx "a full ID passes VERBATIM (never validated/rewritten)" \
+      test "$(claude_model_args claude-fable-5-1)" = "--model claude-fable-5-1"
+    STATE="$d/state.json"
+    printf '{"model_fallbacks":{"claude-fable-5-1":"opus"}}\n' >"$STATE"
+    fx "a recorded per-model fallback is applied" test "$(claude_model_args claude-fable-5-1)" = "--model opus"
+    fx "unmapped model unchanged under a fallback map" test "$(claude_model_args sonnet)" = "--model sonnet"
+    # The visual libs must build their model argv through this helper (no
+    # hard-coded `--model "…"` left) and self-source models.sh so the
+    # standalone scripts/visual-review.sh gets the same rules.
+    fx "visual-capture.sh self-sources models.sh" grep -q '/models.sh"' "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh"
+    fx "visual-review.sh sources models.sh" grep -q 'lib/models.sh"' "$WORKSPACE_ROOT/scripts/visual-review.sh"
+    fx "no hard-coded --model left in the visual libs" \
+      test "$(grep -c -- '--model "' "$WORKSPACE_ROOT/scripts/lib/visual-capture.sh" "$WORKSPACE_ROOT/scripts/lib/visual-repair.sh" | awk -F: '{s+=$2} END {print s+0}')" -eq 0
+    fx "visual_stage_ref uses claude_model_args" fn_body_has visual_stage_ref claude_model_args
+    fx "repair_agent uses claude_model_args on the opus-alias default" \
+      fn_body_has repair_agent 'NIGHT_SHIFT_VISUAL_REPAIR_MODEL:-opus'
+    # model_flag itself now lives in models.sh (shared), not the orchestrator.
+    fx "model_flag defined by models.sh" grep -q '^model_flag() {' "$WORKSPACE_ROOT/scripts/lib/models.sh"
+    fx_not "model_flag no longer defined in night-shift.sh" grep -q '^model_flag() {' "$WORKSPACE_ROOT/scripts/night-shift.sh"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_fallback_chain() {
+  # successor_model: the built-in ladder matches by FAMILY substring (a full
+  # ID maps like its alias — previously `claude-fable-5-1` had no successor
+  # and blocked the run under NIGHT_SHIFT_MODEL_FALLBACK=1), and
+  # NIGHT_SHIFT_MODEL_FALLBACK_CHAIN replaces it with an explicit ordered
+  # list so a model the ladder has never heard of still has a successor.
+  local root="$1" d="$root/chain" fdir="$WORKSPACE_ROOT/scripts/test/fixtures/rate-limit"
+  mkdir -p "$d"
+  (
+    local rc out
+    unset NIGHT_SHIFT_MODEL_FALLBACK_CHAIN
+    fx "ladder: claude-fable-5-1 -> opus" test "$(successor_model claude-fable-5-1)" = "opus"
+    fx "ladder: claude-opus-5 -> sonnet" test "$(successor_model claude-opus-5)" = "sonnet"
+    fx "ladder: opus -> sonnet" test "$(successor_model opus)" = "sonnet"
+    rc=0; out="$(successor_model claude-sonnet-5)" || rc=$?
+    fx "ladder: sonnet family has no successor (rc 1)" test "$rc" -eq 1
+    fx "ladder: no-successor echoes the input" test "$out" = "claude-sonnet-5"
+    export NIGHT_SHIFT_MODEL_FALLBACK_CHAIN="claude-fable-5-1 > opus > claude-sonnet-5 > haiku"
+    fx "chain: first -> second" test "$(successor_model claude-fable-5-1)" = "opus"
+    fx "chain: entries are whitespace-trimmed" test "$(successor_model opus)" = "claude-sonnet-5"
+    fx "chain: a model the ladder cannot map now has a successor" test "$(successor_model claude-sonnet-5)" = "haiku"
+    rc=0; out="$(successor_model haiku)" || rc=$?
+    fx "chain: last entry has no successor (rc 1)" test "$rc" -eq 1
+    fx "chain: last entry echoed" test "$out" = "haiku"
+    rc=0; out="$(successor_model fable-test)" || rc=$?
+    fx "chain REPLACES the ladder: an unlisted fable spelling has no successor" test "$rc" -eq 1
+    # End-to-end through handle_per_model_limit: the recorded fallback is the
+    # chain's successor, and resolve_effective_model returns it afterward.
+    STATE="$d/state.json"; RUN_ROOT="$d"; RUN_ID="chain-$$"
+    printf '%s\n' '{"status":"running","stage":"implementation","session_id":"old-sid"}' >"$STATE"
+    block_run() { printf '%s\n' "$1" >"$d/blocked.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    NIGHT_SHIFT_MODEL_FALLBACK=1 handle_per_model_limit "$fdir/per-model-limit.json" "claude-sonnet-5" 2>/dev/null || exit 1
+    fx "no block: the chain supplied a successor" test ! -f "$d/blocked.txt"
+    fx "fallback recorded from the chain" test "$(jq -r '.model_fallbacks["claude-sonnet-5"]' "$STATE")" = "haiku"
+    fx "resolve_effective_model follows it" test "$(resolve_effective_model claude-sonnet-5)" = "haiku"
+    fx "model_fallback event journaled" grep -q '^model_fallback|' "$d/events.txt"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_per_step_models() {
+  # Every step is its own optional knob: EMPTY follows the tier the step
+  # belonged to (an unset engine is byte-identical to the two-tier rule), a
+  # value — alias, full ID or inherit — moves just that step.
+  local root="$1" d="$root/psm"
+  mkdir -p "$d"
+  printf 'Spec\n\n## Test Plan\n- x\n' >"$d/plain.md"
+  (
+    local out k fn
+    SPEC="$d/plain.md"
+    PLAN_MODEL=opus IMPLEMENT_MODEL=sonnet DESIGN_IMPLEMENT_MODEL=opus PERSONA_MODEL=sonnet
+    VISUAL_MODEL="" OBSERVE_REQUEST_MODEL="" COMPLETE_MODEL=""
+    PERSONA_PLAN_MODEL="" PERSONA_IMPLEMENTATION_MODEL=""
+    fx "visual follows implement when empty" test "$(stage_model visual)" = "sonnet"
+    fx "observe follows implement when empty" test "$(stage_model observe)" = "sonnet"
+    fx "complete follows implement when empty" test "$(stage_model complete)" = "sonnet"
+    fx "persona plan follows PERSONA_MODEL when empty" test "$(persona_stage_model plan)" = "sonnet"
+    fx "persona implementation follows PERSONA_MODEL when empty" test "$(persona_stage_model implementation)" = "sonnet"
+    fx "unknown persona stage -> PERSONA_MODEL" test "$(persona_stage_model bogus)" = "sonnet"
+    VISUAL_MODEL=haiku OBSERVE_REQUEST_MODEL=claude-opus-5 COMPLETE_MODEL=inherit
+    PERSONA_PLAN_MODEL=opus PERSONA_IMPLEMENTATION_MODEL=claude-fable-5-1
+    fx "visual override (alias)" test "$(stage_model visual)" = "haiku"
+    fx "observe override (full ID verbatim)" test "$(stage_model observe)" = "claude-opus-5"
+    fx "complete override: inherit passes through" test "$(stage_model complete)" = "inherit"
+    fx "implement untouched by step overrides" test "$(stage_model implement)" = "sonnet"
+    fx "plan untouched by step overrides" test "$(stage_model plan)" = "opus"
+    fx "persona plan override" test "$(persona_stage_model plan)" = "opus"
+    fx "persona implementation override" test "$(persona_stage_model implementation)" = "claude-fable-5-1"
+    # Wiring: the persona spawn AND its per-model-cap handler resolve the
+    # stage's model (a plan-review cap must map the plan-review model), and
+    # the feedback / sweep-fix / port-audit sites read their own knobs.
+    fx "invoke_persona_once resolves persona_stage_model" \
+      fn_body_has invoke_persona_once 'persona_stage_model "$stage"'
+    fx "handle_persona_rate_limits resolves persona_stage_model" \
+      fn_body_has handle_persona_rate_limits 'persona_stage_model "$persona_stage"'
+    fx "write_run_feedback reads FEEDBACK_MODEL" fn_body_has write_run_feedback 'FEEDBACK_MODEL:-'
+    fx "sweep_fix_cycle reads SWEEP_FIX_MODEL" fn_body_has sweep_fix_cycle 'SWEEP_FIX_MODEL:-$IMPLEMENT_MODEL'
+    fx "port_audit_candidate reads PORT_AUDIT_MODEL" fn_body_has port_audit_candidate 'PORT_AUDIT_MODEL:-$PERSONA_MODEL'
+    # --list-config discovers every knob from source, with its default.
+    out="$(list_config)"
+    for k in NIGHT_SHIFT_VISUAL_MODEL NIGHT_SHIFT_OBSERVE_REQUEST_MODEL NIGHT_SHIFT_COMPLETE_MODEL \
+      NIGHT_SHIFT_PERSONA_PLAN_MODEL NIGHT_SHIFT_PERSONA_IMPLEMENTATION_MODEL NIGHT_SHIFT_FEEDBACK_MODEL \
+      NIGHT_SHIFT_SWEEP_FIX_MODEL NIGHT_SHIFT_PORT_AUDIT_MODEL NIGHT_SHIFT_VISUAL_REF_MODEL \
+      NIGHT_SHIFT_VISUAL_REPAIR_MODEL NIGHT_SHIFT_MODEL_FALLBACK_CHAIN NIGHT_SHIFT_MEMORY \
+      NIGHT_SHIFT_MEMORY_URL NIGHT_SHIFT_REVIEWER_ISOLATION; do
+      fx "--list-config lists $k" grep -q "^  $k " <<<"$out"
+    done
+    fx "visual repair default is the opus ALIAS (no dated ID)" grep -qE 'NIGHT_SHIFT_VISUAL_REPAIR_MODEL +default: opus$' <<<"$out"
+    fx "memory default is off" grep -qE 'NIGHT_SHIFT_MEMORY +default: off$' <<<"$out"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_memory_integration() {
+  # scripts/lib/memory.sh: everything is inert unless NIGHT_SHIFT_MEMORY=ai-memory;
+  # on, the reviewer sessions get hooks off + no MCP, the plan/completion
+  # prompt blocks exist, and the startup probe journals but never blocks.
+  local root="$1" d="$root/mem"
+  mkdir -p "$d"
+  (
+    local v fn rc out
+    for v in off 0 "" ai-memory; do fx "validate_memory_knob accepts '$v'" validate_memory_knob "$v"; done
+    fx_not "validate_memory_knob rejects a typo" validate_memory_knob ai-memroy
+    MEMORY=off REVIEWER_ISOLATION=""
+    fx_not "memory inactive by default" memory_active
+    fx_not "isolation inactive by default" reviewer_isolation_active
+    fx "no isolation argv by default" test -z "$(reviewer_isolation_args)"
+    fx "no recall block when off" test -z "$(memory_recall_prompt_block)"
+    fx "no handoff block when off" test -z "$(memory_handoff_prompt_block)"
+    MEMORY=ai-memory
+    fx "memory active" memory_active
+    fx "isolation follows memory" reviewer_isolation_active
+    fx "isolation argv: hooks off + strict MCP" \
+      test "$(reviewer_isolation_args)" = '--settings {"disableAllHooks":true} --strict-mcp-config'
+    # The argv is printed unquoted at the call site: it must word-split into
+    # exactly three elements with the settings JSON intact as ONE of them.
+    # shellcheck disable=SC2046
+    set -- $(reviewer_isolation_args)
+    fx "isolation argv splits into 3 words" test "$#" -eq 3
+    fx "settings JSON survives the split as one word" test "$2" = '{"disableAllHooks":true}'
+    fx "recall block names the memory MCP tools" bash -c 'grep -q memory_query <<<"$1" && grep -q memory_briefing <<<"$1"' _ "$(memory_recall_prompt_block)"
+    fx "recall block frames memory as untrusted evidence" grep -qi 'untrusted' <<<"$(memory_recall_prompt_block)"
+    fx "recall block never blocks on memory" grep -q 'never block' <<<"$(memory_recall_prompt_block)"
+    fx "handoff block names memory_handoff_begin + shared" bash -c 'grep -q memory_handoff_begin <<<"$1" && grep -q "shared: true" <<<"$1"' _ "$(memory_handoff_prompt_block)"
+    fx "handoff block never blocks completion" grep -q 'never block completion' <<<"$(memory_handoff_prompt_block)"
+    REVIEWER_ISOLATION=0
+    fx_not "explicit NIGHT_SHIFT_REVIEWER_ISOLATION=0 overrides memory" reviewer_isolation_active
+    MEMORY=off REVIEWER_ISOLATION=1
+    fx "explicit =1 isolates without memory" reviewer_isolation_active
+    # Startup probe, seam-driven (memory_probe_http): journals memory_probe
+    # with ok:true on a 200, WARNs + ok:false otherwise, NEVER blocks, and is
+    # a no-op when memory is off.
+    MEMORY=ai-memory REVIEWER_ISOLATION="" MEMORY_URL="http://127.0.0.1:1/"
+    STATE=""; RUN_ROOT="$d"; RUN_ID="mem-$$"
+    block_run() { printf 'BLOCKED %s\n' "$1" >"$d/blocked.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    memory_probe_http() { printf '%s\n' "$1" >>"$d/probe-urls.txt"; printf '200'; }
+    memory_startup_probe 2>/dev/null
+    fx "probe GETs /auth/me (trailing slash stripped)" grep -qx 'http://127.0.0.1:1/auth/me' "$d/probe-urls.txt"
+    fx "memory_probe journaled ok:true" grep -q '^memory_probe|.*"ok":true' "$d/events.txt"
+    memory_probe_http() { return 1; }
+    memory_startup_probe 2>"$d/warn.txt"
+    fx "unreachable server WARNs" grep -q 'WARN: ai-memory NOT reachable' "$d/warn.txt"
+    fx "unreachable server journals ok:false" grep -q '^memory_probe|.*"ok":false' "$d/events.txt"
+    fx "unreachable server never blocks" test ! -f "$d/blocked.txt"
+    unset -f memory_probe_http
+    # The real seam fails closed on a dead loopback port (curl present) — it
+    # must return non-zero, never a fake "200", when nothing is listening.
+    rc=0; out="$(memory_probe_http http://127.0.0.1:1/auth/me)" || rc=$?
+    if command -v curl >/dev/null 2>&1; then
+      fx "real memory_probe_http fails closed on a dead port" test "$rc" -ne 0
+      fx "real memory_probe_http never prints 200 for a dead port" test "$out" != "200"
+    fi
+    MEMORY=off; : >"$d/events.txt"
+    memory_startup_probe
+    fx "probe is a no-op when memory is off" test ! -s "$d/events.txt"
+    # Wiring: every context-isolated reviewer passes the isolation argv; the
+    # primary does NOT (its memory hooks are the point); main_run validates
+    # the knob loudly and runs the probe next to the contract canaries.
+    for fn in invoke_persona_once invoke_observer_once sweep_run; do
+      fx "$fn passes reviewer_isolation_args" fn_body_has "$fn" reviewer_isolation_args
+    done
+    fx_not "invoke_primary is never isolated" fn_body_has invoke_primary reviewer_isolation_args
+    fx "main_run validates the memory knob" fn_body_has main_run validate_memory_knob
+    fx "main_run runs memory_startup_probe" fn_body_has main_run memory_startup_probe
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_memory_prompt_wiring() {
+  # primary_prompt: the recall block only in the planning stage, the handoff
+  # block only in the completion stage, neither when memory is off — same
+  # prompt-level posture as doc-freshness.
+  local root="$1" dir="$root/memprompt"
+  mkdir -p "$dir"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  fixture_write_min_spec "$SPEC"
+  (
+    MEMORY=ai-memory
+    printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-plan.txt"
+    fx "planning prompt carries the recall block" grep -q 'memory_query' "$dir/p-plan.txt"
+    fx_not "planning prompt carries no handoff block" grep -q 'memory_handoff_begin' "$dir/p-plan.txt"
+    printf '{"stage":"completion","stage_turns":0,"primary_turns":9,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-complete.txt"
+    fx "completion prompt carries the handoff block" grep -q 'memory_handoff_begin' "$dir/p-complete.txt"
+    fx_not "completion prompt carries no recall block" grep -q 'memory_query' "$dir/p-complete.txt"
+    printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-impl.txt"
+    fx_not "implementation prompt carries neither" grep -q 'memory_query\|memory_handoff_begin' "$dir/p-impl.txt"
+    MEMORY=off
+    printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-plan-off.txt"
+    fx_not "memory off: planning prompt has no memory text" grep -q 'Agent memory' "$dir/p-plan-off.txt"
+    exit 0
+  ) >/dev/null || return 1
   return 0
 }
 

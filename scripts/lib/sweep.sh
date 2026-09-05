@@ -107,12 +107,13 @@ write_run_feedback() {
   else
     # model computed only on this branch — the cursor branch above passes its
     # own $CURSOR_IMPLEMENT_MODEL and never reads it, so resolving it up front
-    # for both branches was dead work on the cursor path.
+    # for both branches was dead work on the cursor path. FEEDBACK_MODEL is
+    # this session's own optional override; empty follows IMPLEMENT_MODEL.
     # model_flag intentionally word-splits into `--model X` (or nothing); same
     # idiom as sweep_run/invoke_observer_once.
     # shellcheck disable=SC2046
     (cd "$project" && printf '%s' "$prompt_text" |
-      claude -p $(model_flag "$(resolve_effective_model "${IMPLEMENT_MODEL:-sonnet}")") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+      claude -p $(model_flag "$(resolve_effective_model "${FEEDBACK_MODEL:-${IMPLEMENT_MODEL:-sonnet}}")") --output-format json) >"$raw" 2>"$raw.err" || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
     log "WARN: run feedback session failed (rc=$rc; see $raw.err)"
@@ -184,9 +185,14 @@ sweep_run() {
   # reconstruct the diff itself via `main...HEAD` instead (wrong scope once
   # main has advanced; proven live). See sweep_prompt's authoritative-scope
   # instruction above, which this flag makes actually satisfiable.
+  # reviewer_isolation_args word-splits the same way: hooks off + no MCP for
+  # this whole-branch REVIEW session under NIGHT_SHIFT_MEMORY /
+  # NIGHT_SHIFT_REVIEWER_ISOLATION=1 (it is a reviewer, like the observer);
+  # nothing otherwise. Guarded: --sweep-only sources memory.sh too, but a
+  # bare `. sweep.sh` in a fixture may not.
   # shellcheck disable=SC2046
   (cd "$project" && sweep_prompt "$out" |
-    claude -p $(model_flag "$model") --add-dir "$out" --output-format json) >"$raw" 2>"$raw.err" || rc=$?
+    claude -p $(model_flag "$model") $(command -v reviewer_isolation_args >/dev/null 2>&1 && reviewer_isolation_args) --add-dir "$out" --output-format json) >"$raw" 2>"$raw.err" || rc=$?
   if [ "$rc" -ne 0 ] && command -v is_rate_limit_response >/dev/null 2>&1 && is_rate_limit_response "$raw"; then
     # Bound the wait. This session runs at the very tail of an otherwise-
     # successful run (or standalone via --sweep-only) — it is advisory, never
@@ -342,10 +348,11 @@ sweep_fix_cycle() {
         >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
     else
       # model_flag intentionally word-splits, same idiom as
-      # sweep_run/invoke_observer_once.
+      # sweep_run/invoke_observer_once. SWEEP_FIX_MODEL is this session's own
+      # optional override; empty follows IMPLEMENT_MODEL.
       # shellcheck disable=SC2046
       (cd "$project" && printf '%s' "$fix_prompt" |
-        claude -p $(model_flag "$(resolve_effective_model "$IMPLEMENT_MODEL")") \
+        claude -p $(model_flag "$(resolve_effective_model "${SWEEP_FIX_MODEL:-$IMPLEMENT_MODEL}")") \
         --add-dir "$out" --permission-mode acceptEdits --output-format json) \
         >"$out/fix-session-$cycles.json" 2>"$out/fix-session-$cycles.err" || true
     fi

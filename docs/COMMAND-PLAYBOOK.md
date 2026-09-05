@@ -33,6 +33,8 @@ workspace container (`<workspace>/<app>`).
 | Audit tests for false confidence (vacuous assertions, tautological round-trips) | `scripts/test-audit.sh --project <app> --tests <path...>` | §11 |
 | Audit a spec's quality before launching a run (vague ACs, non-biting validation) | `scripts/spec-audit.sh --spec <spec> [--offline]` | §12 |
 | Run a task's implement stage on Codex instead of Claude | `- Engines: implement=codex` in the spec's `## Review` section | §13 |
+| Give the primary cross-run memory (ai-memory) / isolate reviewers from user hooks | `NIGHT_SHIFT_MEMORY=ai-memory … scripts/night-shift.sh …` | §14 |
+| Move one step to another model (new alias / full ID / `inherit`) | the step's `NIGHT_SHIFT_*_MODEL` knob (`--list-config` lists them) | §6 |
 | Free pre-flight of any night-shift (no cost) | append `--fixture-test --dry-run` | §6 |
 
 ---
@@ -142,6 +144,16 @@ one change: the web bench with Backend & Data Expert promoted into the always-ru
 floor, profiles `full`/`logic` only, template `specs/_template-fullstack.md`). Model tiering: `NIGHT_SHIFT_PLAN_MODEL`
 (opus), `NIGHT_SHIFT_IMPLEMENT_MODEL` (sonnet), `NIGHT_SHIFT_OBSERVER_MODEL` (opus),
 `NIGHT_SHIFT_PERSONA_MODEL` (sonnet); set any to `inherit` for the CLI's startup model.
+Every other step has an optional override, empty by default (= follow its tier):
+`NIGHT_SHIFT_VISUAL_MODEL` / `_OBSERVE_REQUEST_MODEL` / `_COMPLETE_MODEL` /
+`_FEEDBACK_MODEL` / `_SWEEP_FIX_MODEL` (→ implement), `_PERSONA_PLAN_MODEL` /
+`_PERSONA_IMPLEMENTATION_MODEL` / `_PORT_AUDIT_MODEL` (→ personas), `_SWEEP_MODEL`
+(→ observer), `_VISUAL_REF_MODEL` (`claude-haiku-4-5`) / `_VISUAL_REPAIR_MODEL`
+(`opus`) / `_TEST_AUDIT_MODEL` (`sonnet`). Values go verbatim to `claude --model`
+(alias, full ID, or `inherit`); `scripts/night-shift.sh --list-config` prints every
+knob with its default. Under `NIGHT_SHIFT_MODEL_FALLBACK=1`,
+`NIGHT_SHIFT_MODEL_FALLBACK_CHAIN=a>b>c` names the per-model-cap successor order
+for models the built-in `fable>opus>sonnet` ladder does not know.
 Opt-in second implementer vendor: `NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor` (default
 `claude`) runs post-plan primary work on the Cursor CLI instead —
 `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` (default `cursor-grok-4.6-high`),
@@ -408,6 +420,31 @@ the resume invocation — codex re-resolves its model per call, unlike `claude
 apart, before `block_run` — no Claude-shaped 429 handling for codex in v1).
 `NIGHT_SHIFT_REVIEW.md` and the observer's own verdict then honestly show
 `"primary": "codex"` for that task instead of always `"claude"`.
+
+## §14 — Give the primary cross-run memory (ai-memory) → `NIGHT_SHIFT_MEMORY=ai-memory`
+
+```sh
+# once: run the server + wire Claude Code (user scope) — see docs/ai-memory-integration.md
+ai-memory install-mcp   --client claude-code --apply
+ai-memory install-hooks --agent  claude-code --apply --project-strategy repo-root
+# every run:
+NIGHT_SHIFT_MEMORY=ai-memory NIGHT_SHIFT_ACCEPT_COSTS=YES \
+  scripts/night-shift.sh --project <workspace>/<app> --spec specs/<name>.md
+```
+
+Default `off` = byte-identical engine. On: a startup probe of
+`NIGHT_SHIFT_MEMORY_URL` (default `http://127.0.0.1:49374`; `_TOKEN` for a
+Bearer, `_TIMEOUT` default 3s) journals `memory_probe` and WARNs — never
+blocks; the plan-scope prompt tells the primary to recall prior decisions via
+the `memory_query`/`memory_briefing` MCP tools (as untrusted evidence) and the
+completion-scope prompt tells it to file one shared `memory_handoff_begin`;
+both skip silently when the tools are absent. Reviewer isolation rides along:
+personas, observer and branch sweep get `--settings '{"disableAllHooks":true}'
+--strict-mcp-config` so ai-memory's SessionStart handoff injection (which has
+no print-mode exclusion) never reaches the independent gate and the throwaway
+reviewer cwds never become wiki projects. `NIGHT_SHIFT_REVIEWER_ISOLATION=1`
+gives you the isolation alone; `=0` forces it off under memory (not
+recommended). Any other `NIGHT_SHIFT_MEMORY` value dies at startup.
 
 ## Prerequisites & environment
 
