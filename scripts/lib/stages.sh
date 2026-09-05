@@ -29,7 +29,10 @@ enforce_limits() {
   stage_elapsed=$((now - stage_started))
   task_elapsed=$((now - task_started))
   if limit_exceeded "$stage_turns" "$stage_elapsed" "$task_turns" "$task_elapsed"; then
-    block_run "turn/time limit reached (stage ${stage_turns}/${MAX_STAGE_TURNS}, task ${task_turns}/${MAX_TASK_TURNS})"
+    # Name what the run was doing when the budget ran out (stage, review
+    # round, reviewers still pending, open finding ids) — the 3am reader
+    # needs the diagnosis, not just the counter.
+    block_run "turn/time limit reached (stage ${stage_turns}/${MAX_STAGE_TURNS}, task ${task_turns}/${MAX_TASK_TURNS}); $(jq -r '"at stage \(.stage), review round \(.review_round // 0), pending personas: \(.pending_personas // "none"), open findings: \((.finding_ids // []) | join(", ") | if . == "" then "none" else . end)"' "$STATE" 2>/dev/null)"
   fi
 }
 

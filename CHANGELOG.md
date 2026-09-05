@@ -6,6 +6,111 @@ observer approval.
 
 ## Unreleased
 
+### Self-recovery, review caps, and a closed self-improvement loop
+
+- **The Claude primary now retries transient failures.** Any `claude -p`
+  failure that is not one of the two recognized 429 shapes (an API
+  5xx/overloaded, a network reset, a CLI crash, a turn killed by its deadline)
+  used to `block_run` the whole night on the first occurrence — the one paid
+  call in the engine with zero retry. It now gets the cursor branch's shape:
+  `NIGHT_SHIFT_CLAUDE_MAX_RETRIES` (default `2`) extra attempts with linear
+  backoff (`NIGHT_SHIFT_CLAUDE_RETRY_BACKOFF`, default `30`s × attempt),
+  bounded by `NIGHT_SHIFT_CLAUDE_MAX_WAIT` (default `300`s) of cumulative
+  sleep per turn, resuming the failed attempt's own session when it minted
+  one; each retry journals `primary_retry {backend, attempt, rc, reason}`,
+  and the eventual block names the CLI's own error line (`claude_failure_reason`)
+  and stays `--resume`-able. Fresh starts pre-mint a `--session-id`
+  (`mint_session_id`) so a turn that dies before printing its envelope
+  (deadline kill, CLI crash) is RESUMED by the retry rather than re-run blind
+  over its own edits; a resume the CLI rejects as unknown restarts fresh (and
+  archives the stale signal), and a failed resume that echoes a different
+  session id blocks as drift rather than being retried. The claude spawns'
+  stderr is now captured to `raw/primary-N.json.err` alongside cursor's.
+- **A wall-clock deadline on every paid Claude call** (`scripts/lib/resilience.sh`
+  `run_with_turn_timeout`): the primary, persona and observer spawns can no
+  longer hang past every budget (the stage/task caps were only checked
+  *between* turns). Deliberately not GNU `timeout`, which moves its child into
+  a new process group and would put the session out of reach of the engine's
+  pgid-based kills (persona reaping, `block_run`, Ctrl-C): the command is
+  backgrounded in the caller's own group with stdin preserved, a watchdog
+  TERMs then KILLs it at the deadline, and an interrupt of the shell is
+  forwarded to it, and the CLI's own children (a wedged MCP server) are
+  signalled too. The deadline is the smaller of `NIGHT_SHIFT_TURN_TIMEOUT`
+  (default 1800s; 0 = no per-turn cap) and the stage's remaining time budget
+  plus 60s grace (floor 300s) — the per-turn cap is what leaves budget to
+  retry in, the stage term is what makes it never a false kill. A killed
+  turn feeds the retry path above without the API backoff (a hang says
+  nothing about API load) — unless the stage budget is already spent, in
+  which case the run blocks immediately with the real reason. Every failed
+  attempt's envelope/stderr is kept (`raw/primary-N.json.attempt-K`) and its
+  cost ledgered. A persona or observer call killed by its deadline is retried
+  once with a note naming the deadline (not a "malformed verdict" note that
+  would ask the model to fix a verdict it never produced), and the run-tail
+  sessions (feedback, branch sweep, sweep fix) run under the per-turn cap too,
+  so a hung tail session can no longer hold a finished run open.
+- **Signal auto-repair.** A `next-action.json` wrapped in a ```` ```json ````
+  fence or prose — the single most common malformation — used to cost a paid
+  correction turn against `NIGHT_SHIFT_MAX_MALFORMED_SIGNALS`. `validate_signal`
+  now runs the same salvage ladder the persona/observer verdicts get (last
+  fenced block, then the outermost object; objects only) before counting a
+  rejection, keeps the original as `next-action.json.unrepaired.txt`, and
+  journals `signal_repaired {strategy}`.
+- **Orphaned smoke servers are reaped on recovery.** The smoke server's
+  process group and its leader's start time are mirrored into `state.json`
+  (`.smoke_pgid`, `.smoke_pgid_started`) while it lives; a run killed
+  mid-poll (SIGKILL, panic) used to orphan it holding its port. `recover_run`
+  stops a still-live recorded server whose identity still matches (journaled
+  `smoke_reaped`) — a reused pid after a reboot is left alone and the stale
+  record dropped.
+- **Review-loop caps with a diagnostic block.** `NIGHT_SHIFT_MAX_REVIEW_ROUNDS`
+  (default `6`) and `NIGHT_SHIFT_MAX_OBSERVER_BLOCKS` (default `3`, per task)
+  replace "grind the turn budget, then block with `turn/time limit reached`"
+  with an early block naming the stage, the round, and the pending reviewers
+  / open finding ids. Both are `--resume`-able after raising the knob by
+  one: the round cap is checked before the round is counted, and the observer
+  cap hands the task to the implement scope before blocking so the resume
+  implements the block notes instead of re-reviewing the same candidate.
+- **Sub-agent 429s no longer poison the shared counter.** The consecutive-429
+  counter was reset only by a successful *primary* turn, so five persona/
+  observer 429s inside one review batch could trip the 5-cap on a limit that
+  was clearing; it now also resets when a sub-agent call completes
+  (`subagent_success_reset`).
+- **A passed candidate is no longer failed by a cleanup nit**: a validation
+  worktree that cannot be removed is retried after `git worktree prune`, then
+  WARNs + journals `worktree_cleanup_failed` and clears the pointer instead of
+  `block_run`ing a green result.
+- **Structured block kinds.** `block_run <reason> [kind]` records
+  `.block_kind` (`primary_failure`, `per_model_cap`) next to the prose reason,
+  and the recovery predicates switch on it (with the legacy prose prefix as a
+  fallback for older state files), so the block text is free to change.
+- **One JSON salvage ladder** (`salvage_json_from_text`, lib/normalize.sh)
+  now serves the observer/persona verdict extraction and the signal repair.
+- **The self-improvement loop is closed by default.** Every run's feedback
+  bullets (`.night-shift/feedback.md`) were write-only; the planning prompt
+  now carries the last `NIGHT_SHIFT_FEEDBACK_RECALL_LINES` (default `40`)
+  lines as advisory, explicitly untrusted hints (`NIGHT_SHIFT_FEEDBACK_RECALL=0`
+  turns the recall off). Because the file lives in the agent-writable tree
+  and is recalled into every later run, it gets the state.json treatment: a
+  private copy outside the tree, refreshed by `write_run_feedback`; a
+  the recalled text is read from that copy, never from the tree file; each
+  entry is appended to the copy and mirrored to the tree; a run start
+  regenerates a divergent mirror from the copy (WARN +
+  `feedback_mirror_divergent`) and seeds the copy from the mirror only when
+  the copy is missing — so an in-run edit to the mirror is discarded, never
+  laundered into the source. After an observer BLOCK the fresh implement session gets the
+  required changes *verbatim* (`control/observer-block.md`, inlined) instead
+  of only the verdict file's name. `write_run_metrics` appends one
+  deterministic row per run to `.night-shift/metrics.jsonl` (turns, rounds,
+  observer blocks, candidates, every retry/wait/fallback count, signal
+  repairs, total cost, the run's models; journaled as `run_metrics`), and
+  `metrics.jsonl` + `port-audit/` now survive compaction like `feedback.md`.
+- **Bookkeeping cost**: the journal's tamper-evidence anchor is appended to
+  (`integrity_append`) instead of re-copied on every event (was O(n²) over a
+  run); the per-turn log line reads state once instead of four times; the
+  pnpm `node_modules` mirror drops two `basename` forks per entry; the
+  fixture suite's coverage ratchet does one `grep` pass instead of ~600 and
+  its smoke fixture's deliberate timeouts halved.
+
 ### Per-step model knobs, open fallback chain, ai-memory (opt-in)
 
 - **Every step is now its own model knob**, all optional and empty by default

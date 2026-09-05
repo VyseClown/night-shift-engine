@@ -144,6 +144,14 @@ one change: the web bench with Backend & Data Expert promoted into the always-ru
 floor, profiles `full`/`logic` only, template `specs/_template-fullstack.md`). Model tiering: `NIGHT_SHIFT_PLAN_MODEL`
 (opus), `NIGHT_SHIFT_IMPLEMENT_MODEL` (sonnet), `NIGHT_SHIFT_OBSERVER_MODEL` (opus),
 `NIGHT_SHIFT_PERSONA_MODEL` (sonnet); set any to `inherit` for the CLI's startup model.
+Self-recovery is on by default: a transient Claude failure retries
+(`NIGHT_SHIFT_CLAUDE_MAX_RETRIES` 2 / `_CLAUDE_RETRY_BACKOFF` 30 / `_CLAUDE_MAX_WAIT`
+300), the primary/persona/observer calls run under `NIGHT_SHIFT_TURN_TIMEOUT`
+(1800s, bounded by the stage's remaining budget; the feedback/sweep tail sessions
+get the cap alone), review loops cap at `NIGHT_SHIFT_MAX_REVIEW_ROUNDS` 6 /
+`NIGHT_SHIFT_MAX_OBSERVER_BLOCKS` 3 with a diagnostic block, and the planning
+prompt recalls `.night-shift/feedback.md` (`NIGHT_SHIFT_FEEDBACK_RECALL`, lines
+`_FEEDBACK_RECALL_LINES` 40). One metrics row per run: `.night-shift/metrics.jsonl`.
 Every other step has an optional override, empty by default (= follow its tier):
 `NIGHT_SHIFT_VISUAL_MODEL` / `_OBSERVE_REQUEST_MODEL` / `_COMPLETE_MODEL` /
 `_FEEDBACK_MODEL` / `_SWEEP_FIX_MODEL` (→ implement), `_PERSONA_PLAN_MODEL` /

@@ -26,28 +26,66 @@
 # tmp before a --resume) degrades to seed-on-first-check with a log line — never
 # a block. The anchor dir is kept on a blocked run so --resume retains
 # integrity continuity; it is removed only on successful completion.
-integrity_dir() { printf '%s/night-shift-auth-%s' "$(tmp_base)" "$RUN_ID"; }
+# The anchor dir is a run constant: resolve it ONCE per RUN_ID into
+# INTEGRITY_DIR (tmp_base forks a `cd && pwd -P`), in the calling shell —
+# state_set runs dozens of times per turn and every journal event goes
+# through here, so the per-call `$(integrity_dir)` fork storm added up.
+integrity_dir_resolve() {
+  if [ "${INTEGRITY_DIR_FOR:-}" != "${RUN_ID:-}" ] || [ -z "${INTEGRITY_DIR:-}" ]; then
+    INTEGRITY_DIR="$(tmp_base)/night-shift-auth-${RUN_ID:-}"
+    INTEGRITY_DIR_FOR="${RUN_ID:-}"
+  fi
+}
+integrity_dir() { integrity_dir_resolve; printf '%s' "$INTEGRITY_DIR"; }
 
+# Pure string op for a RUN_ROOT path (the common case); basename otherwise.
 integrity_key() {
   local file="$1"
   case "$file" in
     "$RUN_ROOT"/*) printf '%s' "${file#"$RUN_ROOT"/}" ;;
-    *) basename "$file" ;;
+    *) printf '%s' "${file##*/}" ;;
   esac
 }
 
 integrity_put() {
   [ -n "${RUN_ID:-}" ] && [ -n "${RUN_ROOT:-}" ] && [ -f "${1:-}" ] || return 0
   local dst
-  dst="$(integrity_dir)/$(integrity_key "$1")"
-  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 0
+  integrity_dir_resolve
+  dst="$INTEGRITY_DIR/$(integrity_key "$1")"
+  mkdir -p "${dst%/*}" 2>/dev/null || return 0
   cp "$1" "$dst" 2>/dev/null || true
+}
+
+# Append-only twin of integrity_put for the journal: re-anchoring events.jsonl
+# with a full cp after EVERY append made journal bookkeeping O(n²) over a long
+# run. Append the same line to the private copy instead; a missing copy (a
+# reboot cleared tmp, first event) falls back to the full copy. Divergence is
+# still caught by integrity_guard at completion, exactly as before.
+# Self-healing: the per-append cp it replaced re-established anchor == file
+# on every event, so a single torn/failed mirror write could never persist;
+# here a failed append falls back to a full copy at once, and every
+# INTEGRITY_RESYNC_EVERY-th append does a full copy regardless — so a
+# divergence from an earlier partial write is bounded to that window
+# instead of surfacing as a false integrity_violation at completion.
+INTEGRITY_RESYNC_EVERY=50
+integrity_append() {
+  [ -n "${RUN_ID:-}" ] && [ -n "${RUN_ROOT:-}" ] && [ -f "${1:-}" ] || return 0
+  local dst
+  integrity_dir_resolve
+  dst="$INTEGRITY_DIR/$(integrity_key "$1")"
+  INTEGRITY_APPEND_N=$(( ${INTEGRITY_APPEND_N:-0} + 1 ))
+  if [ ! -f "$dst" ] || [ $(( INTEGRITY_APPEND_N % INTEGRITY_RESYNC_EVERY )) -eq 0 ]; then
+    integrity_put "$1"
+    return 0
+  fi
+  printf '%s\n' "$2" >>"$dst" 2>/dev/null || integrity_put "$1"
 }
 
 integrity_check() {
   [ -n "${RUN_ID:-}" ] && [ -n "${RUN_ROOT:-}" ] && [ -f "${1:-}" ] || return 0
   local auth
-  auth="$(integrity_dir)/$(integrity_key "$1")"
+  integrity_dir_resolve
+  auth="$INTEGRITY_DIR/$(integrity_key "$1")"
   if [ ! -f "$auth" ]; then
     log "integrity: no private copy of $(integrity_key "$1") (fresh seed or cleared tmp); seeding"
     integrity_put "$1"

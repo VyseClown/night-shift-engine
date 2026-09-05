@@ -30,9 +30,16 @@ emit_event() {
       --arg payload "$payload" \
       '{ts:$ts, run:$run, stage:$stage, type:$type, payload:$payload}' 2>/dev/null)" || return 0
   [ -n "$line" ] || return 0
-  printf '%s\n' "$line" >>"$RUN_ROOT/events.jsonl" 2>/dev/null || return 0
+  # A failed/torn journal write still re-syncs the anchor to whatever landed,
+  # so the mirror can never be AHEAD of the journal.
+  printf '%s\n' "$line" >>"$RUN_ROOT/events.jsonl" 2>/dev/null || {
+    ! command -v integrity_put >/dev/null 2>&1 || integrity_put "$RUN_ROOT/events.jsonl"
+    return 0
+  }
   # Tamper-evidence: the journal sits in the agent-writable project tree just
-  # like state.json, so re-anchor after every append; integrity_guard verifies
-  # it at completion. No-op when the integrity lib isn't loaded (bare sourcing).
-  ! command -v integrity_put >/dev/null 2>&1 || integrity_put "$RUN_ROOT/events.jsonl"
+  # like state.json, so mirror every append into the private copy
+  # (integrity_append — an append, not a full re-copy, so a long run's journal
+  # bookkeeping stays O(n)); integrity_guard verifies it at completion. No-op
+  # when the integrity lib isn't loaded (bare sourcing).
+  ! command -v integrity_append >/dev/null 2>&1 || integrity_append "$RUN_ROOT/events.jsonl" "$line"
 }

@@ -112,9 +112,12 @@ is not a git repo.
   compact archive; blocked and failed runs retain full state for recovery.
 - **`.night-shift/events.jsonl`** is the run's decision journal — one JSON line
   per decision point (run init with spec/base/branch, stage transitions,
-  accepted/rejected signals with reasons, persona verdicts with attempts and
-  retry reasons, observer retries, integrity violations, reaps, rate-limit
-  waits, blocks, completion). Study a finished or wrecked run
+  accepted/rejected/repaired signals with reasons, persona verdicts with
+  attempts and retry reasons, observer retries, primary retries, integrity
+  violations, reaps, rate-limit waits, blocks, completion, the run's metrics
+  row). **`.night-shift/feedback.md`** and **`.night-shift/metrics.jsonl`**
+  persist across runs: the next run's planning prompt recalls the feedback
+  tail, and one metrics row per run accumulates. Study a finished or wrecked run
   decision-by-decision with `jq . events.jsonl`; archived on success alongside
   `costs.jsonl`.
 - **`.night-shift/run.log`** is the persistent, timestamped copy of every human
@@ -193,8 +196,14 @@ NIGHT_SHIFT_ACCEPT_COSTS=YES scripts/night-shift.sh --project PATH --spec specs/
   mid-run.
 - **Limit behavior is safe.** If Claude returns a structured session-limit 429,
   the wrapper waits until the reported reset time plus a safety buffer, pauses
-  its elapsed-time budgets, and resumes the same explicit stage session.
-  Other API failures still stop via `block_run`. Nothing is pushed or merged.
+  its elapsed-time budgets, and resumes the same explicit stage session. Any
+  other primary failure (5xx/overloaded, network, CLI crash, a turn past its
+  wall-clock deadline) is retried with backoff (`NIGHT_SHIFT_CLAUDE_MAX_RETRIES`,
+  default 2) before `block_run`; the block is `--resume`-able. The primary,
+  persona and observer calls run under a per-turn deadline
+  (`NIGHT_SHIFT_TURN_TIMEOUT`, default 1800s, always bounded by the stage's
+  remaining budget; the run-tail feedback/sweep sessions get the cap alone).
+  Nothing is pushed or merged.
 - **Resuming a logic-blocked run.** `--resume` re-enters it, including when it
   blocked with **no pinned session** — normal under the default
   `NIGHT_SHIFT_SESSION_SCOPE=stage`, where the stage restarts from the files on

@@ -116,11 +116,18 @@ recoverable_rate_limit_state() {
   emitted="$(jq -r '.session_id // empty' "$raw")"
   [ -n "$session" ] && [ "$emitted" = "$session" ] || return 1
   if [ "$status" = "blocked" ] && [ "$(jq -r '.rate_limit_reset_at // empty' "$state")" = "" ]; then
-    case "$(jq -r '.block_reason // empty' "$state")" in
-      "primary command failed with status "*) ;;
-      *) return 1 ;;
-    esac
+    block_is_primary_failure "$state" || return 1
   fi
+}
+
+# Pure: the blocked state records a primary-turn failure — by the structured
+# .block_kind (block_run's 2nd arg) or, for state written before that field
+# existed, by the prose prefix every primary-failure block_run has carried.
+block_is_primary_failure() {
+  case "$(jq -r '.block_kind // empty' "$1" 2>/dev/null):$(jq -r '.block_reason // empty' "$1" 2>/dev/null)" in
+    primary_failure:*|":primary command failed"*) return 0 ;;
+  esac
+  return 1
 }
 
 # True when an explicit `--resume` may re-enter a logic-blocked run: status is
@@ -308,10 +315,10 @@ handle_per_model_limit() {
   local raw="$1" model="$2" mode="${3:-primary}" line successor
   line="$(jq -r '.result // empty' "$raw" 2>/dev/null)"
   if [ "${NIGHT_SHIFT_MODEL_FALLBACK:-0}" != "1" ]; then
-    block_run "per-model usage cap hit on model '$model' ($line); set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
+    block_run "per-model usage cap hit on model '$model' ($line); set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota" per_model_cap
   fi
   successor="$(successor_model "$model")" ||
-    block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor (not in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN, and outside the built-in fable>opus>sonnet ladder) — name it in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN=a>b>c, or set the affected NIGHT_SHIFT_*_MODEL knob to another model and re-run with --resume, or wait for the model's quota"
+    block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor (not in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN, and outside the built-in fable>opus>sonnet ladder) — name it in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN=a>b>c, or set the affected NIGHT_SHIFT_*_MODEL knob to another model and re-run with --resume, or wait for the model's quota" per_model_cap
   if [ "$mode" = "primary" ]; then
     state_set '.model_fallbacks[$from]=$to | .session_id=null | .updated_at=$now' \
       --arg from "$model" --arg to "$successor" --arg now "$(now_iso)"
