@@ -17,16 +17,45 @@ extract_claude_structured() {
   [ -n "$result" ] || return 1
   # (1) The whole result is already a JSON object.
   printf '%s' "$result" | jq '.' >"$out" 2>/dev/null && return 0
-  # (2) The LAST fenced code block (``` or ```json) — the model's verdict block.
-  printf '%s\n' "$result" | awk '
-    /^[ \t]*```/ { if (infence) { infence=0; last=buf } else { infence=1; buf="" } next }
+  # (2)+(3) The shared text-level salvage ladder (fenced block, then the
+  # outermost object) — the same one validate_signal's repair uses.
+  local text="$out.text.$$"
+  printf '%s\n' "$result" >"$text"
+  salvage_json_from_text "$text" "$out" >/dev/null && { rm -f "$text"; return 0; }
+  rm -f "$text"
+  return 1
+}
+
+# The text-level JSON salvage ladder, shared by every reply parser: from the
+# free text in file $1, write the LAST fenced code block (``` or ```json) if
+# it parses as JSON, else the outermost {...} embedded anywhere in prose, to
+# $2; print the strategy that hit ("fenced" / "outermost-object"). Returns 1
+# (and leaves $2 empty) when neither parses. Callers add their own shape
+# rule on top (an object for a signal, the verdict keys for a review).
+salvage_json_from_text() {
+  local in="$1" out="$2" fence
+  # Every fenced block, tried LAST to first: the verdict is conventionally the
+  # final fence, but a model that appends a fenced shell snippet or a fenced
+  # quote after its verdict used to defeat the fence strategy entirely (and
+  # the outermost-object fallback would then splice the two together). A
+  # fence must hold EXACTLY one JSON value (`jq -s` + length check) so a block
+  # of several objects is skipped, not silently truncated to its first.
+  # Fences are separated by \036 (record separator) so a blank line inside
+  # one cannot split it.
+  local fences=()
+  IFS=$'\036' read -r -d '' -a fences < <(awk '
+    /^[ \t]*```/ { if (infence) { infence=0; printf "%s\036", buf } else { infence=1; buf="" } next }
     infence { buf = buf $0 "\n" }
-    END { printf "%s", last }
-  ' | jq '.' >"$out" 2>/dev/null && [ -s "$out" ] && return 0
-  # (3) The outermost {...} object embedded anywhere in prose.
-  printf '%s' "$result" | tr '\n' ' ' \
-    | sed -E 's/^[^{]*//; s/[^}]*$//' \
-    | jq '.' >"$out" 2>/dev/null && [ -s "$out" ] && return 0
+  ' "$in"; printf '\0') || true
+  local i=$(( ${#fences[@]} - 1 ))
+  while [ "$i" -ge 0 ]; do
+    fence="${fences[$i]}"; i=$((i - 1))
+    [ -n "$fence" ] || continue
+    printf '%s' "$fence" | jq -s 'select(length == 1) | .[0]' >"$out" 2>/dev/null && [ -s "$out" ] && { printf 'fenced'; return 0; }
+  done
+  tr '\n' ' ' <"$in" | sed -E 's/^[^{]*//; s/[^}]*$//' |
+    jq '.' >"$out" 2>/dev/null && [ -s "$out" ] && { printf 'outermost-object'; return 0; }
+  : >"$out"
   return 1
 }
 

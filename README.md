@@ -52,7 +52,11 @@ write a spec  →  list it in TODO.md  →  launch the script  →  review in th
    commit. A BLOCK returns the task to a fresh implement session.
 6. **Wrap-up.** On completion a short session distills the run's journal into
    feedback for whoever writes specs, appended to `<project>/.night-shift/feedback.md`
-   (default on). Optionally, `NIGHT_SHIFT_BRANCH_SWEEP=1` (or `=advisory`) adds
+   (default on) — and the NEXT run's planning prompt recalls the tail of that
+   file as advisory hints (`NIGHT_SHIFT_FEEDBACK_RECALL`, default on), closing
+   the loop. A deterministic metrics row per run (turns, review rounds,
+   observer blocks, retries, cost, models) is appended to
+   `<project>/.night-shift/metrics.jsonl`. Optionally, `NIGHT_SHIFT_BRANCH_SWEEP=1` (or `=advisory`) adds
    one whole-branch strong-model review at the very end — the full merge-base
    diff, for cross-task interactions a per-task review can't see — and `=1`
    additionally runs one capped fix cycle on findings. Run it standalone anytime
@@ -125,6 +129,23 @@ budgets (`NIGHT_SHIFT_MAX_STAGE_TURNS` / `…_TASK_TURNS` / `…_STAGE_SECONDS` 
 (`NIGHT_SHIFT_MAX_MALFORMED_SIGNALS`, default 5) that fails fast instead of
 grinding the whole turn budget on junk. Hitting any limit blocks the run for
 manual review rather than continuing.
+
+Any other failure of the Claude primary — an API 5xx/overloaded, a network
+reset, a CLI crash, or a turn past its wall-clock deadline — is retried with
+backoff (`NIGHT_SHIFT_CLAUDE_MAX_RETRIES` default `2`, `_CLAUDE_RETRY_BACKOFF`
+`30`s × attempt, `_CLAUDE_MAX_WAIT` `300`s cumulative), resuming the failed
+attempt's own session (a fresh start pre-mints its session id so a turn
+that dies before answering is resumed, not re-run blind); each retry
+journals `primary_retry`. The primary, persona and observer calls run under a
+per-turn deadline (`NIGHT_SHIFT_TURN_TIMEOUT`, default 1800s, always bounded
+by the stage's remaining budget), so a hung CLI or MCP feeds that retry path
+instead of holding the run open. A fenced or prose-wrapped `next-action.json` is
+repaired in place (`signal_repaired`) before it counts as a malformed
+signal. Review loops are capped with a diagnostic block —
+`NIGHT_SHIFT_MAX_REVIEW_ROUNDS` (default `6`) per stage and
+`NIGHT_SHIFT_MAX_OBSERVER_BLOCKS` (default `3`) per task — naming the
+pending reviewers or open finding ids. A smoke server orphaned by a killed
+run is reaped on recovery.
 
 A Claude session-limit 429 waits until the reported reset plus a safety
 buffer, then resumes the same pinned session (up to 5 consecutive resets

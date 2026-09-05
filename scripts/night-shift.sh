@@ -216,6 +216,38 @@ CURSOR_RETRY_BACKOFF="${NIGHT_SHIFT_CURSOR_RETRY_BACKOFF:-30}"
 # The fallback is the whole point: an unreachable cursor must cost the night a
 # bounded delay, not the night.
 CURSOR_MAX_WAIT="${NIGHT_SHIFT_CURSOR_MAX_WAIT:-600}"
+# Claude primary resilience (scripts/lib/resilience.sh). The claude branch of
+# invoke_primary used to be the ONE paid call with zero retry: any failure
+# that was not a recognized 429 shape — an API 5xx/overloaded, a network
+# reset, a CLI crash — block_run'd the whole night on the first occurrence.
+# It now gets the cursor branch's shape: CLAUDE_MAX_RETRIES extra attempts
+# with linear backoff (CLAUDE_RETRY_BACKOFF * attempt seconds), bounded by
+# CLAUDE_MAX_WAIT of cumulative sleep per turn, resuming the failed attempt's
+# own session when it minted one. TURN_TIMEOUT is the per-turn wall-clock
+# cap for ONE paid claude call (primary, persona, observer), default 1800s,
+# always further bounded by the stage's remaining time budget (see
+# turn_timeout_seconds; 0 = stage budget only) — a hung CLI/MCP then feeds
+# the retry path with budget left to retry in, instead of holding the run
+# open past every budget, which are only checked BETWEEN turns.
+CLAUDE_MAX_RETRIES="${NIGHT_SHIFT_CLAUDE_MAX_RETRIES:-2}"
+CLAUDE_RETRY_BACKOFF="${NIGHT_SHIFT_CLAUDE_RETRY_BACKOFF:-30}"
+CLAUDE_MAX_WAIT="${NIGHT_SHIFT_CLAUDE_MAX_WAIT:-300}"
+TURN_TIMEOUT="${NIGHT_SHIFT_TURN_TIMEOUT:-1800}"
+# Review-loop caps with a DIAGNOSTIC block. Persona rounds and observer
+# BLOCK→implement cycles were bounded only by the turn/time budgets and the
+# three-round "materially unchanged" stall detectors — a reviewer that keeps
+# finding NEW issues (or rephrasing old ones) could grind the whole task
+# budget and then block with a generic "turn/time limit reached". These name
+# the stage, the round, and the pending reviewers / open finding ids instead.
+MAX_REVIEW_ROUNDS="${NIGHT_SHIFT_MAX_REVIEW_ROUNDS:-6}"
+MAX_OBSERVER_BLOCKS="${NIGHT_SHIFT_MAX_OBSERVER_BLOCKS:-3}"
+# Self-improvement loop (scripts/lib/sweep.sh prior_feedback_prompt_block):
+# the run-feedback bullets every run appends to <project>/.night-shift/
+# feedback.md were write-only — no later run ever read them. The planning
+# prompt now carries the last FEEDBACK_RECALL_LINES lines as advisory hints
+# (the spec always wins). "0" turns the recall off; the file is still written.
+FEEDBACK_RECALL="${NIGHT_SHIFT_FEEDBACK_RECALL:-1}"
+FEEDBACK_RECALL_LINES="${NIGHT_SHIFT_FEEDBACK_RECALL_LINES:-40}"
 # Codex as an IMPLEMENT-stage primary vendor (engine + Codex split design,
 # 2026-07-29): opt-in per spec via `- Engines: implement=codex`, validated at
 # spec selection (validate_spec_engines). These three knobs configure that
@@ -324,6 +356,10 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # state). See scripts/lib/recovery.sh.
 # shellcheck source=scripts/lib/recovery.sh
 . "$NIGHT_SHIFT_LIB/recovery.sh"
+# Wall-clock guard + failure classification for the paid claude calls. See
+# scripts/lib/resilience.sh.
+# shellcheck source=scripts/lib/resilience.sh
+. "$NIGHT_SHIFT_LIB/resilience.sh"
 # The run's decision journal (emit_event -> $RUN_ROOT/events.jsonl). See
 # scripts/lib/events.sh.
 # shellcheck source=scripts/lib/events.sh
@@ -797,12 +833,12 @@ link_node_modules_isolated() {
   mkdir -p "$dst" || return 1
   for entry in "$src"/.[!.]* "$src"/*; do
     { [ -e "$entry" ] || [ -L "$entry" ]; } || continue
-    name="$(basename "$entry")"
+    name="${entry##*/}"
     if [ -d "$entry" ] && [ ! -L "$entry" ] && [ "${name#@}" != "$name" ]; then
       mkdir -p "$dst/$name" || return 1
       for sub in "$entry"/*; do
         { [ -e "$sub" ] || [ -L "$sub" ]; } || continue
-        link_nm_entry "$sub" "$dst/$name/$(basename "$sub")" "$projreal" "$worktree" || return 1
+        link_nm_entry "$sub" "$dst/$name/${sub##*/}" "$projreal" "$worktree" || return 1
       done
     else
       link_nm_entry "$entry" "$dst/$name" "$projreal" "$worktree" || return 1
@@ -940,13 +976,14 @@ compact_success() {
   fi
   for entry in "$run_dir"/* "$run_dir"/.[!.]* "$run_dir"/..?*; do
     [ -e "$entry" ] || continue
-    # feedback.md (write_run_feedback) is a PERSISTENT cross-run file living
-    # directly under RUN_ROOT ($project/.night-shift/feedback.md) — unlike
-    # everything else compacted here it is not per-run evidence, it is the
-    # human-facing feedback log that accumulates across every run against
-    # this project, so it must survive compaction untouched.
+    # PERSISTENT cross-run files living directly under RUN_ROOT survive
+    # compaction untouched — unlike everything else here they are not per-run
+    # evidence: feedback.md (write_run_feedback, read back by
+    # prior_feedback_prompt_block on the next run), metrics.jsonl
+    # (write_run_metrics, one row per run), and port-audit/ (per-screen
+    # reports a later audit can diff against).
     case "$entry" in
-      "$run_dir/archive"|"$run_dir/feedback.md") continue ;;
+      "$run_dir/archive"|"$run_dir/feedback.md"|"$run_dir/metrics.jsonl"|"$run_dir/port-audit") continue ;;
     esac
     rm -rf "$entry"
   done
@@ -1060,6 +1097,9 @@ state_int() {
 
 initialize_run() {
   RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  # Reconcile the run-feedback mirror with the engine's private copy BEFORE
+  # any agent session (see feedback_sync_at_start).
+  feedback_sync_at_start "$PROJECT"
   RUN_ROOT="$PROJECT/.night-shift"
   STATE="$RUN_ROOT/state.json"
   mkdir -p "$RUN_ROOT/control" "$RUN_ROOT/raw" "$RUN_ROOT/prompts" \
@@ -1225,6 +1265,13 @@ recover_run() {
       die "existing run was started with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend; relaunch with NIGHT_SHIFT_IMPLEMENT_BACKEND=$stored_backend to resume it (got $IMPLEMENT_BACKEND)"
   fi
   RUN_ID="$(jq -r '.run_id' "$STATE")"
+  # A smoke server the interrupted run left behind (SIGKILL/panic mid-poll)
+  # would otherwise hold its port and fail this run's own smoke phase. After
+  # RUN_ID is loaded so the smoke_reaped event and the state write anchor.
+  reap_recorded_smoke_pgid
+  # Reconcile the run-feedback mirror with the engine's private copy BEFORE
+  # any agent session (see feedback_sync_at_start).
+  feedback_sync_at_start "$PROJECT"
   SPEC="$(jq -r '.task' "$STATE")"
   set_spec_workdir "$SPEC" || die "resumed spec Workdir is invalid"
   validate_spec_smoke "$SPEC" || die "resumed spec Smoke field is invalid"
@@ -1274,8 +1321,8 @@ recover_run() {
     state_set '.status="running" | del(.block_reason) |
       .stage_started_at=$now | .task_started_at=$now | .stage_started[.stage]=$now | .updated_at=$iso' \
       --argjson now "$(now_epoch)" --arg iso "$(now_iso)"
-    case "$prior_block_reason" in
-      *"per-model usage cap"*)
+    case "$(jq -r '.block_kind // empty' "$STATE" 2>/dev/null):$prior_block_reason" in
+      per_model_cap:*|*"per-model usage cap"*)
         log "  per-model-cap block: nulling the stage session so it restarts fresh and re-pins --model from the knob"
         state_set '.session_id=null | .updated_at=$iso' --arg iso "$(now_iso)"
         ;;
@@ -1749,6 +1796,23 @@ screen to match its Figma design. Before/while implementing:
     planning) memory_note="$(memory_recall_prompt_block)" ;;
     completion) memory_note="$(memory_handoff_prompt_block)" ;;
   esac
+  # Self-improvement loop, same prompt-level posture: (1) the previous runs'
+  # feedback bullets (feedback.md tail) as advisory hints for PLANNING; (2)
+  # after an observer BLOCK, its required changes VERBATIM for the implement
+  # scope — the fresh session was only told where the verdict file lives.
+  local feedback_note="" observer_block_note=""
+  case "$stage" in
+    planning) feedback_note="$(prior_feedback_prompt_block "$PROJECT")" ;;
+    implementation|implementation_review)
+      if [ -s "$RUN_ROOT/control/observer-block.md" ]; then
+        observer_block_note="
+The observer BLOCKED the previous candidate. Its required changes, verbatim —
+resolve EVERY one before creating the next candidate (the full verdict is at
+.night-shift/validated/observer-*.json):
+$(cat "$RUN_ROOT/control/observer-block.md")
+"
+      fi ;;
+  esac
   # The wrapper runs every validation phase inside the spec's Workdir; the
   # primary must run them in the SAME directory or its execution evidence
   # records diverging exit statuses and the strict evidence match blocks the
@@ -1766,6 +1830,8 @@ $workdir_note
 $design_build_note
 $doc_freshness_note
 $memory_note
+$feedback_note
+$observer_block_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
 You own planning, implementation, resolving review findings, validation,
@@ -1792,7 +1858,8 @@ out-of-stage signal is rejected and wastes a turn.
 $rejection_note
 Before ending this turn, write a fresh JSON signal to:
   .night-shift/control/next-action.json
-It must validate against $SCHEMA_DIR/next-action.json: a single JSON object with
+It must validate against $SCHEMA_DIR/next-action.json: the file's ENTIRE content
+is one bare JSON object (no code fences, no prose before or after it) with
 EXACTLY these five top-level keys — no more, no fewer — shaped like:
   {"action":"<$expected or BLOCKED>","artifacts":[],"reason":"<one sentence>","stage":"$stage","task":"$SPEC"}
 "task" must equal $SPEC exactly and "stage" must equal "$stage". "artifacts"
@@ -1981,6 +2048,15 @@ invoke_primary_codex() {
   done
 }
 
+# The ONE drift predicate: a resumed session ($1) whose turn echoed a
+# different id ($2) is a resume contract the engine does not model — block,
+# never continue on the wrong session. No-op on a fresh start (empty $1) or a
+# turn that printed no envelope (empty $2 — that is the retry path's case).
+block_on_session_drift() {
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ "$1" != "$2" ] || return 0
+  block_run "primary session ID changed from $1 to $2 (the CLI's resume contract drifted)"
+}
+
 invoke_primary() {
   # Declare then assign separately so a jq failure on $STATE is not masked by
   # local's own (always-zero) exit status — the discipline used in enforce_limits
@@ -1995,6 +2071,8 @@ invoke_primary() {
   # call): attempts against CURSOR_MAX_RETRIES, and seconds already slept
   # against the CURSOR_MAX_WAIT ceiling.
   local cursor_backoff=0 cursor_backoff_total=0 cursor_fb_reason=""
+  # The claude twin of the cursor counters above (see CLAUDE_MAX_RETRIES).
+  local claude_attempts=0 claude_backoff=0 claude_backoff_total=0 turn_deadline=0 fail_reason="" session_seed=""
   # The consecutive 429-without-success counter now lives entirely in
   # handle_rate_limit_wait (lib/recovery.sh): persisted in state so recovery
   # after a crash picks up the count; reset to 0 on the first clean turn below.
@@ -2015,7 +2093,8 @@ invoke_primary() {
   scope="$(stage_session_scope "$(jq -r '.stage' "$STATE")")"
   model="$(resolve_effective_model "$(stage_model "$scope")")"
   backend="$(implement_scope_backend "$scope")"
-  log "primary turn $(jq -r '.primary_turns + 1' "$STATE") · stage $(jq -r '.stage' "$STATE") · stage turn $(jq -r '.stage_turns + 1' "$STATE")/$MAX_STAGE_TURNS · task turn $(jq -r '.task_turns + 1' "$STATE")/$MAX_TASK_TURNS"
+  log "$(jq -r --arg ms "$MAX_STAGE_TURNS" --arg mt "$MAX_TASK_TURNS" \
+    '"primary turn \(.primary_turns + 1) · stage \(.stage) · stage turn \(.stage_turns + 1)/\($ms) · task turn \(.task_turns + 1)/\($mt)"' "$STATE")"
   engine="$(stage_engine "$scope")"
   if [ "$engine" = "codex" ]; then
     # Bounded retry lives inside invoke_primary_codex; a successful call
@@ -2059,13 +2138,23 @@ invoke_primary() {
           --trust -f --add-dir "$WORKSPACE_ROOT" "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
       fi
     elif [ -z "$session" ]; then
+      # run_with_turn_timeout: the wall-clock deadline for this one call (a
+      # killed turn returns 124/142 and feeds the retry branch below). stderr
+      # goes to $raw.err so a retry can quote the CLI's own error line.
       # model_flag must word-split into `--model X` (or vanish when empty).
+      # session_id_flag: a pre-minted id so a turn that dies before printing
+      # its envelope (deadline kill, CLI crash) can still be RESUMED by the
+      # retry instead of re-run blind over its own edits. Empty (no UUID
+      # source on the host) = the pre-existing fresh start.
+      session_seed="$(mint_session_id)" || session_seed=""
+      turn_deadline="$(turn_timeout_seconds)"
       # shellcheck disable=SC2046
-      (cd "$PROJECT" && claude -p $(model_flag "$model") --permission-mode bypassPermissions \
-        --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+      (cd "$PROJECT" && run_with_turn_timeout "$turn_deadline" claude -p $(model_flag "$model") $(session_id_flag "$session_seed") --permission-mode bypassPermissions \
+        --output-format json "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
     else
-      (cd "$PROJECT" && claude -p --resume "$session" --permission-mode bypassPermissions \
-        --output-format json "$(cat "$prompt")") >"$raw" || rc=$?
+      turn_deadline="$(turn_timeout_seconds)"
+      (cd "$PROJECT" && run_with_turn_timeout "$turn_deadline" claude -p --resume "$session" --permission-mode bypassPermissions \
+        --output-format json "$(cat "$prompt")") >"$raw" 2>"$raw.err" || rc=$?
     fi
     emitted="$(jq -r '.session_id // empty' "$raw" 2>/dev/null)"
     # rc==0 is not proof of success for cursor: the envelope's session_id can
@@ -2103,6 +2192,10 @@ invoke_primary() {
         rc=1
       fi
     fi
+    # Claude backend: a --resume that echoed a DIFFERENT session id is CLI
+    # drift the engine does not model — the ONE check for both the rc=0 and
+    # rc!=0 cases (cursor converts its own drift to rc=1 above and retries).
+    [ "$backend" = "cursor" ] || block_on_session_drift "$session" "$emitted"
     [ "$rc" -ne 0 ] || break
     if [ "$backend" = "cursor" ]; then
       # Cursor has no parseable 429 contract (stderr prose, no reset time):
@@ -2194,17 +2287,79 @@ invoke_primary() {
       model="$(resolve_effective_model "$model")"
       continue
     fi
-    block_run "primary command failed with status $rc"
+    # Claude backend, any failure that is NOT one of the two 429 shapes above
+    # — an API 5xx/overloaded, a network reset, a CLI crash, or a turn killed
+    # by its wall-clock deadline: bounded retry with linear backoff, the claude
+    # twin of the cursor branch (same counters, same ceiling, same "resume the
+    # failed attempt's own session" rule — a failed claude turn may already
+    # have edited files or committed, and a fresh session would redo that work
+    # blind). Retries do not consume turn counters, so enforce_limits is
+    # re-entered before each one. The 429 shapes stay on their own paths
+    # above; an envelope with rc 0 but no session id is still the hard block
+    # below (contract drift, not a transient).
+    fail_reason="$(claude_failure_reason "$rc" "$raw" "$raw.err" "$turn_deadline")"
+    # A deadline kill with the stage budget already spent has nothing left to
+    # retry in (enforce_limits would block the retry with a generic limit
+    # message): block now, with the real reason.
+    if turn_timeout_hit "$rc" && [ "$(stage_seconds_remaining)" -le 0 ]; then
+      block_run "primary turn killed ($fail_reason) and the stage's time budget is spent — nothing left to retry in; see $raw.err, then re-run with --resume (the stage clock restarts)" primary_failure
+    fi
+    # Keep every failed attempt's envelope + stderr (the loop reuses $raw) and
+    # ledger its cost — an attempt that died after spending is still spend.
+    cp "$raw" "$raw.attempt-$((claude_attempts + 1))" 2>/dev/null || true
+    cp "$raw.err" "$raw.err.attempt-$((claude_attempts + 1))" 2>/dev/null || true
+    record_cost "$raw" "$(basename "$raw").attempt-$((claude_attempts + 1))"
+    if [ "$claude_attempts" -lt "$CLAUDE_MAX_RETRIES" ]; then
+      # Backoff exists to let an overloaded API clear; a deadline kill says
+      # nothing about API load, so it resumes at once.
+      claude_backoff=$((CLAUDE_RETRY_BACKOFF * (claude_attempts + 1)))
+      ! turn_timeout_hit "$rc" || claude_backoff=0
+      if [ $((claude_backoff_total + claude_backoff)) -le "$CLAUDE_MAX_WAIT" ]; then
+        claude_attempts=$((claude_attempts + 1))
+        claude_backoff_total=$((claude_backoff_total + claude_backoff))
+        emit_event primary_retry "$(jq -cn --argjson a "$claude_attempts" --argjson rc "$rc" --arg reason "$fail_reason" \
+          '{backend:"claude", attempt:$a, rc:$rc, reason:$reason}')"
+        log "primary turn failed ($fail_reason); retry $claude_attempts/$CLAUDE_MAX_RETRIES in ${claude_backoff}s (cumulative ${claude_backoff_total}s of the ${CLAUDE_MAX_WAIT}s NIGHT_SHIFT_CLAUDE_MAX_WAIT ceiling)"
+        sleep "$claude_backoff"
+        # Which session the retry continues, in order of evidence: the failed
+        # attempt's own envelope id when it printed one; a resume the CLI
+        # rejected as unknown ("No conversation found" — the session was never
+        # created) starts fresh; a fresh start that died before its envelope
+        # resumes the pre-minted seed (its session may already carry edits and
+        # commits); no seed at all = a fresh start. A fresh start archives the
+        # stale signal first, like the cursor branch.
+        if [ -n "$emitted" ]; then
+          session="$emitted"
+        elif [ -n "$session" ] && grep -qF 'No conversation found' "$raw.err" 2>/dev/null; then
+          # The CLI's exact phrase for an unknown --resume id (matched
+          # verbatim: a looser pattern once matched an MCP server's own
+          # "session not found" prose and restarted a healthy session fresh).
+          # The fresh start must be reflected in state AND the prompt: the
+          # prompt built at the top of this turn framed a --resume, and
+          # primary_prompt reads .session_id to choose the fresh-session
+          # file-handoff reorientation block (same discipline as the cursor
+          # fallback above).
+          session=""
+          state_set '.session_id=null | .updated_at=$now' --arg now "$(now_iso)"
+          archive_old_signal
+          primary_prompt "$prompt"
+        elif [ -z "$session" ]; then
+          session="$session_seed"
+          [ -n "$session" ] || archive_old_signal
+        fi
+        enforce_limits
+        continue
+      fi
+      log "primary turn failed ($fail_reason); the next retry's backoff would pass the ${CLAUDE_MAX_WAIT}s NIGHT_SHIFT_CLAUDE_MAX_WAIT ceiling — blocking"
+    fi
+    block_run "primary command failed ($fail_reason) after $claude_attempts retries; see $raw and $raw.err, then re-run with --resume once the cause clears" primary_failure
   done
   fi
   [ -n "$emitted" ] || block_run "primary emitted no resumable session ID"
-  # Reachable only on the CLAUDE path now: a cursor turn with a changed (or
-  # missing) session id is converted to rc=1 inside the loop above and routed
-  # through the retry/fallback branch, so it can never break out of the loop
-  # into these two hard blocks. Claude's behavior here is unchanged.
-  if [ -n "$session" ] && [ "$emitted" != "$session" ]; then
-    block_run "primary session ID changed from $session to $emitted"
-  fi
+  # The same drift invariant for a codex resume (the claude path checks it
+  # inside the loop, right after the envelope is read; cursor converts its own
+  # drift to rc=1 there and retries).
+  [ "$engine" != "codex" ] || block_on_session_drift "$session" "$emitted"
   # The primary just had unattended write access to the whole project including
   # .night-shift/. Verify the wrapper-owned state BEFORE the engine's own writes
   # below would launder an out-of-band edit into the private copy.
@@ -2281,8 +2436,13 @@ rate_limit_contract_canary() {
   return 0
 }
 
+# $2 (optional) = a structured block KIND written to state's .block_kind next
+# to the prose .block_reason, so recovery predicates can switch on an enum
+# (recoverable_rate_limit_state, recover_run's per-model-cap arm) instead of
+# matching human-readable text that is free to change. Known kinds:
+# primary_failure, per_model_cap.
 block_run() {
-  local reason="$1"
+  local reason="$1" kind="${2:-}"
   # Disarm the interrupt trap first: block_run's cleanup below is slow, and a second
   # signal arriving mid-cleanup would re-enter block_run (double cleanup, garbled
   # reason). The EXIT trap still runs release_lock. (HUP/INT/TERM only; not EXIT.)
@@ -2302,8 +2462,8 @@ block_run() {
   # real reason. Guard the state write so its failure is tolerated and the
   # original reason always surfaces in the final die below.
   if [ -f "${STATE:-}" ]; then
-    ( state_set '.status="blocked" | .block_reason=$reason | .updated_at=$now' \
-        --arg reason "$reason" --arg now "$(now_iso)" ) 2>/dev/null || true
+    ( state_set '.status="blocked" | .block_reason=$reason | .updated_at=$now | (if $kind == "" then del(.block_kind) else .block_kind=$kind end)' \
+        --arg reason "$reason" --arg kind "$kind" --arg now "$(now_iso)" ) 2>/dev/null || true
   fi
   die "$reason; complete state preserved at ${RUN_ROOT:-unknown}"
 }
@@ -2621,8 +2781,13 @@ invoke_persona_once() {
   # or NIGHT_SHIFT_REVIEWER_ISOLATION=1 is active; nothing otherwise).
   # shellcheck disable=SC2046
   (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
-    claude -p $(claude_model_args "$(persona_stage_model "$stage")") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+    run_with_turn_timeout "$(turn_timeout_seconds)" claude -p $(claude_model_args "$(persona_stage_model "$stage")") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
+    # A turn killed by its wall-clock deadline (run_with_turn_timeout) is a
+    # third shape: not a rate limit, not a malformed verdict — 43 lets the
+    # caller retry with a note saying so instead of a "no parseable JSON"
+    # note that would send the model the wrong correction.
+    ! turn_timeout_hit "$rc" || return 43
     # A 429 (session OR per-model) is a live-recoverable transient — a standard
     # rate limit that also recovers fine on the primary path — NOT "no parseable
     # JSON verdict". Distinguishing it here with a distinct return code lets the
@@ -2733,9 +2898,14 @@ spawn_persona_worker() {
       log "persona ($persona_stage): $persona → $(jq -r '.status' "$out")"
       return 0
     fi
-    # Say WHY on the retry: extraction failure vs a verdict the normalizer +
-    # schema still rejected. A blind identical re-send repeats the mistake.
-    if [ "$iv" -ne 0 ]; then
+    # Say WHY on the retry: deadline kill vs extraction failure vs a verdict
+    # the normalizer + schema still rejected. A blind identical re-send
+    # repeats the mistake. A deadline kill DOES spend one of the two attempts:
+    # it consumed a full deadline of the stage budget, and a second one is the
+    # parent's block to diagnose, not an infinite loop.
+    if [ "$iv" -eq 43 ]; then
+      retry_note="the previous attempt exceeded its wall-clock deadline before answering; keep the review focused and answer promptly with the fenced json verdict"
+    elif [ "$iv" -ne 0 ]; then
       retry_note="no parseable JSON verdict could be extracted from the reply; end with EXACTLY one fenced json code block and nothing after it"
     else
       retry_note="the verdict failed the persona-review contract: exactly the keys $PERSONA_REVIEW_KEYS; each finding needs id/evidence/required_change; APPROVE must carry zero findings, BLOCK at least one"
@@ -2809,6 +2979,17 @@ journal_persona_result() {
 # AND no .failed-<slug> marker. A persona that already exhausted its own 2-try
 # JSON-retry budget must not get a bonus attempt just because a sibling in the
 # same batch was rate-limited.
+# The consecutive-429 counter (handle_rate_limit_wait, lib/recovery.sh) is
+# shared by the primary and every sub-agent call site but was reset ONLY by a
+# successful PRIMARY turn — five sub-agent 429s spread across one review batch
+# could trip the 5-cap on a limit that was clearing normally. Called wherever
+# a sub-agent call completes; skips the state write when already 0.
+subagent_success_reset() {
+  [ -f "${STATE:-}" ] || return 0
+  [ "$(jq -r '.rate_limit_consecutive // 0' "$STATE" 2>/dev/null)" != "0" ] || return 0
+  state_set '.rate_limit_consecutive=0'
+}
+
 handle_persona_rate_limits() {
   local result_dir="$1" persona_stage="$2" bundle="$3"; shift 3
   local persona slug marker raw first_raw pid
@@ -2896,6 +3077,9 @@ spawn_personas() {
     # below reads .attempts-<slug>: a re-spawned persona's fresh worker call
     # writes its own .attempts-<slug>/result, which that loop must see.
     handle_persona_rate_limits "$result_dir" "$persona_stage" "$bundle" "${names[@]}"
+    # The batch is through its 429 recovery: at least one sub-agent call just
+    # completed, which is what the shared consecutive-429 counter means.
+    subagent_success_reset
     # Costs + journal: recorded by the parent from exactly the attempts each
     # worker made this round (.attempts-<slug>), BEFORE any failure becomes
     # block_run — so a blocked round still keeps every paid attempt's cost.
@@ -2933,7 +3117,17 @@ run_personas() {
     implementation|implementation_review) persona_stage="implementation"; set_stage implementation_review ;;
     *) block_run "RUN_PERSONAS is invalid from stage $review_stage" ;;
   esac
-  result_dir="$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/$persona_stage/round-$(( $(jq -r '.review_round' "$STATE") + 1 ))"
+  # Diagnostic cap (NIGHT_SHIFT_MAX_REVIEW_ROUNDS), checked BEFORE the round
+  # is counted or its dir created, so raising the knob by one and resuming
+  # buys exactly one more round: a bench that keeps finding new issues every
+  # round would otherwise grind the task's whole turn budget and block with a
+  # generic limit message. Name the stage, round, and the reviewers still
+  # pending so the 3am log is actionable.
+  local round_n
+  round_n=$(( $(jq -r '.review_round' "$STATE") + 1 ))
+  [ "$round_n" -le "$MAX_REVIEW_ROUNDS" ] ||
+    block_run "persona review round $round_n on the $persona_stage stage would exceed NIGHT_SHIFT_MAX_REVIEW_ROUNDS=$MAX_REVIEW_ROUNDS; still pending: $(jq -r '.pending_personas // "the full active set"' "$STATE") — inspect the latest round under $RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/$persona_stage/, then re-run with --resume (raise the knob to allow more rounds)"
+  result_dir="$RUN_ROOT/validated/personas/$(basename "$SPEC" .md)/$persona_stage/round-$round_n"
   mkdir -p "$result_dir"
   state_set '.review_round += 1'
 
@@ -3167,8 +3361,18 @@ EOF
     block_run "final validation introduced a new or worsened failure"
   evidence_exit_status_matches "$evidence" final_validation "$RUN_ROOT/validated/final.json" ||
     block_run "primary final evidence does not match wrapper-owned validation (exit statuses)"
-  git -C "$PROJECT" worktree remove --force "$validation_worktree" >/dev/null ||
-    block_run "candidate passed but validation worktree cleanup failed"
+  # A candidate that passed every real gate is not failed by a cleanup nit.
+  # One retry after `git worktree prune` (a stale admin entry is the common
+  # cause); a persistent failure WARNs + journals the path and still clears
+  # the pointer — keeping it would make a later --resume die in
+  # cleanup_validation_worktree over a candidate that was never interrupted.
+  if ! git -C "$PROJECT" worktree remove --force "$validation_worktree" >/dev/null 2>&1; then
+    git -C "$PROJECT" worktree prune >/dev/null 2>&1 || true
+    if ! git -C "$PROJECT" worktree remove --force "$validation_worktree" >/dev/null 2>&1; then
+      log "WARN: candidate passed but the validation worktree could not be removed ($validation_worktree); left for manual cleanup (git worktree remove --force)"
+      emit_event worktree_cleanup_failed "$(jq -cn --arg p "$validation_worktree" '{path:$p}')"
+    fi
+  fi
   state_set 'del(.validation_worktree)'
   # Append preserving INSERTION order (jq `unique` sorts, which would make
   # candidate_commits[-1] the lexicographically-largest hash, not the latest).
@@ -3737,8 +3941,11 @@ invoke_observer_once() {
   # depend on what the user's global settings inject; nothing otherwise).
   # shellcheck disable=SC2046
   (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" "$expected_primary" |
-    claude -p $(claude_model_args "$OBSERVER_MODEL") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+    run_with_turn_timeout "$(turn_timeout_seconds)" claude -p $(claude_model_args "$OBSERVER_MODEL") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
+    # Deadline kill: 43, as in invoke_persona_once (retried with a deadline
+    # note, not a contract note).
+    ! turn_timeout_hit "$rc" || return 43
     # Same 429 distinction as invoke_persona_once: a live-recoverable transient,
     # not "the verdict failed the observer-review contract" — the caller
     # (validated_observer_retry) must wait/fall back and retry WITHOUT spending
@@ -3935,13 +4142,40 @@ run_observer() {
   emit_event observer_verdict "$(jq -c '{status, findings: (.findings | length), finding_ids: [.findings[]?.id]}' "$out" 2>/dev/null)"
   if [ "$(jq -r '.status' "$out")" = "APPROVE" ]; then
     log "observer: APPROVE — task complete, ready to commit/next"
+    rm -f "$RUN_ROOT/control/observer-block.md"
+    state_set '.observer_block_rounds=0'
     set_stage completion
   else
     log "observer: BLOCK ($(jq -r '.findings | length' "$out") finding(s)) — back to implementation"
     detect_stalled_findings "$out"
-    state_set '.implementation_approved=false | .candidate_verified=false'
+    # Count BLOCK→implement cycles per task (NIGHT_SHIFT_MAX_OBSERVER_BLOCKS)
+    # and hand the fresh implement session the required changes VERBATIM
+    # (control/observer-block.md, inlined by primary_prompt) instead of only
+    # naming the verdict file for it to find and parse.
+    state_set '.implementation_approved=false | .candidate_verified=false | .observer_block_rounds=((.observer_block_rounds // 0) + 1)'
+    write_observer_block_notes "$out" "$RUN_ROOT/control/observer-block.md"
+    local blocks_n
+    blocks_n="$(jq -r '.observer_block_rounds // 0' "$STATE")"
+    # Hand the task to the implement scope BEFORE a cap block, so a --resume
+    # with the knob raised starts implementing the block notes instead of
+    # paying for a re-review of the same candidate.
     set_stage implementation
+    [ "$blocks_n" -lt "$MAX_OBSERVER_BLOCKS" ] ||
+      block_run "observer BLOCKed $blocks_n candidates in a row on this task (NIGHT_SHIFT_MAX_OBSERVER_BLOCKS=$MAX_OBSERVER_BLOCKS); open findings: $(jq -r '[.findings[]?.id] | join(", ")' "$out") — see $out and control/observer-block.md, then re-run with --resume (raise the knob to allow more cycles)"
   fi
+}
+
+# Write the observer's BLOCK findings as a short markdown list the next
+# implement session gets INLINE (primary_prompt's observer_block_note): one
+# `- <id>: <required_change>` per finding, evidence on the next line. Bounded
+# so a verbose verdict cannot bloat the prompt. $1 = verdict JSON, $2 = target.
+write_observer_block_notes() {
+  local out="$1" target="$2"
+  # All bounding in jq (at most 20 findings, 600/400 chars per field) so the
+  # note can never end mid-line or mid-character.
+  jq -r '(.findings[:20][]? | "- \(.id): \(.required_change // "(no required_change given)" | tostring | .[0:600])\n  evidence: \(.evidence // "-" | tostring | .[0:400])"),
+    (if ((.findings // []) | length) > 20 then "- (+\(((.findings | length) - 20)) more findings — see the observer verdict file)" else empty end)' "$out" >"$target" 2>/dev/null || true
+  [ -s "$target" ] || rm -f "$target"
 }
 
 validated_observer_retry() {
@@ -3974,6 +4208,16 @@ validated_observer_retry() {
     # the success path we return 0 below WITHOUT a second record_cost call,
     # so there is no double-counting.
     record_cost "$raw.$attempt" "$(basename "$raw")"
+    if [ "$iv" -eq 43 ]; then
+      # Deadline kill: retry the contract slot with a note naming the real
+      # cause (a contract note would ask the model to fix a verdict it never
+      # produced). Spends the attempt, like a persona worker's.
+      retry_note="the previous attempt exceeded its wall-clock deadline before answering; keep the review focused and answer promptly with the fenced json verdict"
+      attempt=$((attempt + 1))
+      emit_event observer_retry "$(jq -cn --argjson a "$attempt" --arg r "$retry_note" \
+        '{attempt:$a, reason:$r}')"
+      continue
+    fi
     normalize_observer_output "$out" "$SPEC" "$candidate" "$expected_primary"
     enforce_elapsed_limits
     # .primary is checked against the task's ACTUAL implement vendor
@@ -3986,6 +4230,7 @@ validated_observer_retry() {
       { [ "$(jq -r '.task' "$out")" = "$SPEC" ] ||
         [ "$(basename "$(jq -r '.task' "$out")")" = "$(basename "$SPEC")" ]; } &&
       [ "$(jq -r '.candidate_commit' "$out")" = "$candidate" ]; then
+      subagent_success_reset
       return 0
     fi
     retry_note="the verdict failed the observer-review contract: exactly the keys $OBSERVER_REVIEW_KEYS with the exact task and candidate values shown; status APPROVE or BLOCK only; finding ids match OBS-NNN"
@@ -4054,6 +4299,10 @@ complete_run() {
   # only on NIGHT_SHIFT_RUN_FEEDBACK (default "1", the cost off-switch).
   # Always advisory: never blocks or delays completion (see write_run_feedback).
   [ "$RUN_FEEDBACK" = "1" ] && write_run_feedback "$PROJECT"
+  # Deterministic per-run metrics row (no model call): one jq pass over the
+  # journal into <project>/.night-shift/metrics.jsonl, so run-over-run
+  # trends (review rounds, retries, cost) exist without reading archives.
+  write_run_metrics "$PROJECT"
   # Optional advisory whole-branch review (Task 1, agentic-gaps tranche):
   # never gates completion here — a fix cycle on the verdict lands in a later
   # task. sweep_build_package refusing (main/master tip, empty branch) is a
@@ -4134,7 +4383,7 @@ EOF
   state_set '
     .task=$task | .stage="planning" | .stage_turns=0 | .task_turns=0 |
     .session_id=null |
-    .implement_backend_used=null |
+    .implement_backend_used=null | .observer_block_rounds=0 |
     .stage_started_at=$epoch | .task_started_at=$epoch |
     .base_commit=$base | .base_branch=$branch | .review_round=0 |
     .baseline_status=$baseline_status | .finding_ids=[] | .candidate_commits=[] |
@@ -4359,9 +4608,17 @@ main_run() {
     claude|cursor) ;;
     *) die "NIGHT_SHIFT_IMPLEMENT_BACKEND must be claude or cursor (got: $IMPLEMENT_BACKEND)" ;;
   esac
-  case "$CURSOR_MAX_RETRIES" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_RETRIES must be a non-negative integer" ;; esac
-  case "$CURSOR_RETRY_BACKOFF" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_RETRY_BACKOFF must be a non-negative integer" ;; esac
-  case "$CURSOR_MAX_WAIT" in ''|*[!0-9]*) die "NIGHT_SHIFT_CURSOR_MAX_WAIT must be a non-negative integer" ;; esac
+  # Integer knobs, one loop each (bash 3.2-safe indirect expansion): the
+  # NIGHT_SHIFT_ name is derived from the variable, so a message can never
+  # name the wrong knob.
+  local knob
+  for knob in CURSOR_MAX_RETRIES CURSOR_RETRY_BACKOFF CURSOR_MAX_WAIT \
+    CLAUDE_MAX_RETRIES CLAUDE_RETRY_BACKOFF CLAUDE_MAX_WAIT TURN_TIMEOUT FEEDBACK_RECALL_LINES; do
+    case "${!knob}" in ''|*[!0-9]*) die "NIGHT_SHIFT_$knob must be a non-negative integer" ;; esac
+  done
+  for knob in MAX_REVIEW_ROUNDS MAX_OBSERVER_BLOCKS; do
+    case "${!knob}" in ''|*[!0-9]*|0) die "NIGHT_SHIFT_$knob must be a positive integer" ;; esac
+  done
   if [ "$IMPLEMENT_BACKEND" = "cursor" ] && [ "$SESSION_SCOPE" != "stage" ]; then
     die "NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor requires NIGHT_SHIFT_SESSION_SCOPE=stage (the backend switches vendors at stage-scope session boundaries)"
   fi

@@ -594,6 +594,67 @@ cleanup_smoke_pgid() {
   kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pgid" 2>/dev/null || true
   sleep 1
   kill -KILL -- "-$pgid" 2>/dev/null || kill -KILL "$pgid" 2>/dev/null || true
+  smoke_pgid_record ""
+}
+
+# The in-memory SMOKE_PGID dies with the engine process, so a SIGKILL/panic
+# mid-poll used to orphan the dev server (port held, the next run's smoke
+# phase fails against it). Mirror the pgid into state.json while the server
+# lives (the same pre-creation-record idea .validation_worktree uses) so
+# reap_recorded_smoke_pgid can stop it on recovery. Best-effort, never fatal:
+# a state write failure must not fail the smoke phase, and the EXIT-trap
+# cleanup can run after compaction removed state.json. $1 = pgid, "" = clear.
+smoke_pgid_record() {
+  local pgid="${1:-}" started=""
+  [ -f "${STATE:-}" ] || return 0
+  command -v state_set >/dev/null 2>&1 || return 0
+  if [ -n "$pgid" ]; then
+    # The leader's start time is the identity a later reap verifies: a pid
+    # (and pgid) is reused after a reboot, and killing whatever now owns it
+    # would be killing a stranger.
+    started="$(smoke_pgid_identity "$pgid")"
+    ( state_set '.smoke_pgid=$p | .smoke_pgid_started=$s' --argjson p "$pgid" --arg s "$started" ) >/dev/null 2>&1 || true
+  else
+    ( state_set 'del(.smoke_pgid, .smoke_pgid_started)' ) >/dev/null 2>&1 || true
+  fi
+}
+
+# The process's start time as `ps` reports it (whitespace-normalized), empty
+# when the process is gone. Portable: `-o lstart=` exists on macOS and Linux.
+smoke_pgid_identity() {
+  local id
+  id="$(ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')"
+  # busybox ps has no lstart column: fall back to the command name, still a
+  # positive identity (a reused pid running something else is left alone).
+  [ -n "$id" ] || id="$(ps -o comm= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//; s/^/comm:/' | grep -v '^comm:$')"
+  printf '%s' "$id"
+}
+
+# Recovery: stop a still-live smoke server the interrupted run recorded in
+# state (see smoke_pgid_record), journal it, and clear the record. A dead or
+# absent pgid just clears. Called by recover_run before anything else uses
+# the project.
+reap_recorded_smoke_pgid() {
+  [ -f "${STATE:-}" ] || return 0
+  local pgid started now_started
+  pgid="$(jq -r '.smoke_pgid // empty' "$STATE" 2>/dev/null)"
+  case "$pgid" in ''|*[!0-9]*) return 0 ;; esac
+  started="$(jq -r '.smoke_pgid_started // empty' "$STATE" 2>/dev/null)"
+  now_started="$(smoke_pgid_identity "$pgid")"
+  if [ -n "$now_started" ] && [ "$started" = "$now_started" ]; then
+    # Alive and still the process we recorded: the one kill ladder
+    # (cleanup_smoke_pgid) stops it and clears the record.
+    log "recovery: the previous run's smoke server is still alive (pgid $pgid); stopping it so this run's smoke phase gets its port back"
+    SMOKE_PGID="$pgid"
+    cleanup_smoke_pgid
+    ! command -v emit_event >/dev/null 2>&1 || emit_event smoke_reaped "$(jq -cn --argjson p "$pgid" '{pgid:$p}')"
+  else
+    # Gone, recorded without an identity, or a DIFFERENT process now owns
+    # the pid (reuse after a reboot): never kill a stranger — drop the record.
+    [ -z "$now_started" ] ||
+      log "recovery: pid $pgid recorded as the previous run's smoke server now belongs to a different process (started $now_started); leaving it alone"
+    smoke_pgid_record ""
+  fi
 }
 
 # Spec-declared smoke-run validation phase: proves the app actually BOOTS, not
@@ -654,6 +715,7 @@ run_smoke_phase() {
       (cd "$exec_dir" && bash -lc "$cmd" >"$out" 2>&1 </dev/null) & pid=$!
       set +m
       SMOKE_PGID="$pid"
+      smoke_pgid_record "$pid"
       rc=1
       # WALL-CLOCK deadline, not a sleep counter: each poll's curl can itself
       # burn up to --max-time 5s, so counting only the sleeps would stretch a

@@ -164,8 +164,29 @@ directory; run engine/workflow git inside the engine directory.
   `test_audit` event (`{files, final_total}`) is journaled; a failed or
   missing report only WARNs. See `docs/COMMAND-PLAYBOOK.md` §11 for the
   standalone CLI contract.
+- **Self-recovery knobs (all default ON):** `NIGHT_SHIFT_CLAUDE_MAX_RETRIES`
+  (2) / `_CLAUDE_RETRY_BACKOFF` (30s × attempt) / `_CLAUDE_MAX_WAIT` (300s)
+  retry a transient Claude primary failure before a `--resume`-able block;
+  `NIGHT_SHIFT_TURN_TIMEOUT` (default 1800s, always bounded by the stage's
+  remaining time budget + 60s, floor 300s; 0 = stage budget only) is the
+  wall-clock deadline of ONE paid Claude call (primary, persona, observer); `NIGHT_SHIFT_MAX_REVIEW_ROUNDS` (6, per stage) and
+  `NIGHT_SHIFT_MAX_OBSERVER_BLOCKS` (3, per task) cap the review loops with a
+  block that names the pending reviewers / open finding ids. A fenced or
+  prose-wrapped `next-action.json` is repaired in place before it counts as
+  malformed. **Self-improvement loop:** the planning prompt recalls the last
+  `NIGHT_SHIFT_FEEDBACK_RECALL_LINES` (40) lines of `.night-shift/feedback.md`
+  (`NIGHT_SHIFT_FEEDBACK_RECALL=0` to turn off); an observer BLOCK's required
+  changes are inlined verbatim into the fresh implement session; one
+  deterministic row per run lands in `.night-shift/metrics.jsonl`. The
+  recalled feedback is read from the engine's private copy outside the tree
+  (`feedback_anchor_path`); `.night-shift/feedback.md` is a mirror that a
+  run start regenerates when it was edited outside `write_run_feedback`.
 - **Journal events added by this tranche** (for anyone grepping
-  `events.jsonl`): `sweep` (branch-sweep verdict), `sweep_fix` /
+  `events.jsonl`): `primary_retry` (a transient Claude primary failure
+  retrying, with the CLI's own reason), `signal_repaired` (a fenced/prose
+  signal salvaged, with the strategy), `smoke_reaped` (an orphaned smoke
+  server stopped on recovery), `run_metrics` (the per-run metrics row),
+  `sweep` (branch-sweep verdict), `sweep_fix` /
   `sweep_fix_reverted` (fix-cycle round + deterministic revert, the latter
   carrying a `reason` of `dirty_tree` or a failed re-validation), `run_feedback`
   (feedback entry appended), `smoke` (smoke-phase result), and — from the

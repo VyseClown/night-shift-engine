@@ -18,9 +18,34 @@ archive_old_signal() {
   fi
 }
 
+# Salvage a signal file that is not bare JSON — a ```json fence or prose
+# around the object is the single most common malformation, and each one
+# used to cost a paid correction turn against MAX_MALFORMED_SIGNALS. Same
+# ladder the persona/observer verdicts already get (lib/normalize.sh): the
+# last fenced block, then the outermost {...}. Only a JSON OBJECT counts; the
+# original is kept beside the file for forensics and a `signal_repaired`
+# event is journaled. Schema validation still runs on the repaired file, so
+# a repair can only turn a certain rejection into a real check. Returns 1
+# (file untouched) when nothing salvageable is found.
+repair_signal_json() {
+  local signal="$1" tmp="$1.repair.$$" strategy=""
+  strategy="$(salvage_json_from_text "$signal" "$tmp")" || { rm -f "$tmp"; return 1; }
+  # A signal is an OBJECT; a salvaged array/scalar is not a signal.
+  jq -e 'type == "object"' "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  cp "$signal" "$signal.unrepaired.txt" 2>/dev/null || true
+  mv "$tmp" "$signal" || { rm -f "$tmp"; return 1; }
+  ! command -v emit_event >/dev/null 2>&1 ||
+    emit_event signal_repaired "$(jq -cn --arg s "$strategy" '{strategy:$s}')"
+  ! command -v log >/dev/null 2>&1 ||
+    log "primary signal was not bare JSON; repaired in place ($strategy) — original kept at $(basename "$signal").unrepaired.txt"
+  return 0
+}
+
 validate_signal() {
   local signal="$RUN_ROOT/control/next-action.json"
   [ -f "$signal" ] || return 2
+  # Not parseable at all? Try the salvage ladder before counting a rejection.
+  jq -e . "$signal" >/dev/null 2>&1 || repair_signal_json "$signal" || true
   json_schema_basic next-action "$signal" || return 1
   [ "$(jq -r '.task' "$signal")" = "$SPEC" ] || return 1
   # An action whose artifact requirement (per the action_artifact_requirement

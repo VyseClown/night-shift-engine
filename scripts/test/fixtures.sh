@@ -232,6 +232,17 @@ run_dry_fixtures() {
   fixture_assert "per-step model knobs follow their tier when empty, override when set" fixture_per_step_models "$root"
   fixture_assert "memory: knob validation, reviewer-isolation argv, prompt blocks, startup probe" fixture_memory_integration "$root"
   fixture_assert "primary_prompt carries memory recall (planning) / handoff (completion) iff NIGHT_SHIFT_MEMORY" fixture_memory_prompt_wiring "$root"
+  fixture_assert "resilience: turn timeout helpers + failure reasons" fixture_turn_timeout_helpers "$root"
+  fixture_assert "resilience: claude primary retries transient failures with backoff, then blocks" fixture_primary_claude_retry "$root"
+  fixture_assert "signals: fenced/prose-wrapped next-action.json is repaired before it counts as malformed" fixture_signal_repair "$root"
+  fixture_assert "recovery: a smoke server recorded in state is reaped on recover" fixture_smoke_pgid_recovery "$root"
+  fixture_assert "review caps: persona rounds / observer blocks block with a diagnostic; block notes inlined" fixture_review_caps_and_block_notes "$root"
+  fixture_assert "self-improvement: feedback.md tail recalled into the planning prompt" fixture_feedback_recall "$root"
+  fixture_assert "self-improvement: run metrics row + compaction keeps metrics/port-audit" fixture_run_metrics "$root"
+  fixture_assert "integrity_append mirrors journal appends without a full re-copy" fixture_integrity_append "$root"
+  fixture_assert "subagent_success_reset clears the shared 429 counter" fixture_subagent_success_reset "$root"
+  fixture_assert "a passed candidate's failed worktree cleanup WARNs, never blocks" fixture_worktree_cleanup_warn "$root"
+  fixture_assert "block_run kinds: recovery predicates switch on .block_kind with a prose fallback" fixture_block_kind "$root"
   fixture_assert "primary_prompt carries the build-from-Figma procedure iff a Design Contract" fixture_design_build_note "$root"
   fixture_assert "expected_action pins each stage's only valid signal" fixture_expected_action "$root"
   fixture_assert "schema enums stay in sync with the engine's state machine + personas" fixture_schema_inline_sync "$root"
@@ -1768,13 +1779,29 @@ fixture_coverage_ratchet() {
   # function can never be silently untested. "Referenced" is by name anywhere
   # under scripts/test/ (behavioral call, stub, or structural check all count;
   # this is a tripwire for total blind spots, not a quality meter).
-  local allow="$WORKSPACE_ROOT/scripts/test/untested-allowlist.txt" fn missing=""
+  # ONE fixed-string grep pass over the corpus for every name, then one
+  # `comm` for the set difference; only the (few) names that pass neither get
+  # the original per-name substring grep — so the loose "appears anywhere"
+  # semantics are exactly preserved (grep -oF reports the leftmost-longest
+  # match, which can hide a name that only occurs as a prefix of a longer one)
+  # at a handful of forks instead of one per function.
+  local allow="$WORKSPACE_ROOT/scripts/test/untested-allowlist.txt" fn missing="" names referenced candidates
+  names="$(declare -F | awk '{print $3}' | grep -vE '^(fixture_.*|fx|fx_not)$' | sort -u)"
+  # The pattern list goes through a file, not `-f -`: BSD grep reads patterns
+  # from stdin only on some builds, and a silent empty pattern set would make
+  # every function "unreferenced".
+  local names_file="$WORKSPACE_ROOT/.night-shift-fixtures/ratchet-names.$$"
+  mkdir -p "${names_file%/*}"
+  printf '%s\n' "$names" >"$names_file"
+  referenced="$(grep -rhoF -f "$names_file" --exclude=untested-allowlist.txt "$WORKSPACE_ROOT/scripts/test/" 2>/dev/null | sort -u)"
+  rm -f "$names_file"
+  candidates="$(comm -23 <(printf '%s\n' "$names") <(printf '%s\n' "$referenced"))"
   while IFS= read -r fn; do
-    case "$fn" in fixture_*|fx|fx_not) continue ;; esac
+    [ -n "$fn" ] || continue
     grep -rq --exclude=untested-allowlist.txt -- "$fn" "$WORKSPACE_ROOT/scripts/test/" && continue
     grep -qx -- "$fn" "$allow" 2>/dev/null && continue
     missing="$missing $fn"
-  done < <(declare -F | awk '{print $3}')
+  done <<<"$candidates"
   fx "no unreferenced, unallowlisted engine functions:${missing}" test -z "$missing"
 }
 
@@ -5204,6 +5231,626 @@ fixture_memory_prompt_wiring() {
   return 0
 }
 
+fixture_turn_timeout_helpers() {
+  # scripts/lib/resilience.sh: the wall-clock guard + failure classification
+  # behind the claude primary retry.
+  local root="$1" d="$root/tt"
+  mkdir -p "$d"
+  (
+    local rc out
+    # A shell function (the suite's own claude() stubs) runs directly, never
+    # under an external wrapper that could not see it.
+    stubfn() { printf 'ran'; }
+    fx "function passthrough" test "$(run_with_turn_timeout 1 stubfn)" = "ran"
+    fx "0 = no guard" test "$(run_with_turn_timeout 0 printf 'x')" = "x"
+    local t0; t0="$(now_epoch)"
+    rc=0; run_with_turn_timeout 1 sleep 3 || rc=$?
+    fx "a binary past its deadline is killed" turn_timeout_hit "$rc"
+    fx "…and the caller returns promptly (no grace-period stall)" test $(( $(now_epoch) - t0 )) -le 3
+    rc=0; run_with_turn_timeout 5 true || rc=$?
+    fx "a binary inside its deadline returns its own status" test "$rc" -eq 0
+    rc=0; run_with_turn_timeout 5 sh -c 'exit 7' || rc=$?
+    fx "the child's own nonzero status passes through" test "$rc" -eq 7
+    # The prompt arrives on stdin at every call site: it must survive the
+    # background spawn (an async command's stdin defaults to /dev/null).
+    fx "stdin is preserved through the guard" test "$(printf 'the-prompt' | run_with_turn_timeout 5 cat)" = "the-prompt"
+    # The child stays in THIS process group (unlike GNU timeout), so the
+    # engine's pgid-based kills (reap_persona_workers, block_run) still reach it.
+    fx "the guarded child keeps the caller's process group" \
+      test "$(run_with_turn_timeout 5 sh -c 'ps -o pgid= -p $$' | tr -d ' ')" = "$(ps -o pgid= -p $$ | tr -d ' ')"
+    # A deadline kill also reaches the child's OWN children (the wedged-MCP
+    # case): a grandchild sleep must not outlive the guard.
+    if command -v pkill >/dev/null 2>&1; then
+      # (The children are signalled BEFORE the parent — a dead parent's
+      # children reparent to init and pkill -P could no longer find them — so
+      # the parent may observe its child's death and exit on its own before
+      # the TERM lands; only "did not finish normally" is deterministic.)
+      rc=0; run_with_turn_timeout 1 sh -c 'sleep 30 & echo $! >"$1"; wait; exit 99' _ "$d/grandchild.pid" || rc=$?
+      fx "the parent did not finish normally" test "$rc" -ne 0
+      sleep 1
+      fx_not "…and its grandchild did not outlive it" kill -0 "$(cat "$d/grandchild.pid")" 2>/dev/null
+    fi
+    fx "an interrupt of the shell is forwarded to the child (trap body)" fn_body_has run_with_turn_timeout 'turn_interrupt_child $pid'
+    fx "the forwarding trap escalates to KILL" fn_body_has turn_interrupt_child 'kill -KILL'
+    # The ONE drift predicate, used at both the claude in-loop site and the
+    # codex post-loop site.
+    fx "drift predicate: no-op on a fresh start" block_on_session_drift "" "new-id"
+    fx "drift predicate: no-op with no envelope" block_on_session_drift "old-id" ""
+    fx "drift predicate: no-op on the same id" block_on_session_drift "same" "same"
+    ( block_run() { printf '%s' "$1" >"$d/drift.txt"; exit 9; }
+      block_on_session_drift "old-id" "new-id" ) >/dev/null 2>&1; rc=$?
+    fx "drift predicate: a changed id blocks" test "$rc" -eq 9
+    fx "…naming both ids" grep -q 'changed from old-id to new-id' "$d/drift.txt"
+    fx "invoke_primary checks drift at exactly two sites (claude in-loop, codex post-loop)" \
+      test "$(declare -f invoke_primary | grep -c 'block_on_session_drift "\$session" "\$emitted"')" -eq 2
+    fx "an unknown --resume is recognized by the CLI's exact phrase only" fn_body_has invoke_primary "grep -qF 'No conversation found'"
+    fx "…and rebuilds the prompt for the fresh start" \
+      test "$(declare -f invoke_primary | sed -n '/No conversation found/,/elif/p' | grep -c 'primary_prompt "$prompt"')" -eq 1
+    # Persona/observer deadline kills are a distinct retry shape (43).
+    fx "invoke_persona_once returns 43 on a deadline kill" fn_body_has invoke_persona_once 'turn_timeout_hit "$rc" || return 43'
+    fx "invoke_observer_once returns 43 on a deadline kill" fn_body_has invoke_observer_once 'turn_timeout_hit "$rc" || return 43'
+    fx "spawn_persona_worker retries a 43 with a deadline note" fn_body_has spawn_persona_worker '[ "$iv" -eq 43 ]'
+    fx "validated_observer_retry retries a 43 with a deadline note" fn_body_has validated_observer_retry '[ "$iv" -eq 43 ]'
+    # Run-tail sessions (feedback, sweep, sweep fix) get the per-turn cap only.
+    TURN_TIMEOUT=1234; fx "sweep_turn_deadline = the per-turn cap" test "$(sweep_turn_deadline)" = "1234"
+    TURN_TIMEOUT=0; fx "sweep_turn_deadline honors 0 = no guard" test "$(sweep_turn_deadline)" = "0"
+    TURN_TIMEOUT=bogus; fx "sweep_turn_deadline: a non-numeric knob means no guard" test "$(sweep_turn_deadline)" = "0"
+    for f in write_run_feedback sweep_run sweep_fix_cycle; do
+      fx "$f runs its claude call under sweep_turn_deadline" fn_body_has "$f" 'run_with_turn_timeout "$(sweep_turn_deadline)" claude'
+    done
+    fx "sweep_run guards BOTH spawns (first + rate-limit retry)" \
+      test "$(declare -f sweep_run | grep -c 'run_with_turn_timeout "$(sweep_turn_deadline)" claude')" -eq 2
+    # Session pre-minting helpers.
+    out="$(mint_session_id)" || out=""
+    if command -v uuidgen >/dev/null 2>&1 || [ -r /proc/sys/kernel/random/uuid ]; then
+      fx "mint_session_id yields a lowercase UUID" bash -c '[[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]' _ "$out"
+      fx "session_id_flag renders --session-id" test "$(session_id_flag "$out")" = "--session-id $out"
+    fi
+    fx "session_id_flag is empty for no id" test -z "$(session_id_flag "")"
+    fx_not "exit 1 is not a timeout shape" turn_timeout_hit 1
+    for rc in 124 142 137 143; do fx "$rc is a timeout shape" turn_timeout_hit "$rc"; done
+    # turn_timeout_seconds: explicit knob wins; else stage remaining + 60s
+    # grace, floored at 300; no usable state -> the whole stage budget.
+    TURN_TIMEOUT=900; fx "explicit knob wins" test "$(turn_timeout_seconds)" = "900"
+    TURN_TIMEOUT=0; MAX_STAGE_SECONDS=3600; STATE="$d/state.json"
+    printf '{"stage_started_at":%s}\n' "$(( $(now_epoch) - 600 ))" >"$STATE"
+    out="$(stage_seconds_remaining)"
+    fx "stage_seconds_remaining = budget - elapsed" test "$out" -ge 2990 -a "$out" -le 3002
+    out="$(turn_timeout_seconds)"
+    fx "derived from the stage's remaining budget (+60s grace)" test "$out" -ge 3050 -a "$out" -le 3062
+    printf '{"stage_started_at":%s}\n' "$(( $(now_epoch) - 4000 ))" >"$STATE"
+    fx "a spent stage budget reads negative" test "$(stage_seconds_remaining)" -lt 0
+    printf '{"stage_started_at":%s}\n' "$(( $(now_epoch) - 3590 ))" >"$STATE"
+    fx "floored at 300s near the stage cap" test "$(turn_timeout_seconds)" = "300"
+    printf '{}\n' >"$STATE"
+    fx "no stage clock -> the whole stage budget (+60s grace)" test "$(turn_timeout_seconds)" = "3660"
+    # claude_failure_reason: deadline, envelope error, stderr tail, bare rc.
+    fx "deadline reason" grep -q 'exceeded its 42s wall-clock deadline' <<<"$(claude_failure_reason 124 "" "" 42)"
+    printf '{"is_error":true,"result":"API Error: 529 overloaded"}\n' >"$d/raw.json"
+    fx "envelope error text" grep -q '529 overloaded' <<<"$(claude_failure_reason 1 "$d/raw.json" "" 0)"
+    printf 'garbage' >"$d/raw2.json"; printf 'stderr: connection reset by peer\n' >"$d/err.txt"
+    fx "stderr tail" grep -q 'connection reset' <<<"$(claude_failure_reason 1 "$d/raw2.json" "$d/err.txt" 0)"
+    fx "bare rc" grep -q 'exit 7: no error text captured' <<<"$(claude_failure_reason 7 "" "" 0)"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_primary_claude_retry() {
+  # Drives the REAL invoke_primary loop with a stubbed claude that fails
+  # twice (rc 1, an overloaded envelope) then succeeds: two primary_retry
+  # events, a successful turn, session pinned; with the retry budget at 0 it
+  # blocks on the first failure with the descriptive reason; and a backoff
+  # past the NIGHT_SHIFT_CLAUDE_MAX_WAIT ceiling blocks before sleeping.
+  local root="$1" d="$root/pcr"
+  mkdir -p "$d/control" "$d/raw" "$d/prompts" "$d/proj"
+  (
+    local rc
+    STATE="$d/state.json"; RUN_ROOT="$d"; RUN_ID="pcr-$$"; PROJECT="$d/proj"; SPEC="$d/spec.md"
+    printf 'Spec\n' >"$SPEC"
+    printf '{"status":"running","stage":"planning","stage_turns":0,"task_turns":0,"primary_turns":0,"session_id":null,"stage_started_at":%s,"task_started_at":%s}\n' "$(now_epoch)" "$(now_epoch)" >"$STATE"
+    IMPLEMENT_BACKEND=claude ENGINE_IMPLEMENT=claude
+    CLAUDE_MAX_RETRIES=2 CLAUDE_RETRY_BACKOFF=0 CLAUDE_MAX_WAIT=300 TURN_TIMEOUT=0
+    enforce_limits() { :; }; enforce_elapsed_limits() { :; }; archive_old_signal() { :; }
+    primary_prompt() { printf 'prompt\n' >"$1"; }
+    maybe_refresh_session() { printf '%s' "$1"; }
+    integrity_guard() { :; }; record_cost() { :; }
+    block_run() { printf '%s\n' "$1" >"$d/blocked.txt"; exit 42; }
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    : >"$d/calls"; : >"$d/argv"
+    # The stub echoes back whichever session the engine asked for
+    # (--session-id on a fresh start, --resume afterwards), like the CLI.
+    claude() {
+      local a sid="" prev=""
+      for a in "$@"; do
+        case "$prev" in --session-id|--resume) sid="$a" ;; esac
+        prev="$a"
+      done
+      printf '%s\n' "$*" >>"$d/argv"
+      printf 'x' >>"$d/calls"
+      if [ "$(wc -c <"$d/calls" | tr -d ' ')" -le 2 ]; then
+        printf '{"is_error":true,"result":"API Error: 529 overloaded"}\n'; return 1
+      fi
+      printf '{"session_id":"%s","result":"done","total_cost_usd":0,"num_turns":1,"is_error":false}\n' "${sid:-sid-ok}"
+    }
+    invoke_primary || exit 1
+    fx "three calls: two failures + one success" test "$(wc -c <"$d/calls" | tr -d ' ')" -eq 3
+    fx "two primary_retry events" test "$(grep -c '^primary_retry|' "$d/events.txt")" -eq 2
+    fx "retry payload names the backend, attempt and reason" \
+      jq -e '.backend=="claude" and .attempt==2 and .rc==1 and (.reason|test("529 overloaded"))' <<<"$(sed -n 's/^primary_retry|//p' "$d/events.txt" | tail -1)"
+    fx "no block" test ! -f "$d/blocked.txt"
+    fx "turn counters advanced once (retries are not turns)" test "$(jq -r '.primary_turns' "$STATE")" = "1"
+    fx "each failed attempt's envelope is kept" test -s "$d/raw/primary-1.json.attempt-1" -a -s "$d/raw/primary-1.json.attempt-2"
+    fx "a deadline kill skips the API backoff" fn_body_has invoke_primary '! turn_timeout_hit "$rc" || claude_backoff=0'
+    if command -v uuidgen >/dev/null 2>&1 || [ -r /proc/sys/kernel/random/uuid ]; then
+      # A fresh start pre-mints a session id; the retries RESUME it (the
+      # failed attempt may already have edited files), never a blind fresh start.
+      fx "fresh start passes a pre-minted --session-id" grep -q -- '--session-id' "$d/argv"
+      fx "retries resume the pre-minted id" test "$(grep -c -- '--resume' "$d/argv")" -eq 2
+      fx "session pinned to the pre-minted id" test "$(jq -r '.session_id' "$STATE")" = "$(sed -n '1p' "$d/argv" | sed -E 's/.*--session-id ([^ ]+).*/\1/')"
+    fi
+    # A resume the CLI rejects as unknown restarts FRESH (new seed) and
+    # archives the stale signal; a drifted id on a failed resume blocks.
+    : >"$d/calls"; : >"$d/events.txt"; : >"$d/argv"; archived=0
+    archive_old_signal() { archived=$((archived + 1)); }
+    printf '{"status":"running","stage":"planning","stage_turns":0,"task_turns":0,"primary_turns":0,"session_id":null,"stage_started_at":%s,"task_started_at":%s}\n' "$(now_epoch)" "$(now_epoch)" >"$STATE"
+    claude() {
+      local a prev="" sid=""
+      for a in "$@"; do case "$prev" in --session-id|--resume) sid="$a" ;; esac; prev="$a"; done
+      printf '%s\n' "$*" >>"$d/argv"; printf 'x' >>"$d/calls"
+      case "$(wc -c <"$d/calls" | tr -d ' ')" in
+        1) printf '{"is_error":true,"result":"boom"}\n'; return 1 ;;
+        2) printf 'No conversation found with session ID: %s\n' "$sid" >&2; return 1 ;;
+      esac
+      printf '{"session_id":"%s","result":"done","total_cost_usd":0,"num_turns":1,"is_error":false}\n' "$sid"
+    }
+    invoke_primary || exit 1
+    fx "an unknown-session resume falls back to a fresh start" test "$(grep -c -- '--session-id' "$d/argv")" -eq 2
+    fx "the fresh restart archives the stale signal" test "$archived" -ge 1
+    : >"$d/calls"; : >"$d/events.txt"; rm -f "$d/blocked.txt"
+    printf '{"status":"running","stage":"planning","stage_turns":0,"task_turns":0,"primary_turns":0,"session_id":"sid-A","stage_started_at":%s,"task_started_at":%s}\n' "$(now_epoch)" "$(now_epoch)" >"$STATE"
+    claude() { printf '{"session_id":"sid-B","is_error":true,"result":"boom"}\n'; return 1; }
+    rc=0; ( invoke_primary ) || rc=$?
+    fx "a drifted session id on a failed resume blocks" test "$rc" -eq 42
+    fx "drift block names both ids" grep -q 'changed from sid-A to sid-B' "$d/blocked.txt"
+    fx_not "drift is never retried" grep -q '^primary_retry|' "$d/events.txt"
+    # A deadline kill with the stage budget spent blocks at once with the
+    # real reason, instead of a fake retry into enforce_limits' generic block.
+    : >"$d/calls"; : >"$d/events.txt"; rm -f "$d/blocked.txt"
+    printf '{"status":"running","stage":"planning","stage_turns":0,"task_turns":0,"primary_turns":0,"session_id":null,"stage_started_at":%s,"task_started_at":%s}\n' "$(( $(now_epoch) - 4000 ))" "$(now_epoch)" >"$STATE"
+    claude() { return 143; }
+    rc=0; ( MAX_STAGE_SECONDS=3600; invoke_primary ) || rc=$?
+    fx "deadline kill with no budget left blocks" test "$rc" -eq 42
+    fx "…naming the deadline and the spent budget" grep -q 'wall-clock deadline.*time budget is spent' "$d/blocked.txt"
+    fx_not "…without a fake retry" grep -q '^primary_retry|' "$d/events.txt"
+    unset -f archive_old_signal; archive_old_signal() { :; }
+    claude() {
+      printf 'x' >>"$d/calls"
+      if [ "$(wc -c <"$d/calls" | tr -d ' ')" -le 2 ]; then
+        printf '{"is_error":true,"result":"API Error: 529 overloaded"}\n'; return 1
+      fi
+      printf '{"session_id":"sid-ok","result":"done","total_cost_usd":0,"num_turns":1,"is_error":false}\n'
+    }
+    # Retry budget 0: the first failure blocks, with the descriptive reason.
+    : >"$d/calls"; : >"$d/events.txt"
+    printf '{"status":"running","stage":"planning","stage_turns":0,"task_turns":0,"primary_turns":0,"session_id":null,"stage_started_at":%s,"task_started_at":%s}\n' "$(now_epoch)" "$(now_epoch)" >"$STATE"
+    rc=0; ( CLAUDE_MAX_RETRIES=0; invoke_primary ) || rc=$?
+    fx "budget 0 blocks" test "$rc" -eq 42
+    fx "block reason is descriptive and resumable" grep -q 'primary command failed (exit 1: API Error: 529 overloaded) after 0 retries' "$d/blocked.txt"
+    fx "the block reason still satisfies the --resume predicate" bash -c '[ "$1" != "${1#primary command failed}" ]' _ "$(cat "$d/blocked.txt")"
+    fx_not "no retry event when the budget is 0" grep -q '^primary_retry|' "$d/events.txt"
+    # Ceiling: a backoff that would pass CLAUDE_MAX_WAIT blocks instead of sleeping.
+    : >"$d/calls"; : >"$d/events.txt"; rm -f "$d/blocked.txt"
+    rc=0; ( CLAUDE_RETRY_BACKOFF=100 CLAUDE_MAX_WAIT=50; invoke_primary ) || rc=$?
+    fx "ceiling blocks" test "$rc" -eq 42
+    fx "only one call before the ceiling block" test "$(wc -c <"$d/calls" | tr -d ' ')" -eq 1
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_signal_repair() {
+  local root="$1" d="$root/sigrep"
+  mkdir -p "$d/control"
+  (
+    local rc sig="$d/control/next-action.json"
+    RUN_ROOT="$d"; RUN_ID="sr-$$"; SPEC="$d/spec.md"; STATE=""
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    log() { :; }
+    # A fenced signal: repaired, schema-checked, original kept, event journaled.
+    printf 'Here is my signal:\n```json\n{"action":"RUN_PERSONAS","task":"%s","stage":"planning","artifacts":[],"reason":"plan ready"}\n```\nDone.\n' "$SPEC" >"$sig"
+    validate_signal || exit 1
+    fx "file is now bare JSON" jq -e '.action=="RUN_PERSONAS"' "$sig"
+    fx "original kept for forensics" test -s "$sig.unrepaired.txt"
+    fx "signal_repaired journaled with the strategy" grep -q '^signal_repaired|{"strategy":"fenced"}' "$d/events.txt"
+    # Prose-wrapped (no fence): outermost-object strategy.
+    : >"$d/events.txt"
+    printf 'Sure! %s Let me know.\n' "{\"action\":\"RUN_PERSONAS\",\"task\":\"$SPEC\",\"stage\":\"planning\",\"artifacts\":[],\"reason\":\"ok\"}" >"$sig"
+    validate_signal || exit 1
+    fx "outermost-object strategy journaled" grep -q '"strategy":"outermost-object"' "$d/events.txt"
+    # Already-valid JSON: untouched, no event.
+    : >"$d/events.txt"; rm -f "$sig.unrepaired.txt"
+    printf '{"action":"RUN_PERSONAS","task":"%s","stage":"planning","artifacts":[],"reason":"ok"}\n' "$SPEC" >"$sig"
+    validate_signal || exit 1
+    fx_not "valid JSON is never 'repaired'" test -f "$sig.unrepaired.txt"
+    fx_not "no event for valid JSON" grep -q signal_repaired "$d/events.txt"
+    # Unsalvageable garbage: still rejected (rc 1), file untouched, no event.
+    printf 'no braces here at all\n' >"$sig"
+    rc=0; validate_signal || rc=$?
+    fx "garbage still rejected" test "$rc" -eq 1
+    fx "garbage left untouched" grep -q 'no braces here' "$sig"
+    fx_not "no event for garbage" grep -q signal_repaired "$d/events.txt"
+    fx "validate_signal runs the salvage ladder before the schema check" fn_body_has validate_signal 'repair_signal_json "$signal"'
+    # A fenced NON-object (an array) is not a signal: rejected, untouched.
+    printf '```json\n[1,2]\n```\n' >"$sig"
+    rc=0; validate_signal || rc=$?
+    fx "fenced array rejected" test "$rc" -eq 1
+    fx "fenced array untouched" grep -q '^\[1,2\]' "$sig"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_smoke_pgid_recovery() {
+  local root="$1" d="$root/smokepg"
+  mkdir -p "$d"
+  (
+    local pid
+    STATE="$d/state.json"; RUN_ROOT="$d"; RUN_ID="spg-$$"
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    log() { printf '%s\n' "$*" >>"$d/log.txt"; }
+    # A live "server" recorded through smoke_pgid_record (pgid + the leader's
+    # start time as its identity) is stopped, journaled, and cleared.
+    printf '{"status":"running"}\n' >"$STATE"
+    sleep 60 & pid=$!
+    smoke_pgid_record "$pid"
+    fx "record carries the pgid" test "$(jq -r '.smoke_pgid' "$STATE")" = "$pid"
+    fx "record carries the leader's start time" test -n "$(jq -r '.smoke_pgid_started // empty' "$STATE")"
+    reap_recorded_smoke_pgid
+    sleep 0.2
+    fx "recorded server stopped" bash -c '! kill -0 "$1" 2>/dev/null' _ "$pid"
+    fx "smoke_reaped journaled" grep -q "^smoke_reaped|{\"pgid\":$pid}" "$d/events.txt"
+    fx "record cleared from state" test "$(jq -r '.smoke_pgid // "gone"' "$STATE")" = "gone"
+    wait "$pid" 2>/dev/null || true
+    # A dead pid: just cleared, no reap event.
+    : >"$d/events.txt"
+    printf '{"status":"running","smoke_pgid":%s,"smoke_pgid_started":"x"}\n' "$pid" >"$STATE"
+    reap_recorded_smoke_pgid
+    fx "dead pid cleared silently" test "$(jq -r '.smoke_pgid // "gone"' "$STATE")" = "gone"
+    fx_not "no reap event for a dead pid" grep -q smoke_reaped "$d/events.txt"
+    # A LIVE pid whose identity no longer matches the record (pid reuse after
+    # a reboot) is never killed — the record is dropped instead.
+    : >"$d/events.txt"; : >"$d/log.txt"
+    sleep 60 & pid=$!
+    printf '{"status":"running","smoke_pgid":%s,"smoke_pgid_started":"Mon Jan  1 00:00:00 1990"}\n' "$pid" >"$STATE"
+    reap_recorded_smoke_pgid
+    fx "a reused pid is left alone" kill -0 "$pid"
+    fx "…and logged as a different process" grep -q 'belongs to a different process' "$d/log.txt"
+    fx "…with the stale record dropped" test "$(jq -r '.smoke_pgid // "gone"' "$STATE")" = "gone"
+    fx_not "…and no reap event" grep -q smoke_reaped "$d/events.txt"
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    # A record without an identity (older state) is dropped, never killed.
+    sleep 60 & pid=$!
+    printf '{"status":"running","smoke_pgid":%s}\n' "$pid" >"$STATE"
+    reap_recorded_smoke_pgid
+    fx "a record with no identity is not acted on" kill -0 "$pid"
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    # No record: no-op. smoke_pgid_record '' clears both fields.
+    printf '{"status":"running"}\n' >"$STATE"
+    reap_recorded_smoke_pgid
+    smoke_pgid_record ""
+    fx "smoke_pgid_record '' clears it" test "$(jq -r '.smoke_pgid // "gone"' "$STATE")" = "gone"
+    fx "smoke_pgid_identity is empty for a dead pid" test -z "$(smoke_pgid_identity 999999)"
+    # Wiring: server mode records the pgid; cleanup clears it; recover_run
+    # reaps AFTER loading RUN_ID (so the event and state write are anchored).
+    fx "run_smoke_phase records the pgid" fn_body_has run_smoke_phase 'smoke_pgid_record "$pid"'
+    fx "cleanup_smoke_pgid clears the record" fn_body_has cleanup_smoke_pgid 'smoke_pgid_record ""'
+    local body pre post
+    body="$(declare -f recover_run)"; pre="${body%%"RUN_ID=\"\$(jq -r '.run_id'"*}"; post="${body#*"RUN_ID=\"\$(jq -r '.run_id'"}"
+    fx "recover_run loads RUN_ID" test "$pre" != "$body"
+    case "$post" in *reap_recorded_smoke_pgid*) post=ok ;; *) post=no ;; esac
+    fx "recover_run reaps a recorded server after RUN_ID is loaded" test "$post" = ok
+    case "$pre" in *reap_recorded_smoke_pgid*) pre=early ;; *) pre=ok ;; esac
+    fx "…and not before" test "$pre" = ok
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_review_caps_and_block_notes() {
+  local root="$1" d="$root/caps"
+  mkdir -p "$d/control"
+  (
+    # write_observer_block_notes: one line per finding, evidence bounded.
+    printf '{"status":"BLOCK","findings":[{"id":"OBS-001","required_change":"guard the null case","evidence":"foo.ts:12"},{"id":"OBS-002"}]}\n' >"$d/verdict.json"
+    write_observer_block_notes "$d/verdict.json" "$d/control/observer-block.md"
+    fx "notes list every finding id + required change" grep -q '^- OBS-001: guard the null case' "$d/control/observer-block.md"
+    fx "evidence carried" grep -q 'evidence: foo.ts:12' "$d/control/observer-block.md"
+    fx "missing required_change is explicit" grep -q 'OBS-002: (no required_change given)' "$d/control/observer-block.md"
+    printf '{"status":"APPROVE","findings":[]}\n' >"$d/approve.json"
+    write_observer_block_notes "$d/approve.json" "$d/control/empty.md"
+    fx "no findings -> no notes file" test ! -f "$d/control/empty.md"
+    # Bounded to 20 findings, and the cut is SAID rather than silent.
+    jq -n '{status:"BLOCK", findings:[range(25) | {id:("OBS-\(.)"), required_change:"x", evidence:"y"}]}' >"$d/many.json"
+    write_observer_block_notes "$d/many.json" "$d/control/many.md"
+    fx "at most 20 finding lines" test "$(grep -c '^- OBS-' "$d/control/many.md")" -eq 20
+    fx "the cut is stated (+N more)" grep -q '^- (+5 more findings' "$d/control/many.md"
+    # Wiring of the caps and the reset points.
+    fx "run_personas enforces NIGHT_SHIFT_MAX_REVIEW_ROUNDS" fn_body_has run_personas 'MAX_REVIEW_ROUNDS'
+    fx "run_personas names the pending reviewers in the block" fn_body_has run_personas 'still pending:'
+    # The round cap is checked on review_round + 1 BEFORE the round is counted
+    # or its dir created, so raising the knob by one buys exactly one round.
+    local body pre post
+    body="$(declare -f run_personas)"; pre="${body%%"state_set '.review_round += 1'"*}"
+    fx "run_personas body contains the round increment" test "$pre" != "$body"
+    case "$pre" in *MAX_REVIEW_ROUNDS*) pre=ok ;; *) pre=no ;; esac
+    fx "round cap checks the NEXT round before counting it" test "$pre" = ok
+    fx "run_observer counts BLOCK cycles" fn_body_has run_observer 'observer_block_rounds=((.observer_block_rounds // 0) + 1)'
+    fx "run_observer enforces NIGHT_SHIFT_MAX_OBSERVER_BLOCKS" fn_body_has run_observer 'MAX_OBSERVER_BLOCKS'
+    fx "run_observer writes the block notes" fn_body_has run_observer 'write_observer_block_notes'
+    # set_stage implementation precedes the cap block, so a --resume with the
+    # knob raised implements the notes instead of re-reviewing the candidate.
+    body="$(declare -f run_observer)"; post="${body#*write_observer_block_notes}"
+    fx "run_observer writes notes before the cap" test "$post" != "$body"
+    post="${post#*"set_stage implementation"}"
+    case "$post" in *MAX_OBSERVER_BLOCKS*) post=ok ;; *) post=no ;; esac
+    fx "observer cap block comes after set_stage implementation" test "$post" = ok
+    fx "APPROVE resets the cycle counter + notes" fn_body_has run_observer 'observer_block_rounds=0'
+    fx "start_next_task resets the cycle counter" fn_body_has start_next_task 'observer_block_rounds=0'
+    fx "main_run validates the caps" fn_body_has main_run 'for knob in MAX_REVIEW_ROUNDS MAX_OBSERVER_BLOCKS'
+    fx "…as positive integers (0 rejected)" fn_body_has main_run 'must be a positive integer'
+    exit 0
+  ) >/dev/null || return 1
+  # primary_prompt inlines the notes on the implement stage only.
+  local dir="$d/prompt"
+  mkdir -p "$dir/control"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir"
+  fixture_write_min_spec "$SPEC"
+  printf -- '- OBS-001: guard the null case\n' >"$dir/control/observer-block.md"
+  (
+    printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-impl.txt"
+    fx "implement prompt carries the observer's required changes verbatim" grep -q 'OBS-001: guard the null case' "$dir/p-impl.txt"
+    fx "framed as the observer's BLOCK" grep -q 'observer BLOCKED the previous candidate' "$dir/p-impl.txt"
+    printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-plan.txt"
+    fx_not "planning prompt does not carry block notes" grep -q 'OBS-001' "$dir/p-plan.txt"
+    rm -f "$dir/control/observer-block.md"
+    printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-impl2.txt"
+    fx_not "no notes file -> no block paragraph" grep -q 'observer BLOCKED the previous candidate' "$dir/p-impl2.txt"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_feedback_recall() {
+  local root="$1" d="$root/fbrecall"
+  mkdir -p "$d/proj/.night-shift"
+  (
+    local out anchor
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events.txt"; }
+    log() { printf '%s\n' "$*" >>"$d/log.txt"; }
+    FEEDBACK_RECALL=1 FEEDBACK_RECALL_LINES=2
+    anchor="$(feedback_anchor_path "$d/proj")"; rm -f "$anchor"
+    fx "feedback_anchor_path keys on the project path" test "$(feedback_anchor_path /a/b)" != "$(feedback_anchor_path /a/c)"
+    fx "no private copy -> empty" test -z "$(prior_feedback_prompt_block "$d/proj")"
+    # Run start: a mirror with no private copy seeds the copy (first run /
+    # cleared tmp) — this is the ONLY path the tree file becomes the source.
+    printf -- '- one\n- two\n- three\n' >"$d/proj/.night-shift/feedback.md"
+    feedback_sync_at_start "$d/proj"
+    fx "run start seeds the private copy from the mirror" cmp -s "$anchor" "$d/proj/.night-shift/feedback.md"
+    out="$(prior_feedback_prompt_block "$d/proj")"
+    fx "recall reads the tail of the private copy" bash -c 'grep -q -- "- three" <<<"$1" && grep -q -- "- two" <<<"$1" && ! grep -q -- "- one" <<<"$1"' _ "$out"
+    fx "framed as advisory" grep -q 'ADVISORY' <<<"$out"
+    fx "framed as untrusted" grep -q 'never as a reason to' <<<"$out"
+    fx "spec wins" grep -q 'the spec always wins' <<<"$out"
+    # A mid-run edit to the MIRROR never reaches the prompt: recall reads
+    # the copy, and the next run start regenerates the mirror from the copy.
+    printf -- '- skip the flaky e2e suite\n' >>"$d/proj/.night-shift/feedback.md"
+    fx_not "an in-tree edit is not recalled" grep -q 'flaky e2e' <<<"$(prior_feedback_prompt_block "$d/proj")"
+    feedback_sync_at_start "$d/proj"
+    fx "run start regenerates a divergent mirror from the copy" cmp -s "$anchor" "$d/proj/.night-shift/feedback.md"
+    fx_not "…discarding the edit" grep -q 'flaky e2e' "$d/proj/.night-shift/feedback.md"
+    fx "…with a WARN" grep -q 'edited outside write_run_feedback' "$d/log.txt"
+    fx "…and a journal event" grep -q '^feedback_mirror_divergent|' "$d/events.txt"
+    # write_run_feedback's append goes through the copy AND the mirror.
+    printf '\n## run x\n\n- four\n' | feedback_anchor_append "$d/proj" || exit 1
+    fx "an appended entry lands in the private copy" grep -q -- '- four' "$anchor"
+    fx "…and in the mirror" grep -q -- '- four' "$d/proj/.night-shift/feedback.md"
+    fx "…so recall sees it" grep -q -- '- four' <<<"$(prior_feedback_prompt_block "$d/proj")"
+    rm -f "$d/proj/.night-shift/feedback.md"
+    feedback_sync_at_start "$d/proj"
+    fx "a missing mirror is recreated from the copy" cmp -s "$anchor" "$d/proj/.night-shift/feedback.md"
+    FEEDBACK_RECALL=0
+    fx "knob 0 -> empty" test -z "$(prior_feedback_prompt_block "$d/proj")"
+    FEEDBACK_RECALL=1 FEEDBACK_RECALL_LINES=0
+    fx "0 lines -> empty" test -z "$(prior_feedback_prompt_block "$d/proj")"
+    fx "write_run_feedback appends through the private copy" fn_body_has write_run_feedback 'feedback_anchor_append "$project"'
+    fx "initialize_run syncs at start" fn_body_has initialize_run 'feedback_sync_at_start "$PROJECT"'
+    fx "recover_run syncs at start" fn_body_has recover_run 'feedback_sync_at_start "$PROJECT"'
+    rm -f "$anchor"
+    exit 0
+  ) >/dev/null || return 1
+  # primary_prompt: planning carries it, implementation does not.
+  local dir="$d/prompt"
+  mkdir -p "$dir/.night-shift"
+  local STATE="$dir/state.json" SPEC="$dir/spec.md" RUN_ID=testrun
+  local PROJECT="$dir" BASE_COMMIT=deadbeef RUN_ROOT="$dir/.night-shift"
+  fixture_write_min_spec "$SPEC"
+  printf -- '- previous run: the spec forgot the migration step\n' >"$dir/.night-shift/feedback.md"
+  (
+    FEEDBACK_RECALL=1 FEEDBACK_RECALL_LINES=40
+    rm -f "$(feedback_anchor_path "$dir")"
+    feedback_sync_at_start "$dir"
+    printf '{"stage":"planning","stage_turns":0,"primary_turns":0,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-plan.txt"
+    fx "planning prompt recalls prior feedback" grep -q 'the spec forgot the migration step' "$dir/p-plan.txt"
+    printf '{"stage":"implementation","stage_turns":0,"primary_turns":4,"session_id":null}\n' >"$STATE"
+    primary_prompt "$dir/p-impl.txt"
+    fx_not "implement prompt does not" grep -q 'the spec forgot the migration step' "$dir/p-impl.txt"
+    rm -f "$(feedback_anchor_path "$dir")"
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_run_metrics() {
+  local root="$1" d="$root/metrics"
+  mkdir -p "$d/proj/.night-shift/port-audit" "$d/run"
+  (
+    STATE="$d/run/state.json"; RUN_ROOT="$d/run"; RUN_ID="m-$$"; SPEC="$d/spec.md"
+    emit_event() { printf '%s|%s\n' "$1" "${2:-}" >>"$d/events-out.txt"; }
+    log() { printf '%s\n' "$*" >>"$d/log.txt"; }
+    # review_round in state is 0 by completion (set_stage completion resets
+    # it), so the row counts review-stage transitions from the journal instead.
+    printf '{"primary_turns":7,"review_round":0,"candidate_commits":["a","b"]}\n' >"$STATE"
+    {
+      printf '{"type":"run_started","payload":{"models":{"plan":"opus"}}}\n'
+      printf '{"type":"stage_transition","payload":{"from":"planning","to":"plan_review"}}\n'
+      printf '{"type":"stage_transition","payload":{"from":"implementation","to":"implementation_review"}}\n'
+      printf '{"type":"stage_transition","payload":{"from":"observer_review","to":"completion"}}\n'
+      printf '{"type":"primary_retry","payload":{}}\n{"type":"primary_retry","payload":{}}\n'
+      printf '{"type":"persona_retry","payload":{}}\n{"type":"signal_repaired","payload":{}}\n'
+      printf '{"type":"observer_verdict","payload":{"status":"BLOCK"}}\n{"type":"observer_verdict","payload":{"status":"APPROVE"}}\n'
+    } >"$RUN_ROOT/events.jsonl"
+    printf '{"total_cost_usd":0.5}\n{"total_cost_usd":0.25}\n' >"$RUN_ROOT/cost-ledger.jsonl"
+    write_run_metrics "$d/proj"
+    local row; row="$(tail -1 "$d/proj/.night-shift/metrics.jsonl")"
+    fx "one row appended" test "$(wc -l <"$d/proj/.night-shift/metrics.jsonl" | tr -d ' ')" -eq 1
+    fx "row carries turns/rounds/candidates from state" jq -e '.primary_turns==7 and .review_rounds==2 and .candidates==2' <<<"$row"
+    fx "row counts retries and repairs from the journal" jq -e '.retries.primary==2 and .retries.persona==1 and .signals.repaired==1' <<<"$row"
+    fx "row counts observer BLOCKs" jq -e '.observer_blocks==1' <<<"$row"
+    fx "row sums the cost ledger" jq -e '.total_cost_usd==0.75' <<<"$row"
+    fx "row carries the run's models" jq -e '.models.plan=="opus"' <<<"$row"
+    fx "run_metrics event journaled" grep -q '^run_metrics|' "$d/events-out.txt"
+    # No journal -> WARN, never fails.
+    rm "$RUN_ROOT/events.jsonl"; write_run_metrics "$d/proj" || exit 1
+    fx "missing journal WARNs" grep -q 'WARN: run metrics skipped' "$d/log.txt"
+    # compact_success keeps metrics.jsonl and port-audit/ (and feedback.md).
+    local run="$d/proj/.night-shift"
+    printf '{"status":"complete"}\n' >"$run/state.json"; printf -- '- fb\n' >"$run/feedback.md"
+    printf '{}\n' >"$run/port-audit/Home.json"; mkdir -p "$run/raw"; : >"$run/raw/junk"
+    RUN_ROOT="$run"; STATE="$run/state.json"
+    compact_success "$run" "cs-$$" 2>/dev/null
+    fx "metrics.jsonl survives compaction" test -s "$run/metrics.jsonl"
+    fx "port-audit/ survives compaction" test -f "$run/port-audit/Home.json"
+    fx "feedback.md survives compaction" test -s "$run/feedback.md"
+    fx "per-run dirs are compacted" test ! -d "$run/raw"
+    fx "complete_run writes the metrics row" fn_body_has complete_run 'write_run_metrics "$PROJECT"'
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_integrity_append() {
+  local root="$1" d="$root/iappend"
+  mkdir -p "$d"
+  (
+    RUN_ROOT="$d"; RUN_ID="ia-$$"; STATE=""
+    local f="$d/events.jsonl" anchor
+    integrity_cleanup
+    printf '{"n":1}\n' >"$f"
+    integrity_append "$f" '{"n":1}'
+    anchor="$(integrity_dir)/events.jsonl"
+    fx "first append seeds a full copy" cmp -s "$f" "$anchor"
+    printf '{"n":2}\n' >>"$f"; integrity_append "$f" '{"n":2}'
+    printf '{"n":3}\n' >>"$f"; integrity_append "$f" '{"n":3}'
+    fx "anchor tracks appends line by line" cmp -s "$f" "$anchor"
+    fx "integrity_check passes on an append-anchored journal" integrity_check "$f"
+    printf 'tampered\n' >>"$f"
+    fx_not "an out-of-band append still diverges" integrity_check "$f"
+    # Self-healing: a torn mirror is re-synced by the periodic full copy, so a
+    # transient write failure earlier in a run cannot become a false
+    # integrity_violation at completion.
+    printf '{"n":4}\n' >>"$f"
+    INTEGRITY_APPEND_N=$(( INTEGRITY_RESYNC_EVERY - 1 ))
+    integrity_append "$f" '{"n":4}'
+    fx "the periodic full resync heals an earlier divergence" integrity_check "$f"
+    fx "integrity_dir is cached per run" test "$INTEGRITY_DIR_FOR" = "$RUN_ID"
+    # integrity_dir_resolve re-derives the dir only when RUN_ID changes.
+    local cached="$INTEGRITY_DIR"
+    integrity_dir_resolve
+    fx "integrity_dir_resolve is a no-op for the same run" test "$INTEGRITY_DIR" = "$cached"
+    RUN_ID="ia-other-$$"; integrity_dir_resolve
+    fx "…and re-derives for a new run id" test "$INTEGRITY_DIR" != "$cached" -a "$INTEGRITY_DIR_FOR" = "$RUN_ID"
+    RUN_ID="ia-$$"; integrity_dir_resolve
+    integrity_cleanup
+    fx "emit_event uses integrity_append" fn_body_has emit_event 'integrity_append "$RUN_ROOT/events.jsonl" "$line"'
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_block_kind() {
+  local root="$1" d="$root/bk"
+  mkdir -p "$d"
+  (
+    printf '{"status":"blocked","block_kind":"primary_failure","block_reason":"turn exploded (reworded)"}\n' >"$d/kind.json"
+    fx "structured kind wins over prose" block_is_primary_failure "$d/kind.json"
+    printf '{"status":"blocked","block_reason":"primary command failed with status 1"}\n' >"$d/prose.json"
+    fx "legacy prose prefix still recognized" block_is_primary_failure "$d/prose.json"
+    printf '{"status":"blocked","block_kind":"per_model_cap","block_reason":"primary command failed?"}\n' >"$d/other.json"
+    fx_not "a different kind is not a primary failure" block_is_primary_failure "$d/other.json"
+    fx "block_run writes .block_kind when given" fn_body_has block_run '.block_kind=$kind'
+    # …and DROPS a stale kind otherwise: recover_run only clears .block_reason,
+    # so a kinded block, a --resume, then an unkinded block would otherwise
+    # leave the old kind next to the new reason and misroute the next resume.
+    fx "block_run drops a stale .block_kind on an unkinded block" fn_body_has block_run 'then del(.block_kind) else'
+    ( STATE="$d/stale.json"; RUN_ROOT="$d"; RUN_ID="bk-$$"
+      printf '{"status":"running","block_kind":"per_model_cap"}\n' >"$STATE"
+      log() { :; }; emit_event() { :; }; integrity_put() { :; }; cleanup_smoke_pgid() { :; }
+      reap_persona_workers() { :; }; write_run_metrics() { :; }; die() { builtin exit 1; }
+      ( block_run "observer BLOCKed 3 candidates" ) >/dev/null 2>&1 || true
+      jq -e '.block_kind == null and .block_reason == "observer BLOCKed 3 candidates"' "$STATE" >/dev/null
+    ) && stale_ok=1 || stale_ok=0
+    fx "a stale kind is gone after an unkinded block_run" test "$stale_ok" -eq 1
+    fx "the claude retry exhaustion block is kinded" fn_body_has invoke_primary '" primary_failure'
+    fx "recover_run's per-model-cap arm switches on the kind" fn_body_has recover_run 'per_model_cap:*'
+    fx "recoverable_rate_limit_state uses the predicate" fn_body_has recoverable_rate_limit_state block_is_primary_failure
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_worktree_cleanup_warn() {
+  # verify_candidate: a passed candidate whose validation worktree cannot be
+  # removed retries after a prune, then WARNs + journals and still clears the
+  # pointer (keeping it made a later --resume die over a never-interrupted
+  # candidate). Structural: the surrounding gate needs a full candidate run.
+  (
+    fx "cleanup retries after git worktree prune" fn_body_has verify_candidate 'worktree prune'
+    fx "persistent failure journals worktree_cleanup_failed" fn_body_has verify_candidate 'emit_event worktree_cleanup_failed'
+    fx "the pointer is cleared regardless" fn_body_has verify_candidate "state_set 'del(.validation_worktree)'"
+    fx_not "a passed candidate is never blocked on cleanup" fn_body_has verify_candidate 'block_run "candidate passed but validation worktree cleanup failed"'
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
+fixture_subagent_success_reset() {
+  local root="$1" d="$root/ssr"
+  mkdir -p "$d"
+  (
+    STATE="$d/state.json"; RUN_ROOT="$d"; RUN_ID="ssr-$$"
+    local writes=0
+    state_set() { writes=$((writes + 1)); jq "$@" "$1" "$STATE" >"$STATE.t" 2>/dev/null; jq '.rate_limit_consecutive=0' "$STATE" >"$STATE.t" && mv "$STATE.t" "$STATE"; }
+    printf '{"rate_limit_consecutive":3}\n' >"$STATE"
+    subagent_success_reset
+    fx "a nonzero counter is reset" test "$(jq -r '.rate_limit_consecutive' "$STATE")" = "0"
+    fx "one state write" test "$writes" -eq 1
+    subagent_success_reset
+    fx "already 0 -> no state write" test "$writes" -eq 1
+    STATE="$d/missing.json"; subagent_success_reset
+    fx "no state -> no-op" test "$writes" -eq 1
+    fx "observer success resets the counter" fn_body_has validated_observer_retry subagent_success_reset
+    fx "persona batch completion resets the counter" fn_body_has spawn_personas subagent_success_reset
+    exit 0
+  ) >/dev/null || return 1
+  return 0
+}
+
 fixture_design_build_note() {
   local root="$1" dir="$root/dbn"
   mkdir -p "$dir"
@@ -6796,6 +7443,49 @@ fixture_observer_extraction() {
   printf '%s' 'Verdict: {"status":"APPROVE","findings":[]} done.' | jq -Rs '{result:.}' >"$raw"
   extract_claude_structured "$raw" "$out" &&
     [ "$(jq -r '.status' "$out")" = "APPROVE" ] || ok=0
+  # (4) the verdict fence FOLLOWED by a non-JSON fence (a shell snippet): the
+  # salvage ladder walks fences last-to-first, so the verdict still wins
+  # instead of the outermost-object fallback splicing both together.
+  printf '%s' 'Verdict:
+
+```json
+{"status":"BLOCK","findings":[{"id":"OBS-002"}]}
+```
+
+Reproduce with:
+
+```sh
+npm test -- --grep "{thing}"
+```' | jq -Rs '{result:.}' >"$raw"
+  extract_claude_structured "$raw" "$out" &&
+    [ "$(jq -r '.findings[0].id' "$out")" = "OBS-002" ] || ok=0
+  # (5) a fence holding TWO objects is not a verdict (skipped, not truncated
+  # to its first); the single-object fence before it is used.
+  printf '%s' '```json
+{"status":"APPROVE","findings":[]}
+```
+```json
+{"a":1}
+{"b":2}
+```' | jq -Rs '{result:.}' >"$raw"
+  extract_claude_structured "$raw" "$out" &&
+    [ "$(jq -r '.status' "$out")" = "APPROVE" ] || ok=0
+  # (6) a fence with a blank line inside stays one fence.
+  printf '%s' '```json
+{"status":"APPROVE",
+
+"findings":[]}
+```' | jq -Rs '{result:.}' >"$raw"
+  extract_claude_structured "$raw" "$out" &&
+    [ "$(jq -r '.status' "$out")" = "APPROVE" ] || ok=0
+  # salvage_json_from_text is the shared ladder (signals use it too) and
+  # reports which strategy fired.
+  printf 'x\n```\n{"k":1}\n```\n' >"$root/ex-sal.txt"
+  [ "$(salvage_json_from_text "$root/ex-sal.txt" "$out")" = "fenced" ] && [ "$(jq -r .k "$out")" = "1" ] || ok=0
+  printf 'x {"k":2} y\n' >"$root/ex-sal.txt"
+  [ "$(salvage_json_from_text "$root/ex-sal.txt" "$out")" = "outermost-object" ] && [ "$(jq -r .k "$out")" = "2" ] || ok=0
+  printf 'nothing\n' >"$root/ex-sal.txt"
+  ! salvage_json_from_text "$root/ex-sal.txt" "$out" >/dev/null && [ ! -s "$out" ] || ok=0
   [ "$ok" -eq 1 ]
 }
 
