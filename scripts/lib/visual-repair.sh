@@ -9,6 +9,12 @@
 
 # Return 0 iff every changed path in <project>'s working tree begins with one of
 # the allow-prefixes; else print offenders and return 1.
+# Model helpers (claude_model_args) — sourced by night-shift.sh before this lib,
+# and here again defensively so a standalone consumer builds the same
+# `--model` argv (same one-line guard as visual-capture.sh).
+# shellcheck source=scripts/lib/models.sh
+command -v claude_model_args >/dev/null 2>&1 || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/models.sh"
+
 visual_repair_scope_check() {
   local project="$1"; shift
   local offenders="" line path p ok
@@ -204,9 +210,11 @@ visual_stage_figma_data() {
   # claude process itself, not a wrapper subshell whose kill would orphan claude), then a
   # watchdog kills it after NIGHT_SHIFT_VISUAL_REF_TIMEOUT. The caller degrades cleanly
   # (the agent works from the images when the cache is absent).
-  # claude_model_args word-splits into `--model X` or nothing (inherit).
+  # VISUAL_REF_MODEL is the knob global visual-capture.sh defines (always
+  # sourced before this lib by both consumers). claude_model_args word-splits
+  # into `--model X` or nothing (inherit).
   # shellcheck disable=SC2046
-  claude -p $(claude_model_args "${VISUAL_REF_MODEL:-${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}}") \
+  claude -p $(claude_model_args "$VISUAL_REF_MODEL") \
     --permission-mode bypassPermissions \
     --output-format json --allowed-tools "Write,mcp__figma__get_figma_data" \
     <<<"$prompt" >/dev/null 2>&1 &

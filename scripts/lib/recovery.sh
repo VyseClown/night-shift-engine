@@ -311,7 +311,7 @@ handle_per_model_limit() {
     block_run "per-model usage cap hit on model '$model' ($line); set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
   fi
   successor="$(successor_model "$model")" ||
-    block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor — set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
+    block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor (not in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN, and outside the built-in fable>opus>sonnet ladder) — name it in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN=a>b>c, or set the affected NIGHT_SHIFT_*_MODEL knob to another model and re-run with --resume, or wait for the model's quota"
   if [ "$mode" = "primary" ]; then
     state_set '.model_fallbacks[$from]=$to | .session_id=null | .updated_at=$now' \
       --arg from "$model" --arg to "$successor" --arg now "$(now_iso)"

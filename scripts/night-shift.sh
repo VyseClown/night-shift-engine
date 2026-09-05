@@ -1146,22 +1146,25 @@ initialize_run() {
     state_set '.test_first_baseline_green=false'
   fi
   state_set '.baseline_complete=true'
+  # models.steps: the effective model of every per-step knob, built from the
+  # SAME table the call sites read (step_model over STEP_MODEL_STEPS), so the
+  # journal cannot drift from what actually runs; implement_effective is the
+  # implement scope's real model (the ## Design Contract bump applied — SPEC
+  # is already selected here), next to the raw implement knob.
+  local steps_json="{}" step
+  for step in $STEP_MODEL_STEPS; do
+    steps_json="$(jq -cn --argjson o "$steps_json" --arg k "$step" --arg v "$(step_model "$step")" '$o + {($k):$v}')"
+  done
   emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
     --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
-    --arg design "$DESIGN_IMPLEMENT_MODEL" --arg sweep "$SWEEP_MODEL" \
-    --arg visual "$(stage_model visual)" --arg observe_request "$(stage_model observe)" \
-    --arg complete "$(stage_model complete)" \
-    --arg pers_plan "$(persona_stage_model plan)" --arg pers_impl "$(persona_stage_model implementation)" \
-    --arg feedback "${FEEDBACK_MODEL:-$IMPLEMENT_MODEL}" --arg sweep_fix "${SWEEP_FIX_MODEL:-$IMPLEMENT_MODEL}" \
+    --arg design "$DESIGN_IMPLEMENT_MODEL" --arg impl_eff "$(stage_model implement)" \
+    --arg sweep "$SWEEP_MODEL" --argjson steps "$steps_json" \
     --arg memory "$MEMORY" \
     --arg backend "$IMPLEMENT_BACKEND" --arg cursor "$CURSOR_IMPLEMENT_MODEL" \
     --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" \
     '{spec:$spec, base:$base,
       models: ({plan:$plan, implement:$impl, personas:$pers, observer:$obs,
-        design_implement:$design, sweep:$sweep,
-        steps:{visual:$visual, observe_request:$observe_request, complete:$complete,
-          persona_plan:$pers_plan, persona_implementation:$pers_impl,
-          feedback:$feedback, sweep_fix:$sweep_fix},
+        design_implement:$design, implement_effective:$impl_eff, sweep:$sweep, steps:$steps,
         implement_backend:$backend} + (if $backend == "cursor" then {cursor_model:$cursor} else {} end)),
       memory:$memory,
       engines:{implement:$engine_implement, review:($engine_review|if .=="" then null else . end)}}')"
@@ -1576,9 +1579,9 @@ stage_model() {
     implement)
       if spec_has_design_contract "${SPEC:-}"; then printf '%s' "$DESIGN_IMPLEMENT_MODEL"
       else printf '%s' "$IMPLEMENT_MODEL"; fi ;;
-    visual) printf '%s' "${VISUAL_MODEL:-$IMPLEMENT_MODEL}" ;;
-    observe) printf '%s' "${OBSERVE_REQUEST_MODEL:-$IMPLEMENT_MODEL}" ;;
-    complete) printf '%s' "${COMPLETE_MODEL:-$IMPLEMENT_MODEL}" ;;
+    visual) step_model visual ;;
+    observe) step_model observe_request ;;
+    complete) step_model complete ;;
     *) printf 'inherit' ;;
   esac
 }
@@ -1590,8 +1593,8 @@ stage_model() {
 # PERSONA_MODEL, so an unset knob is byte-identical to the single-knob bench.
 persona_stage_model() {
   case "$1" in
-    plan) printf '%s' "${PERSONA_PLAN_MODEL:-$PERSONA_MODEL}" ;;
-    implementation) printf '%s' "${PERSONA_IMPLEMENTATION_MODEL:-$PERSONA_MODEL}" ;;
+    plan) step_model persona_plan ;;
+    implementation) step_model persona_implementation ;;
     *) printf '%s' "$PERSONA_MODEL" ;;
   esac
 }
@@ -2613,12 +2616,12 @@ invoke_persona_once() {
   lens="$(persona_lens "$persona" "$(spec_track "$SPEC")")"
   # Prompt via STDIN (not argv): the bundle inlines a diff that can be large, and a
   # positional arg risks the ARG_MAX/E2BIG exec limit (repair_agent pipes for the
-  # same reason). model_flag word-splits into `--model X` (or nothing), as does
-  # reviewer_isolation_args (hooks off + no MCP when NIGHT_SHIFT_MEMORY or
-  # NIGHT_SHIFT_REVIEWER_ISOLATION=1 is active; nothing otherwise).
+  # same reason). claude_model_args word-splits into `--model X` (or nothing),
+  # as does reviewer_isolation_args (hooks off + no MCP when NIGHT_SHIFT_MEMORY
+  # or NIGHT_SHIFT_REVIEWER_ISOLATION=1 is active; nothing otherwise).
   # shellcheck disable=SC2046
   (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
-    claude -p $(model_flag "$(resolve_effective_model "$(persona_stage_model "$stage")")") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+    claude -p $(claude_model_args "$(persona_stage_model "$stage")") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # A 429 (session OR per-model) is a live-recoverable transient — a standard
     # rate limit that also recovers fine on the primary path — NOT "no parseable
@@ -3368,9 +3371,9 @@ port_audit_screens_for_spec() {
 # Contract lists at least one `- Design manifest:` path that resolves inside
 # the project (port_audit_screens_for_spec above) — absent either, this is a
 # silent no-op. Runs scripts/port-audit.sh once per screen (screen = manifest
-# basename), on the PORT_AUDIT_MODEL knob — empty follows PERSONA_MODEL
-# (breadth-tier judgment, same as the persona bench; port-audit.sh treats
-# "inherit" as no --model flag) — scoped to
+# basename), on the port_audit step model (PORT_AUDIT_MODEL, empty follows
+# PERSONA_MODEL — breadth-tier judgment, same as the persona bench;
+# port-audit.sh treats "inherit" as no --model flag), scoped to
 # the spec's resolved Workdir when one is set (--scope is project-relative on
 # both sides). NIGHT_SHIFT_PORT_AUDIT_OFFLINE routes the call through the
 # CLI's own --offline canned-reply path (zero cost — the fixture suite and a
@@ -3393,7 +3396,7 @@ port_audit_candidate() {
     [ -n "$screen" ] && [ -n "$full" ] || continue
     report="$PROJECT/.night-shift/port-audit/$screen.json"
     if ! "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$PROJECT" --screen "$screen" \
-        --manifest "$full" --model "$(resolve_effective_model "${PORT_AUDIT_MODEL:-$PERSONA_MODEL}")" "${scope_args[@]}" "${offline_args[@]}" \
+        --manifest "$full" --model "$(resolve_effective_model "$(step_model port_audit)")" "${scope_args[@]}" "${offline_args[@]}" \
         >"$RUN_ROOT/raw/port-audit-$screen.log" 2>&1; then
       log "WARN: port-audit for screen '$screen' failed (advisory only; see raw/port-audit-$screen.log)"
     fi
@@ -3505,7 +3508,7 @@ FILES
   mkdir -p "$RUN_ROOT/raw" 2>/dev/null || true
   if ! "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$PROJECT" --tests "${file_args[@]}" \
       --src "$src" \
-      --model "$(resolve_effective_model "$TEST_AUDIT_MODEL")" --out "$report" \
+      --model "$(resolve_effective_model "$(step_model test_audit)")" --out "$report" \
       >"$RUN_ROOT/raw/test-audit-$(basename "$SPEC" .md).log" 2>&1; then
     log "WARN: test-audit exited non-zero (advisory only; see raw/test-audit-$(basename "$SPEC" .md).log — a non-zero exit here just means findings were found, or degrades cleanly on an infra error)"
   fi
@@ -3728,13 +3731,13 @@ invoke_observer_once() {
   # pulls out; json_schema_basic then enforces the strict contract.
   # Prompt via STDIN (not argv): the context inlines a size-bounded diff that can
   # still be sizeable, and a positional arg risks the ARG_MAX/E2BIG exec limit.
-  # model_flag intentionally word-splits into `--model X` (or nothing), as does
-  # reviewer_isolation_args (hooks off + no MCP under NIGHT_SHIFT_MEMORY /
-  # NIGHT_SHIFT_REVIEWER_ISOLATION=1 — the observer's independence must not
+  # claude_model_args intentionally word-splits into `--model X` (or nothing),
+  # as does reviewer_isolation_args (hooks off + no MCP under NIGHT_SHIFT_MEMORY
+  # / NIGHT_SHIFT_REVIEWER_ISOLATION=1 — the observer's independence must not
   # depend on what the user's global settings inject; nothing otherwise).
   # shellcheck disable=SC2046
   (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" "$expected_primary" |
-    claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+    claude -p $(claude_model_args "$OBSERVER_MODEL") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # Same 429 distinction as invoke_persona_once: a live-recoverable transient,
     # not "the verdict failed the observer-review contract" — the caller
@@ -4397,14 +4400,10 @@ main_run() {
   case "$CODEX_MAX_RETRY" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_CODEX_MAX_RETRY must be a non-negative integer" ;;
   esac
-  # Memory backend: only "ai-memory" (or an off-spelling) — a typo must not
-  # silently run without memory. Same fail-loud-at-startup posture as above.
-  validate_memory_knob "$MEMORY" ||
-    die "NIGHT_SHIFT_MEMORY must be off or ai-memory (got: $MEMORY)"
-  case "$REVIEWER_ISOLATION" in
-    ''|0|1) ;;
-    *) die "NIGHT_SHIFT_REVIEWER_ISOLATION must be 0 or 1 (got: $REVIEWER_ISOLATION)" ;;
-  esac
+  # Memory knobs (backend enum, isolation 0/1, probe timeout) — a typo must
+  # not silently run without memory or without isolation. Same fail-loud
+  # posture as above; the --sweep-only surface runs the same check.
+  validate_memory_config
 
   # Acquire a per-project lock BEFORE touching state.json; two concurrent runs
   # on the same --project would otherwise corrupt the shared state. The lock
@@ -4544,6 +4543,12 @@ if [ "$SWEEP_ONLY" -eq 1 ]; then
   # cursor-agent from this surface). No canary: emit_event needs a RUN_ROOT
   # this surface never has.
   [ "$IMPLEMENT_BACKEND" != "cursor" ] || cursor_startup_probe
+  # Memory knobs: sweep_run consults reviewer_isolation_args, so a mistyped
+  # NIGHT_SHIFT_MEMORY / NIGHT_SHIFT_REVIEWER_ISOLATION must die here exactly
+  # as in main_run instead of silently running the sweep un-isolated. The
+  # probe WARNs only (no RUN_ROOT here, so no journal event).
+  validate_memory_config
+  memory_startup_probe
   # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
   # queued specs, so it never touches --spec/NEXT_TASK task selection. Even
   # with --spec given, sweep_fix_cycle's re-validation branch is a no-op

@@ -1,7 +1,4 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2153
-# ^ STATE is the orchestrator's run-state path global (night-shift.sh), not a
-#   misspelling of a local `state`; resolve_effective_model reads it at runtime.
 # scripts/lib/models.sh
 # Model-name helpers shared by the orchestrator AND the standalone surfaces
 # (scripts/visual-review.sh sources the visual libs without night-shift.sh),
@@ -25,37 +22,32 @@ model_flag() {
 
 # Pure: the model to fall back to when a per-model usage cap hits.
 #
-# NIGHT_SHIFT_MODEL_FALLBACK_CHAIN, when set, is the ONLY source of truth: an
-# ordered, `>`-separated list from scarcest to cheapest (e.g.
-# `claude-fable-5-1>opus>sonnet>haiku`). The successor of a model is the next
-# entry after its first exact match; the last entry — and any model not in the
-# chain — has no successor. This is how a model the built-in ladder has never
-# heard of still gets a fallback: name it in the chain, no engine edit needed.
-#
-# Without the knob the built-in ladder applies. It only ever steps DOWN in
-# scarcity (fable -> opus -> sonnet) so a fallback can never burn a scarcer
-# budget than the one that just capped; it matches by FAMILY substring so a
-# full ID (`claude-fable-5-1`, `claude-opus-4-8`) maps exactly like its alias —
-# knobs are documented to accept full IDs anywhere. sonnet (and any unknown
-# name) has no successor: echo unchanged + return 1, and the caller blocks for
-# manual resume rather than guessing.
+# Two layers, consulted in order:
+#   1. NIGHT_SHIFT_MODEL_FALLBACK_CHAIN — an explicit, ordered, `>`-separated
+#      list from scarcest to cheapest (e.g. `claude-fable-5-1>opus>sonnet`).
+#      The successor of a model is the entry after its first EXACT match. This
+#      is how a model the built-in ladder has never heard of gets a fallback:
+#      name it in the chain, no engine edit needed. The chain OVERRIDES the
+#      ladder for the models it names and leaves every other model to it, so
+#      one exotic PLAN_MODEL entry never strips opus/sonnet of theirs.
+#   2. The built-in ladder. It only ever steps DOWN in scarcity (fable -> opus
+#      -> sonnet) so a fallback can never burn a scarcer budget than the one
+#      that just capped; it matches by FAMILY substring so a full ID
+#      (`claude-fable-5-1`, `claude-opus-4-8`) maps exactly like its alias —
+#      knobs are documented to accept full IDs anywhere.
+# sonnet (and any unknown name) has no successor: echo unchanged + return 1,
+# and the caller blocks for manual resume rather than guessing. Whitespace in
+# the chain is stripped outright (model names never contain spaces).
 successor_model() {
-  local model="$1" chain="${NIGHT_SHIFT_MODEL_FALLBACK_CHAIN:-}" entry found=0 next=""
-  if [ -n "$chain" ]; then
-    # Walk the chain once: the entry AFTER the first exact match is the
-    # successor. Entries are trimmed of surrounding whitespace so a chain
-    # written `a > b > c` behaves like `a>b>c`.
-    while IFS= read -r entry; do
-      entry="${entry#"${entry%%[![:space:]]*}"}"; entry="${entry%"${entry##*[![:space:]]}"}"
-      [ -n "$entry" ] || continue
-      if [ "$found" -eq 1 ]; then next="$entry"; break; fi
-      [ "$entry" = "$model" ] && found=1
-    done <<EOF
-$(printf '%s' "$chain" | tr '>' '\n')
-EOF
-    if [ -n "$next" ]; then printf '%s' "$next"; return 0; fi
-    printf '%s' "$model"; return 1
-  fi
+  local model="$1" entry found=0
+  local -a parts=()
+  IFS='>' read -ra parts <<<"${NIGHT_SHIFT_MODEL_FALLBACK_CHAIN:-}"
+  for entry in ${parts[@]+"${parts[@]}"}; do
+    entry="${entry//[[:space:]]/}"
+    [ -n "$entry" ] || continue
+    [ "$found" -eq 1 ] && { printf '%s' "$entry"; return 0; }
+    [ "$entry" = "$model" ] && found=1
+  done
   case "$model" in
     *fable*) printf 'opus' ;;
     *opus*) printf 'sonnet' ;;
@@ -67,12 +59,14 @@ EOF
 # state (written by handle_per_model_limit under NIGHT_SHIFT_MODEL_FALLBACK=1),
 # so every consumer of a model knob — primary, personas, observer, port-audit —
 # honors a fallback recorded earlier in the run. Follows chains (fable->opus
-# recorded, then opus->sonnet later) with a small hop bound so a corrupt cyclic
-# map cannot loop. No state / no mapping -> echoes the input unchanged.
+# recorded, then opus->sonnet later) with a hop bound — generous enough for
+# any NIGHT_SHIFT_MODEL_FALLBACK_CHAIN an operator would write, small enough
+# that a corrupt cyclic map cannot loop. No state / no mapping -> echoes the
+# input unchanged.
 resolve_effective_model() {
   local model="$1" mapped hops=0
   [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ] || { printf '%s' "$model"; return 0; }
-  while [ "$hops" -lt 4 ]; do
+  while [ "$hops" -lt 16 ]; do
     mapped="$(jq -r --arg m "$model" '.model_fallbacks[$m] // empty' "$STATE" 2>/dev/null)"
     { [ -n "$mapped" ] && [ "$mapped" != "$model" ]; } || break
     model="$mapped"
@@ -82,10 +76,37 @@ resolve_effective_model() {
 }
 
 # Pure: the complete `--model X` argv fragment for a knob value — the fallback
-# map applied, then the inherit/empty rule. The one-liner every call site
-# should use (word-split at the call site, like model_flag). Exists so the
-# visual libs, which run under scripts/visual-review.sh without the
-# orchestrator, build their model args through exactly the same two rules.
+# map applied, then the inherit/empty rule. Every `claude -p` the engine
+# spawns builds its model argv through this one-liner (word-split at the call
+# site, like model_flag); only sites that need the bare resolved NAME (the
+# primary turn, which hands it to handle_per_model_limit; the audit CLIs,
+# which take --model) call resolve_effective_model directly.
 claude_model_args() {
   model_flag "$(resolve_effective_model "$1")"
+}
+
+# The ONE table behind every per-step model knob: step -> its override knob,
+# else its parent tier. EMPTY override = follow the tier (an unset knob is
+# byte-identical to the tiering); `inherit` passes through to model_flag as
+# "no --model". The tier fallbacks (`sonnet`) only matter when a lib is
+# sourced without the orchestrator's knob block — under night-shift.sh every
+# tier is always set. stage_model / persona_stage_model delegate here, every
+# call site reads the same arm, and initialize_run iterates STEP_MODEL_STEPS
+# to journal them, so a new step is one arm + one word in the list and the
+# journal cannot drift from the call site. Unknown step -> "inherit".
+# shellcheck disable=SC2034  # consumed by night-shift.sh's initialize_run (journal) and the fixtures
+STEP_MODEL_STEPS="visual observe_request complete persona_plan persona_implementation feedback sweep_fix port_audit test_audit"
+step_model() {
+  case "$1" in
+    visual) printf '%s' "${VISUAL_MODEL:-${IMPLEMENT_MODEL:-sonnet}}" ;;
+    observe_request) printf '%s' "${OBSERVE_REQUEST_MODEL:-${IMPLEMENT_MODEL:-sonnet}}" ;;
+    complete) printf '%s' "${COMPLETE_MODEL:-${IMPLEMENT_MODEL:-sonnet}}" ;;
+    feedback) printf '%s' "${FEEDBACK_MODEL:-${IMPLEMENT_MODEL:-sonnet}}" ;;
+    sweep_fix) printf '%s' "${SWEEP_FIX_MODEL:-${IMPLEMENT_MODEL:-sonnet}}" ;;
+    persona_plan) printf '%s' "${PERSONA_PLAN_MODEL:-${PERSONA_MODEL:-sonnet}}" ;;
+    persona_implementation) printf '%s' "${PERSONA_IMPLEMENTATION_MODEL:-${PERSONA_MODEL:-sonnet}}" ;;
+    port_audit) printf '%s' "${PORT_AUDIT_MODEL:-${PERSONA_MODEL:-sonnet}}" ;;
+    test_audit) printf '%s' "${TEST_AUDIT_MODEL:-sonnet}" ;;
+    *) printf 'inherit' ;;
+  esac
 }

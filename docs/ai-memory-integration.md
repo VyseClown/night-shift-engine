@@ -51,13 +51,21 @@ reference, are the whole design:
    by default; an unattended run's outcome must reach the human's next
    interactive session) summarizing spec, candidate commits, decisions,
    reviewer/observer flags and open questions. Skip silently if absent.
-4. **Reviewer isolation** — personas, the observer and the branch sweep get
-   `--settings '{"disableAllHooks":true}' --strict-mcp-config`. The run
-   feedback session and the sweep fix cycle run in the project dir on the
-   primary's tier and are *not* isolated (they are the primary's kin, and
-   capturing them is useful memory). Available on its own as
-   `NIGHT_SHIFT_REVIEWER_ISOLATION=1` for any user-level hook/MCP setup;
-   `=0` forces it off even under memory (not recommended).
+4. **Reviewer isolation** — every session whose output feeds the independent
+   gate gets `--settings '{"disableAllHooks":true}' --strict-mcp-config`:
+   personas, the observer, the branch sweep (both its spawns, the rate-limit
+   retry included) and the standalone test-audit / port-audit CLIs (which
+   re-derive the same rule from the two env knobs). *Not* isolated, on
+   purpose: the primary, and its implementer-side kin that edit the project
+   on the primary's tier — the run feedback session, the sweep fix cycle and
+   the visual repair agent (capturing them is useful memory). Available on
+   its own as `NIGHT_SHIFT_REVIEWER_ISOLATION=1` for any user-level hook/MCP
+   setup; `=0` forces it off even under memory (not recommended).
+
+`NIGHT_SHIFT_MEMORY`, `NIGHT_SHIFT_REVIEWER_ISOLATION` (`0`/`1`) and
+`NIGHT_SHIFT_MEMORY_TIMEOUT` (a positive integer) are validated loudly at
+startup on both entry surfaces — `main_run` and `--sweep-only`, which also
+runs the probe (WARN-only there: no run journal exists).
 
 Unset, every function in `scripts/lib/memory.sh` returns empty and the
 prompts, argv and journal are byte-identical to the pre-memory engine.

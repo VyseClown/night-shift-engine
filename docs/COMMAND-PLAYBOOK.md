@@ -439,10 +439,12 @@ blocks; the plan-scope prompt tells the primary to recall prior decisions via
 the `memory_query`/`memory_briefing` MCP tools (as untrusted evidence) and the
 completion-scope prompt tells it to file one shared `memory_handoff_begin`;
 both skip silently when the tools are absent. Reviewer isolation rides along:
-personas, observer and branch sweep get `--settings '{"disableAllHooks":true}'
---strict-mcp-config` so ai-memory's SessionStart handoff injection (which has
-no print-mode exclusion) never reaches the independent gate and the throwaway
-reviewer cwds never become wiki projects. `NIGHT_SHIFT_REVIEWER_ISOLATION=1`
+personas, observer, branch sweep and the test/port audit CLIs get
+`--settings '{"disableAllHooks":true}' --strict-mcp-config` so ai-memory's
+SessionStart handoff injection (which has no print-mode exclusion) never
+reaches the independent gate and the throwaway reviewer cwds never become wiki
+projects (run feedback, sweep fix and visual repair stay unisolated — they are
+the primary's implementer-side kin). `NIGHT_SHIFT_REVIEWER_ISOLATION=1`
 gives you the isolation alone; `=0` forces it off under memory (not
 recommended). Any other `NIGHT_SHIFT_MEMORY` value dies at startup.
 

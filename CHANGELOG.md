@@ -14,9 +14,13 @@ observer approval.
   `_COMPLETE_MODEL` (the primary's visual/observe/complete scopes),
   `_FEEDBACK_MODEL`, `_SWEEP_FIX_MODEL` (→ implement tier);
   `_PERSONA_PLAN_MODEL`, `_PERSONA_IMPLEMENTATION_MODEL`, `_PORT_AUDIT_MODEL`
-  (→ persona tier). `stage_model` and the new `persona_stage_model` resolve
-  them; the `run_started` journal event now records the effective model of
-  every step under `models.steps` plus `design_implement` and `sweep`.
+  (→ persona tier). One `step_model` table in `scripts/lib/models.sh` is the
+  single source every call site reads (`stage_model` / `persona_stage_model`
+  delegate to it), and the `run_started` journal event iterates the same
+  table into `models.steps` (plus `test_audit`, `design_implement`, `sweep`
+  and `implement_effective` — the implement scope's real model with the
+  `## Design Contract` bump applied), so the journal cannot drift from what
+  runs.
 - **Model helpers moved to `scripts/lib/models.sh`** (`model_flag`,
   `successor_model`, `resolve_effective_model`, new `claude_model_args`) so the
   standalone visual surfaces build `--model` argv by the same rules. The visual
@@ -26,21 +30,31 @@ observer approval.
   accept any alias, full ID, or `inherit`, and honor a mid-run per-model
   fallback like every other knob.
 - **`NIGHT_SHIFT_MODEL_FALLBACK_CHAIN`** — an explicit `a>b>c` successor list
-  for `NIGHT_SHIFT_MODEL_FALLBACK=1`, replacing the built-in ladder, so a model
-  the ladder has never heard of still has a documented successor. The built-in
-  ladder itself now matches by family substring (`claude-fable-5-1` → `opus`,
-  `claude-opus-5` → `sonnet`); previously only the bare `claude-fable-5` /
-  `fable*` spellings mapped, so a full fable ID blocked the run under fallback.
+  for `NIGHT_SHIFT_MODEL_FALLBACK=1`, consulted before the built-in ladder for
+  the models it names (unlisted models keep their ladder successor, so a
+  partial chain never strips `opus`/`sonnet`), so a model the ladder has never
+  heard of still has a documented successor; the no-successor block message
+  now names the knob. The built-in ladder itself now matches by family
+  substring (`claude-fable-5-1` → `opus`, `claude-opus-5` → `sonnet`, and the
+  CLI's `opusplan` alias → `sonnet`); previously only the bare `claude-fable-5`
+  / `fable*` spellings mapped, so a full fable ID blocked the run under
+  fallback. `resolve_effective_model`'s hop bound grew from 4 to 16 to follow
+  a long chain.
 - **`NIGHT_SHIFT_MEMORY=ai-memory`** (default off) — opt-in cross-run agent
   memory via a running ai-memory server (`scripts/lib/memory.sh`): a startup
   reachability probe (`memory_probe` journal event, WARN never block), a recall
   paragraph in the plan scope and a handoff paragraph in the completion scope
   (prompt-level; the primary uses ai-memory's MCP tools when installed), and
-  **reviewer isolation** — personas, observer and branch sweep get
-  `--settings '{"disableAllHooks":true}' --strict-mcp-config` so a user-level
-  SessionStart hook (ai-memory's injects the open handoff into every session,
-  print mode included) can never leak the primary's context into the
-  independent gate. `NIGHT_SHIFT_REVIEWER_ISOLATION=0|1` overrides either way.
+  **reviewer isolation** — personas, observer, branch sweep (both spawns, the
+  rate-limit retry included) and the standalone test-audit / port-audit CLIs
+  (their reports feed the observer) get `--settings '{"disableAllHooks":true}'
+  --strict-mcp-config` so a user-level SessionStart hook (ai-memory's injects
+  the open handoff into every session, print mode included) can never leak
+  the primary's context into the independent gate. The primary's
+  implementer-side kin (run feedback, sweep fix, visual repair) stay
+  unisolated on purpose. `NIGHT_SHIFT_REVIEWER_ISOLATION=0|1` overrides either
+  way; `NIGHT_SHIFT_MEMORY_TIMEOUT` must be a positive integer; `--sweep-only`
+  validates the same knobs and runs the probe (WARN-only, no journal there).
   Verdict, verified facts and deferred items: `docs/ai-memory-integration.md`.
 
 ### Codex + Claude engine split (opt-in)
