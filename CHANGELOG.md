@@ -6,6 +6,57 @@ observer approval.
 
 ## Unreleased
 
+### Per-step model knobs, open fallback chain, ai-memory (opt-in)
+
+- **Every step is now its own model knob**, all optional and empty by default
+  (empty = follow the tier the step belonged to, so an unset engine is
+  byte-identical): `NIGHT_SHIFT_VISUAL_MODEL`, `_OBSERVE_REQUEST_MODEL`,
+  `_COMPLETE_MODEL` (the primary's visual/observe/complete scopes),
+  `_FEEDBACK_MODEL`, `_SWEEP_FIX_MODEL` (→ implement tier);
+  `_PERSONA_PLAN_MODEL`, `_PERSONA_IMPLEMENTATION_MODEL`, `_PORT_AUDIT_MODEL`
+  (→ persona tier). One `step_model` table in `scripts/lib/models.sh` is the
+  single source every call site reads (`stage_model` / `persona_stage_model`
+  delegate to it), and the `run_started` journal event iterates the same
+  table into `models.steps` (plus `test_audit`, `design_implement`, `sweep`
+  and `implement_effective` — the implement scope's real model with the
+  `## Design Contract` bump applied), so the journal cannot drift from what
+  runs.
+- **Model helpers moved to `scripts/lib/models.sh`** (`model_flag`,
+  `successor_model`, `resolve_effective_model`, new `claude_model_args`) so the
+  standalone visual surfaces build `--model` argv by the same rules. The visual
+  libs no longer hard-code dated IDs: `NIGHT_SHIFT_VISUAL_REF_MODEL` (default
+  `claude-haiku-4-5`) and `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` (default now the
+  `opus` alias, as the docs always said, instead of a pinned `claude-opus-4-8`)
+  accept any alias, full ID, or `inherit`, and honor a mid-run per-model
+  fallback like every other knob.
+- **`NIGHT_SHIFT_MODEL_FALLBACK_CHAIN`** — an explicit `a>b>c` successor list
+  for `NIGHT_SHIFT_MODEL_FALLBACK=1`, consulted before the built-in ladder for
+  the models it names (unlisted models keep their ladder successor, so a
+  partial chain never strips `opus`/`sonnet`), so a model the ladder has never
+  heard of still has a documented successor; the no-successor block message
+  now names the knob. The built-in ladder itself now matches by family
+  substring (`claude-fable-5-1` → `opus`, `claude-opus-5` → `sonnet`, and the
+  CLI's `opusplan` alias → `sonnet`); previously only the bare `claude-fable-5`
+  / `fable*` spellings mapped, so a full fable ID blocked the run under
+  fallback. `resolve_effective_model`'s hop bound grew from 4 to 16 to follow
+  a long chain.
+- **`NIGHT_SHIFT_MEMORY=ai-memory`** (default off) — opt-in cross-run agent
+  memory via a running ai-memory server (`scripts/lib/memory.sh`): a startup
+  reachability probe (`memory_probe` journal event, WARN never block), a recall
+  paragraph in the plan scope and a handoff paragraph in the completion scope
+  (prompt-level; the primary uses ai-memory's MCP tools when installed), and
+  **reviewer isolation** — personas, observer, branch sweep (both spawns, the
+  rate-limit retry included) and the standalone test-audit / port-audit CLIs
+  (their reports feed the observer) get `--settings '{"disableAllHooks":true}'
+  --strict-mcp-config` so a user-level SessionStart hook (ai-memory's injects
+  the open handoff into every session, print mode included) can never leak
+  the primary's context into the independent gate. The primary's
+  implementer-side kin (run feedback, sweep fix, visual repair) stay
+  unisolated on purpose. `NIGHT_SHIFT_REVIEWER_ISOLATION=0|1` overrides either
+  way; `NIGHT_SHIFT_MEMORY_TIMEOUT` must be a positive integer; `--sweep-only`
+  validates the same knobs and runs the probe (WARN-only, no journal there).
+  Verdict, verified facts and deferred items: `docs/ai-memory-integration.md`.
+
 ### Codex + Claude engine split (opt-in)
 
 - A spec can now declare `- Engines: implement=codex review=codex` to run its

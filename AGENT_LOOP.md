@@ -11,7 +11,8 @@
 > **Recovery is wrapper-owned, not yours.** A Claude session-limit 429 waits for
 > the reported reset and resumes this same session; a per-model usage cap blocks
 > for a knob change by default, or (`NIGHT_SHIFT_MODEL_FALLBACK=1`) steps the
-> capped role down to a cheaper model and continues — persona and observer
+> capped role down to a cheaper model (the built-in `fable>opus>sonnet` ladder,
+> or an explicit `NIGHT_SHIFT_MODEL_FALLBACK_CHAIN=a>b>c`) and continues — persona and observer
 > sub-agent calls get identical treatment, independently of the primary. None of
 > this needs any action from you. A cursor-backend run (`NIGHT_SHIFT_IMPLEMENT_BACKEND=cursor`)
 > adds one more wrapper-owned path: bounded retries, then a sticky fallback to

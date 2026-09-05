@@ -42,6 +42,15 @@ that silently breaks).
 | `NIGHT_SHIFT_VISUAL_REPAIR_MODEL` | Strongest available for design-contract work; `sonnet` for cosmetic-only specs. |
 | `NIGHT_SHIFT_SWEEP_MODEL` | Strongest available — whole-branch judgment; defaults to the observer model. |
 | `NIGHT_SHIFT_IMPLEMENT_BACKEND` | `claude` (default). Opt-in `cursor` runs post-plan implement work on `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` (default `cursor-grok-4.6-high`); plan/observer/design stay strongest-available Claude regardless. Never for money-math or engine-safety specs without an explicit call. |
+| `NIGHT_SHIFT_VISUAL_MODEL` / `_OBSERVE_REQUEST_MODEL` / `_COMPLETE_MODEL` / `_FEEDBACK_MODEL` / `_SWEEP_FIX_MODEL` | Per-step overrides of the implement tier (empty = follow `NIGHT_SHIFT_IMPLEMENT_MODEL`). Leave empty; these are constrained, non-judgment steps. Set one only to move a single step to a cheaper/newer model without touching the tier. |
+| `NIGHT_SHIFT_PERSONA_PLAN_MODEL` / `_PERSONA_IMPLEMENTATION_MODEL` / `_PORT_AUDIT_MODEL` | Per-step overrides of the persona tier (empty = follow `NIGHT_SHIFT_PERSONA_MODEL`). Leave empty. Never put the observer's model on a persona-tier knob under `NIGHT_SHIFT_MODEL_FALLBACK=1`: a per-model cap fallback is keyed by model NAME and applies to every knob carrying it, so a persona-bench cap on `opus` would step the observer down too. |
+| `NIGHT_SHIFT_VISUAL_REF_MODEL` | Cheapest available (default `claude-haiku-4-5`) — one Figma-MCP export/fetch call, no judgment. |
+| `NIGHT_SHIFT_MODEL_FALLBACK_CHAIN` | Unset. Set an explicit `>`-separated chain (e.g. `claude-sonnet-5>haiku`) whenever a knob carries a model the built-in `fable>opus>sonnet` ladder does not know and `NIGHT_SHIFT_MODEL_FALLBACK=1` is on. The chain is consulted first for the models it names; every other model still falls back through the ladder, so a partial chain never strips `opus`/`sonnet` of their successors. |
+
+Every knob passes its value verbatim to `claude --model`; the engine never
+validates or rewrites a model name, so a model that did not exist when the
+engine was written works the day the CLI accepts it. `--list-config` prints
+every knob with its default.
 
 Spec-type adjustments: scratch/demo targets (`nightshift-demo`, throwaway
 specs) run everything on `sonnet` — never spend judgment-tier budget there.

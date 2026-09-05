@@ -97,6 +97,47 @@ IMPLEMENT_MODEL="${NIGHT_SHIFT_IMPLEMENT_MODEL:-sonnet}"
 # the IMPLEMENT scope bumps to this stronger model. inherit/sonnet to override.
 DESIGN_IMPLEMENT_MODEL="${NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL:-opus}"
 OBSERVER_MODEL="${NIGHT_SHIFT_OBSERVER_MODEL:-opus}"
+# Per-STEP overrides (all optional; EMPTY = "same as the tier above", which
+# keeps an unset knob byte-identical to the tiering just described). Each is
+# one Claude session shape the engine spawns, so any step can be moved to a
+# different model — a new alias, a full ID, or `inherit` — without touching
+# the tier it normally follows. Empty is deliberately distinct from `inherit`:
+# `inherit` means "no --model flag", empty means "follow the parent knob".
+#   VISUAL_MODEL / OBSERVE_REQUEST_MODEL / COMPLETE_MODEL: the primary's own
+#     visual-review, observe-request and completion scopes (-> IMPLEMENT_MODEL).
+#   PERSONA_PLAN_MODEL / PERSONA_IMPLEMENTATION_MODEL: the persona bench on the
+#     plan review vs the implementation review (-> PERSONA_MODEL).
+#   FEEDBACK_MODEL: the run-feedback session at completion (-> IMPLEMENT_MODEL).
+#   SWEEP_FIX_MODEL: the branch-sweep fix cycle's implementer (-> IMPLEMENT_MODEL).
+#   PORT_AUDIT_MODEL: the port-fidelity audit's one call (-> PERSONA_MODEL).
+# The per-model 429 fallback ladder (scripts/lib/models.sh successor_model)
+# applies to every one of these; NIGHT_SHIFT_MODEL_FALLBACK_CHAIN replaces the
+# built-in fable>opus>sonnet ladder with an explicit `>`-separated list so a
+# model the ladder has never heard of still has a documented successor.
+VISUAL_MODEL="${NIGHT_SHIFT_VISUAL_MODEL:-}"
+OBSERVE_REQUEST_MODEL="${NIGHT_SHIFT_OBSERVE_REQUEST_MODEL:-}"
+COMPLETE_MODEL="${NIGHT_SHIFT_COMPLETE_MODEL:-}"
+PERSONA_PLAN_MODEL="${NIGHT_SHIFT_PERSONA_PLAN_MODEL:-}"
+PERSONA_IMPLEMENTATION_MODEL="${NIGHT_SHIFT_PERSONA_IMPLEMENTATION_MODEL:-}"
+FEEDBACK_MODEL="${NIGHT_SHIFT_FEEDBACK_MODEL:-}"
+SWEEP_FIX_MODEL="${NIGHT_SHIFT_SWEEP_FIX_MODEL:-}"
+PORT_AUDIT_MODEL="${NIGHT_SHIFT_PORT_AUDIT_MODEL:-}"
+# Opt-in cross-run agent memory (scripts/lib/memory.sh). OFF by default:
+# "ai-memory" wires the engine to a running ai-memory server
+# (github.com/akitaonrails/ai-memory) — a startup probe, a recall paragraph in
+# the plan scope, a handoff paragraph in the completion scope, and reviewer
+# isolation so the memory the primary sees never reaches the independent
+# personas/observer. Any other value fails at startup. See docs/ai-memory-integration.md.
+MEMORY="${NIGHT_SHIFT_MEMORY:-off}"
+MEMORY_URL="${NIGHT_SHIFT_MEMORY_URL:-http://127.0.0.1:49374}"
+# Reviewer isolation: when "1", every context-isolated reviewer session
+# (personas, observer, branch sweep) also runs with hooks disabled and no MCP
+# servers (`--settings '{"disableAllHooks":true}' --strict-mcp-config`), so a
+# user-level SessionStart hook or MCP server — ai-memory's injects the open
+# handoff into EVERY session it sees, print mode included — cannot leak the
+# primary's context into the independent gate. Defaults to ON only when
+# NIGHT_SHIFT_MEMORY is active; "0"/"1" override either way.
+REVIEWER_ISOLATION="${NIGHT_SHIFT_REVIEWER_ISOLATION:-}"
 # Run feedback (scripts/lib/sweep.sh write_run_feedback): default ON — the
 # spec requires feedback to exist even when the branch sweep below is off
 # (complete_run calls write_run_feedback unconditionally of BRANCH_SWEEP).
@@ -255,6 +296,12 @@ VISUAL_REPAIR="${NIGHT_SHIFT_VISUAL_REPAIR:-0}"
 # globals/functions in the same shell, so the rest of the script uses them
 # unchanged. (Most of the deterministic fixture suite exercises this module.)
 NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
+# Model-name helpers (model_flag / successor_model / resolve_effective_model /
+# claude_model_args) — FIRST, so every lib below (the visual libs build their
+# own `claude -p` model args through them) sees the same rules the orchestrator
+# uses. Also sourced standalone by scripts/visual-review.sh.
+# shellcheck source=scripts/lib/models.sh
+. "$NIGHT_SHIFT_LIB/models.sh"
 # shellcheck source=scripts/lib/personas.sh
 . "$NIGHT_SHIFT_LIB/personas.sh"
 # Design-fidelity visual capture (Phase 2). A contract scaffold: inert by default
@@ -310,6 +357,10 @@ NIGHT_SHIFT_LIB="$WORKSPACE_ROOT/scripts/lib"
 # command execution. See scripts/lib/preflight.sh.
 # shellcheck source=scripts/lib/preflight.sh
 . "$NIGHT_SHIFT_LIB/preflight.sh"
+# Opt-in ai-memory integration (NIGHT_SHIFT_MEMORY) + reviewer isolation
+# argv. See scripts/lib/memory.sh.
+# shellcheck source=scripts/lib/memory.sh
+. "$NIGHT_SHIFT_LIB/memory.sh"
 # Ignored, dependency directories the isolated validation worktree needs but git
 # does not track. They are symlinked from the project so RN tooling works without
 # reinstalling or triggering npx downloads. Override with NIGHT_SHIFT_DEPENDENCY_LINKS.
@@ -345,6 +396,16 @@ scope of a ## Design Contract spec bumps to NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL (
 opus) for design-fidelity work — personas on
 NIGHT_SHIFT_PERSONA_MODEL (default sonnet), and the observer on
 NIGHT_SHIFT_OBSERVER_MODEL (default opus); any "inherit" uses the startup model.
+Every remaining step has its own optional override (empty = follow the tier
+above): NIGHT_SHIFT_VISUAL_MODEL / _OBSERVE_REQUEST_MODEL / _COMPLETE_MODEL /
+_FEEDBACK_MODEL / _SWEEP_FIX_MODEL (-> implement), _PERSONA_PLAN_MODEL /
+_PERSONA_IMPLEMENTATION_MODEL / _PORT_AUDIT_MODEL (-> personas), _SWEEP_MODEL
+(-> observer), _VISUAL_REF_MODEL / _VISUAL_REPAIR_MODEL / _TEST_AUDIT_MODEL.
+Model names are passed verbatim to `claude --model` (aliases or full IDs);
+NIGHT_SHIFT_MODEL_FALLBACK_CHAIN="a>b>c" names the per-model-cap fallback
+order for models the built-in fable>opus>sonnet ladder does not know.
+NIGHT_SHIFT_MEMORY=ai-memory (default off) wires an ai-memory server in
+(docs/ai-memory-integration.md). --list-config prints every knob + default.
 Runs use
 explicit session IDs, local candidate commits, per-profile persona approvals, and
 observer approval. Live fixture tests make paid Claude calls;
@@ -1085,13 +1146,27 @@ initialize_run() {
     state_set '.test_first_baseline_green=false'
   fi
   state_set '.baseline_complete=true'
+  # models.steps: the effective model of every per-step knob, built from the
+  # SAME table the call sites read (step_model over STEP_MODEL_STEPS), so the
+  # journal cannot drift from what actually runs; implement_effective is the
+  # implement scope's real model (the ## Design Contract bump applied — SPEC
+  # is already selected here), next to the raw implement knob.
+  local steps_json="{}" step
+  for step in $STEP_MODEL_STEPS; do
+    steps_json="$(jq -cn --argjson o "$steps_json" --arg k "$step" --arg v "$(step_model "$step")" '$o + {($k):$v}')"
+  done
   emit_event run_started "$(jq -cn --arg spec "$SPEC" --arg base "$BASE_COMMIT" \
     --arg plan "$PLAN_MODEL" --arg impl "$IMPLEMENT_MODEL" --arg pers "$PERSONA_MODEL" --arg obs "$OBSERVER_MODEL" \
+    --arg design "$DESIGN_IMPLEMENT_MODEL" --arg impl_eff "$(stage_model implement)" \
+    --arg sweep "$SWEEP_MODEL" --argjson steps "$steps_json" \
+    --arg memory "$MEMORY" \
     --arg backend "$IMPLEMENT_BACKEND" --arg cursor "$CURSOR_IMPLEMENT_MODEL" \
     --arg engine_implement "$ENGINE_IMPLEMENT" --arg engine_review "$ENGINE_REVIEW" \
     '{spec:$spec, base:$base,
       models: ({plan:$plan, implement:$impl, personas:$pers, observer:$obs,
+        design_implement:$design, implement_effective:$impl_eff, sweep:$sweep, steps:$steps,
         implement_backend:$backend} + (if $backend == "cursor" then {cursor_model:$cursor} else {} end)),
+      memory:$memory,
       engines:{implement:$engine_implement, review:($engine_review|if .=="" then null else . end)}}')"
 }
 
@@ -1261,16 +1336,8 @@ session_boundary() {
   [ "$(stage_session_scope "$old_stage")" != "$(stage_session_scope "$new_stage")" ]
 }
 
-# Pure: print the "--model NAME" CLI argument for a model, or nothing for
-# "inherit"/empty (use the CLI's startup model). Printed unquoted at the call
-# site so it word-splits into argv — safe under bash 3.2 + set -u, where an empty
-# array expansion would trip "unbound variable" (model names never contain spaces).
-model_flag() {
-  case "$1" in
-    inherit|"") ;;
-    *) printf -- '--model %s' "$1" ;;
-  esac
-}
+# model_flag lives in scripts/lib/models.sh (shared with the standalone visual
+# surfaces); it is the same "--model NAME or nothing for inherit/empty" rule.
 
 # True when the spec declares a ## Design Contract (the marker that also activates the
 # Design Fidelity Reviewer + visual_review). Drives the build-from-Figma procedure and
@@ -1501,7 +1568,10 @@ maybe_refresh_session() {
 # IMPLEMENT_MODEL, EXCEPT the implement scope of a ## Design Contract spec, which is
 # judgment-heavy design-fidelity work and bumps to DESIGN_IMPLEMENT_MODEL (opus). The
 # strong independent judgment in the observe scope is the separate observer
-# (OBSERVER_MODEL), not this primary turn. Unknown scope ->
+# (OBSERVER_MODEL), not this primary turn. The visual, observe and complete
+# scopes each take their own optional override (VISUAL_MODEL,
+# OBSERVE_REQUEST_MODEL, COMPLETE_MODEL); EMPTY follows IMPLEMENT_MODEL, so an
+# unset knob is byte-identical to the two-tier rule. Unknown scope ->
 # "inherit" (force no model; safe default).
 stage_model() {
   case "$1" in
@@ -1509,8 +1579,23 @@ stage_model() {
     implement)
       if spec_has_design_contract "${SPEC:-}"; then printf '%s' "$DESIGN_IMPLEMENT_MODEL"
       else printf '%s' "$IMPLEMENT_MODEL"; fi ;;
-    visual|observe|complete) printf '%s' "$IMPLEMENT_MODEL" ;;
+    visual) step_model visual ;;
+    observe) step_model observe_request ;;
+    complete) step_model complete ;;
     *) printf 'inherit' ;;
+  esac
+}
+
+# Pure: the model the persona bench runs on for a review stage ("plan" or
+# "implementation" — the persona_stage strings run_personas passes). Each
+# stage takes an optional override (PERSONA_PLAN_MODEL /
+# PERSONA_IMPLEMENTATION_MODEL); EMPTY — and any other stage name — follows
+# PERSONA_MODEL, so an unset knob is byte-identical to the single-knob bench.
+persona_stage_model() {
+  case "$1" in
+    plan) step_model persona_plan ;;
+    implementation) step_model persona_implementation ;;
+    *) printf '%s' "$PERSONA_MODEL" ;;
   esac
 }
 
@@ -1655,6 +1740,15 @@ screen to match its Figma design. Before/while implementing:
         design_build_note="$design_build_note$(manifest_prompt_block "$SPEC")"
       fi ;;
   esac
+  # Opt-in agent memory (scripts/lib/memory.sh): recall before planning, a
+  # handoff before completion. Both blocks are EMPTY (zero cost, byte-identical
+  # prompt) unless NIGHT_SHIFT_MEMORY=ai-memory — same prompt-level posture as
+  # doc_freshness_note above.
+  local memory_note=""
+  case "$stage" in
+    planning) memory_note="$(memory_recall_prompt_block)" ;;
+    completion) memory_note="$(memory_handoff_prompt_block)" ;;
+  esac
   # The wrapper runs every validation phase inside the spec's Workdir; the
   # primary must run them in the SAME directory or its execution evidence
   # records diverging exit statuses and the strict evidence match blocks the
@@ -1671,6 +1765,7 @@ Base commit: $BASE_COMMIT
 $workdir_note
 $design_build_note
 $doc_freshness_note
+$memory_note
 Read $WORKSPACE_ROOT/AGENTS.md and $WORKSPACE_ROOT/AGENT_LOOP.md, then continue
 the task in this session from the state on disk. Preserve baseline dirty work.
 You own planning, implementation, resolving review findings, validation,
@@ -2521,10 +2616,12 @@ invoke_persona_once() {
   lens="$(persona_lens "$persona" "$(spec_track "$SPEC")")"
   # Prompt via STDIN (not argv): the bundle inlines a diff that can be large, and a
   # positional arg risks the ARG_MAX/E2BIG exec limit (repair_agent pipes for the
-  # same reason). model_flag word-splits into `--model X` (or nothing).
+  # same reason). claude_model_args word-splits into `--model X` (or nothing),
+  # as does reviewer_isolation_args (hooks off + no MCP when NIGHT_SHIFT_MEMORY
+  # or NIGHT_SHIFT_REVIEWER_ISOLATION=1 is active; nothing otherwise).
   # shellcheck disable=SC2046
   (cd "$neutral" && persona_prompt "$persona" "$stage" "$bundle" "$lens" "$retry_note" |
-    claude -p $(model_flag "$(resolve_effective_model "$PERSONA_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+    claude -p $(claude_model_args "$(persona_stage_model "$stage")") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # A 429 (session OR per-model) is a live-recoverable transient — a standard
     # rate limit that also recovers fine on the primary path — NOT "no parseable
@@ -2726,7 +2823,7 @@ handle_persona_rate_limits() {
     if is_rate_limit_response "$first_raw"; then
       handle_rate_limit_wait "$first_raw" subagent
     elif is_per_model_limit_response "$first_raw"; then
-      handle_per_model_limit "$first_raw" "$(resolve_effective_model "$PERSONA_MODEL")" subagent
+      handle_per_model_limit "$first_raw" "$(resolve_effective_model "$(persona_stage_model "$persona_stage")")" subagent
     fi
     for marker in "$result_dir"/.ratelimited-*; do
       [ -f "$marker" ] || continue
@@ -3274,8 +3371,9 @@ port_audit_screens_for_spec() {
 # Contract lists at least one `- Design manifest:` path that resolves inside
 # the project (port_audit_screens_for_spec above) — absent either, this is a
 # silent no-op. Runs scripts/port-audit.sh once per screen (screen = manifest
-# basename), on the PERSONA_MODEL knob (breadth-tier judgment, same as the
-# persona bench; port-audit.sh treats "inherit" as no --model flag), scoped to
+# basename), on the port_audit step model (PORT_AUDIT_MODEL, empty follows
+# PERSONA_MODEL — breadth-tier judgment, same as the persona bench;
+# port-audit.sh treats "inherit" as no --model flag), scoped to
 # the spec's resolved Workdir when one is set (--scope is project-relative on
 # both sides). NIGHT_SHIFT_PORT_AUDIT_OFFLINE routes the call through the
 # CLI's own --offline canned-reply path (zero cost — the fixture suite and a
@@ -3298,7 +3396,7 @@ port_audit_candidate() {
     [ -n "$screen" ] && [ -n "$full" ] || continue
     report="$PROJECT/.night-shift/port-audit/$screen.json"
     if ! "$WORKSPACE_ROOT/scripts/port-audit.sh" --project "$PROJECT" --screen "$screen" \
-        --manifest "$full" --model "$(resolve_effective_model "$PERSONA_MODEL")" "${scope_args[@]}" "${offline_args[@]}" \
+        --manifest "$full" --model "$(resolve_effective_model "$(step_model port_audit)")" "${scope_args[@]}" "${offline_args[@]}" \
         >"$RUN_ROOT/raw/port-audit-$screen.log" 2>&1; then
       log "WARN: port-audit for screen '$screen' failed (advisory only; see raw/port-audit-$screen.log)"
     fi
@@ -3410,7 +3508,7 @@ FILES
   mkdir -p "$RUN_ROOT/raw" 2>/dev/null || true
   if ! "$WORKSPACE_ROOT/scripts/test-audit.sh" --project "$PROJECT" --tests "${file_args[@]}" \
       --src "$src" \
-      --model "$(resolve_effective_model "$TEST_AUDIT_MODEL")" --out "$report" \
+      --model "$(resolve_effective_model "$(step_model test_audit)")" --out "$report" \
       >"$RUN_ROOT/raw/test-audit-$(basename "$SPEC" .md).log" 2>&1; then
     log "WARN: test-audit exited non-zero (advisory only; see raw/test-audit-$(basename "$SPEC" .md).log — a non-zero exit here just means findings were found, or degrades cleanly on an infra error)"
   fi
@@ -3633,10 +3731,13 @@ invoke_observer_once() {
   # pulls out; json_schema_basic then enforces the strict contract.
   # Prompt via STDIN (not argv): the context inlines a size-bounded diff that can
   # still be sizeable, and a positional arg risks the ARG_MAX/E2BIG exec limit.
-  # model_flag intentionally word-splits into `--model X` (or nothing).
+  # claude_model_args intentionally word-splits into `--model X` (or nothing),
+  # as does reviewer_isolation_args (hooks off + no MCP under NIGHT_SHIFT_MEMORY
+  # / NIGHT_SHIFT_REVIEWER_ISOLATION=1 — the observer's independence must not
+  # depend on what the user's global settings inject; nothing otherwise).
   # shellcheck disable=SC2046
   (cd "$neutral" && observer_prompt "$context" "$candidate" "$retry_note" "$expected_primary" |
-    claude -p $(model_flag "$(resolve_effective_model "$OBSERVER_MODEL")") --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
+    claude -p $(claude_model_args "$OBSERVER_MODEL") $(reviewer_isolation_args) --output-format json) >"$raw" 2>"${raw}.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # Same 429 distinction as invoke_persona_once: a live-recoverable transient,
     # not "the verdict failed the observer-review contract" — the caller
@@ -4299,6 +4400,10 @@ main_run() {
   case "$CODEX_MAX_RETRY" in
     ''|*[!0-9]*) die "NIGHT_SHIFT_CODEX_MAX_RETRY must be a non-negative integer" ;;
   esac
+  # Memory knobs (backend enum, isolation 0/1, probe timeout) — a typo must
+  # not silently run without memory or without isolation. Same fail-loud
+  # posture as above; the --sweep-only surface runs the same check.
+  validate_memory_config
 
   # Acquire a per-project lock BEFORE touching state.json; two concurrent runs
   # on the same --project would otherwise corrupt the shared state. The lock
@@ -4344,6 +4449,9 @@ main_run() {
   trap 'block_run "run interrupted by signal"' HUP INT TERM
   rate_limit_contract_canary
   cursor_contract_canary
+  # ai-memory reachability (NIGHT_SHIFT_MEMORY=ai-memory only): WARN + journal,
+  # never blocks — runs on EVERY startup like the canaries above.
+  memory_startup_probe
 
   local malformed_n rc
   while :; do
@@ -4435,6 +4543,12 @@ if [ "$SWEEP_ONLY" -eq 1 ]; then
   # cursor-agent from this surface). No canary: emit_event needs a RUN_ROOT
   # this surface never has.
   [ "$IMPLEMENT_BACKEND" != "cursor" ] || cursor_startup_probe
+  # Memory knobs: sweep_run consults reviewer_isolation_args, so a mistyped
+  # NIGHT_SHIFT_MEMORY / NIGHT_SHIFT_REVIEWER_ISOLATION must die here exactly
+  # as in main_run instead of silently running the sweep un-isolated. The
+  # probe WARNs only (no RUN_ROOT here, so no journal event).
+  validate_memory_config
+  memory_startup_probe
   # Standalone, single-shot sweep: no run, no RUN_ROOT/STATE — ignores any
   # queued specs, so it never touches --spec/NEXT_TASK task selection. Even
   # with --spec given, sweep_fix_cycle's re-validation branch is a no-op

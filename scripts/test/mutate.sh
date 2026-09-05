@@ -185,7 +185,7 @@ run_mutants() {
 
   scratch="$(mktemp -d)"; pristine="$(mktemp -d)"
   trap 'rm -rf "$scratch" "$pristine"' EXIT
-  git -C "$ENGINE_DIR" ls-files -z | tar --null -T - -cf - -C "$ENGINE_DIR" | tar -xf - -C "$scratch"
+  git -C "$ENGINE_DIR" ls-files -z | tar --null -C "$ENGINE_DIR" -T - -cf - | tar -xf - -C "$scratch"
   # $scratch now holds tracked files only (never a raw cp -R of $ENGINE_DIR,
   # whose root holds untracked company screenshots under design/); a plain
   # recursive copy FROM $scratch is safe as the second, per-mutant-restore

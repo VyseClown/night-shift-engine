@@ -27,6 +27,17 @@ VISUAL_DEFAULT_TOLERANCE="${NIGHT_SHIFT_VISUAL_TOLERANCE:-0.10}"
 # an environment without a simulator and image-diff tool. The specific tools are
 # intentionally pluggable: a real deployment sets NIGHT_SHIFT_VISUAL_CAPTURE=1 and
 # provides `xcrun`/`adb` (capture) and a diff tool on PATH.
+# Model helpers (claude_model_args) — sourced by night-shift.sh before this lib,
+# and here again defensively so a standalone consumer (scripts/visual-review.sh,
+# a bare `. visual-capture.sh` in a fixture) builds the same `--model` argv.
+# shellcheck source=scripts/lib/models.sh
+command -v claude_model_args >/dev/null 2>&1 || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/models.sh"
+# The cheap Figma-MCP export/fetch calls (visual_stage_ref here,
+# __visual_fetch_figma_json in visual-repair.sh) run on this knob. Default is
+# the haiku tier — a full ID because `haiku` as a bare alias was not verified
+# live on the pinned CLI when this default was set; any alias/ID/inherit works.
+VISUAL_REF_MODEL="${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}"
+
 visual_capture_available() {
   [ "${NIGHT_SHIFT_VISUAL_CAPTURE:-0}" = "1" ] || return 1
   command -v "${NIGHT_SHIFT_VISUAL_CAPTURE_TOOL:-xcrun}" >/dev/null 2>&1 || return 1
@@ -45,7 +56,11 @@ visual_stage_ref() {
   command -v claude >/dev/null 2>&1 || { log "  no claude CLI — cannot MCP-export Figma $node"; return 1; }
   dir="$(dirname "$out")"; base="$(basename "$out")"; mkdir -p "$dir" || return 1
   prompt="Use the mcp__figma__download_figma_images tool to download fileKey ${key} node ${node} as a PNG (pngScale 2) to localPath \"${dir}\" with fileName \"${base}\" — i.e. exactly the file ${out}. Use ONLY that tool; never a Figma token or REST. Reply 'done' once the file exists."
-  ( printf '%s' "$prompt" | claude -p --model "${NIGHT_SHIFT_VISUAL_REF_MODEL:-claude-haiku-4-5}" \
+  # claude_model_args (scripts/lib/models.sh) word-splits into `--model X`, or
+  # nothing for `inherit` — the same rule as every other engine model knob, so
+  # NIGHT_SHIFT_VISUAL_REF_MODEL takes an alias, a full ID, or inherit.
+  # shellcheck disable=SC2046
+  ( printf '%s' "$prompt" | claude -p $(claude_model_args "$VISUAL_REF_MODEL") \
       --permission-mode bypassPermissions \
       --output-format json --allowed-tools "mcp__figma__download_figma_images" >/dev/null 2>&1 ) || true
   [ -s "$out" ]

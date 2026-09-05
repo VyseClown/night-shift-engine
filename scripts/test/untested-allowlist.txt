@@ -8,7 +8,6 @@ check_branch_and_worktree
 cleanup_validation_worktree
 detect_stalled_findings
 handle_signal
-list_config
 metro_is_up
 rate_limit_reset_fields
 recover_run

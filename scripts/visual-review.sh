@@ -67,6 +67,7 @@ die() { log "ERROR: $*"; exit 2; }
 
 # The engine's capture/diff/report primitives (visual_capture_screens,
 # run_visual_capture, __visual_*). It expects a `log` in scope — defined above.
+# (Both libs self-source scripts/lib/models.sh for claude_model_args.)
 # shellcheck source=scripts/lib/visual-capture.sh
 . "$SCRIPT_DIR/lib/visual-capture.sh"
 # shellcheck source=scripts/lib/visual-repair.sh

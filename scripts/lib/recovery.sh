@@ -43,36 +43,9 @@ is_per_model_limit_response() {
   ' "$raw" >/dev/null 2>&1
 }
 
-# Pure: the model to fall back to when a per-model usage cap hits. The ladder
-# only ever steps DOWN in scarcity (fable -> opus -> sonnet) so a fallback can
-# never burn a scarcer budget than the one that just capped. sonnet (and any
-# unknown name) has no successor: echo unchanged + return 1, and the caller
-# blocks for manual resume rather than guessing.
-successor_model() {
-  case "$1" in
-    claude-fable-5|fable*) printf 'opus' ;;
-    opus|opus-*|claude-opus-*) printf 'sonnet' ;;
-    *) printf '%s' "$1"; return 1 ;;
-  esac
-}
-
-# Map a configured model through the run's persisted `.model_fallbacks` in
-# state (written by handle_per_model_limit under NIGHT_SHIFT_MODEL_FALLBACK=1),
-# so every consumer of a model knob — primary, personas, observer, port-audit —
-# honors a fallback recorded earlier in the run. Follows chains (fable->opus
-# recorded, then opus->sonnet later) with a small hop bound so a corrupt cyclic
-# map cannot loop. No state / no mapping -> echoes the input unchanged.
-resolve_effective_model() {
-  local model="$1" mapped hops=0
-  [ -n "${STATE:-}" ] && [ -f "${STATE:-}" ] || { printf '%s' "$model"; return 0; }
-  while [ "$hops" -lt 4 ]; do
-    mapped="$(jq -r --arg m "$model" '.model_fallbacks[$m] // empty' "$STATE" 2>/dev/null)"
-    { [ -n "$mapped" ] && [ "$mapped" != "$model" ]; } || break
-    model="$mapped"
-    hops=$((hops + 1))
-  done
-  printf '%s' "$model"
-}
+# successor_model + resolve_effective_model moved to scripts/lib/models.sh
+# (shared with the standalone visual surfaces); handle_per_model_limit below
+# still consumes them from the same shell.
 
 rate_limit_reset_fields() {
   local raw="$1"
@@ -338,7 +311,7 @@ handle_per_model_limit() {
     block_run "per-model usage cap hit on model '$model' ($line); set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
   fi
   successor="$(successor_model "$model")" ||
-    block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor — set the affected NIGHT_SHIFT_*_MODEL knob to another model (e.g. opus) and re-run with --resume, or wait for the model's quota"
+    block_run "per-model usage cap hit on model '$model' ($line); NIGHT_SHIFT_MODEL_FALLBACK=1 but '$model' has no fallback successor (not in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN, and outside the built-in fable>opus>sonnet ladder) — name it in NIGHT_SHIFT_MODEL_FALLBACK_CHAIN=a>b>c, or set the affected NIGHT_SHIFT_*_MODEL knob to another model and re-run with --resume, or wait for the model's quota"
   if [ "$mode" = "primary" ]; then
     state_set '.model_fallbacks[$from]=$to | .session_id=null | .updated_at=$now' \
       --arg from "$model" --arg to "$successor" --arg now "$(now_iso)"

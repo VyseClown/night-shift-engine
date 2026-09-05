@@ -135,7 +135,9 @@ scarcity ladder (`fable → opus → sonnet`) and continues on the successor.
 Persona and observer sub-agent calls hit the same two shapes independently of
 the primary: a session-limit 429 mid-batch waits once and re-spawns only the
 still-incomplete workers, and a per-model cap follows the identical
-block/fallback rule.
+block/fallback rule. A recorded fallback is keyed by model name and honored by
+every knob carrying that model for the rest of the run — so a persona-tier
+knob set to the observer's model can, on a cap, step the observer down too.
 
 ## Model tiering (cost)
 
@@ -149,6 +151,14 @@ The engine spends the strong model only where judgment matters. All knobs accept
 | `NIGHT_SHIFT_DESIGN_IMPLEMENT_MODEL` | `opus` | Implement grind for a spec with a `## Design Contract` (judgment-heavy design fidelity) |
 | `NIGHT_SHIFT_PERSONA_MODEL` | `sonnet` | Review persona sub-agents |
 | `NIGHT_SHIFT_OBSERVER_MODEL` | `opus` | Independent final gate (the backstop that makes a cheaper primary safe) |
+| `NIGHT_SHIFT_SWEEP_MODEL` | = observer | Whole-branch sweep review |
+| `NIGHT_SHIFT_VISUAL_MODEL` / `_OBSERVE_REQUEST_MODEL` / `_COMPLETE_MODEL` | = implement | Per-step overrides for the primary's visual-review, observe-request and completion scopes (empty follows the implement tier) |
+| `NIGHT_SHIFT_FEEDBACK_MODEL` / `_SWEEP_FIX_MODEL` | = implement | The run-feedback session and the sweep fix cycle |
+| `NIGHT_SHIFT_PERSONA_PLAN_MODEL` / `_PERSONA_IMPLEMENTATION_MODEL` | = personas | The persona bench on the plan review vs the implementation review |
+| `NIGHT_SHIFT_PORT_AUDIT_MODEL` | = personas | The port-fidelity audit call |
+| `NIGHT_SHIFT_TEST_AUDIT_MODEL` | `sonnet` | The test-audit call |
+| `NIGHT_SHIFT_VISUAL_REF_MODEL` / `_VISUAL_REPAIR_MODEL` | `claude-haiku-4-5` / `opus` | Figma-MCP reference export/fetch, and the visual repair agent |
+| `NIGHT_SHIFT_MODEL_FALLBACK_CHAIN` | unset | Explicit `a>b>c` per-model-cap successor order, consulted before the built-in `fable → opus → sonnet` ladder for the models it names (needed for models the ladder does not know; unlisted models keep their ladder successor) |
 | `NIGHT_SHIFT_SESSION_SCOPE` | `stage` | Fresh session per stage scope; `run` for one pinned session. The cursor implement backend requires `stage` — `=run` is rejected at startup. |
 | `NIGHT_SHIFT_IMPLEMENT_BACKEND` | `claude` | Opt-in `cursor` runs post-plan primary work (implement/observe/completion) on the Cursor CLI instead; plan/observer/design stay Claude |
 | `NIGHT_SHIFT_CURSOR_IMPLEMENT_MODEL` | `cursor-grok-4.6-high` | Model slug for the cursor backend, fresh sessions only |
@@ -158,6 +168,26 @@ The engine spends the strong model only where judgment matters. All knobs accept
 
 The model changes only at stage-scope boundaries (which already start a fresh
 session), so it is constant within a scope and resumes never re-pass it.
+Every knob's value goes verbatim to `claude --model` — an alias (`opus`,
+`sonnet`), a full ID (`claude-fable-5-1`, `claude-haiku-4-5`), or `inherit` — so a new
+model works the day the CLI accepts it; `scripts/night-shift.sh --list-config`
+prints every knob with its default.
+
+## Cross-run agent memory (opt-in)
+
+`NIGHT_SHIFT_MEMORY=ai-memory` wires a running
+[ai-memory](https://github.com/akitaonrails/ai-memory) server in: a startup
+reachability probe (journaled `memory_probe`, never blocking), a recall
+paragraph in the plan scope and a handoff paragraph in the completion scope
+(the primary uses ai-memory's MCP tools when they are installed and skips
+silently otherwise), and **reviewer isolation** — personas, the observer, the
+branch sweep and the test/port audit CLIs run with hooks off and no MCP servers
+so the memory the primary sees never reaches the independent gate (the
+primary's implementer-side kin — run feedback, sweep fix, visual repair — stay
+unisolated on purpose). Isolation is also available standalone as
+`NIGHT_SHIFT_REVIEWER_ISOLATION=1`; `--sweep-only` validates and probes the
+same knobs. Default off = byte-identical engine. See
+`docs/ai-memory-integration.md`.
 
 ## Codex as an implement-stage vendor (opt-in)
 

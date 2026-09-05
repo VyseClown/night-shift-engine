@@ -87,6 +87,24 @@ port_audit_model_flag() {
   esac
 }
 
+# Reviewer isolation — a copy of night-shift.sh's reviewer_isolation_args
+# rule (scripts/lib/memory.sh), re-derived from the same two env knobs since
+# this CLI is standalone: NIGHT_SHIFT_REVIEWER_ISOLATION=1, or unset while
+# NIGHT_SHIFT_MEMORY=ai-memory, runs the one `claude -p` with hooks off and no
+# MCP servers (`--settings {"disableAllHooks":true} --strict-mcp-config`,
+# word-split at the call site). This report feeds the observer's evidence, so
+# a user-level SessionStart hook (ai-memory injects the project's open handoff
+# into every session) must not shape it. `=0` forces it off. Keep in lockstep
+# with memory.sh.
+port_audit_isolation_args() {
+  case "${NIGHT_SHIFT_REVIEWER_ISOLATION:-}" in
+    1) ;;
+    0) return 0 ;;
+    *) [ "${NIGHT_SHIFT_MEMORY:-off}" = "ai-memory" ] || return 0 ;;
+  esac
+  printf -- '--settings {"disableAllHooks":true} --strict-mcp-config'
+}
+
 # ---- args -------------------------------------------------------------------
 PROJECT="" SCREEN="" MANIFEST_ARG="" SCOPE="" TOKENS="" MODEL="" OFFLINE=""
 LIVE=0 DEVICE="iphone-15" STATE="default" REFERENCE=""
@@ -188,7 +206,7 @@ while [ "$attempt" -le 2 ]; do
     # own model_flag call sites.
     # shellcheck disable=SC2046
     ( cd "$PROJECT" && { [ -z "$RETRY_NOTE" ] || printf '%b' "$RETRY_NOTE"; cat "$PROMPT_FILE"; } | \
-      claude -p $(port_audit_model_flag "$MODEL") --output-format json ) >"$RAW" 2>"$RAW.err"
+      claude -p $(port_audit_model_flag "$MODEL") $(port_audit_isolation_args) --output-format json ) >"$RAW" 2>"$RAW.err"
     rc=$?
     if [ "$rc" -ne 0 ]; then
       LAST_REASON="claude -p exited $rc: $(head -c 200 "$RAW.err" 2>/dev/null | tr '\n' ' ')"
